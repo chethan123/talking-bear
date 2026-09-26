@@ -313,7 +313,7 @@ The reasons for keeping the stream open:
 | 15 | Playing | `reaction{priority ≥ 3}` | — | Cooldown | `stopPlayback`, `anim reaction`, `timer cooldown` |
 | 16 | Playing | `reaction{priority < 3}` | — | Playing | additive flinch only |
 | 17 | Cooldown | `timer cooldown` | — | Listening | `arm(restoreFloorDb)`. The worklet clears the pre-roll ring and blocks onsets for 100 ms. |
-| 18 | Listening | `timer sleep` | no speech or touch for `T_sleep` (default 120 s, **Q1**) | Asleep | `disarm`, `closeMic`, `suspendCtx`, `wakeLock off`, `anim sleep` |
+| 18 | Listening | `timer sleep` | no speech or touch for `T_sleep` = 120 s (decided in Q1; configurable in settings) | Asleep | `disarm`, `closeMic`, `suspendCtx`, `wakeLock off`, `anim sleep` |
 | 19 | any awake | `visibility hidden` \| `pagehide` \| `freeze` | — | Paused | abort take/playback, `closeMic`, `suspendCtx`, `wakeLock off` |
 | 20 | Paused | `visibility visible` | was awake | Waking | `resumeCtx`, `openMic` (normally no prompt), `wakeLock on` |
 | 21 | any awake | `ctxError` \| `track ended` \| `devicechange` affecting input | — | Error | `closeMic`, `ui error: tap to retry` |
@@ -1917,7 +1917,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 
 | # | Question | My recommendation | Affects |
 |---|---|---|---|
-| **Q1** | When nobody interacts, should the bear **fall asleep and close the mic** (the privacy indicator turns off and the context suspends; tap to wake), or keep listening for as long as the app is visible? | Sleep after **2 min** with no speech or touch; doze visuals from 45 s. Configurable in settings. | §3.4 row 18, battery budget, privacy |
+| **Q1** ✅ | When nobody interacts, should the bear **fall asleep and close the mic** (the privacy indicator turns off and the context suspends; tap to wake), or keep listening for as long as the app is visible? | **Decided 2026-09-26:** sleep after **2 min** with no speech or touch; doze visuals from 45 s. Configurable in settings. | §3.4 row 18, battery budget, privacy |
 | **Q2** | For VAD tuning, will you record **real voices** (family, friends, children), and where may those recordings live? | Record them, with consent. Keep them **out of this repo** in a separate private location that only local runs or a private CI job read. Commit only synthetic fixtures here. | M2 corpus, CI |
 | **Q3** | Who is the **primary audience**: young children, or general or all ages? | Family-friendly, 4+: text-free UI, gentle slapstick (a knock gives "dizzy" but nothing framed as hitting), haptics on. | Reaction table §4.6.4, default voice, UI copy |
 | **Q4** | Do you approve the **character direction** ("Juni": a juniper-teal bear with an amber-eyed, tufted head, a notched ear and a mustard neckerchief), or do you want a different look or name? | Approve as the working design; review the first render in M4. | M4 art |
