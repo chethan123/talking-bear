@@ -91,7 +91,7 @@ The research scratch scripts live in the (ephemeral) session scratchpad, not in 
 - **Runtime:** the container runs with `read_only: true`, all capabilities dropped, no egress, and tight memory/pid limits.
 - **Topology:** per-app Caddy sidecar → app over plain HTTP. TLS terminates at a front Caddy; the site is served at `bear.<domain>`.
 - **Out of scope:** the hosting package itself.
-- **Repo:** this one is **private** and MIT-licensed. That matters for licences ([§8](#8-dependencies)), fixture storage ([Q2](#12-open-questions-asked-one-at-a-time)) and GitHub artifact attestations ([§9](#9-ci-outline)).
+- **Repo:** this one is **private** and MIT-licensed. That matters for licences ([§8](#8-dependencies)), fixtures (no real voices, per [Q2](#12-open-questions-asked-one-at-a-time)) and GitHub artifact attestations ([§9](#9-ci-outline)).
 
 ---
 
@@ -1244,7 +1244,7 @@ The Caddy constraints have two causes:
   - mixes at a set SNR
   - knock bursts
 - Every fixture **starts with ≥ 1 s of silence and ends with ≥ 300 ms of digital zeros** (see [§4.9.3](#493-end-to-end-playwright--chromium-fake-media)).
-- Real-voice fixtures are covered by **Q2**.
+- **No real-voice recordings anywhere (Q2).** The VAD tuning corpus is synthetic plus text-to-speech, and real rooms are validated live without storing audio ([§7 M2](#m2--vad-tuning)).
 
 **Property-based tests (fast-check 4.10):**
 
@@ -1407,11 +1407,11 @@ The lab pages are **dev-only Vite entry points** under `lab/`, never shipped in 
 | X-E10 | 44.1 kHz devices; actual rates | Log `ctx.sampleRate`, `baseLatency`, `outputLatency` and `track.getSettings()` per constraint set. | Resampler paths | M1 |
 | X-E11 | Wake lock under battery saver, lock/unlock | Acquire; lock/unlock; toggle battery saver; log `release` events and rejections. | Wake-lock policy | M1 |
 | X-R4 | Silent-sink suspension: does connecting the worklet let Chrome release the output device while capture continues, and at what resume cost? | Graph A: worklet output unconnected. Graph B: its zero output → destination. After 40 s of silence, check `dumpsys media.audio_flinger` for an active output track and that capture RMS continues; measure 10-minute drain; measure first-playback start latency after suspension. | [§3.2](#32-audio-pipeline-data-flow) wiring | M1 |
-| X-V1 | VAD on real devices, voices and rooms (children, TV, fans) | [§7 M2](#m2--vad-tuning) harness and corpus | Parameters; pre-gate | M2 |
+| X-V1 | VAD on real devices, voices and rooms (children, TV, fans). The corpus is synthetic/TTS only (Q2), so **domain gap** is the main risk [M]. | [§7 M2](#m2--vad-tuning): tune on the synthetic/TTS corpus, then validate live with `lab/vad-live` (aggregate tallies only, no audio stored) | Parameters; pre-gate | M2 |
 | X-V2 | Silero TS port CPU on the phone | `lab/bench`: 60 s of audio through the TS port (and ORT for comparison) in a Worker on D1–D3; p50/p95/max per frame; thermals after 10 min. **Gate: p95 ≤ 8 ms.** | TS port vs ORT vs energy-only | M2 |
-| X-V3 | Children's voices | Include child speakers in the corpus; compare hit rate and splits. | Thresholds | M2 |
-| X-F1 | Which pitch ratio and algorithm people like | `lab/voices.html`: A/B/X of linear `playbackRate`, sinc, (optional) Signalsmith with formant compensation, and PSOLA, at 1.4, 1.7 and 2.0, on the phone speaker and headphones, ≥ 5 listeners including children. | Default preset; whether formant presets are worth it | M3 |
-| X-F2 | Real high-frequency content of Android captures (how audible aliasing would be) | Record 20 sibilant-rich phrases on D1–D3; run the aliasing analysis. | Confidence in the sinc choice (low stakes) | M3 |
+| X-V3 | Children's voices | Corpus: high-pitch TTS variants (a proxy only [M]). Live: a child speaks the scripted phrases into `lab/vad-live` if available; compare tallies with adults. Nothing is stored. | Thresholds | M2 |
+| X-F1 | Which pitch ratio and algorithm people like | `lab/voices.html`: A/B/X of linear `playbackRate`, sinc, (optional) Signalsmith with formant compensation, and PSOLA, at 1.4, 1.7 and 2.0, on the phone speaker and headphones, ≥ 5 listeners including children. **Live input only**: each listener speaks and hears it back; only votes are kept, never audio (Q2). | Default preset; whether formant presets are worth it | M3 |
+| X-F2 | Real high-frequency content of Android captures (how audible aliasing would be) | `lab/spectrum`: speak 20 sibilant-rich phrases on D1–D3; the page computes the > 8 kHz energy share **in memory** and shows only the statistics (no audio stored, Q2). | Confidence in the sinc choice (low stakes) | M3 |
 | X-F3 | Voice-chain time on the phone | `lab/bench` with 1/5/10 s clips | 150 ms budget | M3 |
 | X-A1 | Canvas cost at DPR 2–2.6 | Render the ~60-path rig with all springs active; remote DevTools trace; ≤ 4 ms main thread per frame and 0 dropped frames over 60 s; DPR cap 2 vs native. | Renderer choice holds; DPR cap | M4 |
 | X-A2 | A/V sync | Click-train clip with the mouth flashing; film at 240 fps; target mouth lead 0–40 ms; repeat on Bluetooth while logging `outputLatency`. | Lookahead constant | M4 |
@@ -1441,7 +1441,7 @@ talking-bear/
 │   ├── workflows/release.yml       # tag v*.*.*: multi-arch build + push to GHCR
 │   └── dependabot.yml              # npm, gomod, docker (digests), github-actions (SHAs)
 ├── Dockerfile
-├── .dockerignore                   # node_modules, dist*, .git, test-results, fixtures corpus
+├── .dockerignore                   # node_modules, dist*, .git, test-results
 ├── server/                         # Go static server (stdlib only)
 │   ├── go.mod
 │   ├── main.go                     # embed, handler, probe flag
@@ -1470,9 +1470,10 @@ talking-bear/
 │   ├── pwa/     register.ts
 │   ├── ui/      overlay.ts debug-overlay.ts styles.css
 │   └── test-hooks.ts               # only reachable when VITE_BEAR_TEST_HOOKS==='1'
-├── lab/                            # dev-only pages: routing, latency, record, voices, bench, gestures
+├── lab/                            # dev-only pages: routing, latency, vad-live, voices, spectrum, bench, gestures
+│                                   #   (no page ever stores or downloads captured audio: Q2)
 ├── scripts/
-│   ├── gen-bear-parts.ts   extract-silero-weights.ts   gen-fixtures.ts
+│   ├── gen-bear-parts.ts   extract-silero-weights.ts   gen-fixtures.ts   gen-corpus.ts
 │   ├── precompress.mjs     check-dist.mjs              check-headers.sh
 │   └── vad-eval.ts                 # offline VAD evaluation harness (same TS modules)
 ├── test/                           # helpers: wav.ts, worklet-scope.ts, fixtures/*.wav(+.json)
@@ -1511,7 +1512,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 - **Session:** `app/machine.ts` implementing **all** of §3.4 except `SfxGated`, plus the effect runner. Wake lock, visibility handling and permission tracking are in.
 - **Placeholder playback:** `AudioBufferSourceNode` with `playbackRate = 1.6`, to be replaced in M3. The end of playback is detected at the speaker via `getOutputTimestamp`.
 - **UI:** a single `<canvas>` circle. Radius follows the input level, colour follows the session state; a "tap to wake" overlay; the mic-denied screen.
-- **Lab pages:** `lab/routing`, `lab/latency` and `lab/record` (saves WAV via download; client-side only).
+- **Lab pages:** `lab/routing` and `lab/latency`. No lab page stores or downloads captured audio (Q2).
 - **Device experiments:** run X-E1, X-E2, X-E4, X-E5, X-E6, X-E10, X-E11, X-R4, X-T1 and X-T2, and record the results in `docs/device-notes.md`.
 
 **Tests**
@@ -1539,12 +1540,19 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 - **DSP worker:** VAD mode wired end to end, plus the pre-gate and LSTM warm-up.
 - **Harness:** `scripts/vad-eval.ts` streams WAVs through the **same modules** and reports hit rate, split rate, truncation, onset and end-of-speech latency (median/p90), and false triggers per minute.
 - **Debug overlay:** probability trace, floor and per-frame timings.
-- **Corpus:** record with `lab/record` through the production worklet (48 kHz float WAV, production constraints).
-  - Conditions: quiet, fan low and high, TV dialogue, music, kitchen, arm's length vs on a table.
-  - Speakers: ≥ 5, including children.
-  - Content: single words, 10 s monologues, whispers, shouts.
-  - Plus 10–20 min of noise-only audio per condition.
-  - Labelled with Audacity label tracks exported to JSON. **Storage per Q2.**
+- **Corpus: synthetic + text-to-speech only, no real voices (Q2).** It is built by `scripts/gen-corpus.ts` and committed; labels are exact because they come from the clean signal.
+  - **Speech:** espeak-ng [V GPL-3.0 `COPYING`], run **once** on a dev machine or in a pinned container, with the WAVs committed. It is not a CI dependency, and program output is generally not covered by the GPL [M].
+    - Several voices and variants, including the `whisper` variant [V `espeak-ng-data/voices/!v/whisper`].
+    - Pitch and speed sweeps, including high-pitch "child-like" settings. These are a proxy, not a child's voice [M].
+    - Content: single words, sentences, 10 s passages with pauses.
+    - Plus the formant-synth vowels from `gen-fixtures.ts`.
+  - **Noise:** pink/brown "fan", amplitude-modulated pink, "TV" babble (overlapping low-passed TTS streams), synthetic music (chords and percussion), knocks and clatter. Mixed at SNR {20, 10, 5, 0} dB.
+  - **Device approximation:** convolve with synthetic room impulse responses (RT60 0.2–0.6 s) and a 150 Hz–8 kHz phone-mic band-pass.
+  - **Known limitation [M]:** TTS lacks natural prosody, disfluency and breath noise. Silero was trained on real speech, so its probabilities on TTS may be biased either way. Hence the live validation below.
+- **Live validation without storing audio:** `lab/vad-live` runs the production pipeline with the debug overlay and a tally UI. Everything is computed in memory, and only aggregate JSON (counts and latencies) can be exported.
+  - Protocol: per condition (quiet, fan, TV, music, kitchen; arm's length vs on a table), a speaker reads 20 scripted phrases. The page counts segments, misses, splits and caps, and measures end-of-speech latency against the energy offset.
+  - Then 10 min with nobody speaking, counting false triggers.
+  - Speakers: whoever is available, adults and, if available, children speaking live.
 - **Grid search:**
   - positive threshold {0.4, 0.5, 0.6};
   - negative = positive − {0.1, 0.15, 0.2};
@@ -1554,18 +1562,22 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 **Tests**
 
 - Parity: TS port vs `onnxruntime-web` in CI (`max|Δp| < 1e-3`, 0 flips).
-- Metric regression on the committed synthetic fixtures (and the private corpus locally or in a private job).
+- Metric regression in CI on the committed synthetic/TTS corpus (fast subset on every PR, full grid nightly or on demand).
 - Decimator anti-aliasing property test.
 - X-V2 on D1–D3.
 
 **Exit criteria**
 
-- On the corpus:
+- On the synthetic/TTS corpus (CI-enforced):
   - hit rate ≥ 98 %;
   - splits ≤ 2 %;
   - end-of-speech p90 ≤ 900 ms;
-  - false triggers ≤ 0.1/min on fan and music noise;
-  - TV-speech rate documented, with the proximity gate tuned.
+  - false triggers ≤ 0.1/min on fan and music noise at SNR ≥ 10 dB;
+  - TV-babble rate documented, with the proximity gate tuned.
+- Live validation on D1, with the aggregate tallies recorded in `device-notes.md`:
+  - ≥ 19/20 scripted phrases correctly segmented (no miss, no split) in every condition;
+  - ≤ 0.1 false triggers/min over 10 min in fan and music;
+  - TV rate documented.
 - X-V2 gate passed on D1: p95 ≤ 8 ms per frame.
 - Idle-listening CPU within the [§4.10](#410-performance-and-battery-budget-mid-range-android-reference-pixel-6a-or-galaxy-a5x) budget.
 - An ADR records the VAD backend (TS port / ORT / energy-only) and the pre-gate decision. **If ORT is chosen:** add `'wasm-unsafe-eval'`, raise the precache limit to 16 MiB, and update [§4.8](#48-image-serving-and-headers).
@@ -1766,6 +1778,7 @@ Everything else that runs in the browser (DSP, VAD model code, renderer, gesture
 | Node | 24.21.0 (Active LTS) | Node 26 becomes LTS on 2026-10-28 [V R65]; move after M1 |
 | pnpm | 12.6.0 | strict dependency build scripts and release-age delay by default [V R66] |
 | Go | 1.27.1 | server; stdlib only |
+| espeak-ng | pinned in a container (version recorded in the corpus provenance) | one-off TTS corpus generation for M2 (Q2); output committed; not a CI dependency. GPL-3.0 [V]. |
 | `@vite-pwa/assets-generator` | 2.0.0 | run once with `pnpm dlx`; outputs committed. Its peer range in the plugin is `^1`, so it is not installed as a dependency [V]. |
 
 ### Rejected
@@ -1907,7 +1920,7 @@ Run on D1–D3 and desktop Chrome before each minor release. Record the results 
 | `workbox-window` | MIT | include the notice |
 | Avoided | Rubber Band (GPL-2.0+), `pitchfinder` (GPL-3), SoundTouchJS (MPL-2.0 with unclear LGPL-2.1 provenance), TEN VAD (Apache-2.0 + non-compete conditions) | — |
 
-Test fixtures made with espeak-ng (GPL-3.0+, [S]) would be *program output*, which generally isn't covered by the GPL [M]. Synthetic fixtures avoid the question entirely.
+The M2 corpus uses espeak-ng output (the tool is GPL-3.0 [V]). Program output is generally not covered by the GPL [M]. The tool itself is never bundled or run in CI.
 
 ---
 
@@ -1918,7 +1931,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 | # | Question | My recommendation | Affects |
 |---|---|---|---|
 | **Q1** ✅ | When nobody interacts, should the bear **fall asleep and close the mic** (the privacy indicator turns off and the context suspends; tap to wake), or keep listening for as long as the app is visible? | **Decided 2026-09-26:** sleep after **2 min** with no speech or touch; doze visuals from 45 s. Configurable in settings. | §3.4 row 18, battery budget, privacy |
-| **Q2** | For VAD tuning, will you record **real voices** (family, friends, children), and where may those recordings live? | Record them, with consent. Keep them **out of this repo** in a separate private location that only local runs or a private CI job read. Commit only synthetic fixtures here. | M2 corpus, CI |
+| **Q2** ✅ | For VAD tuning, will you record **real voices** (family, friends, children), and where may those recordings live? | **Decided 2026-09-26: no real voices.** The corpus is synthetic + espeak-ng TTS, committed. Real rooms are validated live via `lab/vad-live` with aggregate tallies only; no page stores captured audio. *(My original recommendation was consent-based recordings kept outside the repo.)* | M2 corpus and exit criteria, X-V1, X-V3, X-F1, X-F2, lab pages |
 | **Q3** | Who is the **primary audience**: young children, or general or all ages? | Family-friendly, 4+: text-free UI, gentle slapstick (a knock gives "dizzy" but nothing framed as hitting), haptics on. | Reaction table §4.6.4, default voice, UI copy |
 | **Q4** | Do you approve the **character direction** ("Juni": a juniper-teal bear with an amber-eyed, tufted head, a notched ear and a mustard neckerchief), or do you want a different look or name? | Approve as the working design; review the first render in M4. | M4 art |
 | **Q5** | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | Yes. | §4.8.3, your Caddy configs |
