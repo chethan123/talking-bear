@@ -1393,10 +1393,15 @@ Nothing here has been measured on a phone yet, so every budget is an estimate [M
 
 **Device matrix for every "on device" experiment:**
 
-- **D1:** Pixel (reference mid-range, e.g. Pixel 6a/7a).
-- **D2:** Samsung One UI mid-range (Galaxy A5x).
-- **D3:** a low-end MediaTek or Unisoc phone, if available.
+- **D1: your mid-range Pixel (6a/7a/8a class). Confirmed in Q7; this is the reference device for every budget and exit criterion.**
+- **D2 (optional, not currently available):** Samsung One UI mid-range (Galaxy A5x).
+- **D3 (optional, not currently available):** a low-end MediaTek or Unisoc phone.
+- **Low-end proxy:** desktop Chrome DevTools CPU throttling at 4–6×. It is an approximation, not a substitute for a real device [M].
 - **Desktop:** Chrome on Linux or Windows.
+
+"On D1–D3" below means D1 plus D2/D3 whenever they are available.
+
+**OEM variance is an accepted open risk (X-D1)** until a second device is tested. Examples: Samsung's audio routing and processing, and the Unisoc AEC quirk Chromium works around [V R3].
 
 Record the Chrome version (`chrome://version`) with every result in `docs/device-notes.md`.
 
@@ -1437,6 +1442,7 @@ The lab pages are **dev-only Vite entry points** under `lab/`, never shipped in 
 | X-P6 | `media-playback-while-not-visible=()` exposure | Set it; hide the page; check whether `ctx.state` becomes `interrupted`. | Optional defence in depth | M8 |
 | X-T1 | TypeScript 7 tool compatibility | Skeleton project: `tsc -b`, `oxlint --type-aware`, Vitest, Vite build. If anything needs the TS JS API, pin TS 6.0.3. | Toolchain | M1 |
 | X-T2 | Rolldown output for `?worker&url` worklets | Build and assert the worklet chunk has no `import`, `import.meta`, `document` or `self` references; load it with `addModule` in Browser Mode. | Worklet bundling | M1 |
+| X-D1 | Only one test device (Pixel). OEM audio behaviour (routing, input processing, Bluetooth) and low-end CPU are unverified. | Before v1.0, repeat X-E1, X-E2, X-E4, X-V2 and the §10 checklist on at least one non-Pixel phone (borrowed, or a cheap second-hand Galaxy A-series). Until then: CPU-throttle proxy, and field reports from anyone who tries the app. | Confidence beyond Pixel | M8 (recommended) |
 | X-L1 | Character too close to existing IP | Reverse-image search of renders; brief IP review. | Launch readiness | M8 |
 
 ---
@@ -1744,7 +1750,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 **Exit criteria**
 
-- Manual checklist passes on D1–D3.
+- Manual checklist passes on D1 (and on D2/D3 or a borrowed non-Pixel phone if obtained; see X-D1).
 - Every [§4.10](#410-performance-and-battery-budget-mid-range-android-reference-pixel-6a-or-galaxy-a5x) budget met or explicitly waived in an ADR.
 - `v1.0.0` tagged.
 
@@ -1952,7 +1958,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 | **Q4** ✅ | Do you approve the **character direction** ("Juni": a juniper-teal bear with an amber-eyed, tufted head, a notched ear and a mustard neckerchief), or do you want a different look or name? | **Decided 2026-09-26: approved as the working design.** You review the first render in M4. | M4 art |
 | **Q5** ✅ | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | **Decided 2026-09-26: yes.** The image owns every app header. The sidecar is a plain `reverse_proxy` (no `header`, no `encode`). The front does TLS, redirect and HSTS only; any shared baseline header uses `?Header`/`>Header`. | §4.8.3, your Caddy configs |
 | **Q6** ✅ | Should the **GHCR package be public or private**? | **Decided 2026-09-26: public.** The image only contains the web bundle that `bear.<domain>` serves publicly anyway, and it saves managing pull tokens on the host. The source repo stays private. | release.yml, host pull config |
-| **Q7** | Which **Android phone(s)** can you test on? The plan assumes D1 = a Pixel-class mid-range phone. | Tell me the models; I'll adjust the device matrix and budgets. | M1+ exit criteria |
+| **Q7** ✅ | Which **Android phone(s)** can you test on? The plan assumes D1 = a Pixel-class mid-range phone. | **Decided 2026-09-26: a mid-range Pixel (6a/7a/8a class) is D1.** No second device yet, so OEM variance is open risk X-D1. | M1+ exit criteria |
 
 ---
 
