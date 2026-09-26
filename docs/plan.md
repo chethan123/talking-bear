@@ -64,7 +64,7 @@ The research scratch scripts live in the (ephemeral) session scratchpad, not in 
 | Rendering | **Procedural Canvas 2D.** Art is authored as SVG path data, a 2D rig with springs, and geometric hit regions. | Rive (proprietary editor/CLI, 360–900 KB gzip wasm, paid export); Lottie (timeline-first, stale player); sprites / three.js (non-code art pipelines) | [§4.6](#46-character-and-animation) |
 | Mouth | RMS envelope plus a 2-band spectral ratio, precomputed from the **processed** buffer and synced via `getOutputTimestamp()` | Visemes (wLipSync needs Unity-calibrated profiles and breaks on pitch-shifted formants; Rhubarb is a 42 MB wasm port) | [§4.6](#46-character-and-animation) |
 | Gestures | Hand-rolled Pointer Events recogniser, with thresholds from Android `ViewConfiguration` | Hammer.js (last release 2016), `@use-gesture` (no region/tickle semantics) | [§4.6](#46-character-and-animation) |
-| PWA | `vite-plugin-pwa` 1.3.0 in `generateSW` mode, `registerType:'prompt'`, everything precached, updates applied only when idle **and** hidden | `autoUpdate` (reloads mid-recording); `injectManifest` / hand-written service worker (no custom fetch logic needed) | [§4.7](#47-pwa) |
+| PWA | `vite-plugin-pwa` 1.3.0 in `generateSW` mode, `registerType:'prompt'`, everything precached (with `clientsClaim`), updates applied only when the page is hidden in `Asleep`/`Paused` | `autoUpdate` (reloads mid-recording); `injectManifest` / hand-written service worker (no custom fetch logic needed) | [§4.7](#47-pwa) |
 | Serving | **Tiny Go server** (~200 lines, stdlib only, `embed.FS`) on `distroless/static-debian13:nonroot`, pinned by digest. Headers live in code, served precompressed with content-hash ETags; zero writes. | static-web-server (fine, but Last-Modified only, and its scratch image runs as root); nginx-unprivileged (no brotli, needs tmpfs); Caddy (root by default, writable dirs) | [§4.8](#48-image-serving-and-headers) |
 | Toolchain | Vite 8.3 (Rolldown), TypeScript 7.0 (native `tsc`), oxlint + tsgolint, Prettier, Vitest 5, Playwright 1.63, pnpm 12, Node 24 LTS | ESLint + typescript-eslint (not compatible with TypeScript 7 yet); Rsbuild / esbuild / Parcel (no better worklet + PWA story) | [§8](#8-dependencies) |
 
@@ -398,7 +398,7 @@ stateDiagram-v2
 | 35 | Cooldown | `timer cooldown` | — | Listening | (entry actions: new epoch, floor restore) |
 | 36 | Cooldown | `reaction{sfx}` | — | SfxGated | `cancelTimer cooldown`, `sfx` |
 | 37 | Cooldown | `reaction{no sfx}` | — | Cooldown | `anim reaction` |
-| 38 | any awake | `hidden` \| `pagehide` \| `freeze` | — | Paused | remember whether the previous state was idle (`Listening` or `MicDenied`) for the update policy ([§4.7](#47-pwa)) |
+| 38 | any awake | `hidden` \| `pagehide` \| `freeze` | — | Paused | then, if `updateReady`, apply the update synchronously ([§4.7](#47-pwa)) |
 | 39 | Paused | `visible` | permission `granted` / `prompt` / `denied` | Waking / NeedsParent / MicDenied | as rows 1 / 2 / 3 |
 | 40 | any mic-open state except Waking | `devicechange` that changes the input set | — | Waking | `closeMic`, `reselectInput` (§4.5 policy), `openMic` |
 | 41 | any awake | `ctxError` \| track `ended` not initiated by us | — | Error | `ui error` (icon: tap to retry) |
@@ -1154,7 +1154,7 @@ Field notes:
 **Service worker: `vite-plugin-pwa` 1.3.0 (`generateSW`) with Workbox 7.4.1** [V R56, R57]
 
 ```ts
-build: { assetsInlineLimit: 0 },   // Vite inlines < 4 KiB assets as data: URLs — incl. a small ?url worklet [V R55]; breaks CSP
+build: { assetsInlineLimit: 0 },   // no data: URLs for small ?url assets (e.g. weights, icons); ?worker&url is emitted as a file anyway [E reviewer build]
 worker: { format: 'es' },
 VitePWA({
   injectRegister: false,           // no inline <script>; we import virtual:pwa-register
@@ -1166,6 +1166,8 @@ VitePWA({
     globIgnores: ['**/*.{br,gz,map}', 'screenshots/**'],                      // screenshots only matter to the installer
     maximumFileSizeToCacheInBytes: 2 * 1024 * 1024, // default; fail the build if anything exceeds it (see check-dist)
     inlineWorkboxRuntime: true,     // single sw.js, no importScripts [V R56]
+    clientsClaim: true,             // prompt mode doesn't set it; without it the first page stays uncontrolled, so
+                                    // offline-before-first-tap relied on the HTTP cache [E reviewer]. Safe: updates still wait for SKIP_WAITING.
     // navigateFallback 'index.html' and cleanupOutdatedCaches: true are plugin defaults [V R56]
   },
 })
@@ -1177,7 +1179,10 @@ VitePWA({
   - any `data:text/javascript` appears in `dist/**/*.js`;
   - any `__bearTest` appears in a production build;
   - the worklet chunk isn't self-contained (contains `import`, `import.meta`, `document` or `self`);
-  - the strings "Talking Tom" or "Outfit7" appear in the public bundle (see X-L1).
+  - the strings "Talking Tom" or "Outfit7" appear in the public bundle (see X-L1);
+  - `dist/lab/**` exists: lab pages, including their trace and download flows, must never ship.
+
+  It runs inside the Dockerfile's `web` stage **before** precompression ([§9](#9-ci-outline)). `index.html` also links `<link rel="icon" href="/icons/icon-192.png">`, so Chrome doesn't request `/favicon.ico` and log a 404.
 - **Rejected:**
   - `injectManifest`: no custom fetch logic is needed.
   - A hand-written service worker: it would re-implement revisioned precache, atomic install and cleanup.
@@ -1187,8 +1192,9 @@ VitePWA({
 - **Why `prompt` and not `autoUpdate`:** `autoUpdate` calls `location.reload()` on activate. That could cut a recording, and the new SW's activate deletes old precache entries, so old lazy chunks would 404 [V R56].
 - Our policy:
   - `onNeedRefresh` sets `updateReady`.
-  - Apply with `updateSW()` **only while the page is hidden and the session is `Asleep`, or `Paused` from an idle state** (`Listening` or `MicDenied`; §3.4 row 38). Never apply from a `Paused` that interrupted `Recording` or `Playing`. A parent can also tap "new version – restart" in settings.
-  - Frozen tabs run no timers, so both the hourly `reg.update()` and a deferred apply may only happen on the next `visible` [M]. That's acceptable.
+  - Apply with `updateSW()` **when the page becomes hidden and the session is `Asleep` or `Paused`**. The call is made synchronously in the `visibilitychange→hidden` handler, right after row 38 has aborted any take or playback, so nothing is cut. Freezing (~5 min in the background) would otherwise remove the chance to run JavaScript.
+  - A parent can also tap "new version – restart" in settings. That control is **enabled only while `updateReady` is true**. In prompt mode, the reload listener is attached inside workbox-window's `waiting` handler, so calling `updateSW()` earlier silently does nothing [E reviewer, V R56/R57].
+  - Frozen tabs run no timers, so the hourly `reg.update()` may only happen on the next `visible` [M]. That's acceptable.
   - All lazy resources (worklet, worker, weights, art) are loaded at wake, so an old page never needs old URLs after activation.
 - **Update checks:** browsers re-check `sw.js` on navigation, or on subresource fetches only after 24 h [V R26]. A never-navigating single-page app therefore calls `reg.update()` on `visibilitychange→visible` and hourly.
 - **HTTP caching of `sw.js`:** `updateViaCache` defaults to `'imports'`, so the top-level `sw.js` fetch always bypasses the HTTP cache [V R26]. We still serve it `no-cache`.
@@ -1223,13 +1229,14 @@ Sources: [V R68–R71, E prototype tested with curl in the research sandbox].
 **Server behaviour:**
 
 - `//go:embed all:dist`. The `all:` prefix matters: Rolldown emits `_`-prefixed chunks, which a plain embed skips [V R70].
-- On startup: walk `dist`, pair each file with its `.br`/`.gz` variants, and precompute content type, Cache-Control and `ETag = "<b64(sha256)[:16]>"` (variants get `.br`/`.gz` suffixes).
+- On startup: walk `dist`, pair each file with its `.br`/`.gz` variants, and precompute content type, Cache-Control and a strong ETag `"<b64url(sha256)[:16]>"`. Variants get the suffix **inside the quotes** (`"…​.br"`); an unquoted suffix makes the header invalid, and `ServeContent` would then ignore `If-None-Match`.
 - Only `GET` and `HEAD`; anything else is 405.
 - `/` → `/index.html`. `/healthz` → 204. Unknown paths → 404 with `no-store`. There is no SPA fallback server-side; offline, the SW's `navigateFallback` covers in-scope navigations.
 - `http.ServeContent` handles `If-None-Match`/304, `Range`/206 and HEAD.
-- **Gotcha:** it omits `Content-Length` when `Content-Encoding` is set [V R70], so the server sets it explicitly.
+- **Gotcha:** for non-range responses it omits `Content-Length` when `Content-Encoding` is set [V R70], so the server sets it explicitly. For Range requests `ServeContent` sets it itself. The `ReadSeeker` passed in must be **the chosen (compressed) variant**, or 206 offsets are wrong.
 - **Gotcha:** `embed.FS` mod-times are zero [V R70], hence the content-hash ETags.
 - Timeouts: `ReadHeaderTimeout 5s`, `ReadTimeout 10s`, `WriteTimeout 60s`, `IdleTimeout 120s`, `MaxHeaderBytes 16 KiB`.
+- The header test table covers 200 (br, gz, identity), 304, 206, **416 on a bad Range** (`serveError` strips `Cache-Control`/`ETag`, which is fine but asserted), 404, 405 and HEAD.
 - A `-probe` flag GETs `127.0.0.1:8080/healthz` and exits 0/1, for compose healthchecks (distroless has no shell or curl).
 
 #### 4.8.2 Dockerfile sketch
@@ -1238,16 +1245,22 @@ Digests were resolved 2026-09-26 [V R72]. Re-resolve at M7, and let Dependabot m
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-ARG BUILD_MODE=production            # "e2e" builds dist with test hooks for the CI e2e image
+# BUILD_MODE=e2e builds dist with test hooks for the CI e2e image
+ARG BUILD_MODE=production
 
 FROM --platform=$BUILDPLATFORM node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web
 ARG BUILD_MODE
 WORKDIR /src
+# include node_modules/dist in the SBOM, not just the final image
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
 RUN npm install -g pnpm@12.6.0 --ignore-scripts
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile
+# .dockerignore excludes node_modules, dist*, .git, test-results
 COPY . .
-RUN pnpm build --mode "$BUILD_MODE" && node scripts/precompress.mjs dist   # after SW generation → .br/.gz never precached
+# the shipped bytes are the checked bytes: check-dist and size-limit run before precompression
+RUN pnpm build --mode "$BUILD_MODE" && node scripts/check-dist.mjs dist "$BUILD_MODE" \
+ && pnpm size-limit && node scripts/precompress.mjs dist
 
 FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.24@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS server
 ARG TARGETOS TARGETARCH
@@ -1258,6 +1271,7 @@ RUN go vet ./... && go test ./... && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -buildid=" -o /out/bearserve .
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+ENV GOMEMLIMIT=48MiB
 COPY --from=server /out/bearserve /bearserve
 USER 65532:65532
 EXPOSE 8080
@@ -1275,7 +1289,8 @@ ENTRYPOINT ["/bearserve"]
   --read-only --cap-drop=ALL --security-opt=no-new-privileges --user 65532:65532 --pids-limit 64 --memory 64m
   ```
 
-  Embedded assets are rodata. Set `GOMEMLIMIT=48MiB` in the image environment.
+  Embedded assets are rodata. `GOMEMLIMIT=48MiB` is set in the image (see the `ENV` line).
+- **Digest kind:** the distroless digest is the multi-arch **image-index** digest, which is correct for a cross-platform `FROM`. The node and golang digests match Docker Hub's tag index [V reviewer check].
 
 #### 4.8.3 Headers
 
@@ -1290,10 +1305,17 @@ ENTRYPOINT ["/bearserve"]
   - **Verified [E]:** without it, `WebAssembly.compile` throws `CompileError: … 'unsafe-eval' is not an allowed source of script`.
   - The **MVP ships no WASM** (TS Silero port, TS resampler), so the MVP CSP **omits `'wasm-unsafe-eval'`**. Add it only if M2 or M3 adopts ORT or Signalsmith.
 - **Vite `data:` inlining.** Vite inlines assets under 4 KiB as `data:` URLs, including a small `?url` worklet [V R55]. Use `build.assetsInlineLimit: 0` and import worklets as `?worker&url` [V R55]. A CI check asserts that `dist/**/*.js` contains no `data:text/javascript`.
-- **Trusted Types.** Relevant sinks are `new Worker`, `importScripts` and `serviceWorker.register`.
-  - Feasible with a `default` policy that allows only same-origin script URLs.
+- **Trusted Types.**
+  - **Script-URL sinks:** Vite and workbox-window hit exactly two, `new Worker(…)` and `serviceWorker.register(…)`. That was observed under Report-Only [E reviewer]. `Worklet.addModule` takes a `USVString` and is **not** a sink [V R24].
+  - **Policy:** a `default` policy with `createScriptURL` allowing same-origin URLs only. It ran the full flow **enforced** with zero violations [E reviewer]. It must live in **the first module imported by `main.ts`**, because ES imports are hoisted and it has to exist before any sink call.
+  - **HTML sinks** (`innerHTML`, `insertAdjacentHTML`, `DOMParser`, …) are also guarded. UI code builds DOM with `createElement`/`textContent` only; no HTML strings anywhere, the debug overlay included.
   - Put the TT directives **on HTML only**: on worker scripts they would break `importScripts`.
-  - Roll out as Report-Only first and collect violations in Playwright. There is no report endpoint, by design.
+  - Roll out as Report-Only first. There is no report endpoint, by design; Playwright collects the violations.
+- **`style-src 'self'` in practice** [E reviewer]:
+  - blocked: `setAttribute('style', …)`, `style=""` in HTML strings, injected `<style>`;
+  - allowed: CSSOM (`el.style.x`, `cssText`, `setProperty`) and `el.animate()`;
+  - Vite 8's production output has no inline script or style.
+  - The Vite **dev** server injects `<style>` tags, so CSP compliance can only be tested against `vite preview` with headers or the image, which is what e2e does.
 
 **Header table** (set by the Go server on every response unless noted)
 
@@ -1301,7 +1323,7 @@ ENTRYPOINT ["/bearserve"]
 |---|---|
 | `Content-Security-Policy` | `default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; style-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'` (**+ `'wasm-unsafe-eval'` in `script-src` only if a WASM dependency is adopted**) |
 | …HTML only (M7 Report-Only → M8 enforce) | `require-trusted-types-for 'script'; trusted-types default` |
-| `Permissions-Policy` | `microphone=(self), screen-wake-lock=(self), autoplay=(self), fullscreen=(self), camera=(), geolocation=(), display-capture=(), usb=(), serial=(), hid=(), bluetooth=(), midi=(), payment=(), accelerometer=(), gyroscope=(), magnetometer=(), idle-detection=(), publickey-credentials-get=(), browsing-topics=()` |
+| `Permissions-Policy` | `microphone=(self), screen-wake-lock=(self), autoplay=(self), fullscreen=(self), camera=(), geolocation=(), display-capture=(), usb=(), serial=(), midi=(), payment=(), accelerometer=(), gyroscope=(), magnetometer=(), idle-detection=(), publickey-credentials-get=(), browsing-topics=()` |
 | `Cross-Origin-Opener-Policy` | `same-origin` |
 | `Cross-Origin-Resource-Policy` | `same-origin` |
 | `Cross-Origin-Embedder-Policy` | **omitted**: no `SharedArrayBuffer` needed. If ever needed, add `require-corp` and assert `crossOriginIsolated`; everything is same-origin, so nothing breaks. |
@@ -1313,8 +1335,11 @@ ENTRYPOINT ["/bearserve"]
 Header notes:
 
 - **Permissions-Policy syntax** is a structured-field dictionary: `()` is an empty allowlist and `self` a bare token [V R27].
+- **`hid` and `bluetooth` are deliberately omitted.** Chromium only recognises a policy name when its runtime feature is enabled on that platform: `bluetooth` depends on WebBluetooth, which is not stable on Linux, and `hid` on WebHID, which is experimental on Android. Listing them logs "Unrecognized feature" on CI or on Android [E reviewer: Linux Chromium 141; V R76 `permissions_policy_features.json5`]. With `frame-ancestors 'none'` and no iframes, `()` added nothing anyway.
 - **`microphone=(self)`** is the default for the top-level page anyway. It blocks delegation to frames and documents intent.
-- **A future option:** `media-playback-while-not-visible=()` would make Chromium put the context into `interrupted` when hidden [V R8]. Whether it is exposed by default is unknown; that is experiment X-P6.
+- **A future option:** `media-playback-while-not-visible=()` would make Chromium put the context into `interrupted` when hidden [V R8]. Its runtime feature is `stable` on Chromium `main` [V R76]; Stable lags 1–2 milestones.
+  - A header policy applies to the top-level document itself, so the app's **own** context would become `interrupted` on hide. `resume()` rejects from `interrupted` until the page is visible again [V R8].
+  - Row 39 would then need to wait for the context to leave `interrupted`, not assume `suspended`. That's experiment X-P6; it's off until then.
 
 **Cache-Control**
 
@@ -1457,7 +1482,7 @@ Assertions:
 - Played frames ≈ (speech + pre-roll + tail) / p, within ±2 VAD frames.
 - YIN f0(out) ≈ f0(in) · p within ±3 %.
 - No `arm` while `Playing`.
-- Zero `securitypolicyviolation` events.
+- Zero `securitypolicyviolation` events with `disposition === 'enforce'`. `'report'` events, e.g. Trusted Types in Report-Only, are collected into the X-P5 list, and that list must be empty from M8.
 
 The production image also exposes `data-state` on the bear element, so a hook-free smoke test can assert transitions.
 
@@ -1490,7 +1515,7 @@ The production image also exposes `data-state` on the bear element, so a hook-fr
 - **Service-worker updates at one origin.** The `update` spec runs v1 and v2 containers behind a small Node proxy in `e2e/`. The proxy flips its upstream on a test-controlled endpoint, and Playwright talks only to the proxy's port, so the origin never changes.
 - **Installability.** The spec includes a **negative control**: a manifest without a 144 px `any` icon must produce a non-empty error list. That proves the check isn't vacuous.
 
-**Where e2e runs before M7.** From M1, e2e runs against `vite preview` with `preview.headers` loaded from a shared `headers.json`. The Go server's `headers.go` tests assert the same file. So CSP and worklet regressions surface from M1, not M7. At M7 the CI target becomes the e2e-mode image, and `vite preview` remains the local path.
+**Where e2e runs before M7.** From M1, e2e runs against `vite preview` with `preview.headers` loaded from the shared `server/headers.json`. The Go server's `headers.go` tests assert the same file. So CSP and worklet regressions surface from M1, not M7. At M7 the CI target becomes the e2e-mode image, and `vite preview` remains the local path.
 
 #### 4.9.4 Manual device checklist
 
@@ -1616,7 +1641,8 @@ talking-bear/
 ├── server/                         # Go static server (stdlib only)
 │   ├── go.mod
 │   ├── main.go                     # embed, handler, probe flag
-│   ├── headers.go                  # CSP / Permissions-Policy / cache / MIME tables
+│   ├── headers.json                # single source of response headers: Go server + vite preview (e2e from M1)
+│   ├── headers.go                  # loads headers.json; cache / MIME tables
 │   └── main_test.go                # table-driven header, ETag, 304, 206, 404, 405 tests
 ├── index.html
 ├── art/
@@ -1654,7 +1680,7 @@ talking-bear/
 │   ├── plan.md                     # this document
 │   ├── device-notes.md             # experiment results per device / Chrome version
 │   └── adr/                        # one short ADR per gated decision (VAD backend, default voice, …)
-├── package.json  pnpm-lock.yaml  .npmrc
+├── package.json  pnpm-lock.yaml  pnpm-workspace.yaml (onlyBuiltDependencies allow-list)  .npmrc
 ├── tsconfig.json                   # references: app, worklet, worker, node
 ├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json
 ├── vite.config.ts  vitest.config.ts  playwright.config.ts
@@ -1867,7 +1893,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 - Installed on D1 as a WebAPK (`chrome://webapks` lists it).
 - **Airplane-mode cold start runs the full loop.**
-- An update never reloads during `Recording`/`Playing` (e2e). It is applied when hidden from `Asleep` or an idle `Paused` (§4.7), driven by the e2e visibility hook.
+- An update never reloads during `Recording`/`Playing` (e2e). It is applied when the page becomes hidden in `Asleep` or `Paused` (§4.7), driven by the e2e visibility hook. The settings restart control is enabled only when `updateReady`.
 - The installability errors list is empty.
 
 ### M7 — Image, headers and CI
@@ -2023,9 +2049,9 @@ Everything else that runs in the browser (DSP, VAD model code, renderer, gesture
 
 ## 9. CI outline
 
-Everything runs on GitHub Actions, `ubuntu-24.04`.
+Everything runs on GitHub Actions, `ubuntu-24.04`. **Every job sets `timeout-minutes`.** The e2e specs run in real time, ≥ 12 s each.
 
-- **Permissions:** `contents: read` by default. `release.yml` adds `packages: write`.
+- **Permissions:** every workflow declares top-level `permissions: { contents: read }`. **Only the single build-and-push job in `release.yml` gets `packages: write`**. Nothing that runs `pnpm install`, tests or linters ever holds a token that can push images. When `release.yml` calls `ci.yml` as a reusable workflow, it passes explicit `permissions: { contents: read }`.
 - **Pinning:** actions are pinned **by commit SHA** [V R67]. Dependabot bumps them.
 
 | Action | Tag |
@@ -2036,64 +2062,81 @@ Everything runs on GitHub Actions, `ubuntu-24.04`.
 | `actions/upload-artifact` | v7.0.1 |
 | `actions/download-artifact` | v8.0.1 |
 | `docker/setup-buildx-action` | v4.4.1 |
+| `docker/setup-qemu-action` | v4.4.0 (arm64 smoke only) |
 | `docker/metadata-action` | v6.2.0 |
 | `docker/login-action` | v4.6.0 |
 | `docker/build-push-action` | v7.4.0 |
 
 The exact SHAs are resolved when `ci.yml` is written in M1 (via `git ls-remote --tags`).
 
-```
-ci.yml (pull_request, push to main)
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ verify:  pnpm install --frozen-lockfile                                      │
-│          oxlint --type-aware · prettier --check · tsc -b                     │
-│          vitest run --project node --coverage   (thresholds on dsp/app/input)│
-│          vitest run --project browser           (Chromium, OfflineAudioCtx)  │
-│          silero parity (TS port vs onnxruntime-web)                          │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ build (needs verify): vite build → dist ; size-limit ; check-dist.mjs        │
-│          (all files precached · no data: JS · no __bearTest · worklet chunk  │
-│           self-contained)                                                    │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ image-smoke (needs verify): buildx --load linux/amd64, BUILD_MODE=production │
-│          go test (inside the Dockerfile) · docker run --read-only            │
-│          --cap-drop=ALL --user 65532 · check-headers.sh                     │
-│          · Playwright smoke (no hooks: data-state, CSP=0, offline)           │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ e2e (needs verify): buildx --load BUILD_MODE=e2e → run container →           │
-│          playwright install --with-deps --no-shell chromium →                │
-│          specs: loop/too-short/too-long/deny/sfx-gating/gestures/offline/    │
-│          update/installability/csp · upload traces on failure                │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ compose-headers (M7+, needs image-smoke): front Caddy + sidecar + image;     │
-│          assert headers end-to-end, no duplicates                            │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ lighthouse (main only, optional, M8)                                         │
-└──────────────────────────────────────────────────────────────────────────────┘
+**The shipped bytes are the checked bytes.** The Dockerfile's `web` stage runs these in order:
 
-release.yml (push tag v*.*.*)
-  needs: the ci.yml jobs on the tagged commit (reusable workflow call)
-  docker/metadata-action: tags X.Y.Z and X.Y (type=semver), labels (OCI)
-  docker/login-action → ghcr.io with GITHUB_TOKEN
-  docker/build-push-action: platforms linux/amd64,linux/arm64 (cross-compiled, no QEMU),
-      provenance: mode=max, sbom: true, cache-from/to: type=gha
+```
+pnpm build → check-dist.mjs → size-limit → precompress.mjs
+```
+
+So the precache completeness, `no __bearTest`, `no dist/lab`, self-contained worklet and size checks run on exactly the `dist` that gets embedded. `check-dist` runs **before** precompression, so `.br`/`.gz` files are never confused with precache entries.
+
+CI builds the web bundle twice, once per `BUILD_MODE` (production and e2e). Both builds use BuildKit cache mounts for the pnpm store, and `cache-from/to: type=gha,scope=ci`.
+
+```
+ci.yml (pull_request, push to main)                                   permissions: contents: read
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ verify:  pnpm install --frozen-lockfile                                                │
+│          oxlint --type-aware · prettier --check · tsc -b                               │
+│          vitest run --project node --coverage   (per-glob thresholds, §4.9.1)          │
+│          vitest run --project browser           (channel 'chromium', OfflineAudioCtx)  │
+│          silero parity (TS port vs onnxruntime-web) · VAD regression (TTS + traces)    │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ image-smoke (needs verify): buildx --load linux/amd64, BUILD_MODE=production           │
+│          (web stage: build → check-dist → size-limit → precompress; go test)           │
+│          docker run --read-only --cap-drop=ALL --user 65532 · check-headers.sh         │
+│          (incl. 304, 206, 416, 404, 405 cases)                                         │
+│          playwright install --with-deps --no-shell chromium                            │
+│          Playwright smoke, no hooks: data-state transitions, 0 enforce-mode CSP         │
+│          violations, offline reload                                                    │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ e2e (needs verify): buildx --load BUILD_MODE=e2e → run container (+ v1/v2 proxy for     │
+│          `update`) → playwright install --with-deps --no-shell chromium → specs:        │
+│          loop/too-short/too-long/deny/sfx-gating/gestures/offline/update/               │
+│          installability/csp · upload traces on failure                                 │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ compose-headers (M7+, needs image-smoke): front Caddy + sidecar + image;               │
+│          assert headers end-to-end, no duplicates                                      │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ lighthouse (main only, optional, M8)                                                   │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+release.yml (push tag v*.*.*)                                         permissions: contents: read
+  ci:      uses: ./.github/workflows/ci.yml   with permissions: contents: read
+  publish (needs ci; the only job with packages: write):
+    docker/metadata-action: tags X.Y.Z and X.Y (type=semver), OCI labels
+    docker/build-push-action: platforms linux/amd64,linux/arm64 (cross-compiled, no QEMU),
+        provenance: mode=max, sbom: true (with BUILDKIT_SBOM_SCAN_STAGE on the web stage),
+        cache-from: type=gha,scope=release   (never written by PR/main runs)
+    before pushing: buildx --load --platform linux/arm64 (cross-compiled build), run it under
+        QEMU and repeat check-headers.sh; then build-push multi-arch (layers cached)
+    docker/login-action → ghcr.io with GITHUB_TOKEN (push happens only after the arm64 smoke)
   job summary: image digest (the monorepo pins by digest)
 ```
 
 Notes:
 
 - **Artifact attestations** (`actions/attest`) on **private** repositories require GitHub Enterprise Cloud [V R67]. This repo is private, so we rely on BuildKit provenance and SBOM attached to the image. Revisit if the repo becomes public.
+- **SBOM scope.** BuildKit's SBOM scans the final image by default: distroless plus one static Go binary. The shipped JavaScript (`workbox-window`, our bundle) would be invisible. So the `web` stage sets `ARG BUILDKIT_SBOM_SCAN_STAGE=true` so `node_modules` is scanned [M: documented BuildKit feature, not re-verified here]. Alternatively, publish a pnpm-generated SBOM as a release asset.
 - **Tag format:** git tag `v1.2.3` → image tags `1.2.3` and `1.2`. No `latest`: the monorepo pins by version and digest.
-- **Package visibility: public (Q6).** A package pushed from a private repo starts out private [M]. After the first push, set it to public once, under the package's settings on GitHub. This is a one-time manual step; I'm not aware of a supported API for user-owned packages [M]. The host then pulls anonymously.
+- **Package visibility: public (Q6).** A package pushed from a private repo starts out private [V: GitHub docs, personal-scope packages]. After the first push, set it to public once, under the package's settings on GitHub. This is a one-time manual step; I'm not aware of a supported API for user-owned packages [M]. The host then pulls anonymously.
   - Add the OCI label `org.opencontainers.image.source=https://github.com/chethan123/talking-bear`. It links the package to the repo; the repo stays private.
   - Provenance with `mode=max` embeds build materials (repo URL, commit, Dockerfile, build args) in the public image. None of that is secret here. Use `mode=min` if you'd rather not publish them.
-- **Release caching:** no dependency cache in `release.yml`. setup-node recommends that for privileged workflows [V R67].
+- **Caching in a privileged workflow.** `cache-from: type=gha` restores BuildKit layers, including the `pnpm install` layer, so it *is* a dependency cache. setup-node advises against automatic caching in privileged workflows [V R67]. Hence the release job reads only its own `scope=release`, which PR and main runs never write. The alternative is a cold release build, which takes a few minutes.
+- **arm64 coverage.** `go test` runs on the build platform, and `image-smoke` is amd64-only. So the release job smoke-tests the arm64 image under QEMU before pushing. A native `ubuntu-24.04-arm` runner is an alternative if one is available to this private repo [M].
+- **pnpm build scripts.** pnpm 12 defaults to `strictDepBuilds: true` [V R66]. `pnpm-workspace.yaml` commits an explicit, currently empty, `onlyBuiltDependencies` allow-list, so a dependency that gains a postinstall fails loudly and is reviewed. None of the pinned packages has one today [V reviewer check].
 
 ---
 
 ## 10. Manual device checklist
 
-Run on D1–D3 and desktop Chrome before each minor release. Record the results in `docs/device-notes.md` with the Chrome version.
+Run on D1 (plus any borrowed device, X-D1) and desktop Chrome before each minor release. Record the results in `docs/device-notes.md` with the Chrome version.
 
 **Setup.** Use `adb reverse` for dev builds and `chrome://inspect` for remote DevTools. Use wireless adb for battery runs, because USB charging distorts power numbers [M].
 
@@ -2110,7 +2153,7 @@ Run on D1–D3 and desktop Chrome before each minor release. Record the results 
 | 9 | Home, lock/unlock, app switch, incoming call, alarm | mic released while hidden (indicator off); clean resume |
 | 10 | Rotate, split-screen, large font, dark mode | layout and hit regions correct |
 | 11 | Airplane mode after install; cold start | full loop works |
-| 12 | New version deployed | update applied only when idle and hidden; no broken assets |
+| 12 | New version deployed | update applied only when the app is backgrounded while asleep or paused; settings restart enabled only when an update is ready; no broken assets |
 | 13 | 10 min idle listening, fixed brightness | CPU, battery and thermal within [§4.10](#410-performance-and-battery-budget-reference-device-d1-the-mid-range-pixel-q7) |
 | 14 | `T_sleep` elapses: (a) right after wake; (b) after one utterance; (c) after only touch play with sounds; (d) in MicDenied | the bear falls asleep in every case; mic indicator off; wake lock released; a tap wakes it |
 | 15 | Long-press, multi-touch, rapid tickle | no context menu or selection; correct reactions |
