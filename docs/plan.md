@@ -1217,7 +1217,7 @@ Header notes:
 | `.woff2` | `font/woff2` |
 | `.wav` | `audio/wav` (never precompressed) |
 
-**Where headers live** (recommendation; **Q5** confirms, because it constrains your Caddy configs)
+**Where headers live** (decided in **Q5**, 2026-09-26: the image owns all app headers. This is a constraint on your monorepo's Caddy configs.)
 
 | Layer | Responsibility |
 |---|---|
@@ -1947,7 +1947,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 | **Q2** ✅ | For VAD tuning, will you record **real voices** (family, friends, children), and where may those recordings live? | **Decided 2026-09-26: no real voices.** The corpus is synthetic + espeak-ng TTS, committed. Real rooms are validated live via `lab/vad-live` with aggregate tallies only; no page stores captured audio. *(My original recommendation was consent-based recordings kept outside the repo.)* | M2 corpus and exit criteria, X-V1, X-V3, X-F1, X-F2, lab pages |
 | **Q3** ✅ | Who is the **primary audience**: young children, or general or all ages? | **Decided 2026-09-26: family-friendly, 4+.** Text-free UI, gentle slapstick (wobble or dizzy, never hitting or pain), haptics on, Bear cub voice, large targets, guarded settings, no outbound links. | §4.6.4 content rules and table, M8 UI, settings defaults |
 | **Q4** ✅ | Do you approve the **character direction** ("Juni": a juniper-teal bear with an amber-eyed, tufted head, a notched ear and a mustard neckerchief), or do you want a different look or name? | **Decided 2026-09-26: approved as the working design.** You review the first render in M4. | M4 art |
-| **Q5** | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | Yes. | §4.8.3, your Caddy configs |
+| **Q5** ✅ | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | **Decided 2026-09-26: yes.** The image owns every app header. The sidecar is a plain `reverse_proxy` (no `header`, no `encode`). The front does TLS, redirect and HSTS only; any shared baseline header uses `?Header`/`>Header`. | §4.8.3, your Caddy configs |
 | **Q6** | Should the **GHCR package be public or private**? | Public. The image only contains the web bundle that `bear.<domain>` serves publicly anyway, and it saves managing pull tokens on the host. The source repo stays private. | release.yml, host pull config |
 | **Q7** | Which **Android phone(s)** can you test on? The plan assumes D1 = a Pixel-class mid-range phone. | Tell me the models; I'll adjust the device matrix and budgets. | M1+ exit criteria |
 
