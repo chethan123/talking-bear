@@ -1253,7 +1253,7 @@ The Caddy constraints have two causes:
   - mixes at a set SNR
   - knock bursts
 - Every fixture **starts with ≥ 1 s of silence and ends with ≥ 300 ms of digital zeros** (see [§4.9.3](#493-end-to-end-playwright--chromium-fake-media)).
-- **No real-voice recordings anywhere (Q2).** The VAD tuning corpus is synthetic plus text-to-speech, and real rooms are validated live without storing audio ([§7 M2](#m2--vad-tuning)).
+- **No real-voice audio is ever stored (Q2, amended).** Real voices tune the VAD through **feature traces**: per-frame probabilities, energies and voicing scores, not audio. The synthetic/TTS corpus is the CI regression suite ([§7 M2](#m2--vad-tuning)).
 
 **Property-based tests (fast-check 4.10):**
 
@@ -1421,9 +1421,9 @@ The lab pages are **dev-only Vite entry points** under `lab/`, never shipped in 
 | X-E10 | 44.1 kHz devices; actual rates | Log `ctx.sampleRate`, `baseLatency`, `outputLatency` and `track.getSettings()` per constraint set. | Resampler paths | M1 |
 | X-E11 | Wake lock under battery saver, lock/unlock | Acquire; lock/unlock; toggle battery saver; log `release` events and rejections. | Wake-lock policy | M1 |
 | X-R4 | Silent-sink suspension: does connecting the worklet let Chrome release the output device while capture continues, and at what resume cost? | Graph A: worklet output unconnected. Graph B: its zero output → destination. After 40 s of silence, check `dumpsys media.audio_flinger` for an active output track and that capture RMS continues; measure 10-minute drain; measure first-playback start latency after suspension. | [§3.2](#32-audio-pipeline-data-flow) wiring | M1 |
-| X-V1 | VAD on real devices, voices and rooms (children, TV, fans). The corpus is synthetic/TTS only (Q2), so **domain gap** is the main risk [M]. | [§7 M2](#m2--vad-tuning): tune on the synthetic/TTS corpus, then validate live with `lab/vad-live` (aggregate tallies only, no audio stored) | Parameters; pre-gate | M2 |
+| X-V1 | VAD on real devices, voices and rooms (children, TV, fans), with no audio stored (Q2) | [§7 M2](#m2--vad-tuning): real-voice **feature traces** from `lab/vad-trace` on D1, grid-searched offline. The TTS corpus remains the CI regression suite. Final end-to-end check with `lab/vad-live`. Residual risk: front-end changes invalidate traces, so a new ~30 min session is needed. | Parameters; pre-gate | M2 |
 | X-V2 | Silero TS port CPU on the phone | `lab/bench`: 60 s of audio through the TS port (and ORT for comparison) in a Worker on D1–D3; p50/p95/max per frame; thermals after 10 min. **Gate: p95 ≤ 8 ms.** | TS port vs ORT vs energy-only | M2 |
-| X-V3 | Children's voices | Corpus: high-pitch TTS variants (a proxy only [M]). Live: a child speaks the scripted phrases into `lab/vad-live` if available; compare tallies with adults. Nothing is stored. | Thresholds | M2 |
+| X-V3 | Children's voices | If available, a child does a scripted `lab/vad-trace` session (traces only, no audio); compare metrics with adult traces. The TTS high-pitch variants are only a CI proxy [M]. | Thresholds | M2 |
 | X-F1 | Which pitch ratio and algorithm people like | `lab/voices.html`: A/B/X of linear `playbackRate`, sinc, (optional) Signalsmith with formant compensation, and PSOLA, at 1.4, 1.7 and 2.0, on the phone speaker and headphones, ≥ 5 listeners including children. **Live input only**: each listener speaks and hears it back; only votes are kept, never audio (Q2). | Default preset; whether formant presets are worth it | M3 |
 | X-F2 | Real high-frequency content of Android captures (how audible aliasing would be) | `lab/spectrum`: speak 20 sibilant-rich phrases on D1–D3; the page computes the > 8 kHz energy share **in memory** and shows only the statistics (no audio stored, Q2). | Confidence in the sinc choice (low stakes) | M3 |
 | X-F3 | Voice-chain time on the phone | `lab/bench` with 1/5/10 s clips | 150 ms budget | M3 |
@@ -1485,13 +1485,14 @@ talking-bear/
 │   ├── pwa/     register.ts
 │   ├── ui/      overlay.ts debug-overlay.ts styles.css
 │   └── test-hooks.ts               # only reachable when VITE_BEAR_TEST_HOOKS==='1'
-├── lab/                            # dev-only pages: routing, latency, vad-live, voices, spectrum, bench, gestures
+├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures
 │                                   #   (no page ever stores or downloads captured audio: Q2)
 ├── scripts/
 │   ├── gen-bear-parts.ts   extract-silero-weights.ts   gen-fixtures.ts   gen-corpus.ts
 │   ├── precompress.mjs     check-dist.mjs              check-headers.sh
 │   └── vad-eval.ts                 # offline VAD evaluation harness (same TS modules)
-├── test/                           # helpers: wav.ts, worklet-scope.ts, fixtures/*.wav(+.json)
+├── test/                           # helpers: wav.ts, worklet-scope.ts, fixtures/*.wav(+.json),
+│                                   #   traces/<session>/{trace.json,trace.bin} (real-voice feature traces, no audio)
 ├── e2e/                            # Playwright specs + fixtures/*.wav
 ├── docs/
 │   ├── plan.md                     # this document
@@ -1553,9 +1554,9 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 - **Resampling:** `dsp/resample.ts`, the Kaiser polyphase sinc used in streaming and offline modes. Worklet streaming 48k/44.1k → 16 kHz.
 - **Silero:** `scripts/extract-silero-weights.ts` pins the upstream commit and SHA-256 of `silero_vad_16k_op15.onnx`, and emits fp16 `weights.bin` plus provenance. `dsp/silero/model.ts` is the TS port.
 - **DSP worker:** VAD mode wired end to end, plus the pre-gate and LSTM warm-up.
-- **Harness:** `scripts/vad-eval.ts` streams WAVs through the **same modules** and reports hit rate, split rate, truncation, onset and end-of-speech latency (median/p90), and false triggers per minute.
+- **Harness:** `scripts/vad-eval.ts` runs the **same modules** on two input kinds: WAVs from the synthetic/TTS corpus, and real-voice **feature traces** (below). It reports hit rate, split rate, truncation, onset and end-of-speech latency (median/p90), and false triggers per minute.
 - **Debug overlay:** probability trace, floor and per-frame timings.
-- **Corpus: synthetic + text-to-speech only, no real voices (Q2).** It is built by `scripts/gen-corpus.ts` and committed; labels are exact because they come from the clean signal.
+- **Regression corpus: synthetic + text-to-speech, no real voices.** It is built by `scripts/gen-corpus.ts` and committed; labels are exact because they come from the clean signal.
   - **Speech:** espeak-ng [V GPL-3.0 `COPYING`], run **once** on a dev machine or in a pinned container, with the WAVs committed. It is not a CI dependency, and program output is generally not covered by the GPL [M].
     - Several voices and variants, including the `whisper` variant [V `espeak-ng-data/voices/!v/whisper`].
     - Pitch and speed sweeps, including high-pitch "child-like" settings. These are a proxy, not a child's voice [M].
@@ -1563,12 +1564,27 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
     - Plus the formant-synth vowels from `gen-fixtures.ts`.
   - **Noise:** pink/brown "fan", amplitude-modulated pink, "TV" babble (overlapping low-passed TTS streams), synthetic music (chords and percussion), knocks and clatter. Mixed at SNR {20, 10, 5, 0} dB.
   - **Device approximation:** convolve with synthetic room impulse responses (RT60 0.2–0.6 s) and a 150 Hz–8 kHz phone-mic band-pass.
-  - **Known limitation [M]:** TTS lacks natural prosody, disfluency and breath noise. Silero was trained on real speech, so its probabilities on TTS may be biased either way. Hence the live validation below.
-- **Live validation without storing audio:** `lab/vad-live` runs the production pipeline with the debug overlay and a tally UI. Everything is computed in memory, and only aggregate JSON (counts and latencies) can be exported.
+  - **Known limitation [M]:** TTS lacks natural prosody, disfluency and breath noise. Silero was trained on real speech, so its probabilities on TTS may be biased either way. So the TTS corpus is the CI **regression** suite, and parameters are **tuned on real-voice traces** (below).
+- **Real-voice feature traces (Q2 amended, 2026-09-26): the primary tuning source.** No audio is ever stored.
+  - **Why this works:** every segmenter and energy-gate parameter acts on per-frame scalars, not audio. That covers thresholds, hangover, minimum speech, floor time constants, onset/offset margins, the absolute minimum and the voicing threshold. So a log of those scalars can be replayed offline through the same `energyGateStep`/`segmenterStep` code for any parameter set.
+  - **`lab/vad-trace`:** capture in listen-only mode (no playback) with production constraints on D1. Silero runs **continuously** (pre-gate bypassed) so the trace is complete. Export via download:
+    - `trace.json`: device, Chrome version, context rate, constraints, Silero weights hash, front-end config hash, condition, script ID, and the event marks below;
+    - `trace.bin`: Float32 streams, i.e. band-limited energy dB, raw dB and voicing score every 10 ms, plus Silero p every 32 ms. That is ≈ 1.3 KB/s, about 1.6 MB per 20 min session.
+  - **What a trace contains:** loudness and speech/no-speech over time. It carries no spectral content, so it isn't intelligible speech [M].
+  - **Ground truth without audio:**
+    - *Scripted sessions:* N prompted phrases with ≥ 2 s gaps. The page shows each prompt and records its display time, so the expected segment count and approximate positions are known. That gives hits, misses and splits.
+    - *Noise-only sessions:* nobody speaks for 10 min per condition (fan, TV, music, kitchen). Every trigger is a false trigger.
+    - *End-of-speech latency:* measured against an energy oracle computed from the trace. It is reliable in quiet to moderate noise; below SNR ≈ 5 dB it is reported but not gated.
+  - **Protocol:** per condition (quiet, fan, TV, music, kitchen; arm's length vs on a table), each available speaker does one scripted session and one noise-only session. Include a child if available.
+  - **Storage:** traces are committed under `test/traces/`. They are small and contain no audio, so CI can gate on real-voice metrics. If you'd rather keep them local, the CI gate falls back to the TTS corpus.
+  - **Limits:**
+    - Changes upstream of the logged scalars invalidate old traces and need a new ~30 min session. That means the HPF or band-limit filters, the decimator, input constraints, the Silero weights, and the pre-gate warm-up length (which re-runs Silero on audio). Traces carry the config hashes, so the harness refuses stale traces.
+    - Production resets Silero's LSTM state at every re-arm; a continuous trace doesn't. That is minor, and `lab/vad-live` covers it end to end.
+- **Live end-to-end check without storing audio:** `lab/vad-live` runs the production pipeline with the debug overlay and a tally UI. Everything is computed in memory, and only aggregate JSON (counts and latencies) can be exported.
   - Protocol: per condition (quiet, fan, TV, music, kitchen; arm's length vs on a table), a speaker reads 20 scripted phrases. The page counts segments, misses, splits and caps, and measures end-of-speech latency against the energy offset.
   - Then 10 min with nobody speaking, counting false triggers.
   - Speakers: whoever is available, adults and, if available, children speaking live.
-- **Grid search:**
+- **Grid search** (run on the real-voice traces; the chosen parameter set must also pass the TTS corpus):
   - positive threshold {0.4, 0.5, 0.6};
   - negative = positive − {0.1, 0.15, 0.2};
   - hangover 400–900 ms;
@@ -1577,19 +1593,26 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 **Tests**
 
 - Parity: TS port vs `onnxruntime-web` in CI (`max|Δp| < 1e-3`, 0 flips).
-- Metric regression in CI on the committed synthetic/TTS corpus (fast subset on every PR, full grid nightly or on demand).
+- Metric regression in CI on the committed synthetic/TTS corpus **and the committed real-voice traces** (fast subset on every PR, full grid nightly or on demand).
+- Trace-format tests: the round trip is lossless; the harness rejects traces whose front-end or weights hash doesn't match the current build.
 - Decimator anti-aliasing property test.
 - X-V2 on D1–D3.
 
 **Exit criteria**
 
-- On the synthetic/TTS corpus (CI-enforced):
+- **On the real-voice traces from D1 (primary gate, CI-enforced):**
+  - hits ≥ 98 % and splits ≤ 2 % on scripted sessions, in every condition at arm's length and on a table;
+  - end-of-speech p90 ≤ 900 ms (where the energy oracle is valid);
+  - false triggers ≤ 0.1/min on fan and music noise-only sessions;
+  - TV rate documented, with the proximity gate tuned;
+  - child speaker's metrics reported separately if a child trace exists.
+- On the synthetic/TTS corpus (CI-enforced, regression floor):
   - hit rate ≥ 98 %;
   - splits ≤ 2 %;
   - end-of-speech p90 ≤ 900 ms;
   - false triggers ≤ 0.1/min on fan and music noise at SNR ≥ 10 dB;
   - TV-babble rate documented, with the proximity gate tuned.
-- Live validation on D1, with the aggregate tallies recorded in `device-notes.md`:
+- Live end-to-end check on D1 with the tuned parameters, aggregate tallies recorded in `device-notes.md`:
   - ≥ 19/20 scripted phrases correctly segmented (no miss, no split) in every condition;
   - ≤ 0.1 false triggers/min over 10 min in fan and music;
   - TV rate documented.
@@ -1953,7 +1976,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 | # | Question | My recommendation | Affects |
 |---|---|---|---|
 | **Q1** ✅ | When nobody interacts, should the bear **fall asleep and close the mic** (the privacy indicator turns off and the context suspends; tap to wake), or keep listening for as long as the app is visible? | **Decided 2026-09-26:** sleep after **2 min** with no speech or touch; doze visuals from 45 s. Configurable in settings. | §3.4 row 18, battery budget, privacy |
-| **Q2** ✅ | For VAD tuning, will you record **real voices** (family, friends, children), and where may those recordings live? | **Decided 2026-09-26: no real voices.** The corpus is synthetic + espeak-ng TTS, committed. Real rooms are validated live via `lab/vad-live` with aggregate tallies only; no page stores captured audio. *(My original recommendation was consent-based recordings kept outside the repo.)* | M2 corpus and exit criteria, X-V1, X-V3, X-F1, X-F2, lab pages |
+| **Q2** ✅ | For VAD tuning, will you record **real voices** (family, friends, children), and where may those recordings live? | **Decided 2026-09-26: no real-voice audio is stored. Amended the same day:** the VAD is tuned on real voices via on-device **feature traces** (per-frame probability, energy and voicing only; `lab/vad-trace`), committed under `test/traces/`. The synthetic + espeak-ng TTS corpus is the CI regression floor. `lab/vad-live` is the final end-to-end check. No page stores captured audio. | M2 corpus, harness and exit criteria, X-V1, X-V3, X-F1, X-F2, lab pages |
 | **Q3** ✅ | Who is the **primary audience**: young children, or general or all ages? | **Decided 2026-09-26: family-friendly, 4+.** Text-free UI, gentle slapstick (wobble or dizzy, never hitting or pain), haptics on, Bear cub voice, large targets, guarded settings, no outbound links. | §4.6.4 content rules and table, M8 UI, settings defaults |
 | **Q4** ✅ | Do you approve the **character direction** ("Juni": a juniper-teal bear with an amber-eyed, tufted head, a notched ear and a mustard neckerchief), or do you want a different look or name? | **Decided 2026-09-26: approved as the working design.** You review the first render in M4. | M4 art |
 | **Q5** ✅ | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | **Decided 2026-09-26: yes.** The image owns every app header. The sidecar is a plain `reverse_proxy` (no `header`, no `encode`). The front does TLS, redirect and HSTS only; any shared baseline header uses `?Header`/`>Header`. | §4.8.3, your Caddy configs |
