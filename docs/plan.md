@@ -258,12 +258,13 @@ export type WorkerToMain =
 // ---- src/app/machine.ts (pure) -----------------------------------------------------
 export function reduce(s: SessionState, e: SessionEvent): { state: SessionState; effects: Effect[] };
 export type Effect =
-  | { k: 'openMic' } | { k: 'closeMic' } | { k: 'resumeCtx' } | { k: 'suspendCtx' }
+  | { k: 'openMic'; req: number } | { k: 'closeMic' }        // closeMic invalidates every pending openMic request
+  | { k: 'resumeCtx' } | { k: 'suspendCtx' } | { k: 'restartWorker' }
   | { k: 'arm'; epoch: number; restoreFloorDb?: number } | { k: 'disarm'; epoch: number }
   | { k: 'take'; epoch: number; id: number; fromFrame: number; toFrame: number }
   | { k: 'process'; id: number; preset: VoicePreset } | { k: 'play'; id: number } | { k: 'stopPlayback' }
-  | { k: 'timer'; name: 'cooldown' | 'sleep' | 'doze' | 'processing' | 'waking'; ms: number }
-  | { k: 'cancelTimer'; name: 'cooldown' | 'sleep' | 'doze' | 'processing' | 'waking' | '*' }
+  | { k: 'timer'; name: 'cooldown' | 'sleep' | 'doze' | 'processing' | 'waking' | 'recording'; ms: number }
+  | { k: 'cancelTimer'; name: 'cooldown' | 'sleep' | 'doze' | 'processing' | 'waking' | 'recording' | '*' }
   | { k: 'wakeLock'; on: boolean } | { k: 'anim'; ev: AnimEvent } | { k: 'sfx'; id: SfxId } // sfx end is tracked at the speaker
   | { k: 'reselectInput' }
   | { k: 'ui'; show: 'tapToWake' | 'parentPermission' | 'micHelp' | 'micMuted' | 'tooNoisy' | 'error' | null };
@@ -321,7 +322,9 @@ stateDiagram-v2
   Recording --> Listening: misfire or mic muted
   Recording --> Processing: speech end (silence or 10 s cap)
   Processing --> Playing: clip processed
-  Processing --> Cooldown: take failed, worker error or 2 s timeout
+  Processing --> Cooldown: take failed, fx error or 2 s timeout
+  Recording --> Cooldown: worker failed / watchdog (restart once)
+  Cooldown --> Waking: input device changed (re-selected after cooldown)
   Playing --> Cooldown: last sample reached speaker
   Playing --> SfxGated: interrupt gesture with sound
   Playing --> Cooldown: interrupt gesture without sound
@@ -334,7 +337,8 @@ stateDiagram-v2
   Error --> Asleep: sleep timer
   note right of Paused
     Mic-holding states and MicDenied go to Paused on hidden, pagehide or freeze.
-    A devicechange re-enters Waking to re-select the input.
+    A devicechange re-enters Waking from Listening/Recording, or after cooldown otherwise.
+    A second worker failure in one wake goes to Error.
     A ctx error or an unexpected track end goes to Error.
   end note
 ```
@@ -355,6 +359,13 @@ stateDiagram-v2
 | Enter a gated state from an armed one | worklet `disarm{epoch}` |
 | Enter `Asleep` / `Paused` / `Error` | `cancelTimer *`; abort take, playback and sfx; `closeMic`; `suspendCtx`; `wakeLock off` |
 | Enter `MicDenied` or `Error` | `timer sleep` (so neither holds anything forever) |
+| Enter `Recording` / exit `Recording` | `timer recording = maxUtterance + 2 s` (a watchdog in case the worker stops producing events) / `cancelTimer recording` |
+
+**Pending mic opens.** Every `openMic` carries a request id `req`, and `micGranted{req}` / `micDenied{req}` echo it.
+
+- `closeMic`, which runs on entry to `Asleep`, `Paused` and `Error`, **invalidates every pending request**.
+- The effect runner **immediately stops every track** of a `getUserMedia` result whose `req` is no longer current. So hiding the page while the prompt or stream-open is still pending can never leave a live mic behind.
+- The reducer ignores stale `micGranted`/`micDenied` (row 44).
 | Any reaction in `Listening` or `MicDenied` | restart `timer sleep` and `timer doze` |
 
 **Transitions.** Epoch and id guards are implicit in every row that consumes a `seg`, clip or `processed` event.
@@ -386,7 +397,7 @@ stateDiagram-v2
 | 23 | Recording | `reaction` | — | Recording | animation only; no sfx, so the take is not polluted |
 | 24 | Processing | all clip chunks received | — | Processing | `process{id, preset}` to the worker |
 | 25 | Processing | `processed{id}` | — | Playing | `cancelTimer processing`; `play` at `currentTime + 50 ms`; `anim talk(envelope, startCtxTime)` |
-| 26 | Processing | `takeFailed` \| `error` \| worker crash \| `timer processing` | — | Cooldown | `anim confused`; `timer cooldown` |
+| 26 | Processing | `takeFailed` \| `error(fx)` \| `timer processing` | — | Cooldown | `anim confused`; `timer cooldown` (a worker crash here goes to row 45) |
 | 27 | Processing | `reaction` | — | Processing | animation only |
 | 28 | Playing | `playbackAtSpeakerEnded` | — | Cooldown | `timer cooldown = 250 ms` (tuned by X-E5) |
 | 29 | Playing | `reaction{priority ≥ 3, sfx}` | — | SfxGated | `stopPlayback`, `sfx`, `anim reaction` |
@@ -395,16 +406,20 @@ stateDiagram-v2
 | 32 | SfxGated | `reaction{sfx}` | — | SfxGated | `sfx`; gate end = max(current end, new end) |
 | 33 | SfxGated | `reaction{no sfx}` | — | SfxGated | `anim reaction` |
 | 34 | SfxGated | `sfxAtSpeakerEnded` | the latest sfx has left the speaker (`clipTimeNow` ≥ its duration) | Cooldown | `timer cooldown = 250 ms` |
-| 35 | Cooldown | `timer cooldown` | — | Listening | (entry actions: new epoch, floor restore) |
+| 35 | Cooldown | `timer cooldown` | no `reselectPending` | Listening | (entry actions: new epoch, floor restore) |
+| 35b | Cooldown | `timer cooldown` | `reselectPending` | Waking | clear the flag; `closeMic`, `reselectInput`, `openMic` |
 | 36 | Cooldown | `reaction{sfx}` | — | SfxGated | `cancelTimer cooldown`, `sfx` |
 | 37 | Cooldown | `reaction{no sfx}` | — | Cooldown | `anim reaction` |
 | 38 | any awake | `hidden` \| `pagehide` \| `freeze` | — | Paused | then, if `updateReady`, apply the update synchronously ([§4.7](#47-pwa)) |
 | 39 | Paused | `visible` | permission `granted` / `prompt` / `denied` | Waking / NeedsParent / MicDenied | as rows 1 / 2 / 3 |
-| 40 | any mic-open state except Waking | `devicechange` that changes the input set | — | Waking | `closeMic`, `reselectInput` (§4.5 policy), `openMic` |
+| 40 | Listening \| Recording | `devicechange` that changes the input set | — | Waking | abort any take; `closeMic`, `reselectInput` (§4.5 policy), `openMic` |
+| 40b | Processing \| Playing \| SfxGated \| Cooldown | `devicechange` that changes the input set | — | unchanged | set `reselectPending`. The input is re-selected only after the bear's audio has left the speaker and the cooldown has elapsed (row 35b), so re-arming can never overlap audible output. Chrome may re-route the current output meanwhile; that's fine. |
 | 41 | any awake | `ctxError` \| track `ended` not initiated by us | — | Error | `ui error` (icon: tap to retry) |
 | 42 | Error | `tapBear` | — | Waking | as row 1 |
 | 43 | Error | `timer sleep` \| `hidden` | — | Asleep | — |
-| 44 | any | `seg` / clip / `takeFailed` / `processed` with a stale epoch or id | — | unchanged | none (explicit ignore) |
+| 44 | any | `seg` / clip / `takeFailed` / `processed` with a stale epoch or id; `micGranted`/`micDenied` with a stale `req` | — | unchanged | none (explicit ignore); the runner has already stopped any stale tracks |
+| 45 | any mic-open state | `workerFailed` (error event or crash) \| `timer recording` | first failure in this wake | Cooldown | abort take and processing; `restartWorker`; `anim confused`; `timer cooldown`. The re-arm after cooldown uses a new epoch on the new worker. |
+| 46 | any mic-open state | `workerFailed` \| `timer recording` | a restart already happened in this wake | Error | abort; `ui error` |
 
 **How the rows combine at the edges:**
 
@@ -672,7 +687,7 @@ Cost: 10 µs per frame at 16 kHz, plus 86 µs for voicing [E].
 
 - **Gate to keep the TS port (M2).** On-device p95 must be **≤ 8 ms per 32 ms frame** on the mid-range reference phone.
   - If it misses: first optimise (real FFT for the STFT, loop tuning).
-  - Then fall back to the ORT backend (+3.3 MB, precache limit raised to 16 MiB, `'wasm-unsafe-eval'`).
+  - Then fall back to the ORT backend: +3.3 MB; `'wasm-unsafe-eval'`; precache limit raised to 16 MiB; **`wasm` and `onnx` added to `globPatterns`**; `.onnx` served as `application/octet-stream`.
   - Or accept energy-only.
 - **Rejected:**
   - WebRTC VAD (noise false positives).
@@ -752,10 +767,11 @@ Chain: `clip → HPF 80 Hz (2nd-order Butterworth) → resample (ratio 1/p) → 
 
 - **Target:** integrated loudness **−20 LUFS**, per ITU-R BS.1770: K-weighting, 400 ms blocks, absolute and relative gating. That's about 80 lines of TS [M].
 - **Make-up gain capped at +12 dB,** so quiet speech stays quieter. Loud input is only ever attenuated. Normalisation is skipped when there are no voiced frames.
+- **Clips shorter than one 400 ms BS.1770 block.** The minimum take (300 ms pre-roll + 150 ms speech + 150 ms tail) becomes 375 ms at ×1.6, and shorter at higher ratios. For these, loudness is the **ungated K-weighted mean square over the whole clip**, with no zero-padding, which would bias the measurement. The same make-up cap and true-peak ceiling apply. A unit test with a 150 ms "hi" fixture at ×2.0 asserts a finite gain within the caps.
 - **True-peak ceiling −3 dBTP,** estimated with 4× oversampling. The applied gain is `min(loudness gain, ceiling gain)`.
 - **Output bus:** voice and sfx share a master `GainNode` at 0.7 before `destination`.
-  - A **Quiet mode** setting, **on by default**, takes another −6 dB.
-  - Another −6 dB is applied while a wired or Bluetooth headset is the output route, detected from the §4.5 device labels.
+  - A **Quiet mode** setting, **on by default**, takes another −6 dB for every route.
+  - **No route-dependent attenuation.** Android exposes only a `default` output and synthetic *input* labels ([§4.5](#45-android-chrome-specifics)), so headphones without a mic, or a connected device that isn't the active output, can't be detected reliably. The protection is route-independent instead: the 0.7 master gain plus Quiet mode, which is on by default. The parent sheet and settings say to keep Quiet mode on with headphones.
 - **Limits of this:** no web API reports absolute SPL or the device's volume setting, so every cap is relative to the phone's media volume [M]. X-E1 includes an optional SPL check.
 
 The result plays through an `AudioBufferSourceNode` at rate 1. Fades and envelope come from the **exact** buffer that plays.
@@ -1175,7 +1191,7 @@ VitePWA({
 
 - **Why precache everything.** Runtime caching stores only what was requested. A user who goes offline before their first tap must still have the worklet, the weights and everything else.
 - **Build check.** `scripts/check-dist.mjs` fails the build in any of these cases:
-  - an emitted file, other than `screenshots/**` and `*.{br,gz,map}`, is missing from the precache manifest. Workbox silently skips oversize files [V R57];
+  - an emitted file is missing from the precache manifest. Workbox silently skips oversize files [V R57]. **Exempt:** `sw.js` itself, which Workbox never precaches because its own revision would be self-referential; `screenshots/**`; `*.{br,gz,map}`; and `workbox-*.js` if the runtime is ever un-inlined;
   - any `data:text/javascript` appears in `dist/**/*.js`;
   - any `__bearTest` appears in a production build;
   - the worklet chunk isn't self-contained (contains `import`, `import.meta`, `document` or `self`);
@@ -1415,7 +1431,7 @@ The Caddy constraints have two causes:
 | Resampler (`ratio = outRate/inRate`) | output length `round(n·ratio) ± 1`; RMS of sines below `0.9·min(1, ratio)` × Nyquist preserved within ±0.5 dB; a sine at f comes out at f/ratio within 1 %; **alias tests on the real downsampling cases**: an 18 kHz tone at `ratio = 0.5` (pitch ×2) and a 9 kHz tone through the 48k→16k decimator (`ratio = 1/3`) must both land below −60 dBFS |
 | Segmenter | events alternate start/end, and end never comes first; every segment ≥ `minSpeech`; all-zero input never triggers; appending silence after `end` never yields `start` |
 | Ring buffer | model-based test against an array model across wrap-around |
-| Session reducer | on random event sequences with an injected clock: **no `arm` while any gated state is active or any sfx or playback is audible**; no `sfx` effect outside transitions into `SfxGated` or within `MicDenied`; in `Listening` the sleep and doze timers are always armed; with no `seg.start` or `reaction`, every trace reaches `Asleep` within `T_sleep` + maximum utterance + processing timeout + playback + cooldown; stale-epoch events never change state; the mic stream is open iff the state is mic-open; the full (state × event) cross product is handled explicitly |
+| Session reducer | on random event sequences with an injected clock: **no `arm` while any gated state is active or any sfx or playback is audible**; no `sfx` effect outside transitions into `SfxGated` or within `MicDenied`; in `Listening` the sleep and doze timers are always armed; with no `seg.start` or `reaction`, every trace reaches `Asleep` within `T_sleep` + maximum utterance + processing timeout + playback + cooldown; stale-epoch events and stale-`req` mic results never change state; a worker failure in any mic-open state leads to `Cooldown` or `Error`, never a stall; no `arm` happens while a `reselectPending` input change is outstanding; the mic stream is open iff the state is mic-open; the full (state × event) cross product is handled explicitly |
 | Recogniser | `pointercancel` never yields a reaction; taps are position-invariant within slop |
 
 **Worklet code in Node.** `class X extends AudioWorkletProcessor` runs at import time, so the scope has to exist *before* the module is evaluated.
@@ -1718,6 +1734,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 - Unit and property tests for the resampler (including both alias tests), ring buffer, energy gate, segmenter and session reducer (the full [§4.9.1](#491-unit-tests-vitest-5-environment-node) invariant list).
 - Worklet `process()` in Node, with the scope stubbed in `setupFiles`.
+- Effect-runner test with a fake `getUserMedia` that resolves **after** `hidden`: every returned track is stopped immediately, and no track is live outside mic-open states.
 - Browser Mode: worklet in an `OfflineAudioContext`.
 - E2E `loop`, `too-short`, `too-long` and `deny` with fake-mic fixtures, run **against `vite preview` with the production headers** from `headers.json` ([§4.9.3](#493-end-to-end-playwright--chromium-fake-media)), including the zero-CSP-violation assertion.
 
@@ -1735,6 +1752,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 **Build**
 
+- **Licence notice (with the weights, not at M8):** `THIRD_PARTY_NOTICES.md` in the repo, plus `public/licenses.txt`, which is served and precached, carrying Silero's MIT copyright and licence text. They land in the same PR that adds `weights.bin`, so no build or image, including M7's first public `v0.1.0`, ever ships the weights without the notice. `check-dist` asserts `licenses.txt` exists whenever `weights.bin` does.
 - **Silero:** `scripts/extract-silero-weights.ts` pins the upstream commit and SHA-256 of `silero_vad_16k_op15.onnx`. It records which Silero release that file is (v6.x) in the provenance JSON, and emits fp16 `weights.bin`. ONNX parsing uses a small hand-written protobuf reader for `TensorProto.raw_data` (≈ 60 lines; the research spike had one). `dsp/silero/model.ts` is the TS port.
 - **DSP worker:** Silero wired end to end; voicing on a 32 ms window; the optional pre-gate behind a flag (off).
 - **Harness:** `scripts/vad-eval.ts` runs the **same modules** on two input kinds: WAVs from the synthetic/TTS corpus, and real-voice **feature traces** (below). It reports hit, miss and split counts, truncation, end-of-speech latency (defined in [§4.2.3](#423-decision)), and false triggers per minute.
@@ -1795,7 +1813,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 - **Live check on D1 with the frozen parameters:** ≤ 1 miss or split in 30 phrases in each of quiet, fan and TV. That's consistent with the trace gate, and aggregate tallies go in `device-notes.md`.
 - X-V2 gate passed on D1: p95 ≤ 8 ms per frame.
 - Idle-listening CPU (quiet room) within the [§4.10](#410-performance-and-battery-budget-reference-device-d1-the-mid-range-pixel-q7) budget. **If it isn't met, the pre-gate is turned on** and re-validated with `lab/vad-live`.
-- An ADR records the VAD backend (TS port / ORT / energy-only) and the pre-gate decision. **If ORT is chosen:** add `'wasm-unsafe-eval'`, raise the precache limit to 16 MiB, and update [§4.8](#48-image-serving-and-headers).
+- An ADR records the VAD backend (TS port / ORT / energy-only) and the pre-gate decision. **If ORT is chosen:** add `'wasm-unsafe-eval'`, raise the precache limit to 16 MiB, **add `wasm` and `onnx` to `globPatterns`** (otherwise the fallback breaks offline and `check-dist` rejects the build), and update [§4.8](#48-image-serving-and-headers).
 
 ### M3 — Voice effect
 
@@ -1837,7 +1855,9 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 **Tests**
 
 - Director reducer tests.
-- Spring stability (property test: bounded energy for f ≤ 10 Hz at dt ∈ [1/240, 1/30]).
+- Spring stability, tested at the **actual fixed substep, dt = 1/120 s** (ω·dt ≤ 0.52 for f ≤ 10 Hz). Semi-implicit Euler is unstable for ω·dt > 2, so dt = 1/30 at 10 Hz (ω·dt ≈ 2.09) would fail by design.
+  - Property: bounded energy for f ≤ 10 Hz, ζ ∈ [0.3, 1.2].
+  - Separately: the accumulator's catch-up, where a frame dt up to the 50 ms clamp runs ≤ 6 substeps, stays bounded, and the render interpolation is monotone.
 - Envelope-to-mouth mapping tests.
 - Playwright screenshot tests of key poses at a fixed seed and time (`page.clock` is fine here: no audio).
 - X-A1, X-A2, X-A3 and X-A4 on the device.
@@ -1953,7 +1973,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
   - accessible names on controls;
   - `aria-live` announcements **only when entering non-listening states**. With TalkBack on, a spoken announcement comes out of the speaker, so while armed it could self-trigger the VAD. Otherwise treat it like an sfx and gate the mic;
   - reduced motion and Gentle mode verified.
-- **Licensing and security:** licences page / `THIRD_PARTY_NOTICES.md` (Silero MIT); enforce Trusted Types if X-P5 is clean.
+- **Licensing and security:** an in-app licences screen inside settings, rendering the `licenses.txt` that has shipped since M2; enforce Trusted Types if X-P5 is clean.
 - **Performance and budgets:** performance pass against [§4.10](#410-performance-and-battery-budget-reference-device-d1-the-mid-range-pixel-q7); battery measurement; `size-limit` budgets enforced in CI.
 - **IP review:** final character and name review (X-L1; the name search already happened before M6).
 - **Second device:** X-D1 if a non-Pixel phone can be borrowed.
@@ -2178,7 +2198,7 @@ Run on D1 (plus any borrowed device, X-D1) and desktop Chrome before each minor 
 | Item | Licence | Obligation |
 |---|---|---|
 | App (this repo) | MIT | none |
-| Silero VAD weights and graph | MIT [V R38] | include the copyright and licence text in `THIRD_PARTY_NOTICES.md` and on the licences screen |
+| Silero VAD weights and graph | MIT [V R38] | include the copyright and licence text in `THIRD_PARTY_NOTICES.md` and in the shipped `licenses.txt` **from M2, when the weights are added**; the licences screen follows in M8 |
 | `workbox-window` | MIT | include the notice |
 | Avoided | Rubber Band (GPL-2.0+), `pitchfinder` (GPL-3), SoundTouchJS (MPL-2.0 with unclear LGPL-2.1 provenance), TEN VAD (Apache-2.0 + non-compete conditions) | — |
 
