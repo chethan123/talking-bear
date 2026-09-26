@@ -1884,6 +1884,9 @@ Notes:
 
 - **Artifact attestations** (`actions/attest`) on **private** repositories require GitHub Enterprise Cloud [V R67]. This repo is private, so we rely on BuildKit provenance and SBOM attached to the image. Revisit if the repo becomes public.
 - **Tag format:** git tag `v1.2.3` → image tags `1.2.3` and `1.2`. No `latest`: the monorepo pins by version and digest.
+- **Package visibility: public (Q6).** A package pushed from a private repo starts out private [M]. After the first push, set it to public once, under the package's settings on GitHub. This is a one-time manual step; I'm not aware of a supported API for user-owned packages [M]. The host then pulls anonymously.
+  - Add the OCI label `org.opencontainers.image.source=https://github.com/chethan123/talking-bear`. It links the package to the repo; the repo stays private.
+  - Provenance with `mode=max` embeds build materials (repo URL, commit, Dockerfile, build args) in the public image. None of that is secret here. Use `mode=min` if you'd rather not publish them.
 - **Release caching:** no dependency cache in `release.yml`. setup-node recommends that for privileged workflows [V R67].
 
 ---
@@ -1948,7 +1951,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 | **Q3** ✅ | Who is the **primary audience**: young children, or general or all ages? | **Decided 2026-09-26: family-friendly, 4+.** Text-free UI, gentle slapstick (wobble or dizzy, never hitting or pain), haptics on, Bear cub voice, large targets, guarded settings, no outbound links. | §4.6.4 content rules and table, M8 UI, settings defaults |
 | **Q4** ✅ | Do you approve the **character direction** ("Juni": a juniper-teal bear with an amber-eyed, tufted head, a notched ear and a mustard neckerchief), or do you want a different look or name? | **Decided 2026-09-26: approved as the working design.** You review the first render in M4. | M4 art |
 | **Q5** ✅ | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | **Decided 2026-09-26: yes.** The image owns every app header. The sidecar is a plain `reverse_proxy` (no `header`, no `encode`). The front does TLS, redirect and HSTS only; any shared baseline header uses `?Header`/`>Header`. | §4.8.3, your Caddy configs |
-| **Q6** | Should the **GHCR package be public or private**? | Public. The image only contains the web bundle that `bear.<domain>` serves publicly anyway, and it saves managing pull tokens on the host. The source repo stays private. | release.yml, host pull config |
+| **Q6** ✅ | Should the **GHCR package be public or private**? | **Decided 2026-09-26: public.** The image only contains the web bundle that `bear.<domain>` serves publicly anyway, and it saves managing pull tokens on the host. The source repo stays private. | release.yml, host pull config |
 | **Q7** | Which **Android phone(s)** can you test on? The plan assumes D1 = a Pixel-class mid-range phone. | Tell me the models; I'll adjust the device matrix and budgets. | M1+ exit criteria |
 
 ---
