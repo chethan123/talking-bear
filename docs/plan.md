@@ -872,12 +872,19 @@ A CSS px is ≈ 1 dp on Chrome Android [M].
 
 All sound effects are **synthesised with Web Audio** (oscillators, filtered noise, envelopes), so there are no audio assets. Every reaction with sound goes through the `SfxGated` path.
 
+**Content rules for the family-friendly, 4+ audience (decided in Q3):**
+
+- The bear reacts with surprise, ticklishness, delight or mild grumpiness. **Never pain, fear or crying.** No sound or pose frames a touch as hitting or hurting.
+- "Slapstick" is limited to wobbles, boings and a gentle dizzy spell with circling stars and a happy recovery.
+- Sound effects peak **≥ 6 dB below** the normalised voice level, with no sudden loud transients. A 5 ms attack minimum avoids startling clicks.
+- No text is needed to play; everything is communicated through the bear's body language and icons ([§7 M8](#m8--polish)).
+
 | Region | Tap | Long-press | Stroke | Tickle | Other |
 |---|---|---|---|---|---|
 | Nose | Sneeze: anticipation 300 ms, then snap (head −15°, squash 0.9), noise burst + "choo". ×3 → big sneeze. | Nose wrinkle, cross-eyed at finger | — | — | — |
-| Head top / tuft | Tuft boing (spring impulse), "boing" | Head presses up into finger | **Pet:** eyes close, leans into stroke, purr-hum (110 Hz saw, 25 Hz AM, low-passed), blush. Against the fur: brows down, head shake. | — | Flick: head knocked sideways ∝ velocity. ×3 in 3 s → dizzy (P4). **See Q3.** |
+| Head top / tuft | Tuft boing (spring impulse), "boing" | Head presses up into finger | **Pet:** eyes close, leans into stroke, purr-hum (110 Hz saw, 25 Hz AM, low-passed), blush. Against the fur: brows down, head shake. | — | Flick: head **wobbles** (spring impulse, amplitude capped), "whoa!". ×3 in 3 s → gentle dizzy (stars circle, sways, then a happy shake-off) (P4). |
 | Ear L/R | Ear flick, "hm?" | **Ear droops** (fold→1), half-lids, low hum; springs back on release | Ear flattens along the stroke | — | — |
-| Eyes | Hard blink, paw rubs eye, soft "ow" | — | — | — | — |
+| Eyes | Hard blink, paw rubs eye, grumpy-cute "hmph!" (no pain sound) | — | — | — | — |
 | Cheeks | Cheek puff | — | Blush | — | **Pinch: squish** (head scaleX↓ scaleY↑), puckered lips, "pop" on release |
 | Belly | **"Oof"** (sine 300→120 Hz + noise), jiggle, squash | Belly rub: content sigh | Pet (belly) | **Giggle** (5–7 chirps at 700–1100 Hz with vibrato). > 3 s → laugh fit, falls back (P4). | Hug: arms wrap, squeal |
 | Paw | Waves back | High-five: paw rises to finger, "hi!" on release | — | — | — |
@@ -968,7 +975,7 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
 - **Allocation:** the pose `Float32Array`, spring state, matrix stack and gesture ring buffers are all preallocated. Nothing allocates per frame.
 - **Idle throttling:** when nothing moves apart from the breathing and blink layers, render at 30 fps (still dt-based). Rendering stops entirely in `Asleep` apart from a slow breathing loop at 15 fps, and while the page is hidden (rAF pauses anyway [V R31]).
 - **`prefers-reduced-motion`:**
-  - squash, sway and knockback scaled × 0.3;
+  - squash, sway and wobble scaled × 0.3;
   - dizzy and laugh fits replaced by gentle variants;
   - spring damping ζ ≥ 0.9;
   - blinks, mouth and gaze kept.
@@ -1709,7 +1716,11 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 **Build**
 
-- **Onboarding:** a first-run hint, "tap the bear", with no text-heavy UI.
+- **Kid-first UI (Q3):**
+  - **Text-free:** a pulsing paw icon over the sleeping bear means "tap to wake"; mic-denied help is an icon with the bear miming a cupped ear. Short text for parents is available only inside settings.
+  - **Targets:** UI controls ≥ 48 dp. Bear hit regions padded by 12 px beyond the art.
+  - **Guarded settings:** settings open on a **1 s long-press** of the gear icon, so a small child doesn't change things by accident.
+  - **No outbound links.** Nothing a child can tap leaves the app; the licences screen is inside settings.
 - **Status and help:**
   - "too noisy" hint and hold-to-talk fallback;
   - "too loud" reaction;
@@ -1717,7 +1728,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
   - Bluetooth input handling per X-E4;
   - phone-call handling per X-E8.
 - **Sleep:** dozing and asleep behaviour (Q1).
-- **Settings:** voice, haptics, noisy-room NS toggle, sleep timeout.
+- **Settings:** voice (default Bear cub), haptics (default on), noisy-room NS toggle, sleep timeout (default 2 min).
 - **Accessibility:** accessible names on controls; `aria-live` state announcements; reduced motion verified.
 - **Licensing and security:** licences page / `THIRD_PARTY_NOTICES.md` (Silero MIT); enforce Trusted Types if X-P5 is clean.
 - **Performance and budgets:** performance pass against [§4.10](#410-performance-and-battery-budget-mid-range-android-reference-pixel-6a-or-galaxy-a5x); battery measurement; `size-limit` budgets enforced in CI.
@@ -1932,7 +1943,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 |---|---|---|---|
 | **Q1** ✅ | When nobody interacts, should the bear **fall asleep and close the mic** (the privacy indicator turns off and the context suspends; tap to wake), or keep listening for as long as the app is visible? | **Decided 2026-09-26:** sleep after **2 min** with no speech or touch; doze visuals from 45 s. Configurable in settings. | §3.4 row 18, battery budget, privacy |
 | **Q2** ✅ | For VAD tuning, will you record **real voices** (family, friends, children), and where may those recordings live? | **Decided 2026-09-26: no real voices.** The corpus is synthetic + espeak-ng TTS, committed. Real rooms are validated live via `lab/vad-live` with aggregate tallies only; no page stores captured audio. *(My original recommendation was consent-based recordings kept outside the repo.)* | M2 corpus and exit criteria, X-V1, X-V3, X-F1, X-F2, lab pages |
-| **Q3** | Who is the **primary audience**: young children, or general or all ages? | Family-friendly, 4+: text-free UI, gentle slapstick (a knock gives "dizzy" but nothing framed as hitting), haptics on. | Reaction table §4.6.4, default voice, UI copy |
+| **Q3** ✅ | Who is the **primary audience**: young children, or general or all ages? | **Decided 2026-09-26: family-friendly, 4+.** Text-free UI, gentle slapstick (wobble or dizzy, never hitting or pain), haptics on, Bear cub voice, large targets, guarded settings, no outbound links. | §4.6.4 content rules and table, M8 UI, settings defaults |
 | **Q4** | Do you approve the **character direction** ("Juni": a juniper-teal bear with an amber-eyed, tufted head, a notched ear and a mustard neckerchief), or do you want a different look or name? | Approve as the working design; review the first render in M4. | M4 art |
 | **Q5** | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | Yes. | §4.8.3, your Caddy configs |
 | **Q6** | Should the **GHCR package be public or private**? | Public. The image only contains the web bundle that `bear.<domain>` serves publicly anyway, and it saves managing pull tokens on the host. The source repo stays private. | release.yml, host pull config |
