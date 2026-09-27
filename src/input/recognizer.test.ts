@@ -459,6 +459,24 @@ describe('long-press', () => {
   it('an up is never a long-press trigger: no tick after 500 ms, no long-press', () => {
     expect(kinds(run([dn(0, 100, 100), up(600, 100, 100)], on('belly')).all)).toEqual(['tap:down']);
   });
+
+  it('each pointer long-presses on its own time, with its own region', () => {
+    const trace = [
+      dn(0, 100, 100, 1),
+      dn(200, 800, 100, 2),
+      tick(500),
+      tick(600),
+      tick(700),
+      up(800, 100, 100, 1),
+    ];
+    const { steps } = run(trace, split('pawL', 'pawR'));
+    expect(steps.slice(2).map((st) => st.out)).toEqual([
+      [{ g: 'longPress', region: 'pawL', phase: 'start' }],
+      NO_GESTURES,
+      [{ g: 'longPress', region: 'pawR', phase: 'start' }],
+      [{ g: 'longPress', region: 'pawL', phase: 'end' }],
+    ]);
+  });
 });
 
 describe('stroke', () => {
