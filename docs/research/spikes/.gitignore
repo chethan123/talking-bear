@@ -1,0 +1,9 @@
+node_modules/
+dist*/
+*.log
+*.wav
+silero-vad/
+ss_module.cjs
+weights.bin
+blocks.json
+out/

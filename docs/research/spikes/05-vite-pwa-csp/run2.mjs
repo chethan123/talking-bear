@@ -1,0 +1,37 @@
+import pw from 'playwright'; const { chromium } = pw; import fs from 'node:fs';
+const port = process.argv[2];
+const browser = await chromium.launch({ args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] });
+const ctx = await browser.newContext(); const page = await ctx.newPage();
+const logs = []; page.on('console', m => logs.push(`[${m.type()}] ${m.text()}`)); page.on('pageerror', e => logs.push(`[pageerror] ${e.message}`));
+const failed = []; page.on('requestfailed', r => failed.push(r.url().split('/').pop() + ' ' + (r.failure()?.errorText||'')));
+fs.writeFileSync('root.txt', 'dist');
+await page.goto(`http://localhost:${port}/`);
+await page.waitForFunction(() => navigator.serviceWorker.getRegistration().then(r => !!r?.active), null, { timeout: 15000 }).catch(()=>{});
+await page.waitForTimeout(800);
+const s1 = await page.evaluate(() => ({ controller: !!navigator.serviceWorker.controller }));
+console.log('\n### A. first session after offlineReady, no reload:', JSON.stringify(s1));
+await ctx.setOffline(true);
+await page.locator('#c').click(); await page.waitForTimeout(2500);
+console.log('offline click logs:', logs.filter(l => /worklet|lazy|click flow|error/i.test(l)).join(' | '));
+console.log('failed requests while offline:', JSON.stringify(failed));
+await ctx.setOffline(false); logs.length = 0; failed.length = 0;
+// B. reload -> controlled; then deploy v2 and update
+await page.reload(); await page.waitForTimeout(800);
+const s2 = await page.evaluate(() => ({ controller: !!navigator.serviceWorker.controller }));
+console.log('\n### B. after reload:', JSON.stringify(s2));
+fs.writeFileSync('root.txt', 'dist-v2');
+await page.evaluate(async () => { const r = await navigator.serviceWorker.getRegistration(); await r.update(); });
+await page.waitForFunction(() => navigator.serviceWorker.getRegistration().then(r => !!r?.waiting), null, { timeout: 15000 }).then(()=>console.log('v2 SW is waiting; onNeedRefresh logs:', logs.filter(l=>/refresh/.test(l)).join('|'))).catch(()=>console.log('no waiting SW appeared'));
+const navP = page.waitForNavigation({ timeout: 10000 }).then(()=> 'page reloaded').catch(()=> 'NO reload within 10s');
+await page.evaluate(() => window.updateSW());
+console.log('after updateSW():', await navP);
+await page.waitForTimeout(800);
+const s3 = await page.evaluate(async () => { const r = await navigator.serviceWorker.getRegistration(); return { controller: !!navigator.serviceWorker.controller, waiting: !!r.waiting, activeScript: r.active?.scriptURL.split('/').pop() }; });
+console.log('state:', JSON.stringify(s3));
+await page.locator('#c').click(); await page.waitForTimeout(2000);
+console.log('post-update click logs:', logs.filter(l => /lazy|worklet ok/.test(l)).join(' | '));
+// C. old page still open in another tab? simulate: an old entry chunk fetch of the v1 lazy chunk from cache/network
+const oldLazy = fs.readdirSync('dist/assets').find(f => /^lazy-.*\.js$/.test(f));
+const r = await page.evaluate(async (u) => { try { const r = await fetch('/assets/' + u); return r.status + (r.headers.get('x-from')||''); } catch (e) { return 'ERR ' + e.message; } }, oldLazy);
+console.log('fetch of v1 lazy chunk after v2 activation (server now v2 only):', oldLazy, '->', r);
+await browser.close();

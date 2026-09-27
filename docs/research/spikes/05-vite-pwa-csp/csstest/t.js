@@ -1,0 +1,11 @@
+const el = document.getElementById('c');
+const cs = () => getComputedStyle(el).height;
+console.log('before', cs(), JSON.stringify(el.getAttribute('style')));
+el.setAttribute('style', 'height:5px');
+console.log('after setAttribute', cs(), JSON.stringify(el.getAttribute('style')), 'cssText=', JSON.stringify(el.style.cssText));
+el.style.cssText = 'height:7px';
+console.log('after cssText', cs());
+const d = document.createElement('div'); d.innerHTML = '<span style="height:9px;display:block">x</span>'; document.body.appendChild(d);
+console.log('innerHTML style attr computed', getComputedStyle(d.firstChild).height);
+const s = document.createElement('style'); s.textContent = '#c{height:11px}'; document.head.appendChild(s);
+console.log('after <style> element', cs());
