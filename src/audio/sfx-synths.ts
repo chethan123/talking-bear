@@ -69,10 +69,10 @@ function contour(param: AudioParam, t0: number, points: readonly ContourPoint[])
 
 /**
  * Starts every source at `t0` and stops it at `t0 + dur`, the sfx's exact end. Once they have ended,
- * disconnects `outs` (the nodes connected to the sfx's `out`). Returns `dur`. `ends` are the context times at
- * which the sfx's gain envelopes are back at 0 (what `envelope()` returns); a `RangeError` is thrown, before
- * any source starts, if one is later than `t0 + dur`, since stopping the sources there would cut the sound off
- * mid-envelope.
+ * disconnects `outs` (the nodes connected to the sfx's `out`). Returns `dur`. `ends` are the context times
+ * at which the sfx's gain envelopes are back at 0 (what `envelope()` returns); a `RangeError` is thrown,
+ * before any source starts, if one is later than `t0 + dur`, since stopping the sources there would cut the
+ * sound off mid-envelope.
  */
 export function run(
   sources: readonly AudioScheduledSourceNode[],
@@ -192,7 +192,7 @@ function blip(b: VoiceBlip): SfxSynth {
  * `len`).
  */
 export interface Chirps {
-  /** [onset (s after the sfx's start), starting pitch (Hz)] per chirp. */
+  /** [onset (s after the sfx's start), start pitch (Hz)] per chirp, in order, none before the last ends. */
   notes: readonly (readonly [t: number, hz: number])[];
   len: number;
   /** Pitch at the chirp's end relative to its start. */
@@ -211,7 +211,9 @@ function chirpsEnd(c: Chirps): number {
 
 /**
  * Builds `c`'s chirps at `t0` into `dest`; returns their sources, their envelope and when the last chirp's
- * envelope is back at 0. Throws a `RangeError`, before building anything, if `c.env` ends after `c.len`.
+ * envelope is back at 0. Throws a `RangeError`, before building anything, if `c.env` ends after `c.len` or a
+ * chirp starts before the previous one has ended (they share one oscillator and one envelope, so an overlap
+ * would cut the earlier chirp off).
  */
 export function chirps(
   ctx: BaseAudioContext,
@@ -222,6 +224,13 @@ export function chirps(
   const envLen = c.env.at(-1)?.[0] ?? 0;
   if (!(envLen <= c.len)) {
     throw new RangeError(`chirps: the envelope ends at ${envLen} s, after the chirp length ${c.len} s`);
+  }
+  let prevEnd = -Infinity;
+  for (const [t] of c.notes) {
+    if (!(t + 1e-9 >= prevEnd)) {
+      throw new RangeError(`chirps: the chirp at ${t} s starts before the previous one ends at ${prevEnd} s`);
+    }
+    prevEnd = t + c.len;
   }
   const osc = new OscillatorNode(ctx, { type: 'triangle' });
   const vib = lfo(ctx, c.vibratoHz, c.vibratoCents, osc.detune);

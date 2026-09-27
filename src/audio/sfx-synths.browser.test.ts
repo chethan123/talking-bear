@@ -395,7 +395,7 @@ describe('the checks catch broken synths (negative controls)', () => {
     expect(() => onTime.start(), 'run() started it').toThrow();
   });
 
-  test('chirps() rejects an envelope longer than the chirp', () => {
+  test('chirps() rejects an envelope longer than the chirp, and overlapping chirps', () => {
     const ctx = new OfflineAudioContext(1, 128, SAMPLE_RATE);
     const c: Chirps = {
       notes: [
@@ -412,6 +412,18 @@ describe('the checks catch broken synths (negative controls)', () => {
       ],
     };
     expect(() => chirps(ctx, ctx.destination, 0, c)).toThrow(RangeError);
+    const overlapping: Chirps = {
+      ...c,
+      notes: [
+        [0, 1000],
+        [0.05, 900],
+      ],
+      env: [
+        [0.008, 0.2],
+        [0.06, 0],
+      ],
+    };
+    expect(() => chirps(ctx, ctx.destination, 0, overlapping)).toThrow(RangeError);
     const fits = chirps(ctx, ctx.destination, 0, {
       ...c,
       env: [
