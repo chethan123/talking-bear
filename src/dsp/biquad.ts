@@ -2,6 +2,8 @@
 // Transposed, plus a cascade. Used by the capture high-pass (80 Hz, plan §4.1.2) and the VAD gate band-limit
 // (2x HPF 200 Hz + LPF 3.4 kHz at 16 kHz, plan §4.2.1). Pure: no DOM, no globals; Float32Array in and out,
 // float64 coefficients and state.
+// Also the ITU-R BS.1770 K-weighting forms (as in libebur128), plan §4.3.4: highShelf (pre-filter shelf)
+// and highpassQ (RLB high-pass), with their coefficient functions.
 
 /** Q of a second-order Butterworth section. */
 const BUTTERWORTH_Q = Math.SQRT1_2;
@@ -106,4 +108,70 @@ export function cascade(...stages: Biquad[]): Biquad {
       for (let k = 0; k < stages.length; k++) stages[k]!.reset();
     },
   };
+}
+
+/** Normalised biquad coefficients (a0 = 1): H(z) = (b0 + b1·z^-1 + b2·z^-2) / (1 + a1·z^-1 + a2·z^-2). */
+export interface BiquadCoefficients {
+  readonly b0: number;
+  readonly b1: number;
+  readonly b2: number;
+  readonly a1: number;
+  readonly a2: number;
+}
+
+/** libebur128 / ITU-R BS.1770 shelf: Vb = Vh^SHELF_VB_EXPONENT (not the RBJ cookbook shelf). */
+const SHELF_VB_EXPONENT = 0.4996667741545416;
+
+function checkQ(q: number): void {
+  if (!(Number.isFinite(q) && q > 0)) {
+    throw new RangeError(`q must be finite and > 0 (q = ${q})`);
+  }
+}
+
+/**
+ * High-shelf coefficients in libebur128's BS.1770 form (bilinear transform, K = tan(π·f0/fs),
+ * Vh = 10^(gainDb/20), Vb = Vh^0.4996667741545416). The DC gain is exactly 1 (0 dB) and the Nyquist gain
+ * exactly Vh (gainDb). Throws RangeError unless 0 < f0 < fs/2, q > 0 and gainDb is finite.
+ */
+export function highShelfCoefficients(fs: number, f0: number, gainDb: number, q: number): BiquadCoefficients {
+  checkCutoff(fs, f0);
+  checkQ(q);
+  if (!Number.isFinite(gainDb)) throw new RangeError(`gainDb must be finite (gainDb = ${gainDb})`);
+  const K = Math.tan((Math.PI * f0) / fs);
+  const Vh = 10 ** (gainDb / 20);
+  const Vb = Vh ** SHELF_VB_EXPONENT;
+  const a0 = 1 + K / q + K * K;
+  return {
+    b0: (Vh + (Vb * K) / q + K * K) / a0,
+    b1: (2 * (K * K - Vh)) / a0,
+    b2: (Vh - (Vb * K) / q + K * K) / a0,
+    a1: (2 * (K * K - 1)) / a0,
+    a2: (1 - K / q + K * K) / a0,
+  };
+}
+
+/**
+ * Second-order high-pass coefficients in the BS.1770 RLB form (as in libebur128 and BS.1770-4 Table 2):
+ * bilinear transform with K = tan(π·f0/fs); the numerator is [1, −2, 1] and is not divided by a0, so DC is
+ * blocked and the Nyquist gain is 1 + K/q + K² (+0.043 dB for the RLB stage at 48 kHz).
+ * Throws RangeError unless 0 < f0 < fs/2 and q > 0.
+ */
+export function highpassQCoefficients(fs: number, f0: number, q: number): BiquadCoefficients {
+  checkCutoff(fs, f0);
+  checkQ(q);
+  const K = Math.tan((Math.PI * f0) / fs);
+  const a0 = 1 + K / q + K * K;
+  return { b0: 1, b1: -2, b2: 1, a1: (2 * (K * K - 1)) / a0, a2: (1 - K / q + K * K) / a0 };
+}
+
+/** High shelf in libebur128's BS.1770 form; see highShelfCoefficients. */
+export function highShelf(fs: number, f0: number, gainDb: number, q: number): Biquad {
+  const c = highShelfCoefficients(fs, f0, gainDb, q);
+  return new Section(c.b0, c.b1, c.b2, c.a1, c.a2);
+}
+
+/** Second-order high-pass in the BS.1770 RLB form; see highpassQCoefficients. */
+export function highpassQ(fs: number, f0: number, q: number): Biquad {
+  const c = highpassQCoefficients(fs, f0, q);
+  return new Section(c.b0, c.b1, c.b2, c.a1, c.a2);
 }

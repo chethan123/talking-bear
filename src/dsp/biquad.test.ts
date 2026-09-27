@@ -2,6 +2,13 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { mulberry32, rmsDb, sine, toneLevelDb } from '../../test/dsp-helpers.ts';
 import { butterworthHighpass, butterworthLowpass, cascade, type Biquad } from './biquad.ts';
+import {
+  highpassQ,
+  highpassQCoefficients,
+  highShelf,
+  highShelfCoefficients,
+  type BiquadCoefficients,
+} from './biquad.ts';
 
 /** Float32 bit patterns, so comparisons are bit-exact (+0 vs -0 and NaN payloads count). */
 function bits(a: Float32Array): Uint32Array {
@@ -240,5 +247,106 @@ describe('dsp-helpers', () => {
       if (va !== c()) differs = true;
     }
     expect(differs).toBe(true);
+  });
+});
+
+/** Test-local DF2T with the same float64 recurrence as the module's Section. */
+function df2t(c: BiquadCoefficients, x: Float32Array): Float32Array {
+  const y = new Float32Array(x.length);
+  let s1 = 0;
+  let s2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const xi = x[i]!;
+    const yi = c.b0 * xi + s1;
+    s1 = c.b1 * xi - c.a1 * yi + s2;
+    s2 = c.b2 * xi - c.a2 * yi;
+    y[i] = yi;
+  }
+  return y;
+}
+
+function impulse(n: number): Float32Array {
+  const x = new Float32Array(n);
+  x[0] = 1;
+  return x;
+}
+
+/** |H(e^jω)| in dB at f, evaluated analytically from the coefficients. */
+function responseDb(c: BiquadCoefficients, fs: number, f: number): number {
+  const w = (2 * Math.PI * f) / fs;
+  const nr = c.b0 + c.b1 * Math.cos(w) + c.b2 * Math.cos(2 * w);
+  const ni = -(c.b1 * Math.sin(w) + c.b2 * Math.sin(2 * w));
+  const dr = 1 + c.a1 * Math.cos(w) + c.a2 * Math.cos(2 * w);
+  const di = -(c.a1 * Math.sin(w) + c.a2 * Math.sin(2 * w));
+  return 20 * Math.log10(Math.hypot(nr, ni) / Math.hypot(dr, di));
+}
+
+describe('highShelf / highpassQ (BS.1770 forms)', () => {
+  // ITU-R BS.1770 analog prototypes, as in libebur128.
+  const SHELF_F0 = 1681.974450955533;
+  const SHELF_GAIN_DB = 3.999843853973347;
+  const SHELF_Q = 0.7071752369554196;
+  const RLB_F0 = 38.13547087602444;
+  const RLB_Q = 0.5003270373238773;
+
+  it('reproduce the BS.1770-4 K-weighting coefficients at 48 kHz within 1e-6', () => {
+    const s = highShelfCoefficients(48000, SHELF_F0, SHELF_GAIN_DB, SHELF_Q);
+    expect(Math.abs(s.b0 - 1.53512485958697)).toBeLessThan(1e-6);
+    expect(Math.abs(s.b1 - -2.69169618940638)).toBeLessThan(1e-6);
+    expect(Math.abs(s.b2 - 1.19839281085285)).toBeLessThan(1e-6);
+    expect(Math.abs(s.a1 - -1.69065929318241)).toBeLessThan(1e-6);
+    expect(Math.abs(s.a2 - 0.73248077421585)).toBeLessThan(1e-6);
+    const r = highpassQCoefficients(48000, RLB_F0, RLB_Q);
+    expect(r.b0).toBe(1);
+    expect(r.b1).toBe(-2);
+    expect(r.b2).toBe(1);
+    expect(Math.abs(r.a1 - -1.99004745483398)).toBeLessThan(1e-6);
+    expect(Math.abs(r.a2 - 0.99007225036621)).toBeLessThan(1e-6);
+  });
+
+  it('the factories run exactly their coefficient functions (bit-exact impulse response)', () => {
+    const x = impulse(256);
+    const s = highShelf(48000, SHELF_F0, SHELF_GAIN_DB, SHELF_Q).process(x);
+    const sRef = df2t(highShelfCoefficients(48000, SHELF_F0, SHELF_GAIN_DB, SHELF_Q), x);
+    expect(firstMismatch(s, sRef)).toBe(-1);
+    const r = highpassQ(48000, RLB_F0, RLB_Q).process(x);
+    const rRef = df2t(highpassQCoefficients(48000, RLB_F0, RLB_Q), x);
+    expect(firstMismatch(r, rRef)).toBe(-1);
+  });
+
+  it('highShelf: unity DC gain, 0 dB at 50 Hz, +4 dB at 20 kHz', () => {
+    const c = highShelfCoefficients(48000, SHELF_F0, SHELF_GAIN_DB, SHELF_Q);
+    expect(Math.abs((c.b0 + c.b1 + c.b2) / (1 + c.a1 + c.a2) - 1)).toBeLessThan(1e-12);
+    expect(Math.abs(responseDb(c, 48000, 50))).toBeLessThan(0.01);
+    expect(Math.abs(responseDb(c, 48000, 20000) - 4)).toBeLessThan(0.01);
+  });
+
+  it('highpassQ: blocks DC, attenuates 20 Hz, Nyquist-side gain 1 + K/q + K²', () => {
+    const c = highpassQCoefficients(48000, RLB_F0, RLB_Q);
+    expect(c.b0 + c.b1 + c.b2).toBe(0);
+    expect(responseDb(c, 48000, 20)).toBeLessThanOrEqual(-10);
+    const K = Math.tan((Math.PI * RLB_F0) / 48000);
+    const expected = 20 * Math.log10(1 + K / RLB_Q + K * K);
+    expect(Math.abs(responseDb(c, 48000, 20000) - expected)).toBeLessThan(0.001);
+  });
+
+  it('reject invalid parameters with RangeError', () => {
+    expect(() => highShelf(48000, 0, 4, 0.7)).toThrow(RangeError);
+    expect(() => highShelf(48000, 24000, 4, 0.7)).toThrow(RangeError);
+    expect(() => highShelf(48000, 1000, 4, 0)).toThrow(RangeError);
+    expect(() => highShelf(48000, 1000, Number.NaN, 0.7)).toThrow(RangeError);
+    expect(() => highpassQ(48000, 38, -1)).toThrow(RangeError);
+    expect(() => highpassQ(48000, 38, Number.NaN)).toThrow(RangeError);
+    expect(() => highpassQ(Number.NaN, 38, 0.5)).toThrow(RangeError);
+  });
+
+  it('are stable: impulse-response energy in samples 48000…96000 < 1e-12', () => {
+    const x = impulse(96_000);
+    for (const f of [highShelf(48000, SHELF_F0, SHELF_GAIN_DB, SHELF_Q), highpassQ(48000, RLB_F0, RLB_Q)]) {
+      const y = f.process(x);
+      let e = 0;
+      for (let i = 48_000; i < 96_000; i++) e += y[i]! * y[i]!;
+      expect(e).toBeLessThan(1e-12);
+    }
   });
 });
