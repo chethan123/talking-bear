@@ -86,6 +86,19 @@ export interface Engine {
   masterBus(): AudioNode | null;
 }
 
+/**
+ * The e2e test hooks' access to the output (plan §4.9.3, issue #36). createEngine's result has it; `Engine`, the
+ * interface the session and its test fakes implement, doesn't.
+ */
+export interface OutputTapHost {
+  /**
+   * Re-routes the master bus's `output` → `node` → `destination`, so `node` sees the bus's final signal (after
+   * Quiet mode, from M3). Call it at most once, after the graph exists (after the first `ctxRunning`); it
+   * throws otherwise and leaves the graph unchanged.
+   */
+  insertOutputTap(node: AudioNode): void;
+}
+
 type Processed = NonNullable<ReturnType<Engine['getProcessed']>>;
 type ClipChunk = Extract<WorkletToMain, { t: 'clipChunk' }>;
 
@@ -140,7 +153,7 @@ function concat(chunks: readonly Float32Array[], length: number): Float32Array {
 export function createEngine(opts: {
   connectWorkletOutput: boolean;
   onEvent: (e: EngineEvent) => void;
-}): Engine {
+}): Engine & OutputTapHost {
   const { connectWorkletOutput, onEvent } = opts;
   const emit = (e: EngineEvent): void => {
     onEvent(e);
@@ -154,6 +167,8 @@ export function createEngine(opts: {
   let bus: MasterBus | null = null;
   let node: AudioWorkletNode | null = null;
   let setup: Promise<AudioContext> | null = null;
+  /** The node insertOutputTap() put between the bus and `destination`, if any. */
+  let outputTap: AudioNode | null = null;
   /** Set by resume(), cleared by suspend(): the latest call wins when they race with the first build. */
   let wantRunning = false;
 
@@ -550,6 +565,14 @@ export function createEngine(opts: {
     },
     masterBus(): AudioNode | null {
       return bus === null ? null : bus.input;
+    },
+    insertOutputTap(tap: AudioNode): void {
+      if (ctx === null || bus === null) throw new Error('insertOutputTap: the audio graph is not built yet');
+      if (outputTap !== null) throw new Error('insertOutputTap: an output tap is already inserted');
+      bus.output.disconnect(ctx.destination);
+      bus.output.connect(tap);
+      tap.connect(ctx.destination);
+      outputTap = tap;
     },
   };
 }
