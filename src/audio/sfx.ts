@@ -1,0 +1,140 @@
+import { minEndWaitMs, outputContextTimeNow } from './output-clock.ts';
+import type { SfxId } from './sfx-ids.ts';
+
+/** Schedules one sound effect's nodes at context time `when`, connected to `out`; returns its exact duration (s). */
+export type SfxSynth = (ctx: BaseAudioContext, out: AudioNode, when: number) => number;
+
+/** One scheduled sfx: its own gain into `out` (so `stopAll` can cut it) and a silent end marker. */
+interface Voice {
+  gain: GainNode;
+  marker: ConstantSourceNode;
+}
+
+interface Waiter {
+  resolve: () => void;
+  reject: (reason: unknown) => void;
+}
+
+const SCHEDULE_AHEAD_SEC = 0.02;
+const POLL_MS = 10;
+
+/**
+ * The sound-effect scheduler (plan §4.4 point 5, §3.4 row 34). `allEnded()` resolves when every sfx has
+ * left the speaker, judged like the player: the output clock has passed the latest end, every sfx's
+ * `ended` event has fired, and at least `max(outputLatency, 50 ms)` has passed since the last of them.
+ * The condition is re-read on every 10 ms poll, so an sfx scheduled while it waits extends the wait.
+ *
+ * A synth's own nodes are not visible here, so each sfx gets a silent `ConstantSourceNode` (offset 0)
+ * that starts and stops with it; that marker's `ended` event is the sfx's `ended` event.
+ */
+export function createSfx(
+  ctx: AudioContext,
+  out: AudioNode,
+  synths: Record<SfxId, SfxSynth>,
+  sleep: (ms: number) => Promise<unknown> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): {
+  /** Schedules `id` at `ctx.currentTime + 0.02`. */
+  play(id: SfxId): { endCtxTime: number };
+  /** Cuts every scheduled sfx (the cut counts as their end) and rejects every pending `allEnded()` with `'stopped'`. */
+  stopAll(): void;
+  /** Resolves when every sfx has left the speaker, including sfx scheduled while it waits (same predicate and min wait as the player). Rejects with 'stopped' after stopAll(). */
+  allEnded(): Promise<void>;
+} {
+  const voices = new Set<Voice>();
+  const waiters = new Set<Waiter>();
+  let latestEnd = -Infinity; // context time at which the latest scheduled sfx ends
+  let lastEndedAt = -Infinity; // performance.now() of the most recent `ended` event
+
+  const play = (id: SfxId): { endCtxTime: number } => {
+    const when = ctx.currentTime + SCHEDULE_AHEAD_SEC;
+    const gain = new GainNode(ctx);
+    gain.connect(out);
+    const duration = synths[id](ctx, gain, when);
+    const endCtxTime = when + duration;
+    latestEnd = Math.max(latestEnd, endCtxTime);
+    const marker = new ConstantSourceNode(ctx, { offset: 0 });
+    marker.connect(gain);
+    const v: Voice = { gain, marker };
+    marker.addEventListener(
+      'ended',
+      () => {
+        if (!voices.delete(v)) return; // already cut by stopAll
+        gain.disconnect();
+        lastEndedAt = performance.now();
+      },
+      { once: true },
+    );
+    marker.start(when);
+    marker.stop(endCtxTime);
+    voices.add(v);
+    return { endCtxTime };
+  };
+
+  const stopAll = (): void => {
+    if (voices.size > 0) {
+      for (const v of voices) {
+        v.marker.stop();
+        v.gain.disconnect();
+      }
+      voices.clear();
+      // The cut is where these sfx end: audio rendered up to now still has to leave the speaker.
+      latestEnd = Math.min(latestEnd, ctx.currentTime);
+      lastEndedAt = performance.now();
+    }
+    const pending = [...waiters];
+    waiters.clear();
+    for (const w of pending) w.reject('stopped');
+  };
+
+  const leftSpeaker = (): boolean =>
+    voices.size === 0 &&
+    outputContextTimeNow(ctx) >= latestEnd &&
+    performance.now() - lastEndedAt >= minEndWaitMs(ctx);
+
+  const allEnded = (): Promise<void> =>
+    new Promise<void>((resolve, reject) => {
+      const w: Waiter = { resolve, reject };
+      waiters.add(w);
+      const poll = async (): Promise<void> => {
+        for (;;) {
+          if (!waiters.has(w)) return; // rejected by stopAll
+          if (leftSpeaker()) {
+            waiters.delete(w);
+            resolve();
+            return;
+          }
+          await sleep(POLL_MS);
+        }
+      };
+      poll().catch((err: unknown) => {
+        waiters.delete(w);
+        reject(err);
+      });
+    });
+
+  return { play, stopAll, allEnded };
+}
+
+const BEEP_HZ = 880;
+const BEEP_SEC = 0.15;
+const BEEP_ATTACK_SEC = 0.005;
+const BEEP_RELEASE_SEC = 0.05;
+const BEEP_PEAK = 0.25; // −12 dBFS
+
+/** 880 Hz sine, 150 ms: 5 ms linear attack to 0.25 (−12 dBFS), hold, 50 ms linear release to 0. */
+const testBeep: SfxSynth = (ctx, out, when) => {
+  const osc = new OscillatorNode(ctx, { type: 'sine', frequency: BEEP_HZ });
+  const env = new GainNode(ctx, { gain: 0 });
+  env.gain.setValueAtTime(0, when);
+  env.gain.linearRampToValueAtTime(BEEP_PEAK, when + BEEP_ATTACK_SEC);
+  env.gain.setValueAtTime(BEEP_PEAK, when + BEEP_SEC - BEEP_RELEASE_SEC);
+  env.gain.linearRampToValueAtTime(0, when + BEEP_SEC);
+  osc.connect(env).connect(out);
+  osc.addEventListener('ended', () => env.disconnect(), { once: true });
+  osc.start(when);
+  osc.stop(when + BEEP_SEC);
+  return BEEP_SEC;
+};
+
+/** The M1 sound effects; M5 replaces them with `SYNTHS` from `sfx-synths.ts`. */
+export const M1_SYNTHS: Record<SfxId, SfxSynth> = { testBeep };
