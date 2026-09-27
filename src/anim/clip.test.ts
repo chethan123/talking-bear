@@ -7,7 +7,10 @@ import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
 import type { Clip, Key } from './clip.ts';
-import { Ch, CH_COUNT, createPose } from './pose.ts';
+import { SESSION_CLIPS } from './clips/session.ts';
+import type { SessionClipName } from './clips/session.ts';
+import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
+import type { Pose } from './pose.ts';
 
 type Ease = Key['ease'];
 const DEG = Math.PI / 180;
@@ -122,6 +125,12 @@ function monotoneWithin(xs: readonly number[], up: boolean, lo: number, hi: numb
     if (i > 0 && (up ? x < xs[i - 1]! : x > xs[i - 1]!)) return false;
   }
   return true;
+}
+
+/** The times i/240 s covering [0, duration]. */
+function grid(duration: number): number[] {
+  const n = Math.ceil(duration * 240);
+  return Array.from({ length: n + 1 }, (_, i) => Math.min(i / 240, duration));
 }
 
 describe('sampleClip: validation 1, the sample at a key time is the key value', () => {
@@ -440,5 +449,198 @@ describe('BASE: the base-state poses', () => {
     expect(BASE.asleep[Ch.HeadTilt]).toBe(Math.fround(-6 * DEG));
     expect(BASE.dozing[Ch.HeadTilt]).toBe(Math.fround(-3 * DEG));
     expect(BASE.thinking[Ch.HeadRot]).toBe(Math.fround(4 * DEG));
+  });
+});
+
+describe('SESSION_CLIPS: the session-driven clips', () => {
+  const NAMES: readonly SessionClipName[] = ['wake', 'sleep', 'earTwitch', 'confused', 'shrug'];
+  const DURATIONS: Record<SessionClipName, number> = {
+    wake: 1.2,
+    sleep: 1.0,
+    earTwitch: 0.35,
+    confused: 0.9,
+    shrug: 0.8,
+  };
+  const CLIPS = NAMES.map((name) => [name, SESSION_CLIPS[name]] as const);
+
+  it.each(CLIPS)('validation 6: %s has keys sorted by t and a duration ≥ its last key', (_name, c) => {
+    for (const tr of c.tracks) {
+      const ks = tr.keys;
+      expect(ks.length, `channel ${tr.ch}`).toBeGreaterThan(0);
+      expect(ks[0]!.t, `channel ${tr.ch}`).toBeGreaterThanOrEqual(0);
+      for (let k = 1; k < ks.length; k++)
+        expect(ks[k]!.t, `channel ${tr.ch} key ${k}`).toBeGreaterThan(ks[k - 1]!.t);
+      expect(c.duration, `channel ${tr.ch}`).toBeGreaterThanOrEqual(ks.at(-1)!.t);
+    }
+  });
+
+  it('are exactly the five session clips, each named after its key, with the durations of the issue', () => {
+    expect(Object.keys(SESSION_CLIPS).toSorted()).toEqual(NAMES.toSorted());
+    for (const name of NAMES) {
+      expect(SESSION_CLIPS[name].name).toBe(name);
+      expect(SESSION_CLIPS[name].duration, name).toBe(DURATIONS[name]);
+    }
+  });
+
+  it.each(CLIPS)('%s: no impulses, one track per valid channel, no mouth channel', (_name, c) => {
+    expect(c.impulses).toBeUndefined();
+    const chs = c.tracks.map((tr) => tr.ch);
+    for (const ch of chs) {
+      expect(Number.isInteger(ch) && ch >= 0 && ch < CH_COUNT, `channel ${ch}`).toBe(true);
+      expect(MOUTH).not.toContain(ch);
+    }
+    expect(new Set(chs).size).toBe(chs.length);
+  });
+
+  it.each(CLIPS)('%s: every track starts at (0, 0) and ends at 0, so nothing pops', (_name, c) => {
+    for (const tr of c.tracks) {
+      expect(tr.keys[0], `channel ${tr.ch}`).toMatchObject({ t: 0, v: 0 });
+      expect(tr.keys.at(-1)!.v, `channel ${tr.ch}`).toBe(0);
+    }
+    const neutral = Array.from(createPose());
+    expect(Array.from(sampleClip(c, 0, createPose()))).toEqual(neutral);
+    expect(Array.from(sampleClip(c, c.duration, createPose()))).toEqual(neutral);
+  });
+
+  it('wake: BodySquash 0 → −0.05 (0.3 s) → 0.04 (0.7 s) → 0, and those are its extremes', () => {
+    const c = SESSION_CLIPS.wake;
+    expect(sampleAt(c, 0.3, Ch.BodySquash)).toBe(Math.fround(-0.05));
+    expect(sampleAt(c, 0.7, Ch.BodySquash)).toBe(Math.fround(0.04));
+    const squash = grid(c.duration).map((t) => sampleAt(c, t, Ch.BodySquash));
+    expect(Math.min(...squash)).toBe(Math.fround(-0.05));
+    expect(Math.max(...squash)).toBe(Math.fround(0.04));
+  });
+
+  it.each([
+    ['wake', 40],
+    ['shrug', 15],
+  ] as const)(
+    '%s raises both arms outward, mirror-symmetric (ArmRotR = −ArmRotL), peaking at %s°',
+    (name, deg) => {
+      const c = SESSION_CLIPS[name];
+      const out = createPose();
+      let peak = 0;
+      for (const t of grid(c.duration)) {
+        sampleClip(c, t, out);
+        const l = out[Ch.ArmRotL]!;
+        expect(l + out[Ch.ArmRotR]!, `t = ${t}`).toBe(0);
+        expect(l, `t = ${t}`).toBeGreaterThanOrEqual(0);
+        peak = Math.max(peak, l);
+      }
+      expect(Math.abs(peak - deg * DEG)).toBeLessThanOrEqual(1e-6);
+    },
+  );
+
+  it('shrug: brows up +4 while the arms are up', () => {
+    expect(sampleAt(SESSION_CLIPS.shrug, 0.4, Ch.BrowL)).toBe(4);
+    expect(sampleAt(SESSION_CLIPS.shrug, 0.4, Ch.BrowR)).toBe(4);
+  });
+
+  it('confused: HeadTilt swings to +10° and to −10°; BrowL +6 and BrowR −4 in the middle', () => {
+    const c = SESSION_CLIPS.confused;
+    const tilt = grid(c.duration).map((t) => sampleAt(c, t, Ch.HeadTilt));
+    expect(Math.abs(Math.max(...tilt) - 10 * DEG)).toBeLessThanOrEqual(1e-6);
+    expect(Math.abs(Math.min(...tilt) + 10 * DEG)).toBeLessThanOrEqual(1e-6);
+    expect(sampleAt(c, 0.45, Ch.BrowL)).toBe(6);
+    expect(sampleAt(c, 0.45, Ch.BrowR)).toBe(-4);
+  });
+
+  it('earTwitch: EarFoldR 0 → 0.4 (0.1 s) → 0; EarRotR flicks outward first and is still from 0.3 s', () => {
+    const c = SESSION_CLIPS.earTwitch;
+    expect(sampleAt(c, 0.1, Ch.EarFoldR)).toBe(Math.fround(0.4));
+    expect(Math.max(...grid(c.duration).map((t) => sampleAt(c, t, Ch.EarFoldR)))).toBe(Math.fround(0.4));
+    expect(Math.abs(sampleAt(c, 0.04, Ch.EarRotR) - 12 * DEG)).toBeLessThanOrEqual(1e-6);
+    const rot = grid(c.duration).map((t) => [t, sampleAt(c, t, Ch.EarRotR)] as const);
+    expect(rot.find(([, v]) => v !== 0)![1]).toBeGreaterThan(0);
+    for (const [t, v] of rot) if (t >= 0.3) expect(v, `t = ${t}`).toBe(0);
+  });
+
+  describe('on top of the director base crossfade (#79: 150 ms linear fade starting with the clip)', () => {
+    const BASES: readonly BaseName[] = ['asleep', 'idle', 'attentive', 'thinking', 'talking', 'dozing'];
+    /** Channels that must stay in [0, 1]. */
+    const ZERO_ONE = [
+      Ch.LidL,
+      Ch.LidR,
+      Ch.EarFoldL,
+      Ch.EarFoldR,
+      Ch.NoseWrinkle,
+      Ch.CheekPuff,
+      Ch.Blush,
+      Ch.Stars,
+      ...MOUTH,
+    ];
+    /** The base each clip fades to: `wake` → idle, `sleep` → asleep; the others keep the base. */
+    function nextBases(name: SessionClipName): readonly BaseName[] {
+      if (name === 'wake') return ['idle'];
+      if (name === 'sleep') return ['asleep'];
+      return BASES;
+    }
+    const scratch = createPose();
+    /** `lerpPose(BASE[prev], BASE[next], min(1, t / 0.15))` plus the clip sampled at `t`, into `out`. */
+    function composite(c: Clip, prev: BaseName, next: BaseName, t: number, out: Pose): Pose {
+      lerpPose(BASE[prev], BASE[next], Math.min(1, t / 0.15), out);
+      return addPose(out, sampleClip(c, t, scratch), 1, out);
+    }
+
+    it.each(NAMES)('%s keeps every 0–1 channel in [0, 1] from every base', (name) => {
+      const c = SESSION_CLIPS[name];
+      const out = createPose();
+      const outside: string[] = [];
+      for (const prev of BASES) {
+        for (const next of nextBases(name)) {
+          for (const t of grid(c.duration)) {
+            composite(c, prev, next, t, out);
+            for (const ch of ZERO_ONE) {
+              const v = out[ch]!;
+              if (v < -1e-6 || v > 1 + 1e-6) outside.push(`${prev}→${next} t=${t} ch=${ch} v=${v}`);
+            }
+          }
+        }
+      }
+      expect(outside).toEqual([]);
+    });
+
+    it('wake from asleep: the lids open linearly, 1 − t/0.3, and stay open from 0.3 s', () => {
+      const c = SESSION_CLIPS.wake;
+      const out = createPose();
+      for (const t of grid(c.duration)) {
+        composite(c, 'asleep', 'idle', t, out);
+        const expected = t <= 0.3 ? 1 - t / 0.3 : 0;
+        expect(Math.abs(out[Ch.LidL]! - expected), `t = ${t}`).toBeLessThanOrEqual(1e-6);
+        expect(Math.abs(out[Ch.LidR]! - expected), `t = ${t}`).toBeLessThanOrEqual(1e-6);
+      }
+    });
+
+    it.each(['idle', 'dozing'] as const)(
+      'sleep from %s: the lids close without reopening, fully by 0.75 s; the head reaches −8° at 0.6 s and −6° at 1 s',
+      (prev) => {
+        const c = SESSION_CLIPS.sleep;
+        const out = createPose();
+        let last = -Infinity;
+        for (const t of grid(c.duration)) {
+          const l = composite(c, prev, 'asleep', t, out)[Ch.LidL]!;
+          expect(l, `t = ${t}`).toBeGreaterThanOrEqual(last - 1e-6);
+          if (t >= 0.75) expect(Math.abs(l - 1), `t = ${t}`).toBeLessThanOrEqual(1e-6);
+          last = l;
+        }
+        expect(Math.abs(composite(c, prev, 'asleep', 0.6, out)[Ch.HeadTilt]! + 8 * DEG)).toBeLessThanOrEqual(
+          1e-4,
+        );
+        expect(Math.abs(composite(c, prev, 'asleep', 1.0, out)[Ch.HeadTilt]! + 6 * DEG)).toBeLessThanOrEqual(
+          1e-4,
+        );
+      },
+    );
+
+    it('sleep from dozing: the lids never open below 0.6 and the head never lifts above −3°', () => {
+      const c = SESSION_CLIPS.sleep;
+      const out = createPose();
+      for (const t of grid(c.duration)) {
+        composite(c, 'dozing', 'asleep', t, out);
+        expect(out[Ch.LidL], `t = ${t}`).toBeGreaterThanOrEqual(0.6 - 1e-6);
+        expect(out[Ch.LidR], `t = ${t}`).toBeGreaterThanOrEqual(0.6 - 1e-6);
+        expect(out[Ch.HeadTilt], `t = ${t}`).toBeLessThanOrEqual(-3 * DEG + 1e-6);
+      }
+    });
   });
 });
