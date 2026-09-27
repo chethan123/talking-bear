@@ -9,12 +9,13 @@
 - The root is exactly `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1400">`: a design box of 1000 × 1400 units, with y pointing down.
 - The only allowed elements are `<svg>`, `<defs>`, `<g>` and `<path>`. Write ellipses and circles as `<path d>` arcs or Béziers.
 - No `<ellipse>`, `<circle>`, `<rect>`, `<use>`, `transform`, CSS (`style`, `class`, `<style>`) or gradients.
+- Every other element sits inside the root `<svg>`.
 - No comments, XML declaration, `<title>` or text content, and every attribute is double-quoted. The test parses the file with regexes and rejects anything else.
 
 ### Bones
 
 - A rig bone is a `<g id="…" data-pivot="x,y" data-parent="…">`. Its children are the paths and bones nested in it, and its `data-parent` names the bone it is nested in. `root` has no `data-parent`.
-- `data-pivot` is in design units. A bone without one takes its parent's pivot. This file gives every bone an explicit pivot.
+- `data-pivot` is in design units. The generator gives a bone without one its parent's pivot, but every bone in this file must have an explicit pivot, and the test checks it.
 - The bones and their parents follow the plan §4.6.5 rig:
   - `root` (pivot 500,1340, the feet contact) → `body` (500,1250, squash about the base);
   - `body` → `legL`/`legR` → `footL`/`footR`;
@@ -33,7 +34,7 @@ Every drawable `<path>` has:
 - `fill`: an uppercase `#RRGGBB` colour from the palette below;
 - optionally `fill-opacity`;
 - `data-parent`: the bone it is nested in, or `root`;
-- optionally `data-mirror="…"`: this path is the left part, and the generator also emits a copy mirrored about x = 500 with that id. The copy draws right after its source and belongs to the matching right bone (`legL` → `legR`).
+- optionally `data-mirror="…"`: this path is the left part, and the generator also emits a copy mirrored about x = 500 with that id. The copy draws right after its source and belongs to the matching right bone (`legL` → `legR`). Only a part inside a left bone (`…L`, with a matching `…R` bone) can be mirrored, and the copy's id swaps the part id's last `L` for `R` (`legShadeL` → `legShadeR`, `browLArch` → `browRArch`).
 
 **Draw order** is document order, back to front. Because a mirrored copy draws right after its source, only mirror a part whose right-hand copy may draw at that point.
 
@@ -41,7 +42,7 @@ Every drawable `<path>` has:
 
 - **Eyes.** Inside `eyeL` the parts are `scleraL`, `irisL`, `pupilL`, `highlightL`, `lidUpperL` and `lidLowerL`, in that order (and the same with `R`). The sclera has `data-clip="true"`: the renderer clips the iris, pupil and highlight drawn right after it. Eye parts are never mirrored, because a mirrored copy would land between a sclera and its iris.
 - **Lids.** `lidUpperL` and `lidUpperR` are drawn **closed**. The renderer scales them in y about their top edge by the `LidL`/`LidR` channel (0 = hidden, 1 = closed), so the raw file shows Juni with closed eyes. The lower lids are static.
-- **Mouth.** The mouth interior, tongue and teeth are drawn in code, at the anchor (500, 525). The SVG only has the neutral preview `mouthPreview`, with `data-skip="true"`, which the generator ignores.
+- **Mouth.** The mouth interior, tongue and teeth are drawn in code, at the anchor (500, 525). The SVG only has the neutral preview `mouthPreview`, with `data-skip="true"`, which the generator ignores. No other path has `data-skip`.
 - **Blush.** `blushL` (mirrored to `blushR`) ships with `fill-opacity="0"`. It is reaction-only, and the renderer drives its alpha (at most 0.35).
 - **Ears.** The right ear has the notch, so neither ear is mirrored.
 

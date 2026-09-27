@@ -83,11 +83,16 @@ const PIVOTS: Readonly<Record<string, string>> = {
 
 const EYE_PARTS = ['sclera', 'iris', 'pupil', 'highlight', 'lidUpper', 'lidLower'] as const;
 
+const ID = /^[A-Za-z][\w-]*$/;
+const PIVOT = /^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/;
+
 interface SvgElement {
   name: string;
   attrs: ReadonlyMap<string, string>;
   /** id of the nearest enclosing `<g>`, if any */
   enclosingBone: string | undefined;
+  /** whether the element is nested inside the root `<svg>` */
+  insideSvg: boolean;
 }
 
 function parseSvg(src: string): SvgElement[] {
@@ -113,7 +118,12 @@ function parseSvg(src: string): SvgElement[] {
       if (attrs.has(key)) throw new Error(`duplicate ${key} on <${name}> at offset ${m.index}`);
       attrs.set(key, value);
     }
-    elements.push({ name, attrs, enclosingBone: open.findLast((e) => e.name === 'g')?.id });
+    elements.push({
+      name,
+      attrs,
+      enclosingBone: open.findLast((e) => e.name === 'g')?.id,
+      insideSvg: open[0]?.name === 'svg',
+    });
     if (selfClosing === '') open.push({ name, id: attrs.get('id') });
   }
   const rest = src.slice(last).trim();
@@ -130,10 +140,11 @@ const boneIds = new Set(bones.flatMap((b) => b.attrs.get('id') ?? []));
 const label = (e: SvgElement): string => `<${e.name} id="${e.attrs.get('id') ?? '?'}">`;
 
 describe('art/bear.svg', () => {
-  it('has exactly one root <svg> with the design box', () => {
+  it('has exactly one root <svg> with the design box, and every other element inside it', () => {
     expect(src.startsWith(ROOT_TAG)).toBe(true);
     expect(elements[0]?.name).toBe('svg');
     expect(elements.filter((e) => e.name === 'svg')).toHaveLength(1);
+    for (const e of elements.slice(1)) expect(e.insideSvg, `${label(e)} is inside <svg>`).toBe(true);
   });
 
   it('uses only <svg>, <defs>, <g> and <path>, with no transform, style or other attributes', () => {
@@ -151,7 +162,24 @@ describe('art/bear.svg', () => {
     const defined = ids.filter((id): id is string => id !== undefined);
     expect(defined.filter((id, i) => defined.indexOf(id) !== i)).toEqual([]);
     for (const e of [...bones, ...paths]) {
-      expect(e.attrs.get('id'), label(e)).toMatch(/^[A-Za-z][\w-]*$/);
+      expect(e.attrs.get('id'), label(e)).toMatch(ID);
+    }
+    for (const p of paths.filter((q) => q.attrs.has('data-mirror'))) {
+      expect(p.attrs.get('data-mirror'), `data-mirror of ${label(p)}`).toMatch(ID);
+    }
+  });
+
+  it('mirrors only left parts of left bones, into the matching right part id and right bone', () => {
+    const mirrored = paths.filter((p) => p.attrs.has('data-mirror'));
+    expect(mirrored.length).toBeGreaterThan(0);
+    for (const p of mirrored) {
+      const id = p.attrs.get('id') ?? '';
+      expect(id, `${label(p)} is a left part`).toMatch(/L/);
+      // The copy swaps the part's last L for R: legShadeL → legShadeR, browLArch → browRArch.
+      expect(p.attrs.get('data-mirror'), `data-mirror of ${label(p)}`).toBe(id.replace(/L(?=[^L]*$)/, 'R'));
+      const bone = p.enclosingBone ?? '';
+      expect(bone, `bone of mirrored ${label(p)}`).toMatch(/L$/);
+      expect(boneIds.has(`${bone.slice(0, -1)}R`), `right bone for ${bone}`).toBe(true);
     }
   });
 
@@ -178,14 +206,13 @@ describe('art/bear.svg', () => {
     }
   });
 
-  it('places the pivots the spec fixes, and writes every pivot as "x,y"', () => {
+  it('gives every bone an explicit "x,y" pivot, with the values the spec fixes', () => {
     for (const [id, pivot] of Object.entries(PIVOTS)) {
       const bone = bones.find((b) => b.attrs.get('id') === id);
       expect(bone?.attrs.get('data-pivot'), `pivot of ${id}`).toBe(pivot);
     }
     for (const b of bones) {
-      const pivot = b.attrs.get('data-pivot');
-      if (pivot !== undefined) expect(pivot, `pivot of ${label(b)}`).toMatch(/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/);
+      expect(b.attrs.get('data-pivot') ?? '', `pivot of ${label(b)}`).toMatch(PIVOT);
     }
   });
 
@@ -227,12 +254,10 @@ describe('art/bear.svg', () => {
     }
   });
 
-  it('has the neutral mouth preview, which the generator skips', () => {
-    const preview = paths.find((p) => p.attrs.get('id') === 'mouthPreview');
-    expect(preview?.attrs.get('data-skip')).toBe('true');
-    for (const p of paths.filter((q) => q.attrs.has('data-skip'))) {
-      expect(p.attrs.get('data-skip'), label(p)).toBe('true');
-    }
+  it('has the neutral mouth preview, the only path the generator skips', () => {
+    const skipped = paths.filter((p) => p.attrs.has('data-skip'));
+    expect(skipped.map((p) => p.attrs.get('id'))).toEqual(['mouthPreview']);
+    expect(skipped[0]?.attrs.get('data-skip')).toBe('true');
   });
 
   it('draws between 45 and 80 paths, counting mirrored parts twice', () => {
