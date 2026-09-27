@@ -4,12 +4,12 @@
 //
 //   node scripts/check-no-hooks.ts <distDir>
 //
-// Exit 0 when <distDir> holds at least one file and no file under it (recursively, any type) contains
-// `__bearTest`; exit 1 otherwise, listing every file that does.
+// Exit 0 when <distDir> holds at least one file and no file under it (recursively, any type, following symlinked
+// files and directories) contains `__bearTest`; exit 1 otherwise, listing every file that does.
 //
 // Run by Node with type stripping: erasable TypeScript syntax only.
 
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const NEEDLE = '__bearTest';
@@ -23,8 +23,10 @@ function main(args: readonly string[]): number {
   let files: string[];
   try {
     files = readdirSync(dist, { recursive: true, withFileTypes: true })
-      .filter((d) => d.isFile())
-      .map((d) => join(d.parentPath, d.name))
+      .map((d) => ({ d, path: join(d.parentPath, d.name) }))
+      // A symlink to a file is scanned too (readFileSync follows it); symlinked directories are already walked.
+      .filter(({ d, path }) => d.isFile() || (d.isSymbolicLink() && statSync(path).isFile()))
+      .map(({ path }) => path)
       .toSorted();
   } catch (err) {
     console.error(`check-no-hooks: cannot read ${dist}: ${err instanceof Error ? err.message : String(err)}`);
