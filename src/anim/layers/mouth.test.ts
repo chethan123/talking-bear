@@ -101,6 +101,16 @@ function layerAt(env: Envelope): { layer: MouthLayer; sample: (t: number, pose?:
   };
 }
 
+/**
+ * Jaw with three upward crossings of 0.8 (frames 2→3, 12→13 and 26→27, the last one reaching fround(0.8), the
+ * float32 nearest 0.8, which is above it), three downward ones (5→6, 17→18, 28→29), a near miss (20→21:
+ * 0.4 → 0.79) and a stretch that dips while staying above 0.8 (13…16). Crossings are ≥ 100 ms apart.
+ */
+const BROW_JAW = [
+  0, 0.3, 0.6, 0.9, 0.95, 0.9, 0.7, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.85, 0.9, 0.82, 0.81, 0.6, 0.4, 0.4, 0.4,
+  0.79, 0.79, 0.5, 0.5, 0.5, 0.5, 0.8, 0.8, 0.5, 0.2, 0, 0, 0,
+];
+
 // Expected values below are written with the issue's numbers as literals (−6, /20, 0.030, 0.8, +5, 0.150),
 // never with the exported constants, so a wrong constant fails the behaviour tests too.
 describe('constants', () => {
@@ -319,6 +329,50 @@ describe('MouthLayer sync (Validation 2)', () => {
     expect(layer.envIndex).toBe(-1);
     expect(layer.clipTime).toBeCloseTo(-0.86, 12);
   });
+
+  it('L moves the whole sample, head bob and brows included: L = 40 at T is L = 0 at T + 0.04', () => {
+    const env = makeEnv({ jaw: BROW_JAW });
+    const withL = new MouthLayer(40);
+    const withoutL = new MouthLayer(0);
+    withL.setClip(env, 100);
+    withoutL.setClip(env, 100);
+    const a = fakeClock(0);
+    const b = fakeClock(0);
+    let maxBrow = 0;
+    let maxBob = 0;
+    // T from 99.94 to 100.5 in 7 ms steps: clip times −0.02 … 0.54 s, across the whole 0.34 s fixture.
+    for (let j = 0; j <= 80; j++) {
+      const T = 99.94 + j * 0.007;
+      a.set(T);
+      b.set(T + 0.04);
+      const pa = createPose();
+      const pb = createPose();
+      withL.update(pa, a.ctx, a.now);
+      withoutL.update(pb, b.ctx, b.now);
+      for (let c = 0; c < CH_COUNT; c++) expect(pa[c]).toBeCloseTo(pb[c]!, 5);
+      maxBrow = Math.max(maxBrow, pa[Ch.BrowL]!);
+      maxBob = Math.max(maxBob, Math.abs(pa[Ch.HeadY]!));
+    }
+    // Not vacuous: the brows fired and the head bobbed during the sweep.
+    expect(maxBrow).toBeGreaterThan(4);
+    expect(maxBob).toBeGreaterThan(1);
+  });
+
+  it('envIndex is envelopeIndex at the sampled clip time, between frame centres and at the end', () => {
+    const { layer, sample } = layerAt(ENV);
+    // 0.147 and 0.398 lie past a frame midpoint, where round ≠ floor; (100 + 0.145) − 100 reads as x ≈ 14.4999.
+    for (const [t, index] of [
+      [0.145, 14],
+      [0.147, 14],
+      [0.395, 39],
+      [0.398, 39],
+      [0.4, -1],
+    ] as const) {
+      sample(t);
+      expect(layer.envIndex).toBe(envelopeIndex(ENV, layer.clipTime));
+      expect(layer.envIndex).toBe(index);
+    }
+  });
 });
 
 describe('MouthLayer channels', () => {
@@ -378,6 +432,8 @@ describe('MouthLayer head bob', () => {
     expect(sample(0.05)[Ch.HeadY]).toBeCloseTo(-3, 5); // rising 10 per second: −6 · 10/20
     expect(sample(0.15)[Ch.HeadY]).toBeCloseTo(0, 6); // flat
     expect(sample(0.25)[Ch.HeadY]).toBeCloseTo(3, 5); // falling 10 per second
+    // Between frame centres: jaw(0.125) = 1, jaw(0.095) = 0.95: 5/3 per second.
+    expect(sample(0.125)[Ch.HeadY]).toBeCloseTo(-0.5, 5);
     // Window straddling the top of the ramp: jaw(0.12) = 1, jaw(0.09) = 0.9, so 0.1 / 0.030 per second.
     expect(sample(0.12)[Ch.HeadY]).toBeCloseTo((-6 * (0.1 / 0.03)) / 20, 5);
   });
@@ -403,16 +459,7 @@ describe('MouthLayer head bob', () => {
 });
 
 describe('MouthLayer brow impulse (Validation 4)', () => {
-  /**
-   * Jaw with three upward crossings of 0.8 (frames 2→3, 12→13 and 26→27, the last one reaching exactly
-   * fround(0.8)), three downward ones (5→6, 17→18, 28→29), a near miss (20→21: 0.4 → 0.79) and a stretch that
-   * dips while staying above 0.8 (13…16). Crossings are ≥ 100 ms apart.
-   */
-  const JAW = [
-    0, 0.3, 0.6, 0.9, 0.95, 0.9, 0.7, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.85, 0.9, 0.82, 0.81, 0.6, 0.4, 0.4, 0.4,
-    0.79, 0.79, 0.5, 0.5, 0.5, 0.5, 0.8, 0.8, 0.5, 0.2, 0, 0, 0,
-  ];
-  const ENV = makeEnv({ jaw: JAW });
+  const ENV = makeEnv({ jaw: BROW_JAW });
   /** Exact crossing times on the interpolated (float32) jaw track. */
   const UP: number[] = [];
   const DOWN: number[] = [];
@@ -502,6 +549,40 @@ describe('MouthLayer brow impulse (Validation 4)', () => {
     expect(sample(0.02)[Ch.BrowL]).toBeCloseTo(5 * Math.exp(-0.02 / 0.15), 5);
     layer.setClip(makeEnv({ jaw: [0.5, 0.5, 0.5, 0.5] }), 100);
     expect(sample(0.02)[Ch.BrowL]).toBe(0);
+  });
+
+  it('setClip restarts the crossing scan: replaying the clip fires every crossing again', () => {
+    const { layer, sample } = layerAt(ENV);
+    const firesPerPass: number[] = [];
+    for (let pass = 0; pass < 2; pass++) {
+      if (pass === 1) layer.setClip(ENV, 100);
+      let fires = 0;
+      let prev = 0;
+      for (let j = -50; j <= 800; j++) {
+        const brow = sample(j * 0.001)[Ch.BrowL]!;
+        if (brow > prev + 1) fires++;
+        prev = brow;
+      }
+      firesPerPass.push(fires);
+    }
+    expect(firesPerPass).toEqual([3, 3]);
+  });
+
+  it('a clock that steps back before a crossing holds the lift at +5 rather than growing it', () => {
+    const { sample } = layerAt(ENV);
+    const tc = UP[0]!;
+    sample(tc + 0.002);
+    expect(sample(tc - 0.003)[Ch.BrowL]).toBeCloseTo(5, 5);
+  });
+
+  it('a non-finite clip time closes the mouth and adds nothing, even while a brow lift is active', () => {
+    const { layer, sample } = layerAt(ENV);
+    expect(sample(UP[0]! + 0.01)[Ch.BrowL]).toBeGreaterThan(4);
+    const pose = sample(Number.NaN, filledPose(0.5));
+    for (const c of MOUTH) expect(pose[c]).toBe(0);
+    for (const c of ADDED) expect(pose[c]).toBe(0.5);
+    expect(layer.envIndex).toBe(-1);
+    expect(layer.clipTime).toBeNaN();
   });
 });
 
