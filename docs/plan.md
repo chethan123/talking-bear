@@ -390,7 +390,7 @@ stateDiagram-v2
 |---|---|---|---|---|---|
 | 1 | Asleep | `tapBear` | permission `granted` | Waking | `resumeCtx`, `openMic`, `wakeLock on`, `timer waking 5 s`, `anim wake` |
 | 2 | Asleep | `tapBear` | permission `prompt` (first run, or a one-time grant expired) | NeedsParent | `resumeCtx`, `wakeLock on`, `ui parentPermission`, `timer sleep`. This is the one screen with text, for a parent ([§4.5](#45-android-chrome-specifics)). |
-| 3 | Asleep | `tapBear` | permission `denied` | MicDenied | `resumeCtx`, `ui micHelp` |
+| 3 | Asleep | `tapBear` | permission `denied` | MicDenied | `resumeCtx`, `ui micHelp`, `anim wake` (the bear is awake for reactions, row 11) |
 | 4 | NeedsParent | `parentContinue` | — | Waking | `openMic`: Chrome's prompt appears now, in front of the parent |
 | 5 | NeedsParent | `timer sleep` \| `hidden` | — | Asleep | — |
 | 6 | Waking | `micGranted` \| `ctxRunning` | the *other* flag is already set | Listening | `cancelTimer waking` (entry actions arm) |
@@ -1880,7 +1880,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
   - Property: bounded energy for f ≤ 10 Hz, ζ ∈ [0.3, 1.2].
   - Separately: the accumulator's catch-up, where a frame dt up to the 50 ms clamp runs ≤ 6 substeps, stays bounded, and the render interpolation is monotone.
 - Envelope-to-mouth mapping tests.
-- Playwright screenshot tests of key poses at a fixed seed and time (`page.clock` is fine here: no audio).
+- Screenshot tests of key poses at a fixed seed and time: Vitest Browser Mode `toMatchScreenshot` for the renderer, and Playwright e2e for full-app states (`page.clock` is fine here: no audio).
 - X-A1, X-A2, X-A3 and X-A4 on the device.
 
 **Exit criteria**
