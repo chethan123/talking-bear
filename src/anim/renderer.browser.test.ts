@@ -280,14 +280,18 @@ describe('render allocates nothing per frame', () => {
         }
         return usedJSHeapSize() - before;
       };
-      /** Measures until 3 consecutive runs are clean (growth in [0, BOUND)) or `max` runs are done. */
+      /**
+       * Measures until 3 consecutive runs are clean or `max` runs are done. Clean is |growth| < BOUND: right
+       * after a forced GC the reading can also drop by a few bytes (CI's Chromium read −16 B on clean runs),
+       * while an allocation shows as growth (≥ 60 KB for one boxed number per frame).
+       */
       const settle = (poses: readonly Pose[], max: number): { ok: boolean; history: number[] } => {
         const history: number[] = [];
         let streak = 0;
         while (streak < 3 && history.length < max) {
           const growth = measure(poses, doNothing);
           history.push(growth);
-          streak = growth >= 0 && growth < BOUND ? streak + 1 : 0;
+          streak = Math.abs(growth) < BOUND ? streak + 1 : 0;
         }
         return { ok: streak === 3, history };
       };
