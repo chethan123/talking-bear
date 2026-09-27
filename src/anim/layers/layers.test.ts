@@ -423,7 +423,8 @@ describe('blink', () => {
     expect(Math.abs(doubles / n - 0.15)).toBeLessThanOrEqual(0.005);
     // About 83 % of seeds pass both of the issue's single-run tolerances.
     expect(pass).toBeGreaterThanOrEqual(70);
-  });
+    // 100 × 600 000 updates take ≈ 3 s alone; allow for a loaded CI runner.
+  }, 30_000);
 });
 
 /** Direct DFT bin k of x: Σ x[n]·e^(−i·2π·k·n/N), as [re, im]. */
@@ -1263,7 +1264,8 @@ describe('allocation: no layer allocates per update', () => {
     let best = heapGrowth(steps50k);
     for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(steps50k));
     expect(best).toBeLessThan(LIMIT);
-  });
+    // Up to 30 runs of 50 000 steps; allow for a loaded CI runner.
+  }, 30_000);
 
   it('both meters have teeth (positive controls)', () => {
     expect(countAllocations(() => void new Float32Array(1))).toBe(1);
