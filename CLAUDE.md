@@ -90,10 +90,10 @@ _Filled in by T02._
 
 ## Glossary
 
-- **epoch**: a per-listen counter. Every `arm` starts a new epoch; every VAD event, clip chunk and processing result carries its epoch, and the session reducer ignores stale ones (plan §3.1).
+- **epoch**: a per-listen counter. Every `arm` starts a new epoch; every VAD event, clip chunk and processing result carries its epoch or request id, and the session reducer ignores stale ones (plan §3.1).
 - **ctx frame** (context-rate frame index): a sample index in the capture worklet's `currentFrame` domain at the `AudioContext` rate. It is the one canonical timeline; 16 kHz VAD frames are converted to it (plan §3.1).
 - **take**: the clip cut from the capture ring buffer for one utterance, `take{epoch, id, fromFrame, toFrame}`, deferred by the worklet until `currentFrame ≥ toFrame` and streamed back in transferred chunks (plan §3.1, §3.4 row 20).
 - **pre-roll**: the 300 ms before the detected speech onset that a take includes, clamped so it never reaches before `armFrame` (plan §4.2.3, §4.4).
 - **hangover**: how long the segmenter waits after speech falls below the negative threshold before it ends the segment; defaults 600 ms (Silero) and 800 ms (energy fallback) (plan §4.2.3).
-- **SfxGated**: the session state in which a reaction sound effect is playing and the VAD feed is stopped, so `arm` never overlaps sound; it leaves for `Cooldown` once the last sfx has reached the speaker (plan §3.4).
+- **SfxGated**: the session state in which a reaction sound effect is playing and the VAD feed is stopped, so `arm` never overlaps sound; it leaves for `Cooldown` once the latest sfx has left the speaker (plan §3.4 row 34).
 - **D1**: the reference device, a mid-range Pixel (6a/7a/8a class, plan Q7); every budget and exit criterion is measured on it (plan §4.10, §5).
