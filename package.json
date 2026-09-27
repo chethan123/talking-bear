@@ -22,6 +22,8 @@
     "e2e": "pnpm build:e2e && playwright test",
     "fixtures": "node scripts/gen-fixtures.ts",
     "gen:bear": "node scripts/gen-bear-parts.ts",
+    "silero:fetch": "node scripts/fetch-silero-onnx.ts",
+    "silero:extract": "node scripts/extract-silero-weights.ts",
     "verify": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
