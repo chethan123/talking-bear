@@ -19,7 +19,7 @@ function expectRangeError(fn: () => unknown, message?: string): void {
     caught = error;
   }
   expect(caught).toBeInstanceOf(RangeError);
-  if (message !== undefined) expect((caught as RangeError).message).toBe(message);
+  if (message !== undefined) expect(caught).toHaveProperty('message', message);
 }
 
 function snapshot(rb: RingBuffer): Record<string, unknown> {
