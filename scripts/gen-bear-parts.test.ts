@@ -5,8 +5,10 @@ import { pathToFileURL } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { BONE, BONES, PART, PARTS } from '../src/art/bear-parts.gen.ts';
 import {
   OUT_FILE,
+  REPO_ROOT,
   SVG_FILE,
   checkGenerated,
   compileBearSvg,
@@ -366,6 +368,51 @@ describe('compileBearSvg: anything outside the subset throws', () => {
 
   it('accepts an empty <defs>', () => {
     expect(() => compileBearSvg(edit('  <g id="root"', '  <defs id="defs"/>\n  <g id="root"'))).not.toThrow();
+  });
+});
+
+describe(`${SVG_FILE} → ${OUT_FILE}`, () => {
+  it('is up to date (what --check verifies in CI)', () => {
+    const svg = readFileSync(join(REPO_ROOT, SVG_FILE), 'utf8');
+    expect(generate(svg)).toBe(readFileSync(join(REPO_ROOT, OUT_FILE), 'utf8'));
+  });
+
+  it('has one root, parents before children, and BONE mapping every id to its index', () => {
+    expect(BONES[0]?.parent).toBe(-1);
+    for (const [i, b] of BONES.entries()) {
+      if (i > 0) expect(b.parent, b.id).toBeGreaterThanOrEqual(0);
+      expect(b.parent, b.id).toBeLessThan(i);
+      expect(BONE[b.id], b.id).toBe(i);
+    }
+    expect(Object.keys(BONE)).toHaveLength(BONES.length);
+  });
+
+  it('has valid path data and a matching bbox for every part, and PART mapping every id to its index', () => {
+    for (const [i, p] of PARTS.entries()) {
+      expect(p.d, p.id).toMatch(/^[MLHVCSQTAZmlhvcsqtaz\d ,.eE+-]+$/);
+      expectClose(p.bbox, bbox(p.d), 2); // bbox is rounded to 0.001
+      expect(BONES[p.bone], p.id).toBeDefined();
+      expect(PART[p.id], p.id).toBe(i);
+    }
+    expect(Object.keys(PART)).toHaveLength(PARTS.length);
+  });
+
+  it('places each mirrored copy right after its source, on the matching right bone', () => {
+    const mirrored = PARTS.filter((p) => p.mirror);
+    expect(mirrored.length).toBeGreaterThan(0);
+    for (const copy of mirrored) {
+      const source = PARTS[(PART[copy.id] ?? 0) - 1];
+      expect(source?.mirror, copy.id).toBe(false);
+      expect({ ...copy, id: '', bone: 0, mirror: false }).toEqual({ ...source, id: '', bone: 0 });
+      const sourceBone = BONES[source?.bone ?? -1]?.id ?? '';
+      expect(BONES[copy.bone]?.id, copy.id).toBe(sourceBone.replace(/L$/, 'R'));
+    }
+  });
+
+  it('skips the mouth preview, clips at the scleras and keeps the blush transparent', () => {
+    expect(PART['mouthPreview']).toBeUndefined();
+    expect(PARTS.filter((p) => p.clip).map((p) => p.id)).toEqual(['scleraL', 'scleraR']);
+    expect(PARTS.filter((p) => p.fill === '#F2A07B').map((p) => p.opacity)).toEqual([0, 0]);
   });
 });
 

@@ -20,6 +20,7 @@
     "test:browser": "vitest run --project browser",
     "e2e": "pnpm build:e2e && playwright test",
     "fixtures": "node scripts/gen-fixtures.ts",
+    "gen:bear": "node scripts/gen-bear-parts.ts",
     "verify": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
