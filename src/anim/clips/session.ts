@@ -11,9 +11,10 @@
  *   its end. No clip writes a mouth channel.
  * - `wake` and `sleep` play while the director crossfades the base pose over 150 ms (to `idle` and
  *   `asleep`). Their lid and head tracks are shaped against that fade: `wake` turns the asleep → idle fade
- *   into a linear 1 → 0 lid opening over 0.3 s; `sleep` holds the lids at 0.6 and the head at −3° (the
- *   `dozing` values) for the first 150 ms, then closes the lids by 0.75 s and drops the head past −6° to
- *   −8° before it settles on the `asleep` −6°.
+ *   into a linear 1 → 0 lid opening over 0.3 s; during the fade, `sleep` lets the lids close no further
+ *   than 0.6 and the head drop no further than −3° (the `dozing` values, so from Dozing nothing reopens or
+ *   lifts), then closes the lids by 0.75 s and drops the head past −6° to −8° before it settles on the
+ *   `asleep` −6°.
  * - `earTwitch` keys its `EarRotR` flick instead of using `impulses`: the app's named SpringBank indices
  *   (`SPRING`, #81) don't exist yet. #81/#89 may add an `earR` impulse once `SPRING` exists.
  */
