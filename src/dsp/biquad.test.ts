@@ -33,6 +33,9 @@ function gainDb(make: () => Biquad, fs: number, f: number): number {
   return toneLevelDb(y, f, fs, from, x.length) - toneLevelDb(x, f, fs, from, x.length);
 }
 
+const hpf80At48k = (): Biquad => butterworthHighpass(48_000, 80);
+const hpf200At16k = (): Biquad => butterworthHighpass(16_000, 200);
+const lpf3400At16k = (): Biquad => butterworthLowpass(16_000, 3400);
 const gate16k = (): Biquad =>
   cascade(
     butterworthHighpass(16_000, 200),
@@ -41,47 +44,41 @@ const gate16k = (): Biquad =>
   );
 
 const FILTERS: ReadonlyArray<readonly [string, () => Biquad]> = [
-  ['HPF 80 Hz @ 48 kHz', () => butterworthHighpass(48_000, 80)],
-  ['HPF 200 Hz @ 16 kHz', () => butterworthHighpass(16_000, 200)],
-  ['LPF 3400 Hz @ 16 kHz', () => butterworthLowpass(16_000, 3400)],
+  ['HPF 80 Hz @ 48 kHz', hpf80At48k],
+  ['HPF 200 Hz @ 16 kHz', hpf200At16k],
+  ['LPF 3400 Hz @ 16 kHz', lpf3400At16k],
   ['gate band-limit cascade (HPF 200 x2, LPF 3400) @ 16 kHz', gate16k],
 ];
 
 describe('butterworthHighpass 80 Hz @ 48 kHz (validation 1)', () => {
-  const make = (): Biquad => butterworthHighpass(48_000, 80);
-
   it('is -3.01 dB at 80 Hz', () => {
-    expect(Math.abs(gainDb(make, 48_000, 80) + 3.01)).toBeLessThanOrEqual(0.05);
+    expect(Math.abs(gainDb(hpf80At48k, 48_000, 80) + 3.01)).toBeLessThanOrEqual(0.05);
   });
 
   it('is at most -23.5 dB at 20 Hz', () => {
-    expect(gainDb(make, 48_000, 20)).toBeLessThanOrEqual(-23.5);
+    expect(gainDb(hpf80At48k, 48_000, 20)).toBeLessThanOrEqual(-23.5);
   });
 
   it('is 0 dB at 1 kHz', () => {
-    expect(Math.abs(gainDb(make, 48_000, 1000))).toBeLessThanOrEqual(0.1);
+    expect(Math.abs(gainDb(hpf80At48k, 48_000, 1000))).toBeLessThanOrEqual(0.1);
   });
 });
 
 describe('gate band-limit filters @ 16 kHz (validation 2)', () => {
   it('HPF 200 Hz is -3.01 dB at 200 Hz', () => {
-    expect(Math.abs(gainDb(() => butterworthHighpass(16_000, 200), 16_000, 200) + 3.01)).toBeLessThanOrEqual(
-      0.05,
-    );
+    expect(Math.abs(gainDb(hpf200At16k, 16_000, 200) + 3.01)).toBeLessThanOrEqual(0.05);
   });
 
-  const lpf = (): Biquad => butterworthLowpass(16_000, 3400);
-
   it('LPF 3400 Hz is -3.01 dB at 3400 Hz', () => {
-    expect(Math.abs(gainDb(lpf, 16_000, 3400) + 3.01)).toBeLessThanOrEqual(0.05);
+    expect(Math.abs(gainDb(lpf3400At16k, 16_000, 3400) + 3.01)).toBeLessThanOrEqual(0.05);
   });
 
   it('LPF 3400 Hz is 0 dB at 1 kHz', () => {
-    expect(Math.abs(gainDb(lpf, 16_000, 1000))).toBeLessThanOrEqual(0.2);
+    expect(Math.abs(gainDb(lpf3400At16k, 16_000, 1000))).toBeLessThanOrEqual(0.2);
   });
 
   it('LPF 3400 Hz is at most -12 dB at 7 kHz', () => {
-    expect(gainDb(lpf, 16_000, 7000)).toBeLessThanOrEqual(-12);
+    expect(gainDb(lpf3400At16k, 16_000, 7000)).toBeLessThanOrEqual(-12);
   });
 });
 
