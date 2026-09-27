@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { FakeClock } from '../../test/fake-clock.ts';
 import { realClock } from '../app/clock.ts';
+import { createMicPermission, type PermissionsNavigator } from './permissions.ts';
 import { createVisibility, type VisEvent } from './visibility.ts';
 import { createWakeLock, type WakeLockNavigator } from './wake-lock.ts';
 
@@ -60,6 +61,31 @@ function makeWakeLockNav() {
     return s;
   };
   return { nav, request, calls, grant };
+}
+
+class FakePermissionStatus extends EventTarget {
+  readonly name = 'microphone';
+  state: PermissionState;
+  constructor(state: PermissionState) {
+    super();
+    this.state = state;
+  }
+  /** What Chrome does when the user changes the permission: new state, then `change`. */
+  change(s: PermissionState): void {
+    this.state = s;
+    this.dispatchEvent(new Event('change'));
+  }
+}
+
+/** `navigator.permissions` that always returns the same live status object. */
+function makePermissionNav(initial: PermissionState) {
+  const status = new FakePermissionStatus(initial);
+  const query = vi.fn(async (desc: { name: string }) => {
+    expect(desc.name).toBe('microphone');
+    return status;
+  });
+  const nav: PermissionsNavigator = { permissions: { query } };
+  return { nav, status, query };
 }
 
 /** Lets every pending promise callback run (a macrotask turn drains the microtask queue). */
@@ -364,5 +390,130 @@ describe('createWakeLock', () => {
     }).not.toThrow();
     expect(wl.held()).toBe(false);
     expect(log).not.toHaveBeenCalled();
+  });
+});
+
+// ---- 4. Mic permission -------------------------------------------------------------------------
+
+describe('createMicPermission', () => {
+  it("gives 'prompt' when the API is missing, throws or rejects", async () => {
+    const vis = makeVisibility().vis;
+    await expect(createMicPermission({}, vis).query()).resolves.toBe('prompt');
+
+    const throwing: PermissionsNavigator = {
+      permissions: {
+        query: () => {
+          throw new TypeError('unsupported');
+        },
+      },
+    };
+    await expect(createMicPermission(throwing, vis).query()).resolves.toBe('prompt');
+
+    const rejecting: PermissionsNavigator = {
+      permissions: { query: () => Promise.reject(new TypeError('unsupported')) },
+    };
+    await expect(createMicPermission(rejecting, vis).query()).resolves.toBe('prompt');
+  });
+
+  it('passes the state through', async () => {
+    const vis = makeVisibility().vis;
+    for (const s of ['granted', 'prompt', 'denied'] as const) {
+      await expect(createMicPermission(makePermissionNav(s).nav, vis).query()).resolves.toBe(s);
+    }
+  });
+
+  it('notifies on change events only when the value changes', async () => {
+    const { vis } = makeVisibility();
+    const { nav, status } = makePermissionNav('prompt');
+    const perm = createMicPermission(nav, vis);
+    await expect(perm.query()).resolves.toBe('prompt');
+    const seen: string[] = [];
+    perm.subscribe((s) => seen.push(s));
+
+    status.change('granted');
+    expect(seen).toEqual(['granted']);
+    status.dispatchEvent(new Event('change')); // same value
+    expect(seen).toEqual(['granted']);
+    await perm.query(); // repeated queries don't add listeners or notifications
+    await perm.query();
+    status.change('denied');
+    expect(seen).toEqual(['granted', 'denied']);
+  });
+
+  it('re-queries on every visible and notifies only when the value changes', async () => {
+    const { doc, vis } = makeVisibility();
+    const { nav, status, query } = makePermissionNav('granted');
+    const perm = createMicPermission(nav, vis);
+    await perm.query();
+    const seen: string[] = [];
+    perm.subscribe((s) => seen.push(s));
+    const calls = query.mock.calls.length;
+
+    doc.setVisibility('hidden'); // a one-time grant expires in the background: no change event
+    status.state = 'prompt';
+    expect(query).toHaveBeenCalledTimes(calls); // hidden doesn't query
+    doc.setVisibility('visible');
+    expect(query).toHaveBeenCalledTimes(calls + 1);
+    await flush();
+    expect(seen).toEqual(['prompt']);
+
+    vis.simulate('visible'); // unchanged
+    await flush();
+    expect(query).toHaveBeenCalledTimes(calls + 2);
+    expect(seen).toEqual(['prompt']);
+  });
+
+  it('unsubscribe stops notifications', async () => {
+    const { vis } = makeVisibility();
+    const { nav, status } = makePermissionNav('granted');
+    const perm = createMicPermission(nav, vis);
+    await perm.query();
+    const cb = vi.fn();
+    const off = perm.subscribe(cb);
+    off();
+    status.change('denied');
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('subscribing before any query attaches the change listener, with the first value as the baseline', async () => {
+    const { vis } = makeVisibility();
+    const { nav, status } = makePermissionNav('prompt');
+    const perm = createMicPermission(nav, vis);
+    const seen: string[] = [];
+    perm.subscribe((s) => seen.push(s));
+    await flush();
+    expect(seen).toEqual([]);
+    status.change('granted');
+    expect(seen).toEqual(['granted']);
+  });
+
+  it('ignores a query result that a newer change event overtook', async () => {
+    const { vis } = makeVisibility();
+    const status = new FakePermissionStatus('granted');
+    let release: (() => void) | undefined;
+    let slow = false;
+    const nav: PermissionsNavigator = {
+      permissions: {
+        query: () =>
+          slow
+            ? new Promise<FakePermissionStatus>((resolve) => {
+                const stale = new FakePermissionStatus('granted');
+                release = () => resolve(stale);
+              })
+            : Promise.resolve(status),
+      },
+    };
+    const perm = createMicPermission(nav, vis);
+    await perm.query();
+    const seen: string[] = [];
+    perm.subscribe((s) => seen.push(s));
+
+    slow = true;
+    const pending = perm.query(); // started before the change, resolves after it with the old value
+    status.change('denied');
+    release?.();
+    await expect(pending).resolves.toBe('granted');
+    await flush();
+    expect(seen).toEqual(['denied']);
   });
 });
