@@ -17,6 +17,8 @@ import {
   AWAKE,
   GATED,
   MIC_OPEN,
+  TABLE,
+  WAKE_LOCK_HELD,
   initialSessionState,
   overlayFor,
   reduce,
@@ -40,6 +42,21 @@ function deepFreeze<T>(o: T): T {
 function run(s: SessionState, e: SessionEvent) {
   return reduce(deepFreeze(s), deepFreeze(e));
 }
+
+const STATES: StateName[] = [
+  'Asleep',
+  'NeedsParent',
+  'Waking',
+  'MicDenied',
+  'Listening',
+  'Recording',
+  'Processing',
+  'Playing',
+  'SfxGated',
+  'Cooldown',
+  'Paused',
+  'Error',
+];
 
 // Representative counters: every current epoch / req / id / seq is distinct from its stale neighbour.
 const EPOCH = 7;
@@ -176,6 +193,10 @@ const reactionAnim = (priority: Priority): Effect => ({
 });
 const tmr = (name: TimerName): EventOf<'timer'> => ({ t: 'timer', name });
 const seg = (epoch: number, ev: EventOf<'seg'>['ev']): SessionEvent => ({ t: 'seg', epoch, ev });
+
+/** C11: where hidden / pagehide / freeze leave each state. */
+const hideTarget = (name: StateName): StateName =>
+  AWAKE.has(name) ? 'Paused' : name === 'NeedsParent' || name === 'Error' ? 'Asleep' : name;
 
 // ---- Validation 1: one it() per plan row -------------------------------------------------------------------
 describe('plan §3.4 rows', () => {
@@ -744,5 +765,591 @@ describe('entry and exit actions', () => {
   it('same-state rows run no exit or entry actions', () => {
     const r = transitionTo(deepFreeze(stateIn('Cooldown')), 'Cooldown', DEFAULT_CONFIG, [RESTART]);
     expect(r.effects).toStrictEqual([RESTART]);
+  });
+});
+
+// ---- Validation 3: clarifications ----------------------------------------------------------------------------
+describe('clarifications C1–C12', () => {
+  it('C1: wakeLock is derived from WAKE_LOCK_HELD changes only', () => {
+    let s = stateIn('Asleep', { permission: 'prompt' });
+    let r = run(s, { t: 'tapBear' });
+    expect(r.effects.filter((f) => f.k === 'wakeLock')).toStrictEqual([wakeLock(true)]);
+    s = r.state;
+    r = run(s, { t: 'parentContinue' }); // NeedsParent → Waking: held → held
+    expect(r.effects.some((f) => f.k === 'wakeLock')).toBe(false);
+    s = r.state;
+    r = run(s, { t: 'micDenied', req: s.micReq }); // Waking → MicDenied: released
+    expect(r.effects.filter((f) => f.k === 'wakeLock')).toStrictEqual([wakeLock(false)]);
+    s = r.state;
+    r = run(s, tmr('sleep')); // MicDenied → Asleep: neither holds it
+    expect(r.effects.some((f) => f.k === 'wakeLock')).toBe(false);
+  });
+
+  it('C2: overlayFor and derived ui effects', () => {
+    const expected: Record<StateName, Overlay> = {
+      Asleep: 'tapToWake',
+      NeedsParent: 'parentPermission',
+      Waking: null,
+      MicDenied: 'micHelp',
+      Listening: null,
+      Recording: null,
+      Processing: null,
+      Playing: null,
+      SfxGated: null,
+      Cooldown: null,
+      Paused: null,
+      Error: 'error',
+    };
+    for (const name of STATES) {
+      expect(overlayFor({ name, micMuted: false })).toBe(expected[name]);
+      expect(overlayFor({ name, micMuted: true })).toBe(name === 'Listening' ? 'micMuted' : expected[name]);
+    }
+    // Entering Listening while muted shows the badge; leaving Listening hides it.
+    expect(run(stateIn('Cooldown', { micMuted: true }), tmr('cooldown')).effects.at(-1)).toStrictEqual(
+      ui('micMuted'),
+    );
+    const onset = run(stateIn('Listening', { micMuted: true }), seg(EPOCH, { kind: 'start', frame: 1 }));
+    expect(onset.effects.at(-1)).toStrictEqual(ui(null));
+    // A mute outside Listening changes no overlay; a repeated mute in Listening is a no-op.
+    expect(run(stateIn('Processing'), { t: 'trackMuted' }).effects).toStrictEqual([]);
+    expectIgnored(stateIn('Listening', { micMuted: true }), { t: 'trackMuted' });
+  });
+
+  it('C3: tapBear is handled only in Asleep and Error', () => {
+    for (const name of STATES) {
+      expect(TABLE[name].tapBear === 'ignore').toBe(name !== 'Asleep' && name !== 'Error');
+    }
+  });
+
+  it('C4: reactions — ignored while not awake or waking; sfx seq numbering; anim shape', () => {
+    for (const name of ['Waking', 'NeedsParent', 'Asleep', 'Paused', 'Error'] as const) {
+      expect(TABLE[name].reaction).toBe('ignore');
+    }
+    let s = stateIn('MicDenied', { permission: 'denied' });
+    let r = run(s, reaction(2, true));
+    expect(r.effects[0]).toStrictEqual(sfx(SEQ + 1));
+    s = r.state;
+    r = run(s, reaction(4, true));
+    expect(r.effects).toStrictEqual([
+      sfx(SEQ + 2),
+      { k: 'anim', ev: { e: 'reaction', name: 'poke', priority: 4 } },
+      SLEEP_T,
+    ]);
+    expect(r.state.sfxSeq).toBe(SEQ + 2);
+  });
+
+  it('C5: sfx audibility gates rows 6 and 35 into SfxGated; sfxAtSpeakerEnded is a max in every state', () => {
+    for (const name of STATES) {
+      if (name === 'SfxGated') continue; // row 34
+      const s = stateIn(name, { sfxSeq: 6, sfxEndedSeq: 4 });
+      expect(run(s, { t: 'sfxAtSpeakerEnded', seq: 5 }).state.sfxEndedSeq).toBe(5);
+      expectIgnored(s, { t: 'sfxAtSpeakerEnded', seq: 3 });
+    }
+    // A MicDenied reaction sound is still audible when Waking completes: gate instead of arming.
+    let s = stateIn('MicDenied', { permission: 'denied' });
+    s = run(s, reaction(2, true)).state;
+    s = run(s, { t: 'settingsRetry' }).state;
+    s = run(s, { t: 'ctxRunning', sampleRate: 48_000 }).state;
+    let r = run(s, { t: 'micGranted', req: s.micReq });
+    expect(r.state.name).toBe('SfxGated');
+    expect(r.effects).toStrictEqual([cancel('waking')]);
+    r = run(r.state, { t: 'sfxAtSpeakerEnded', seq: r.state.sfxSeq });
+    expect(r.state.name).toBe('Cooldown');
+    r = run(r.state, tmr('cooldown'));
+    expect(r.state.name).toBe('Listening');
+    expect(r.effects.some((f) => f.k === 'arm')).toBe(true);
+    // Row 35 with an audible sfx (after a worker failure in SfxGated).
+    expectStep(stateIn('Cooldown', { sfxEndedSeq: SEQ - 1 }), tmr('cooldown'), 'SfxGated', [
+      cancel('cooldown'),
+    ]);
+  });
+
+  it('C6: ctxRunning is recorded in every state; Waking completes in either order', () => {
+    for (const name of STATES) {
+      const r = run(stateIn(name, { ctxRunning: false, sampleRate: 48_000 }), {
+        t: 'ctxRunning',
+        sampleRate: 44_100,
+      });
+      expect(r.state.ctxRunning).toBe(true);
+      expect(r.state.sampleRate).toBe(44_100);
+    }
+    const w = stateIn('Waking');
+    const viaCtx = run(run(w, { t: 'ctxRunning', sampleRate: 48_000 }).state, { t: 'micGranted', req: REQ });
+    const viaMic = run(run(w, { t: 'micGranted', req: REQ }).state, { t: 'ctxRunning', sampleRate: 48_000 });
+    expect(viaCtx.state).toStrictEqual(viaMic.state);
+    expect(viaCtx.state.name).toBe('Listening');
+    // Rows 40 and 35b re-enter Waking with the context still running.
+    expect(run(stateIn('Listening'), { t: 'inputsChanged' }).state.ctxRunning).toBe(true);
+    expect(run(stateIn('Cooldown', { reselectPending: true }), tmr('cooldown')).state.ctxRunning).toBe(true);
+  });
+
+  it('C7: a first worker failure in Waking stays in Waking; the second goes to Error', () => {
+    const s = stateIn('Waking');
+    const first = expectStep(s, { t: 'workerFailed' }, 'Waking', [RESTART], { workerRestarts: 1 });
+    expect(run(first.state, { t: 'workerFailed' }).state.name).toBe('Error');
+  });
+
+  it('C8: take range, capHits, armed and floorSnapshot', () => {
+    const endAt = (last: number) =>
+      seg(EPOCH, { kind: 'end', frame: last + 1, lastSpeechFrame: last, reason: 'silence' });
+    const takeOf = (s: SessionState) => run(s, endAt(200_000)).effects.find((f) => f.k === 'take');
+    // armFrame later than onset − pre-roll clamps the start.
+    expect(takeOf(stateIn('Recording', { armFrame: 140_000 }))).toMatchObject({ fromFrame: 140_000 });
+    // No armed yet: keep 100 ms of pre-roll.
+    expect(takeOf(stateIn('Recording', { armFrame: null }))).toMatchObject({ fromFrame: 144_000 - 4_800 });
+    // 44.1 kHz context: 300 ms = 13 230 frames, 150 ms = 6 615 frames.
+    expect(takeOf(stateIn('Recording', { sampleRate: 44_100, armFrame: 0 }))).toStrictEqual({
+      k: 'take',
+      epoch: EPOCH,
+      id: TAKE + 1,
+      fromFrame: 144_000 - 13_230,
+      toFrame: 200_000 + 6_615,
+    });
+    // armed / floorSnapshot with the current epoch are stored in any state; stale ones are ignored.
+    for (const name of STATES) {
+      const s = stateIn(name, { armFrame: null });
+      expect(run(s, { t: 'armed', epoch: EPOCH, armFrame: 123 }).state.armFrame).toBe(123);
+      expect(run(s, { t: 'floorSnapshot', epoch: EPOCH, floorDb: -41 }).state.floorDb).toBe(-41);
+      expectIgnored(s, { t: 'armed', epoch: EPOCH + 1, armFrame: 123 });
+      expectIgnored(s, { t: 'floorSnapshot', epoch: EPOCH - 1, floorDb: -41 });
+    }
+  });
+
+  it('C9: processing chain guards, playingId, and stopPlayback ending earlier sfx first', () => {
+    const p = stateIn('Processing');
+    expectIgnored(p, { t: 'clipReady', epoch: EPOCH, id: TAKE + 1 });
+    expectIgnored(p, { t: 'fxError', id: TAKE + 1 });
+    const playing = run(p, { t: 'processed', id: TAKE, durationSec: 2 }).state;
+    expect(playing.playingId).toBe(TAKE);
+    expectIgnored(playing, { t: 'playbackAtSpeakerEnded', id: TAKE + 1 });
+    // Every way out of Playing clears playingId.
+    const outs: SessionEvent[] = [
+      { t: 'playbackAtSpeakerEnded', id: TAKE },
+      reaction(3, true),
+      reaction(3, false),
+      { t: 'hidden' },
+      { t: 'ctxError' },
+      { t: 'workerFailed' },
+    ];
+    for (const e of outs) expect(run(playing, e).state.playingId).toBeNull();
+    // stopPlayback sets sfxEndedSeq = sfxSeq before the row's new sfx.
+    const r = run(stateIn('Playing', { sfxSeq: 9, sfxEndedSeq: 8 }), reaction(3, true));
+    expect(r.state.sfxEndedSeq).toBe(9);
+    expect(r.state.sfxSeq).toBe(10);
+    expect(r.effects).toContainEqual(sfx(10));
+  });
+
+  it('C10: permission and mute bookkeeping', () => {
+    for (const name of STATES) {
+      const s = stateIn(name, { permission: 'prompt' });
+      expect(run(s, { t: 'permissionChanged', state: 'denied' }).state.permission).toBe('denied');
+      expect(run(s, { t: 'permissionChanged', state: 'granted' }).state.permission).toBe('granted');
+      expect(run(s, { t: 'trackMuted' }).state.micMuted).toBe(true);
+      expect(run(stateIn(name, { micMuted: true }), { t: 'trackUnmuted' }).state.micMuted).toBe(false);
+    }
+    expect(
+      run(stateIn('MicDenied', { permission: 'denied' }), { t: 'permissionChanged', state: 'prompt' }).state,
+    ).toMatchObject({ name: 'MicDenied', permission: 'prompt' });
+    expect(run(stateIn('Waking'), { t: 'micDenied', req: REQ }).state.permission).toBe('denied');
+    expect(run(stateIn('Waking'), { t: 'noDevice', req: REQ }).state.permission).toBe('granted');
+    expect(
+      run(stateIn('Listening', { micMuted: true }), { t: 'trackUnmuted' }).state.floorDb,
+    ).toBeUndefined();
+  });
+
+  it('C11: visibility, updateReady and applyUpdate', () => {
+    for (const name of STATES) {
+      expect(run(stateIn(name), { t: 'updateReady' }).state.updateReady).toBe(true);
+      expect(TABLE[name].visible === 'ignore').toBe(name !== 'Paused');
+      for (const t of ['hidden', 'pagehide', 'freeze'] as const) {
+        const plain = run(stateIn(name), { t });
+        expect(plain.state.name).toBe(hideTarget(name));
+        expect(plain.effects.some((f) => f.k === 'applyUpdate')).toBe(false);
+        const ready = run(stateIn(name, { updateReady: true }), { t });
+        expect(ready.effects.at(-1)).toStrictEqual({ k: 'applyUpdate' });
+        expect(ready.effects.slice(0, -1)).toStrictEqual(plain.effects);
+        expect(ready.state).toStrictEqual({ ...plain.state, updateReady: false });
+      }
+    }
+    // Already asleep: hidden has no effect but the update.
+    expect(run(stateIn('Asleep', { updateReady: true }), { t: 'hidden' }).effects).toStrictEqual([
+      { k: 'applyUpdate' },
+    ]);
+    expectIgnored(stateIn('Asleep'), { t: 'hidden' });
+    // Falling asleep by timer never applies the update.
+    const bySleep = run(stateIn('Listening', { updateReady: true }), tmr('sleep'));
+    expect(bySleep.state).toMatchObject({ name: 'Asleep', updateReady: true });
+    expect(bySleep.effects.some((f) => f.k === 'applyUpdate')).toBe(false);
+  });
+
+  it('C12: devices and failures', () => {
+    for (const name of STATES) {
+      const handles = ARMED.has(name) || GATED.has(name);
+      expect(TABLE[name].inputsChanged === 'ignore').toBe(!handles);
+      expect(TABLE[name].workerFailed === 'ignore').toBe(!MIC_OPEN.has(name));
+      expect(TABLE[name].ctxError === 'ignore').toBe(!AWAKE.has(name));
+      expect(TABLE[name].trackEnded === 'ignore').toBe(!AWAKE.has(name));
+      if (name !== 'Recording') expectIgnored(stateIn(name), tmr('recording'));
+    }
+    // Row 35b: closeMic, reselectInput, then the Waking entry.
+    const r = run(stateIn('Cooldown', { reselectPending: true }), tmr('cooldown'));
+    expect(r.effects.map((f) => f.k)).toStrictEqual([
+      'cancelTimer',
+      'closeMic',
+      'reselectInput',
+      'openMic',
+      'timer',
+    ]);
+  });
+});
+
+// ---- Plan decisions: approved deviations D2, D3, D4, D6 (ORCH-ANSWER on #28) and the literal rows 32/36 ----
+describe('plan decisions', () => {
+  it('rows 32 and 36 emit no anim (C4: as in the plan)', () => {
+    for (const from of ['SfxGated', 'Cooldown'] as const) {
+      for (const priority of [1, 2, 3, 4] as const) {
+        const r = run(stateIn(from), reaction(priority, true));
+        expect(r.state.name).toBe('SfxGated');
+        expect(r.effects.some((f) => f.k === 'anim')).toBe(false);
+      }
+    }
+  });
+
+  it('D2: a worker failure while Playing stops the replay before the cooldown; no arm until timer cooldown', () => {
+    // A reaction sound is still audible as well (sfxSeq > sfxEndedSeq): stopPlayback silences it too.
+    const s = stateIn('Playing', { sfxSeq: SEQ + 1 });
+    const r = run(s, { t: 'workerFailed' });
+    const stopAt = r.effects.findIndex((f) => f.k === 'stopPlayback');
+    const cooldownAt = r.effects.findIndex((f) => f.k === 'timer' && f.name === 'cooldown');
+    expect(stopAt).toBeGreaterThanOrEqual(0);
+    expect(cooldownAt).toBeGreaterThan(stopAt);
+    expect(r.effects[cooldownAt]).toStrictEqual(COOLDOWN_T);
+    expect(r.effects.some((f) => f.k === 'arm')).toBe(false);
+    expect(r.state).toMatchObject({
+      name: 'Cooldown',
+      playingId: null,
+      sfxSeq: SEQ + 1,
+      sfxEndedSeq: SEQ + 1,
+    });
+    // Nothing else re-arms from this Cooldown; only the cooldown timer does, into Listening.
+    for (const e of [reaction(2, false), { t: 'sfxAtSpeakerEnded', seq: SEQ } as const, tmr('sleep')]) {
+      expect(run(r.state, e).effects.some((f) => f.k === 'arm')).toBe(false);
+    }
+    const rearm = run(r.state, tmr('cooldown'));
+    expect(rearm.state.name).toBe('Listening');
+    expect(rearm.effects.some((f) => f.k === 'arm')).toBe(true);
+  });
+
+  it('D3: entering Asleep, Paused or Error drops a pending input re-selection', () => {
+    for (const e of [{ t: 'hidden' } as const, { t: 'ctxError' } as const]) {
+      const r = run(stateIn('Cooldown', { reselectPending: true }), e);
+      expect(r.state.reselectPending).toBe(false);
+    }
+    const asleep = transitionTo(
+      deepFreeze(stateIn('Processing', { reselectPending: true })),
+      'Asleep',
+      DEFAULT_CONFIG,
+    );
+    expect(asleep.state.reselectPending).toBe(false);
+    // …so the next wake arms without a stale reselect.
+    let s = run(stateIn('Cooldown', { reselectPending: true }), { t: 'hidden' }).state;
+    s = run(s, { t: 'visible' }).state;
+    s = run(s, { t: 'ctxRunning', sampleRate: 48_000 }).state;
+    const r = run(s, { t: 'micGranted', req: s.micReq });
+    expect(r.state).toMatchObject({ name: 'Listening', reselectPending: false });
+  });
+
+  it('D4: tapping in Error wakes by permission, never prompting from a child tap', () => {
+    const prompt = run(stateIn('Error', { permission: 'prompt' }), { t: 'tapBear' });
+    expect(prompt.state.name).toBe('NeedsParent');
+    expect(prompt.effects.some((f) => f.k === 'openMic')).toBe(false);
+    expect(run(stateIn('Error', { permission: 'denied' }), { t: 'tapBear' }).state.name).toBe('MicDenied');
+  });
+
+  it('D6: the doze timer re-arms when it fires, so Listening keeps both timers armed', () => {
+    const r = run(stateIn('Listening'), tmr('doze'));
+    expect(r.state.name).toBe('Listening');
+    expect(r.effects).toContainEqual(DOZE_T);
+    expect(r.effects.some((f) => f.k === 'cancelTimer')).toBe(false); // the sleep timer keeps running
+  });
+});
+
+// ---- Validation 4 and 5: the full (state × event) cross product ------------------------------------------------
+/** Representative current events for every event type. A missing type is a compile error. */
+const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
+  tapBear: () => [{ t: 'tapBear' }],
+  parentContinue: () => [{ t: 'parentContinue' }],
+  settingsRetry: () => [{ t: 'settingsRetry' }],
+  permissionChanged: () =>
+    (['granted', 'prompt', 'denied'] as const).map((state) => ({ t: 'permissionChanged', state })),
+  micGranted: (s) => [{ t: 'micGranted', req: s.micReq }],
+  micDenied: (s) => [{ t: 'micDenied', req: s.micReq }],
+  noDevice: (s) => [{ t: 'noDevice', req: s.micReq }],
+  ctxRunning: () => [{ t: 'ctxRunning', sampleRate: 44_100 }],
+  ctxResumeFailed: () => [{ t: 'ctxResumeFailed' }],
+  ctxError: () => [{ t: 'ctxError' }],
+  armed: (s) => [{ t: 'armed', epoch: s.epoch, armFrame: 99_000 }],
+  seg: (s) => [
+    { t: 'seg', epoch: s.epoch, ev: { kind: 'start', frame: 150_000 } },
+    {
+      t: 'seg',
+      epoch: s.epoch,
+      ev: { kind: 'end', frame: 250_000, lastSpeechFrame: 200_000, reason: 'silence' },
+    },
+    {
+      t: 'seg',
+      epoch: s.epoch,
+      ev: { kind: 'end', frame: 250_000, lastSpeechFrame: 200_000, reason: 'maxLength' },
+    },
+    { t: 'seg', epoch: s.epoch, ev: { kind: 'misfire', frame: 150_000 } },
+  ],
+  floorSnapshot: (s) => [{ t: 'floorSnapshot', epoch: s.epoch, floorDb: -44 }],
+  clipReady: (s) => [{ t: 'clipReady', epoch: s.epoch, id: s.takeId }],
+  takeFailed: (s) => [{ t: 'takeFailed', epoch: s.epoch, id: s.takeId }],
+  processed: (s) => [{ t: 'processed', id: s.takeId, durationSec: 1.2 }],
+  fxError: (s) => [{ t: 'fxError', id: s.takeId }],
+  playbackAtSpeakerEnded: (s) => [{ t: 'playbackAtSpeakerEnded', id: s.playingId ?? s.takeId }],
+  sfxAtSpeakerEnded: (s) => [
+    { t: 'sfxAtSpeakerEnded', seq: s.sfxSeq },
+    { t: 'sfxAtSpeakerEnded', seq: Math.max(0, s.sfxSeq - 1) },
+  ],
+  reaction: () => [reaction(1, false), reaction(2, true), reaction(3, true), reaction(4, false)],
+  timer: () => (['cooldown', 'sleep', 'doze', 'processing', 'waking', 'recording'] as const).map(tmr),
+  trackMuted: () => [{ t: 'trackMuted' }],
+  trackUnmuted: () => [{ t: 'trackUnmuted' }],
+  trackEnded: () => [{ t: 'trackEnded' }],
+  inputsChanged: () => [{ t: 'inputsChanged' }],
+  workerFailed: () => [{ t: 'workerFailed' }],
+  hidden: () => [{ t: 'hidden' }],
+  pagehide: () => [{ t: 'pagehide' }],
+  freeze: () => [{ t: 'freeze' }],
+  visible: () => [{ t: 'visible' }],
+  updateReady: () => [{ t: 'updateReady' }],
+};
+
+/** Stale variants of the events that carry an epoch, id or req (row 44); [] for the others. */
+const STALE: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
+  tapBear: () => [],
+  parentContinue: () => [],
+  settingsRetry: () => [],
+  permissionChanged: () => [],
+  micGranted: (s) => [{ t: 'micGranted', req: s.micReq - 1 }],
+  micDenied: (s) => [{ t: 'micDenied', req: s.micReq - 1 }],
+  noDevice: (s) => [{ t: 'noDevice', req: s.micReq - 1 }],
+  ctxRunning: () => [],
+  ctxResumeFailed: () => [],
+  ctxError: () => [],
+  armed: (s) => [{ t: 'armed', epoch: s.epoch - 1, armFrame: 99_000 }],
+  seg: (s) => SAMPLES.seg(s).map((e) => ({ ...e, epoch: s.epoch - 1 })),
+  floorSnapshot: (s) => [{ t: 'floorSnapshot', epoch: s.epoch - 1, floorDb: -44 }],
+  clipReady: (s) => [
+    { t: 'clipReady', epoch: s.epoch - 1, id: s.takeId },
+    { t: 'clipReady', epoch: s.epoch, id: s.takeId - 1 },
+  ],
+  takeFailed: (s) => [
+    { t: 'takeFailed', epoch: s.epoch - 1, id: s.takeId },
+    { t: 'takeFailed', epoch: s.epoch, id: s.takeId - 1 },
+  ],
+  processed: (s) => [{ t: 'processed', id: s.takeId - 1, durationSec: 1.2 }],
+  fxError: (s) => [{ t: 'fxError', id: s.takeId - 1 }],
+  playbackAtSpeakerEnded: (s) => [{ t: 'playbackAtSpeakerEnded', id: (s.playingId ?? s.takeId) - 1 }],
+  sfxAtSpeakerEnded: () => [],
+  reaction: () => [],
+  timer: () => [],
+  trackMuted: () => [],
+  trackUnmuted: () => [],
+  trackEnded: () => [],
+  inputsChanged: () => [],
+  workerFailed: () => [],
+  hidden: () => [],
+  pagehide: () => [],
+  freeze: () => [],
+  visible: () => [],
+  updateReady: () => [],
+};
+
+const EVENT_TYPES: EventType[] = [
+  'tapBear',
+  'parentContinue',
+  'settingsRetry',
+  'permissionChanged',
+  'micGranted',
+  'micDenied',
+  'noDevice',
+  'ctxRunning',
+  'ctxResumeFailed',
+  'ctxError',
+  'armed',
+  'seg',
+  'floorSnapshot',
+  'clipReady',
+  'takeFailed',
+  'processed',
+  'fxError',
+  'playbackAtSpeakerEnded',
+  'sfxAtSpeakerEnded',
+  'reaction',
+  'timer',
+  'trackMuted',
+  'trackUnmuted',
+  'trackEnded',
+  'inputsChanged',
+  'workerFailed',
+  'hidden',
+  'pagehide',
+  'freeze',
+  'visible',
+  'updateReady',
+];
+
+/** Two variants per state: plain, and one with every flag and counter set. */
+function variants(name: StateName): SessionState[] {
+  return [
+    stateIn(name),
+    stateIn(name, {
+      permission: 'prompt',
+      micMuted: true,
+      reselectPending: GATED.has(name),
+      workerRestarts: 1,
+      updateReady: true,
+      sfxEndedSeq: name === 'SfxGated' || name === 'Cooldown' ? SEQ - 1 : SEQ,
+      floorDb: undefined,
+      capHits: 2,
+    }),
+  ];
+}
+
+/** Invariants every result must satisfy (plan §3.4, §4.9.1, C1, C2, C11). */
+function checkInvariants(s: SessionState, e: SessionEvent, effects: Effect[], next: SessionState) {
+  const wl = effects.filter((f) => f.k === 'wakeLock');
+  const heldChanged = WAKE_LOCK_HELD.has(s.name) !== WAKE_LOCK_HELD.has(next.name);
+  expect(wl).toStrictEqual(heldChanged ? [wakeLock(WAKE_LOCK_HELD.has(next.name))] : []);
+  const shown = effects.filter((f) => f.k === 'ui');
+  expect(shown).toStrictEqual(overlayFor(s) === overlayFor(next) ? [] : [ui(overlayFor(next))]);
+  for (const f of effects) {
+    if (f.k === 'arm') {
+      expect(next.name).toBe('Listening');
+      expect(f.epoch).toBe(next.epoch);
+    }
+    if (f.k === 'sfx')
+      expect(next.name === 'SfxGated' || (s.name === 'MicDenied' && next.name === 'MicDenied')).toBe(true);
+    if (f.k === 'applyUpdate') expect(effects.at(-1)).toBe(f);
+  }
+  expect(effects.some((f) => f.k === 'disarm')).toBe(ARMED.has(s.name) && !ARMED.has(next.name));
+  expect(effects.some((f) => f.k === 'openMic')).toBe(next.name === 'Waking' && next.micReq !== s.micReq);
+  if (effects.some((f) => f.k === 'applyUpdate')) {
+    expect(['hidden', 'pagehide', 'freeze']).toContain(e.t);
+    expect(['Asleep', 'Paused']).toContain(next.name);
+  }
+}
+
+describe('cross product (state × event)', () => {
+  it('TABLE lists exactly every state and every event type', () => {
+    expect(EVENT_TYPES.toSorted()).toStrictEqual(Object.keys(SAMPLES).toSorted());
+    expect(Object.keys(TABLE).toSorted()).toStrictEqual([...STATES].toSorted());
+    for (const name of STATES)
+      expect(Object.keys(TABLE[name]).toSorted()).toStrictEqual([...EVENT_TYPES].toSorted());
+  });
+
+  it('every pair: no throw on frozen input; ignore → same object and no effects; invariants hold', () => {
+    let pairs = 0;
+    for (const name of STATES) {
+      for (const s of variants(name)) {
+        for (const t of EVENT_TYPES) {
+          const events: SessionEvent[] = SAMPLES[t](s);
+          expect(events.length).toBeGreaterThan(0);
+          for (const e of events) {
+            const r = run(s, e);
+            pairs++;
+            if (TABLE[name][t] === 'ignore') {
+              expect(r.state).toBe(s);
+              expect(r.effects).toStrictEqual([]);
+            }
+            checkInvariants(s, e, r.effects, r.state);
+          }
+        }
+      }
+    }
+    expect(pairs).toBeGreaterThan(STATES.length * EVENT_TYPES.length * 2);
+  });
+
+  it('every stale variant (epoch, id or req) returns the same state object and no effects (row 44)', () => {
+    let stale = 0;
+    for (const name of STATES) {
+      for (const s of variants(name)) {
+        for (const t of EVENT_TYPES) {
+          for (const e of STALE[t](s) as SessionEvent[]) {
+            expectIgnored(s, e);
+            stale++;
+          }
+        }
+      }
+    }
+    expect(stale).toBe(STATES.length * 2 * 16);
+  });
+
+  it('reduce never mutates its input (the frozen input is unchanged)', () => {
+    for (const name of STATES) {
+      const s = stateIn(name);
+      const copy = structuredClone(s);
+      for (const t of EVENT_TYPES) for (const e of SAMPLES[t](s)) run(s, e);
+      expect(s).toStrictEqual(copy);
+    }
+  });
+});
+
+describe('initial state and config', () => {
+  it('initialSessionState is Asleep with zero counters, the cub preset and 48 kHz', () => {
+    expect(initialSessionState('prompt')).toStrictEqual({
+      name: 'Asleep',
+      permission: 'prompt',
+      epoch: 0,
+      armFrame: null,
+      onsetFrame: null,
+      floorDb: undefined,
+      takeId: 0,
+      playingId: null,
+      micReq: 0,
+      micGranted: false,
+      ctxRunning: false,
+      sampleRate: 48_000,
+      micMuted: false,
+      reselectPending: false,
+      workerRestarts: 0,
+      capHits: 0,
+      sfxSeq: 0,
+      sfxEndedSeq: 0,
+      updateReady: false,
+      preset: PRESETS.cub,
+    });
+  });
+
+  it('DEFAULT_CONFIG matches issue #28', () => {
+    expect(DEFAULT_CONFIG).toStrictEqual({
+      tSleepMs: 120_000,
+      tDozeMs: 45_000,
+      cooldownMs: 250,
+      wakingMs: 5_000,
+      processingMs: 2_000,
+      maxUtteranceMs: 10_000,
+      preRollMs: 300,
+      tailMs: 150,
+    });
+  });
+
+  it('groups match plan §3.4', () => {
+    expect([...MIC_OPEN]).toStrictEqual([
+      'Waking',
+      'Listening',
+      'Recording',
+      'Processing',
+      'Playing',
+      'SfxGated',
+      'Cooldown',
+    ]);
+    expect([...AWAKE]).toStrictEqual([...MIC_OPEN, 'MicDenied']);
+    expect([...ARMED]).toStrictEqual(['Listening', 'Recording']);
+    expect([...GATED]).toStrictEqual(['Processing', 'Playing', 'SfxGated', 'Cooldown']);
+    expect([...WAKE_LOCK_HELD]).toStrictEqual([...MIC_OPEN, 'NeedsParent']);
   });
 });
