@@ -134,28 +134,13 @@ describe('segmenter rules', () => {
 
   it('counts durations in steps, never from frame-label differences', () => {
     const probs = seq([0.9, 5], [0, 40]);
-    expect(
-      run(
-        P,
-        probs,
-        probs.map((_, i) => linear(i)),
-      ),
-    ).toEqual([start(0, linear(0)), end(23, linear(4), 'silence', linear(23))]);
-    expect(
-      run(
-        P,
-        probs,
-        probs.map((_, i) => square(i)),
-      ),
-    ).toEqual([start(0, square(0)), end(23, square(4), 'silence', square(23))]);
+    const ramp = probs.map((_, i) => linear(i));
+    const squares = probs.map((_, i) => square(i));
+    expect(run(P, probs, ramp)).toEqual([start(0, linear(0)), end(23, linear(4), 'silence', linear(23))]);
+    expect(run(P, probs, squares)).toEqual([start(0, square(0)), end(23, square(4), 'silence', square(23))]);
     const capped = seq([0.9, 314]);
-    expect(
-      run(
-        P,
-        capped,
-        capped.map((_, i) => linear(i)),
-      ),
-    ).toEqual([
+    const cappedRamp = capped.map((_, i) => linear(i));
+    expect(run(P, capped, cappedRamp)).toEqual([
       start(0, linear(0)),
       end(312, linear(312), 'maxLength', linear(312)),
       start(313, linear(313)),
