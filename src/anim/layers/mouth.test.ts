@@ -1,3 +1,5 @@
+import { GCProfiler, setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import fc from 'fast-check';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -500,5 +502,165 @@ describe('MouthLayer brow impulse (Validation 4)', () => {
     expect(sample(0.02)[Ch.BrowL]).toBeCloseTo(5 * Math.exp(-0.02 / 0.15), 5);
     layer.setClip(makeEnv({ jaw: [0.5, 0.5, 0.5, 0.5] }), 100);
     expect(sample(0.02)[Ch.BrowL]).toBe(0);
+  });
+});
+
+type Constructor = new (...args: never[]) => object;
+
+/** Wraps `original` so that every `new` of it, including those inside its static `from` and `of`, calls `onNew`. */
+function countingConstructor<C extends Constructor>(original: C, onNew: () => void): C {
+  return new Proxy(original, {
+    construct(target, args: never[], newTarget: Constructor): object {
+      onNew();
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+}
+
+/** `%TypedArray%.prototype`, which every typed array class inherits its methods from. */
+const TYPED_ARRAY_PROTOTYPE = Reflect.getPrototypeOf(Float32Array.prototype) ?? Float32Array.prototype;
+/** Its methods that return a new typed array. */
+const TYPED_ARRAY_METHODS = ['slice', 'map', 'filter', 'subarray', 'toReversed', 'toSorted', 'with'] as const;
+
+/**
+ * Runs `fn` and counts the allocations it makes through the array globals (the meter of src/anim/clip.test.ts):
+ * every `new` of `Array`, `ArrayBuffer`, `Float32Array` or `Float64Array` (static `from` and `of` included, and
+ * `new` through a typed array's `constructor`), and every call of an allocating `%TypedArray%.prototype` method.
+ * Everything is restored afterwards.
+ */
+function countAllocations(fn: () => void): number {
+  let count = 0;
+  const onNew = (): void => {
+    count++;
+  };
+  const saved: { obj: object; key: string; desc: PropertyDescriptor }[] = [];
+  const patch = (obj: object, key: string, value: unknown): void => {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined) throw new Error(`nothing to patch at ${key}`);
+    saved.push({ obj, key, desc });
+    Object.defineProperty(obj, key, { ...desc, value });
+  };
+  const float32 = countingConstructor(Float32Array, onNew);
+  const float64 = countingConstructor(Float64Array, onNew);
+  patch(Float32Array.prototype, 'constructor', float32);
+  patch(Float64Array.prototype, 'constructor', float64);
+  patch(globalThis, 'Array', countingConstructor(Array, onNew));
+  patch(globalThis, 'ArrayBuffer', countingConstructor(ArrayBuffer, onNew));
+  patch(globalThis, 'Float32Array', float32);
+  patch(globalThis, 'Float64Array', float64);
+  for (const name of TYPED_ARRAY_METHODS) {
+    const original: unknown = Reflect.get(TYPED_ARRAY_PROTOTYPE, name);
+    if (typeof original !== 'function') throw new Error(`no %TypedArray%.prototype.${name}`);
+    patch(TYPED_ARRAY_PROTOTYPE, name, function (this: unknown, ...args: unknown[]): unknown {
+      count++;
+      return Reflect.apply(original, this, args);
+    });
+  }
+  try {
+    fn();
+  } finally {
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const { obj, key, desc } = saved[i]!;
+      Object.defineProperty(obj, key, desc);
+    }
+  }
+  return count;
+}
+
+/** The `gc` function, exposed once at runtime with Node built-ins only (no `--expose-gc` flag needed). */
+let exposedGc: (() => void) | undefined;
+
+/** Runs a full garbage collection. */
+function forceGc(): void {
+  if (exposedGc === undefined) {
+    setFlagsFromString('--expose-gc');
+    const gc: unknown = runInNewContext('gc');
+    if (typeof gc !== 'function') throw new Error('gc() is not available');
+    exposedGc = (): void => {
+      gc();
+    };
+  }
+  exposedGc();
+}
+
+/**
+ * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ */
+function heapGrowth(fn: () => void): number {
+  forceGc();
+  const profiler = new GCProfiler();
+  profiler.start();
+  const before = process.memoryUsage().heapUsed;
+  fn();
+  const growth = process.memoryUsage().heapUsed - before;
+  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+}
+
+describe('MouthLayer allocation (Validation 5)', () => {
+  const UPDATES = 10_000;
+  const LIMIT = 1_048_576;
+  /** 3 s of talking: the jaw swings 0.05…0.95 at 4 Hz, so the head bobs and the brows fire 12 times per pass. */
+  const ENV = makeEnv({
+    jaw: Array.from({ length: 300 }, (_, i) => 0.5 - 0.45 * Math.cos((2 * Math.PI * i) / 25)),
+    width: Array.from({ length: 300 }, (_, i) => (i % 13) / 13),
+    round: Array.from({ length: 300 }, (_, i) => (i % 7) / 7),
+    teeth: Array.from({ length: 300 }, (_, i) => (i % 5) / 5),
+  });
+  const START = 100;
+
+  /**
+   * 10 000 rAF-like updates at 60 fps: a pass restarts the clip every 200 frames (sample times from 60 ms before
+   * the clip to about 260 ms after its end, L included), re-seeding the pose each frame as the director does. With `withNow` false the
+   * layer extrapolates with its own performance.now.
+   */
+  function makeRun(withNow: boolean): () => void {
+    const layer = new MouthLayer();
+    const pose = createPose();
+    const ts = { contextTime: 0, performanceTime: 1000 };
+    const ctx: OutputClockCtx = { currentTime: 0, outputLatency: 0.02, getOutputTimestamp: () => ts };
+    return () => {
+      for (let i = 0; i < UPDATES; i++) {
+        const frame = i % 200;
+        if (frame === 0) layer.setClip(ENV, START);
+        ts.contextTime = START - 0.1 + frame / 60;
+        if (!withNow) ts.performanceTime = performance.now();
+        pose.fill(0);
+        if (withNow) layer.update(pose, ctx, now1000);
+        else layer.update(pose, ctx);
+      }
+    };
+  }
+
+  it('makes no array or typed-array allocation over 10 000 updates', () => {
+    for (const withNow of [true, false]) {
+      const run = makeRun(withNow);
+      expect(countAllocations(run)).toBe(0);
+    }
+  });
+
+  it('grows the heap by < 1 MB over 10 000 updates, once V8 has optimised it', () => {
+    for (const withNow of [true, false]) {
+      const run = makeRun(withNow);
+      // As in src/anim/clip.test.ts: warm up so V8's optimising tiers take over (until then every double is
+      // boxed), then take the best of up to 20 runs, each from a freshly collected heap; a run during which any
+      // GC ran counts as +Infinity. An update that really allocates does so in every run.
+      forceGc();
+      for (let w = 0; w < 10; w++) run();
+      let best = heapGrowth(run);
+      for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(run));
+      expect(best).toBeLessThan(LIMIT);
+    }
+  });
+
+  it('both meters have teeth (positive controls)', () => {
+    expect(countAllocations(() => void new Float32Array(CH_COUNT))).toBe(1);
+    expect(countAllocations(() => void Array.from({ length: 3 }))).toBeGreaterThan(0);
+    const kept: number[][] = [];
+    const growth = heapGrowth(() => {
+      for (let i = 0; i < UPDATES; i++) kept.push(Array.from({ length: 64 }, (_, j) => j + 0.5));
+    });
+    expect(kept).toHaveLength(UPDATES);
+    expect(growth).toBeGreaterThanOrEqual(LIMIT);
   });
 });
