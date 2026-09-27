@@ -50,7 +50,7 @@ export const WEIGHTS_LAYOUT: readonly WeightsLayoutEntry[] = [
 export const WEIGHTS_BYTES = 487_170;
 
 /** SHA-256 of weights.bin, copied from weights.provenance.json (weights.test.ts asserts they match). */
-export const WEIGHTS_SHA256 = '0000000000000000000000000000000000000000000000000000000000000000';
+export const WEIGHTS_SHA256 = 'b39138757bd2b095f350c176e49c643c939f236219ca8d805a2ecd279debf90c';
 
 /** Decodes one IEEE 754 binary16 bit pattern (0 … 0xffff) exactly. */
 export function fp16ToFp32(bits: number): number {
