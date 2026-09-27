@@ -1,3 +1,5 @@
+import fc from 'fast-check';
+import type { Arbitrary, Command } from 'fast-check';
 import { describe, expect, test } from 'vitest';
 
 import { RingBuffer } from './ring-buffer.ts';
@@ -219,5 +221,272 @@ describe('RingBuffer examples', () => {
     const expected = Array.from({ length: 10000 }, (_, i) => Math.fround(((600000 + i) % 1000) / 1000));
     expect(Array.from(got)).toEqual(expected);
     expectRangeError(() => rb.read(47999, 48001));
+  });
+});
+
+// ---- Model-based test (plan §4.9.1) -------------------------------------------------------------------
+
+/** A deliberately naive oracle: every frame ever written (gaps as 0) in a Map, plus start and end. */
+interface Model {
+  readonly capacity: number;
+  readonly frames: Map<number, number>;
+  /** Oldest readable frame. NaN while empty. */
+  start: number;
+  /** One past the newest frame. NaN while empty. */
+  end: number;
+  gapCount: number;
+  gapFrames: number;
+}
+
+type RingCommand = Command<Model, RingBuffer>;
+
+const RANGE_ERROR = 'RangeError';
+
+type Rejection = 'non-integer' | 'empty' | 'reversed' | 'evicted' | 'unwritten';
+
+/** What the generator actually exercised, so the property cannot pass vacuously. */
+const seen: Record<
+  'gapWrites' | 'overlapWrites' | 'evictingWrites' | 'validReads' | 'validReadIntos' | Rejection,
+  number
+> = {
+  gapWrites: 0,
+  overlapWrites: 0,
+  evictingWrites: 0,
+  validReads: 0,
+  validReadIntos: 0,
+  'non-integer': 0,
+  empty: 0,
+  reversed: 0,
+  evicted: 0,
+  unwritten: 0,
+};
+
+function emptyModel(capacity: number): Model {
+  return {
+    capacity,
+    frames: new Map(),
+    start: Number.NaN,
+    end: Number.NaN,
+    gapCount: 0,
+    gapFrames: 0,
+  };
+}
+
+function modelWrite(m: Model, block: Float32Array, startFrame: number): 'ok' | 'overlap' {
+  if (Number.isNaN(m.end)) {
+    m.start = startFrame;
+    m.end = startFrame;
+  } else if (startFrame < m.end) {
+    return 'overlap';
+  }
+  if (startFrame > m.end) {
+    m.gapCount += 1;
+    m.gapFrames += startFrame - m.end;
+    for (let f = m.end; f < startFrame; f++) m.frames.set(f, 0);
+  }
+  block.forEach((value, i) => m.frames.set(startFrame + i, value));
+  m.end = startFrame + block.length;
+  // `end` only grows, so this is max(base, end − capacity).
+  m.start = Math.max(m.start, m.end - m.capacity);
+  return 'ok';
+}
+
+/** Which read rule rejects `[from, to)`, or null when the range is readable. */
+function rejection(m: Readonly<Model>, from: number, to: number): Rejection | null {
+  if (!Number.isInteger(from) || !Number.isInteger(to)) return 'non-integer';
+  if (Number.isNaN(m.end)) return 'empty';
+  if (from > to) return 'reversed';
+  if (from < m.start) return 'evicted';
+  if (to > m.end) return 'unwritten';
+  return null;
+}
+
+function modelRead(m: Readonly<Model>, from: number, to: number): number[] | typeof RANGE_ERROR {
+  const rejected = rejection(m, from, to);
+  if (rejected !== null) {
+    seen[rejected] += 1;
+    return RANGE_ERROR;
+  }
+  const out: number[] = [];
+  for (let f = from; f < to; f++) {
+    const value = m.frames.get(f);
+    if (value === undefined) throw new Error(`model is missing frame ${f}`);
+    out.push(value);
+  }
+  return out;
+}
+
+function attempt<T>(fn: () => T): T | typeof RANGE_ERROR {
+  try {
+    return fn();
+  } catch (error) {
+    if (error instanceof RangeError) return RANGE_ERROR;
+    throw error;
+  }
+}
+
+function expectSameState(m: Readonly<Model>, r: RingBuffer): void {
+  expect(r.capacity).toBe(m.capacity);
+  expect(r.isEmpty).toBe(Number.isNaN(m.end));
+  expect(r.startFrame).toBe(m.start);
+  expect(r.endFrame).toBe(m.end);
+  expect(r.gapCount).toBe(m.gapCount);
+  expect(r.gapFrames).toBe(m.gapFrames);
+}
+
+function expectSameContents(m: Readonly<Model>, r: RingBuffer): void {
+  expectSameState(m, r);
+  if (!Number.isNaN(m.end)) expect(Array.from(r.read(m.start, m.end))).toEqual(modelRead(m, m.start, m.end));
+}
+
+function writeAndCompare(m: Model, r: RingBuffer, block: Float32Array, startFrame: number): void {
+  const startBefore = m.start;
+  r.write(block, startFrame);
+  expect(modelWrite(m, block, startFrame)).toBe('ok');
+  if (m.start > startBefore) seen.evictingWrites += 1;
+  expectSameContents(m, r);
+}
+
+function command(
+  name: string,
+  check: (m: Readonly<Model>) => boolean,
+  run: (m: Model, r: RingBuffer) => void,
+): RingCommand {
+  return { check, run, toString: () => name };
+}
+
+interface RangeSpec {
+  anchor: 'start' | 'end';
+  offset: number;
+  length: number;
+  /** Fold the range into [start, end], so it is valid whenever the buffer is not empty. */
+  clamp: boolean;
+  /** Make one index non-integer (only when not clamped). */
+  fraction: boolean;
+}
+
+/** Integer `from` and `length` for a spec against the model's current state (anchored at 0 while empty). */
+function resolveRange(m: Readonly<Model>, s: RangeSpec): { from: number; length: number } {
+  if (Number.isNaN(m.end)) return { from: s.offset, length: s.length };
+  if (s.clamp) {
+    const from = m.start + (Math.abs(s.offset) % (m.end - m.start + 1));
+    return { from, length: Math.abs(s.length) % (m.end - from + 1) };
+  }
+  return { from: (s.anchor === 'start' ? m.start : m.end) + s.offset, length: s.length };
+}
+
+function rangeSpec(capacity: number, minLength: number): Arbitrary<RangeSpec> {
+  return fc.record({
+    anchor: fc.constantFrom<'start' | 'end'>('start', 'end'),
+    offset: fc.integer({ min: -(capacity + 2), max: capacity + 2 }),
+    length: fc.integer({ min: minLength, max: capacity + 2 }),
+    clamp: fc.boolean(),
+    fraction: fc.oneof(
+      { arbitrary: fc.constant(false), weight: 9 },
+      { arbitrary: fc.constant(true), weight: 1 },
+    ),
+  });
+}
+
+function commandArbitraries(capacity: number): Arbitrary<RingCommand>[] {
+  const block = (minLength: number) => fc.float32Array({ minLength, maxLength: 2 * capacity });
+  const distance = fc.integer({ min: 1, max: 2 * capacity });
+  const base = fc.oneof(
+    fc.constant(0),
+    fc.integer({ min: -1_000_000, max: 1_000_000 }),
+    fc.integer({ min: 2 ** 52, max: 2 ** 53 - 2 ** 24 }),
+  );
+  return [
+    fc.tuple(block(1), base).map(([samples, first]) =>
+      command(
+        `ContiguousWrite(n=${samples.length}, base=${first})`,
+        () => true,
+        (m, r) => writeAndCompare(m, r, samples, Number.isNaN(m.end) ? first : m.end),
+      ),
+    ),
+    fc.tuple(distance, block(0)).map(([gap, samples]) =>
+      command(
+        `GapWrite(gap=${gap}, n=${samples.length})`,
+        (m) => !Number.isNaN(m.end),
+        (m, r) => {
+          seen.gapWrites += 1;
+          writeAndCompare(m, r, samples, m.end + gap);
+        },
+      ),
+    ),
+    fc.tuple(distance, block(1)).map(([back, samples]) =>
+      command(
+        `OverlapWrite(back=${back}, n=${samples.length})`,
+        (m) => !Number.isNaN(m.end),
+        (m, r) => {
+          seen.overlapWrites += 1;
+          const startFrame = m.end - back;
+          expectRangeError(() => r.write(samples, startFrame), 'overlap');
+          expect(modelWrite(m, samples, startFrame)).toBe('overlap');
+          expectSameContents(m, r);
+        },
+      ),
+    ),
+    rangeSpec(capacity, -2).map((s) =>
+      command(
+        `Read(${JSON.stringify(s)})`,
+        () => true,
+        (m, r) => {
+          const { from: first, length } = resolveRange(m, s);
+          let from = first;
+          let to = first + length;
+          if (!s.clamp && s.fraction) {
+            if (s.offset % 2 === 0) from += 0.5;
+            else to += 0.5;
+          }
+          const expected = modelRead(m, from, to);
+          if (expected !== RANGE_ERROR) seen.validReads += 1;
+          expect(attempt(() => Array.from(r.read(from, to)))).toEqual(expected);
+          expectSameState(m, r);
+        },
+      ),
+    ),
+    rangeSpec(capacity, 0).map((s) =>
+      command(
+        `ReadInto(${JSON.stringify(s)})`,
+        () => true,
+        (m, r) => {
+          const { from: first, length } = resolveRange(m, s);
+          const from = !s.clamp && s.fraction ? first + 0.5 : first;
+          const out = new Float32Array(length).fill(-7);
+          const expected = modelRead(m, from, from + length);
+          const result = attempt(() => r.readInto(from, out));
+          if (expected === RANGE_ERROR) {
+            expect(result).toBe(RANGE_ERROR);
+            expect(Array.from(out)).toEqual(Array.from({ length }, () => -7));
+          } else {
+            seen.validReadIntos += 1;
+            expect(result).toBeUndefined();
+            expect(Array.from(out)).toEqual(expected);
+          }
+          expectSameState(m, r);
+        },
+      ),
+    ),
+  ];
+}
+
+describe('RingBuffer model', () => {
+  test('random writes, gaps, overlaps and reads match a Map model', () => {
+    const scenario = fc
+      .integer({ min: 1, max: 300 })
+      .chain((capacity) =>
+        fc.tuple(
+          fc.constant(capacity),
+          fc.commands(commandArbitraries(capacity), { maxCommands: 60, size: 'max' }),
+        ),
+      );
+    fc.assert(
+      fc.property(scenario, ([capacity, commands]) => {
+        fc.modelRun(() => ({ model: emptyModel(capacity), real: new RingBuffer(capacity) }), commands);
+      }),
+      { numRuns: 300 },
+    );
+    for (const [what, count] of Object.entries(seen)) expect(count, what).toBeGreaterThan(0);
   });
 });
