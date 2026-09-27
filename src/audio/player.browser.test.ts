@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { createMasterBus } from './bus.ts';
 import { outputContextTimeNow } from './output-clock.ts';
 import { createPlayer } from './player.ts';
-import { createSfx, M1_SYNTHS } from './sfx.ts';
+import { createSfx, M1_SYNTHS, type SfxSynth } from './sfx.ts';
 
 /** An output timestamp read through `ctx.getOutputTimestamp()`, and when it was read. */
 interface TimestampRead {
@@ -26,6 +26,7 @@ let lastRead: TimestampRead | undefined;
  * would make the assertion depend on timing.
  */
 function outputContextTimeAtResolution(r: TimestampRead | undefined, t0: number, resolvedAt: number): number {
+  expect(r, 'the code read a real output timestamp').toBeDefined();
   expect(r?.ts.performanceTime, 'the code read a real output timestamp').toBeGreaterThan(0);
   expect(r?.readAt, 'read after the play started').toBeGreaterThanOrEqual(t0);
   expect(r?.readAt, 'read before the promise resolved').toBeLessThanOrEqual(resolvedAt);
@@ -73,14 +74,22 @@ describe('master bus', () => {
   });
 
   test('a unit signal into the bus reaches the destination at 0.7 (Quiet off)', async () => {
-    const off = new OfflineAudioContext({ numberOfChannels: 1, length: 128, sampleRate: 48000 });
+    // 0.3 s, and only the last 128 samples are checked, so a Quiet gain ramping with τ = 20 ms (M3) has
+    // settled by then.
+    const sampleRate = 48000;
+    const off = new OfflineAudioContext({
+      numberOfChannels: 1,
+      length: Math.round(0.3 * sampleRate),
+      sampleRate,
+    });
     const bus = createMasterBus(off);
     bus.setQuiet(false); // a no-op in M1; keeps this test true once M3 adds Quiet mode
     const src = new ConstantSourceNode(off, { offset: 1 });
     src.connect(bus.input);
     src.start(0);
     const rendered = await off.startRendering();
-    for (const x of rendered.getChannelData(0)) expect(x).toBeCloseTo(0.7, 6);
+    const data = rendered.getChannelData(0);
+    for (const x of data.subarray(data.length - 128)) expect(x).toBeCloseTo(0.7, 6);
   });
 });
 
@@ -169,6 +178,49 @@ describe('sfx', () => {
     bus.output.disconnect();
   });
 
+  test('a synth that rings 8 ms past its returned duration is not cut to silence at that duration', async () => {
+    const sampleRate = 48000;
+    const off = new OfflineAudioContext({
+      numberOfChannels: 1,
+      length: Math.round(0.2 * sampleRate),
+      sampleRate,
+    });
+    let atDuration: Promise<void> = Promise.resolve();
+    // Holds 0.5 from `when` to `when + 0.058` but reports 0.05; a silent probe ends at the reported end.
+    const ringing: SfxSynth = (c, out, when) => {
+      const tone = new ConstantSourceNode(c, { offset: 0.5 });
+      tone.connect(out);
+      tone.start(when);
+      tone.stop(when + 0.058);
+      const probe = new ConstantSourceNode(c, { offset: 0 });
+      probe.connect(out);
+      atDuration = new Promise((r) => probe.addEventListener('ended', () => r(), { once: true }));
+      probe.start(when);
+      probe.stop(when + 0.05);
+      return 0.05;
+    };
+    // An offline context renders the graph; allEnded() is not used, so its output timestamp can be empty.
+    // The never-resolving sleep keeps the ring-out disconnect out of this render.
+    const offCtx = Object.assign(off, { getOutputTimestamp: () => ({}) });
+    const sfx = createSfx(offCtx, off.destination, { testBeep: ringing }, () => new Promise(() => {}));
+    const { endCtxTime } = sfx.play('testBeep'); // when 0.02, end 0.07
+    // Pause at the first render-quantum boundary after the end, once the `ended` events have been handled.
+    const pauseAt = ((Math.floor((endCtxTime * sampleRate) / 128) + 1) * 128) / sampleRate;
+    const paused = off.suspend(pauseAt).then(async () => {
+      await atDuration;
+      await new Promise((r) => setTimeout(r, 0));
+      await off.resume();
+    });
+    const data = (await off.startRendering()).getChannelData(0);
+    await paused;
+    const ringOut = data.subarray(
+      Math.round(pauseAt * sampleRate),
+      Math.round((endCtxTime + 0.007) * sampleRate),
+    );
+    expect(ringOut.length).toBeGreaterThan(0);
+    for (const x of ringOut) expect(x).toBeCloseTo(0.5, 6);
+  });
+
   test('testBeep: 880 Hz sine, 150 ms, 5 ms attack, 50 ms release, peak 0.25', async () => {
     const sampleRate = 48000;
     const off = new OfflineAudioContext({
@@ -186,9 +238,12 @@ describe('sfx', () => {
       return p;
     };
     expect(peak(0, 0.2)).toBeLessThanOrEqual(0.25 + 1e-6);
-    expect(peak(0.005, 0.1)).toBeGreaterThan(0.249); // full level between attack and release
     expect(peak(0, 0.0025)).toBeLessThanOrEqual(0.125 + 1e-6); // half way up the linear attack
-    expect(peak(0.14, 0.15)).toBeLessThanOrEqual(0.05 + 1e-6); // last 10 ms of the 50 ms release
+    expect(peak(0.004, 0.005)).toBeGreaterThan(0.19); // end of the 5 ms attack (0.2 → 0.25)
+    expect(peak(0.005, 0.1)).toBeGreaterThan(0.249); // full level between attack and release
+    expect(peak(0.1245, 0.1255)).toBeCloseTo(0.125, 2); // half way down the 50 ms linear release
+    expect(peak(0.14, 0.15)).toBeLessThanOrEqual(0.05 + 1e-6); // last 10 ms of the release
+    expect(peak(0.145, 0.148)).toBeGreaterThan(0.005); // the release reaches 0 only at 150 ms
     expect(peak(0.15, 0.2)).toBe(0); // silent after 150 ms
     let crossings = 0;
     let prev = Number.NaN;
