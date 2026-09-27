@@ -24,6 +24,7 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: node scripts/gen-bear-parts.ts --check
       - run: pnpm exec playwright install --with-deps --no-shell chromium
       - run: pnpm verify
       - run: pnpm test:browser
