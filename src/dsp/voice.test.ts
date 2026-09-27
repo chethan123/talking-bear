@@ -255,6 +255,13 @@ describe('trimRange (stage 3 span)', () => {
     expect(trimRange(burst(96000, 72000, 96000), FS)).toEqual({ start: 69600, end: 96000 });
   });
 
+  it('the last, shorter frame is a frame (peak and span)', () => {
+    const x = new Float32Array(48000 + 240);
+    x.fill(0.002, 4800, 5280); // frame 10, about −54 dB
+    x.fill(1, 48000); // 5 ms partial last frame, 0 dB
+    expect(trimRange(x, 48000)).toEqual({ start: 45600, end: 48240 });
+  });
+
   it('leaves a clip untrimmed when no frame reaches the threshold', () => {
     expect(trimRange(new Float32Array(48000), FS)).toEqual({ start: 0, end: 48000 });
     expect(trimRange(new Float32Array(0), FS)).toEqual({ start: 0, end: 0 });
@@ -339,6 +346,12 @@ describe('isVoiced (stage 5)', () => {
     for (const name of ['noise_white_-60dbfs_3s', 'noise_pink_-40dbfs_5s']) {
       expect(isVoiced(resample(hpfTrim(fixture(name), FS), 1.6), FS)).toBe(false);
     }
+  });
+
+  it('windows are exactly 256 samples at 0, 160, 320, … and must fit wholly', () => {
+    const z = bursts([0, 1, 2]).slice(0, 576); // third window [320, 576) fits exactly
+    expect(isVoiced(z, 8000)).toBe(true);
+    expect(isVoiced(z.subarray(0, 575), 8000)).toBe(false);
   });
 
   it('is false when the 8 kHz copy is shorter than one 256-sample window', () => {
@@ -486,6 +499,15 @@ describe('processVoice', () => {
     const nanResult = processVoice(nanOnly, FS, preset(1.6));
     expect(nanResult.clipped).toBe(false);
     expect(nanResult.pcm.every((v) => v === 0)).toBe(true);
+  });
+
+  it('clamps finite samples to ±1e30: input near the float32 maximum still gives a finite output and envelope', () => {
+    const r = processVoice(new Float32Array(48000).fill(3.4e38), FS, PRESETS.cub);
+    expect(r.pcm.length).toBeGreaterThan(0);
+    expect(r.pcm.every((v) => Number.isFinite(v))).toBe(true);
+    for (const track of [r.envelope.jaw, r.envelope.width, r.envelope.round, r.envelope.teeth]) {
+      expect(track.every((v) => Number.isFinite(v))).toBe(true);
+    }
   });
 
   it('returns an empty, unclipped result for an empty input', () => {

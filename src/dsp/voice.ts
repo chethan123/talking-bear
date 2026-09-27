@@ -20,6 +20,11 @@ export const CLIP_LEVEL = 0.99;
 export const CLIP_FRACTION = 0.001;
 /** High-pass corner in Hz (2nd-order Butterworth). */
 export const HPF_HZ = 80;
+/**
+ * hpfTrim clamps finite samples to ±SAMPLE_LIMIT. Real PCM is within ±1; the bound only keeps finite input near
+ * the float32 maximum (±3.4e38) from overflowing to ±Infinity in the high-pass or resampler overshoot.
+ */
+export const SAMPLE_LIMIT = 1e30;
 /** Trim: RMS frame length, the absolute floor and the range below the loudest frame, and the kept margin. */
 export const TRIM_FRAME_SEC = 0.01;
 export const TRIM_FLOOR_DB = -60;
@@ -55,7 +60,7 @@ export function clipDetect(x: Float32Array): boolean {
 }
 
 /**
- * The span [start, end) of x that the trim keeps, at sample rate fs:
+ * The span [start, end) of x that the trim keeps, at sample rate fs (finite and > 0; hpfTrim validates it):
  * - frames of F = round(0.010·fs) samples start at sample 0 (frame k is x[k·F, min((k+1)·F, n)); the last
  *   one may be shorter) and each gets its RMS level in dB, 10·log10(mean square) (−Infinity when all zero);
  * - thr = max(−60, peak frame dB − 50); the first and last frames at or above thr bound the kept span;
@@ -99,7 +104,8 @@ export function trimRange(x: Float32Array, fs: number): { start: number; end: nu
 
 /**
  * Stages 2 and 3, high-pass and trim. Copies x into a new buffer, replacing every non-finite sample (NaN,
- * ±Infinity) with 0, so every later stage sees finite samples; high-passes the copy in place with a fresh
+ * ±Infinity) with 0 and clamping finite samples to ±1e30 (SAMPLE_LIMIT), so every later stage sees finite,
+ * bounded samples that cannot overflow float32; high-passes the copy in place with a fresh
  * 80 Hz 2nd-order Butterworth (butterworthHighpass(fs, 80)); then, when `trim` is true, returns the view of it
  * given by trimRange. Never returns x itself. Throws RangeError unless fs is finite and > 160.
  */
@@ -107,7 +113,7 @@ export function hpfTrim(x: Float32Array, fs: number, trim = true): Float32Array 
   const y = new Float32Array(x.length);
   for (let i = 0; i < x.length; i++) {
     const v = x[i]!;
-    y[i] = Number.isFinite(v) ? v : 0;
+    y[i] = Number.isFinite(v) ? Math.min(SAMPLE_LIMIT, Math.max(-SAMPLE_LIMIT, v)) : 0;
   }
   butterworthHighpass(fs, HPF_HZ).process(y, y);
   if (!trim) return y;
@@ -174,8 +180,10 @@ export const voiceStages = { clipDetect, hpfTrim, resample, isVoiced, applyGain,
  * with p = preset.pitchRatio. Returns { pcm: y, envelope: env, durationSec: y.length / fs, clipped }: y plays
  * at rate 1, and its envelope is computed from exactly that buffer.
  *
- * Non-finite input samples (NaN, ±Infinity) are replaced by 0 before the high-pass (±Infinity still counts as
- * clipped), so every stage after clipDetect sees finite samples and the output and its envelope are finite.
+ * Non-finite input samples (NaN, ±Infinity) are replaced by 0 and finite samples are clamped to ±1e30
+ * (SAMPLE_LIMIT) before the high-pass (clipDetect still sees the raw input, so ±Infinity counts as clipped).
+ * Every stage after clipDetect therefore sees finite, bounded samples, and the output and its envelope are
+ * finite for every input.
  * `pcm` is never modified, and y is a new buffer. `opts.noTrim` is test-only.
  *
  * Throws RangeError (from the stages) unless fs is finite and above 2·1681.97 ≈ 3364 Hz (the BS.1770
