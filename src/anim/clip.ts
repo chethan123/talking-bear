@@ -65,13 +65,14 @@ function ease(kind: Key['ease'], u: number): number {
 /**
  * The value of a key track at time `t`: the first key's value before it, the last key's value from it on,
  * and in between the eased interpolation of the segment `t` falls in (with the ease of its first key).
- * At a key's time the result is exactly that key's value. An empty track is 0.
+ * At a key's time the result is exactly that key's value; at a time shared by several keys, the last of
+ * them. An empty track is 0.
  */
 function sampleKeys(keys: readonly Key[], t: number): number {
   const n = keys.length;
   if (n === 0) return 0;
   const first = keys[0]!;
-  if (t <= first.t) return first.v;
+  if (t < first.t) return first.v;
   for (let k = 1; k < n; k++) {
     const b = keys[k]!;
     if (t < b.t) {

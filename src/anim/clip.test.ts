@@ -1,4 +1,4 @@
-import { setFlagsFromString } from 'node:v8';
+import { GCProfiler, setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
@@ -97,12 +97,18 @@ function forceGc(): void {
   exposedGc();
 }
 
-/** `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. */
+/**
+ * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ */
 function heapGrowth(fn: () => void): number {
   forceGc();
+  const profiler = new GCProfiler();
+  profiler.start();
   const before = process.memoryUsage().heapUsed;
   fn();
-  return process.memoryUsage().heapUsed - before;
+  const growth = process.memoryUsage().heapUsed - before;
+  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
 }
 
 /** 1–6 (at least `minLength`) distinct key times on a 10 ms grid in [0, 5] s, ascending. */
@@ -183,6 +189,41 @@ describe('sampleClip: validation 1, the sample at a key time is the key value', 
     );
     expect(sampleAt(c, 0.1)).toBe(1);
     expect(sampleAt(c, 0.9)).toBe(3);
+  });
+
+  it('keys at the same time step to the later key exactly at that time, the first key time included', () => {
+    const atStart = oneTrack(
+      [
+        { t: 0, v: 0 },
+        { t: 0, v: 1 },
+        { t: 1, v: 1 },
+      ],
+      1,
+    );
+    expect(sampleAt(atStart, 0)).toBe(1);
+    expect(sampleAt(atStart, -1)).toBe(1);
+    expect(sampleAt(atStart, Number.NaN)).toBe(1);
+    const mid = oneTrack(
+      [
+        { t: 0, v: 0 },
+        { t: 0.5, v: 0 },
+        { t: 0.5, v: 1 },
+        { t: 1, v: 1 },
+      ],
+      1,
+    );
+    expect(sampleAt(mid, 0.4999)).toBe(0);
+    expect(sampleAt(mid, 0.5)).toBe(1);
+    const late = oneTrack(
+      [
+        { t: 0.2, v: 0 },
+        { t: 0.2, v: 1 },
+        { t: 1, v: 1 },
+      ],
+      1,
+    );
+    expect(sampleAt(late, 0.1)).toBe(0);
+    expect(sampleAt(late, 0.2)).toBe(1);
   });
 });
 
@@ -315,6 +356,30 @@ describe('sampleClip: validation 4, channels not in the clip are 0', () => {
     }
   });
 
+  it('if two tracks share a channel, the later one wins', () => {
+    const c: Clip = {
+      name: 'twice',
+      duration: 1,
+      tracks: [
+        {
+          ch: Ch.BrowL,
+          keys: [
+            { t: 0, v: 2 },
+            { t: 1, v: 2 },
+          ],
+        },
+        {
+          ch: Ch.BrowL,
+          keys: [
+            { t: 0, v: 5 },
+            { t: 1, v: 5 },
+          ],
+        },
+      ],
+    };
+    expect(sampleAt(c, 0.5, Ch.BrowL)).toBe(5);
+  });
+
   it('a clip without tracks zeroes out, and a track without keys writes 0', () => {
     const out = createPose().fill(7);
     sampleClip({ name: 'empty', duration: 1, tracks: [] }, 0.5, out);
@@ -370,8 +435,10 @@ describe('sampleClip: validation 5, no allocation (10 000 samples, heap growth <
     // V8 still re-tiers after the warm-up: optimised code compiled on a background thread lands late under
     // CPU load (vitest runs test files in parallel), and forced GCs trigger deopts. A run caught in the
     // interpreter or baseline tier grows the heap by 0.7–1.8 MB of boxed doubles (measured with 4 parallel
-    // runs on 4 cores). So take the best of up to 20 runs, each from a freshly collected heap. A sampler
-    // that really allocates does so in every run: one Float32Array per call gives about 2.2 MB in each.
+    // runs on 4 cores). So take the best of up to 20 runs, each from a freshly collected heap; a run during
+    // which any GC ran counts as +Infinity, since that GC freed garbage the run should be charged for. A
+    // sampler that really allocates does so in every run: one Float32Array per call gives about 2.2 MB in
+    // each, and an escaping object per track either shows its megabytes or forces a GC.
     const LIMIT = 1_048_576;
     let best = heapGrowth(run);
     for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(run));
