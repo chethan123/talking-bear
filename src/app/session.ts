@@ -154,9 +154,9 @@ export function createSession(initial: SessionState, deps: SessionDeps): Session
    * Row 39 wakes by the permission known when `visible` arrives, and a one-time grant can expire in the
    * background (§4.5). So `visible` is dispatched only after the permission re-query has settled: the module
    * notifies (→ `permissionChanged`) before its query() promise resolves, so the reducer sees the new permission
-   * first. The query starts in a microtask, after every visibility subscriber of this round, including the
-   * permission module's own re-query; ours is then the newest generation whatever the subscription order, and
-   * the module discards the older result. A rejected query still dispatches `visible` (the reducer wakes by the
+   * first. The query starts in a microtask, after every visibility subscriber of this round (they all run inside
+   * the one Visibility's DOM event), including the permission module's own re-query; ours is then the newest
+   * generation whatever the subscription order, and the module discards the older result. A rejected query still dispatches `visible` (the reducer wakes by the
    * last known permission) rather than leaving the bear in Paused; a query that never settles leaves it in Paused
    * until the next hide/visible retries. A hide, or a newer `visible`, before that cancels this one.
    */
