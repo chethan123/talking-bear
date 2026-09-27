@@ -1,0 +1,12 @@
+{
+  "sampleRate": 48000,
+  "lengthSamples": 67200,
+  "speech": [
+    {
+      "start": 48000,
+      "end": 52800
+    }
+  ],
+  "f0": 140,
+  "seed": 48802
+}
