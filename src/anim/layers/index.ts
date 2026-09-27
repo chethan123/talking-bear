@@ -52,3 +52,19 @@ export interface AnimContext {
 export interface Layer {
   update(dt: number, pose: Pose, ctx: AnimContext): void;
 }
+
+export {
+  EYES_CENTER,
+  GAZE_MAX,
+  GAZE_SPRING,
+  HEAD_FOLLOW,
+  HEAD_FULL_ANGLE,
+  IRIS_TAU,
+  LOOK_SATURATE,
+  SACCADE_MAX,
+  SACCADE_MIN,
+  createGaze,
+} from './gaze.ts';
+export type { GazeLayer, GazeSprings } from './gaze.ts';
+export { EAR_SPRING, EAR_TWITCH_DV, EAR_TWITCH_MAX, EAR_TWITCH_MIN, createEarTwitch } from './ear-twitch.ts';
+export type { EarTwitchLayer, EarTwitchSprings } from './ear-twitch.ts';
