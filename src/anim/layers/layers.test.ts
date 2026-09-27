@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { GCProfiler, setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { mulberry32 as referenceMulberry32 } from '../../../test/dsp-helpers.ts';
 import { Ch, CH_COUNT, createPose } from '../pose.ts';
@@ -37,7 +40,7 @@ import {
   createGaze,
   createMood,
 } from './index.ts';
-import type { AnimContext, Layer, LayerWeights, LookAt } from './index.ts';
+import type { AnimContext, Layer, LayerWeights, LookAt, MoodLayer } from './index.ts';
 
 /** The issue's simulation step (#78 Validation): dt = 1/60 s. */
 const DT = 1 / 60;
@@ -103,6 +106,68 @@ function run(
     layer.update(DT, pose, ctx);
     each(i, (i + 1) * DT, pose);
   }
+}
+
+type Constructor = new (...args: never[]) => object;
+
+/** Wraps `original` so that every `new` of it, including those inside its static `from` and `of`, calls `onNew`. */
+function countingConstructor<C extends Constructor>(original: C, onNew: () => void): C {
+  return new Proxy(original, {
+    construct(target, args: never[], newTarget: Constructor): object {
+      onNew();
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+}
+
+/** `%TypedArray%.prototype`, which every typed array class inherits its methods from. */
+const TYPED_ARRAY_PROTOTYPE = Reflect.getPrototypeOf(Float32Array.prototype) ?? Float32Array.prototype;
+/** Its methods that return a new typed array. */
+const TYPED_ARRAY_METHODS = ['slice', 'map', 'filter', 'subarray', 'toReversed', 'toSorted', 'with'] as const;
+
+/**
+ * Runs `fn` and counts the allocations it makes through the array globals (the pattern of
+ * src/anim/pose.test.ts): every `new` of `Array`, `ArrayBuffer`, `Float32Array` or `Float64Array` (static
+ * `from` and `of` included, and `new` through a typed array's `constructor`), and every call of an allocating
+ * `%TypedArray%.prototype` method. Everything is restored afterwards.
+ */
+function countAllocations(fn: () => void): number {
+  let count = 0;
+  const onNew = (): void => {
+    count++;
+  };
+  const saved: { obj: object; key: string; desc: PropertyDescriptor }[] = [];
+  const patch = (obj: object, key: string, value: unknown): void => {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined) throw new Error(`nothing to patch at ${key}`);
+    saved.push({ obj, key, desc });
+    Object.defineProperty(obj, key, { ...desc, value });
+  };
+  const float32 = countingConstructor(Float32Array, onNew);
+  const float64 = countingConstructor(Float64Array, onNew);
+  patch(Float32Array.prototype, 'constructor', float32);
+  patch(Float64Array.prototype, 'constructor', float64);
+  patch(globalThis, 'Array', countingConstructor(Array, onNew));
+  patch(globalThis, 'ArrayBuffer', countingConstructor(ArrayBuffer, onNew));
+  patch(globalThis, 'Float32Array', float32);
+  patch(globalThis, 'Float64Array', float64);
+  for (const name of TYPED_ARRAY_METHODS) {
+    const original: unknown = Reflect.get(TYPED_ARRAY_PROTOTYPE, name);
+    if (typeof original !== 'function') throw new Error(`no %TypedArray%.prototype.${name}`);
+    patch(TYPED_ARRAY_PROTOTYPE, name, function (this: unknown, ...args: unknown[]): unknown {
+      count++;
+      return Reflect.apply(original, this, args);
+    });
+  }
+  try {
+    fn();
+  } finally {
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const { obj, key, desc } = saved[i]!;
+      Object.defineProperty(obj, key, desc);
+    }
+  }
+  return count;
 }
 
 describe('rng', () => {
@@ -786,5 +851,423 @@ describe('mood', () => {
     expect(mood.joy).toBe(0);
     expect(() => mood.bump('joy', Number.NaN)).toThrow(RangeError);
     expect(() => mood.bump('annoy', Number.POSITIVE_INFINITY)).toThrow(RangeError);
+  });
+});
+
+/** The channels each weighted layer may write. */
+const WEIGHTED: {
+  name: keyof LayerWeights;
+  make: () => Layer;
+  channels: number[];
+}[] = [
+  { name: 'blink', make: () => createBlink(), channels: [Ch.LidL, Ch.LidR] },
+  { name: 'breathing', make: () => createBreathing(), channels: [Ch.BodySquash, Ch.BellyJiggle] },
+  {
+    name: 'gaze',
+    make: () => createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }),
+    channels: [Ch.IrisX, Ch.IrisY, Ch.HeadRot, Ch.HeadTilt],
+  },
+  {
+    name: 'ears',
+    make: () => createEarTwitch({ earL: IDX.earL, earR: IDX.earR }),
+    channels: [Ch.EarRotL, Ch.EarRotR],
+  },
+];
+
+/** A base pose with every channel non-zero, so "adds" is told apart from "overwrites". */
+function base(): Pose {
+  const p = createPose();
+  for (let c = 0; c < CH_COUNT; c++) p[c] = 0.25 * ((c % 5) - 2) + 0.1;
+  return p;
+}
+
+describe('weights', () => {
+  /** Per-step deltas (pose − base) of `layer` at weight `w` for its key, other weights 0.37, over 60 s. */
+  function deltas(entry: (typeof WEIGHTED)[number], w: number): Float64Array {
+    const layer = entry.make();
+    const ctx = makeCtx(SEED, { blink: 0.37, breathing: 0.37, gaze: 0.37, ears: 0.37, [entry.name]: w });
+    const b = base();
+    const pose = createPose();
+    const steps = 3600;
+    const out = new Float64Array(steps * CH_COUNT);
+    for (let i = 0; i < steps; i++) {
+      ctx.springs.step(DT);
+      pose.set(b);
+      layer.update(DT, pose, ctx);
+      for (let c = 0; c < CH_COUNT; c++) out[i * CH_COUNT + c] = pose[c]! - b[c]!;
+    }
+    return out;
+  }
+
+  it.each(WEIGHTED.map((e) => [e.name, e] as const))(
+    '%s adds nothing at weight 0, its full amount at 1 and half at 0.5, on its own channels only',
+    (_name, entry) => {
+      const full = deltas(entry, 1);
+      const half = deltas(entry, 0.5);
+      const none = deltas(entry, 0);
+      let moved = 0;
+      let noneNonZero = 0;
+      let foreign = 0;
+      let halfErr = 0;
+      for (let i = 0; i < full.length; i++) {
+        const c = i % CH_COUNT;
+        if (none[i] !== 0) noneNonZero++;
+        if (!entry.channels.includes(c)) {
+          if (full[i] !== 0 || half[i] !== 0) foreign++;
+          continue;
+        }
+        halfErr = Math.max(halfErr, Math.abs(half[i]! - 0.5 * full[i]!));
+        if (Math.abs(full[i]!) > 1e-3) moved++;
+      }
+      expect(noneNonZero).toBe(0);
+      expect(foreign).toBe(0);
+      expect(halfErr).toBeLessThanOrEqual(1e-6);
+      expect(moved).toBeGreaterThan(10);
+    },
+  );
+
+  it('gives the full amount at weight 1: the iris, the springs and the breathing formula', () => {
+    const gaze = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const ctx = makeCtx();
+    run(gaze, ctx, 600, (_i, _t, pose) => {
+      expect(pose[Ch.IrisX]).toBe(Math.fround(gaze.irisX));
+      expect(pose[Ch.IrisY]).toBe(Math.fround(gaze.irisY));
+      expect(pose[Ch.HeadRot]).toBe(ctx.springs.pos[IDX.headRot]);
+      expect(pose[Ch.HeadTilt]).toBe(ctx.springs.pos[IDX.headTilt]);
+    });
+  });
+});
+
+/** All five layers with their context and pose, stepped by `stepAll`. */
+interface AllLayers {
+  ctx: AnimContext;
+  mood: MoodLayer;
+  layers: Layer[];
+  pose: Pose;
+  lookAt: LookAt;
+}
+
+function makeAll(seed: number): AllLayers {
+  const mood = createMood();
+  return {
+    ctx: makeCtx(seed),
+    mood,
+    layers: [
+      createBlink(),
+      createBreathing(),
+      createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }),
+      createEarTwitch({ earL: IDX.earL, earR: IDX.earR }),
+      mood,
+    ],
+    pose: createPose(),
+    lookAt: { x: 900, y: 200 },
+  };
+}
+
+/**
+ * Step `i` of all five layers, the app's way (#81: the bank, then the layers, on a cleared pose). `lookAt` is
+ * set during steps 1200–1499 of every 3000, and mood is bumped every 1000 steps. Allocates nothing itself.
+ */
+function stepAll(h: AllLayers, i: number): void {
+  const k = i % 3000;
+  h.ctx.lookAt = k >= 1200 && k < 1500 ? h.lookAt : null;
+  if (i % 1000 === 500) h.mood.bump(i % 2000 === 500 ? 'joy' : 'annoy', 0.6);
+  h.ctx.springs.step(DT);
+  h.pose.fill(0);
+  for (let l = 0; l < h.layers.length; l++) h.layers[l]!.update(DT, h.pose, h.ctx);
+}
+
+/** The pose after each of `steps` steps of all five layers, concatenated. */
+function runAll(seed: number, steps: number): Float32Array {
+  const h = makeAll(seed);
+  const out = new Float32Array(steps * CH_COUNT);
+  for (let i = 0; i < steps; i++) {
+    stepAll(h, i);
+    out.set(h.pose, i * CH_COUNT);
+  }
+  return out;
+}
+
+describe('determinism', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('replays the same pose sequence for the same seed, and a different one for another seed', () => {
+    const steps = 7200;
+    const a = runAll(SEED, steps);
+    const b = runAll(SEED, steps);
+    const c = runAll(SEED + 1, steps);
+    let sameDiffers = 0;
+    let otherDiffers = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (!Object.is(a[i], b[i])) sameDiffers++;
+      if (a[i] !== c[i]) otherDiffers++;
+    }
+    expect(sameDiffers).toBe(0);
+    expect(otherDiffers).toBeGreaterThan(1000);
+  });
+
+  it('never calls Math.random', () => {
+    vi.spyOn(Math, 'random').mockImplementation(() => {
+      throw new Error('a layer called Math.random');
+    });
+    expect(() => runAll(SEED, 7200)).not.toThrow();
+  });
+});
+
+/** A source of step sizes. */
+type DtSource = () => number;
+
+/** The app's substep and a seeded variable step in [1/240, 1/30]; each call starts a fresh sequence. */
+const DT_CASES: { name: string; make: () => DtSource }[] = [
+  { name: 'SUBSTEP (1/120 s)', make: () => () => SUBSTEP },
+  {
+    name: 'a seeded variable dt in [1/240, 1/30]',
+    make: () => {
+      const r = mulberry32(0xd7);
+      return () => uniform(r, 1 / 240, 1 / 30);
+    },
+  },
+];
+
+/**
+ * Steps `layer` the app's way with steps from `next` until the simulated time reaches `until`; after each
+ * step, `each(t, dt, pose)` observes it, t being the sum of the steps so far (compensated summation, so t
+ * stays exact to ~1e-12 s over 10 000 s of small steps).
+ */
+function runUntil(
+  layer: Layer,
+  ctx: AnimContext,
+  next: DtSource,
+  until: number,
+  each: (t: number, dt: number, pose: Pose) => void,
+): void {
+  const pose = createPose();
+  let t = 0;
+  let lost = 0;
+  while (t < until) {
+    const dt = next();
+    const y = dt - lost;
+    const sum = t + y;
+    lost = sum - t - y;
+    t = sum;
+    ctx.springs.step(dt);
+    pose.fill(0);
+    layer.update(dt, pose, ctx);
+    each(t, dt, pose);
+  }
+}
+
+/** A layer with an event counter, and the seconds since its latest event. */
+interface Timed {
+  layer: Layer & { readonly count: number };
+  since: () => number;
+}
+
+const TIMED: { name: string; make: () => Timed }[] = [
+  {
+    name: 'blink onsets',
+    make: () => {
+      const layer = createBlink();
+      return { layer, since: () => layer.sinceOnset };
+    },
+  },
+  {
+    name: 'saccades',
+    make: () => {
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      return { layer, since: () => layer.sinceSaccade };
+    },
+  },
+  {
+    name: 'ear twitches',
+    make: () => {
+      const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+      return { layer, since: () => layer.sinceTwitch };
+    },
+  },
+];
+
+/** The exact event times (t − since) of a fresh `timed` layer over 10 000 s with steps from `next`. */
+function eventTimes(timed: Timed, next: DtSource): number[] {
+  const out: number[] = [];
+  let count = 0;
+  runUntil(timed.layer, makeCtx(), next, 10_000, (t) => {
+    if (timed.layer.count !== count) {
+      count = timed.layer.count;
+      out.push(t - timed.since());
+    }
+  });
+  return out;
+}
+
+describe('dt robustness: exact timing at any step (the app runs the layers at SUBSTEP = 1/120 s)', () => {
+  const reference = TIMED.map((timed) => eventTimes(timed.make(), () => DT));
+
+  describe.each(DT_CASES)('at $name', ({ make }) => {
+    it.each(TIMED.map((timed, k) => [timed.name, k] as const))(
+      'dates the %s exactly as at dt = 1/60 (within 1e-9 s)',
+      (_name, k) => {
+        const ref = reference[k]!.filter((t) => t < 9990);
+        const got = eventTimes(TIMED[k]!.make(), make()).filter((t) => t < 9990);
+        expect(ref.length).toBeGreaterThan(600);
+        expect(got).toHaveLength(ref.length);
+        let maxErr = 0;
+        for (let j = 0; j < ref.length; j++) maxErr = Math.max(maxErr, Math.abs(got[j]! - ref[j]!));
+        expect(maxErr).toBeLessThanOrEqual(1e-9);
+      },
+    );
+
+    it('shuts the first single blink at 0.06 s within one step, and has it open at the first step from 0.18 s', () => {
+      const layer = createBlink();
+      let count = 0;
+      let doubles = 0;
+      /** `count` of the first single blink, once it has started. */
+      let single = 0;
+      let onset = Number.NaN;
+      let prevPhase = Number.NaN;
+      let shutPhase = Number.NaN;
+      let shutPrevPhase = Number.NaN;
+      let openLid = Number.NaN;
+      runUntil(layer, makeCtx(), make(), 60, (t, _dt, pose) => {
+        if (layer.count !== count) {
+          if (single === 0 && layer.doubles === doubles) {
+            single = layer.count;
+            onset = t - layer.sinceOnset;
+          }
+          count = layer.count;
+          doubles = layer.doubles;
+        }
+        if (single === 0 || layer.count !== single) return;
+        const phase = t - onset;
+        const lid = pose[Ch.LidL]!;
+        if (Number.isNaN(shutPhase) && lid >= 1 - 1e-6) {
+          shutPhase = phase;
+          shutPrevPhase = prevPhase;
+        }
+        if (Number.isNaN(openLid) && phase >= 0.18) openLid = lid;
+        prevPhase = phase;
+      });
+      expect(single).toBeGreaterThan(0);
+      // The first step whose phase is at or past 0.06 s is the first shut one.
+      expect(shutPhase).toBeGreaterThanOrEqual(0.06 - 1e-9);
+      expect(shutPrevPhase).toBeLessThan(0.06);
+      expect(openLid).toBeLessThanOrEqual(1e-6);
+    });
+
+    it('decays mood to 1/e in 8 s ± 0.1', () => {
+      const mood = createMood();
+      mood.bump('joy', 1);
+      mood.bump('annoy', 1);
+      let joyAt = Number.NaN;
+      let annoyAt = Number.NaN;
+      runUntil(mood, makeCtx(), make(), 9, (t) => {
+        if (Number.isNaN(joyAt) && mood.joy <= 1 / Math.E) joyAt = t;
+        if (Number.isNaN(annoyAt) && mood.annoy <= 1 / Math.E) annoyAt = t;
+      });
+      expect(Math.abs(joyAt - 8)).toBeLessThanOrEqual(0.1);
+      expect(Math.abs(annoyAt - 8)).toBeLessThanOrEqual(0.1);
+    });
+
+    it('breathes 0.012·sin(2π·0.25·t) (belly + 0.2 cycles) within 1e-7, t = Σdt', () => {
+      let maxErr = 0;
+      runUntil(createBreathing(), makeCtx(), make(), 80, (t, _dt, pose) => {
+        maxErr = Math.max(
+          maxErr,
+          Math.abs(pose[Ch.BodySquash]! - 0.012 * Math.sin(TAU * 0.25 * t)),
+          Math.abs(pose[Ch.BellyJiggle]! - 0.012 * Math.sin(TAU * 0.25 * t + 0.2 * TAU)),
+        );
+      });
+      expect(maxErr).toBeLessThanOrEqual(1e-7);
+    });
+
+    it.each<[string, LookAt]>([
+      ['right', { x: 1500, y: 385 }],
+      ['down', { x: 500, y: 1385 }],
+    ])('settles the head at 30 %% ± 3 %% of the follow with lookAt held to the %s', (_side, lookAt) => {
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      const ctx = makeCtx();
+      ctx.lookAt = lookAt;
+      const last = createPose();
+      runUntil(layer, ctx, make(), 5, (_t, _dt, pose) => {
+        last.set(pose);
+      });
+      const [iris, head] = lookAt.x !== EYES_CENTER.x ? [Ch.IrisX, Ch.HeadRot] : [Ch.IrisY, Ch.HeadTilt];
+      expect(Math.abs(last[iris]!)).toBeGreaterThan(9.99);
+      const r = last[head]! / ((last[iris]! / 10) * 0.12);
+      expect(r).toBeGreaterThanOrEqual(0.27);
+      expect(r).toBeLessThanOrEqual(0.33);
+    });
+  });
+});
+
+/** The `gc` function, exposed once at runtime with Node built-ins only (no `--expose-gc` flag needed). */
+let exposedGc: (() => void) | undefined;
+
+/** Runs a full garbage collection (the pattern of src/anim/clip.test.ts). */
+function forceGc(): void {
+  if (exposedGc === undefined) {
+    setFlagsFromString('--expose-gc');
+    const gc: unknown = runInNewContext('gc');
+    if (typeof gc !== 'function') throw new Error('gc() is not available');
+    exposedGc = (): void => {
+      gc();
+    };
+  }
+  exposedGc();
+}
+
+/**
+ * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ */
+function heapGrowth(fn: () => void): number {
+  forceGc();
+  const profiler = new GCProfiler();
+  profiler.start();
+  const before = process.memoryUsage().heapUsed;
+  fn();
+  const growth = process.memoryUsage().heapUsed - before;
+  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+}
+
+describe('allocation: no layer allocates per update', () => {
+  it('makes no array or typed-array allocation over 60 000 steps of all five layers', () => {
+    const h = makeAll(SEED);
+    stepAll(h, 0);
+    const allocations = countAllocations(() => {
+      for (let i = 1; i <= 60_000; i++) stepAll(h, i);
+    });
+    expect(allocations).toBe(0);
+  });
+
+  it('grows the heap by < 1 MB over 50 000 steps of all five layers, once V8 has optimised them', () => {
+    const h = makeAll(SEED);
+    let i = 0;
+    const steps50k = (): void => {
+      for (let n = 0; n < 50_000; n++) stepAll(h, i++);
+    };
+    // As in src/anim/clip.test.ts: warm up so V8's optimising tiers take over (the interpreter boxes every
+    // double), then take the best of up to 20 runs, each from a freshly collected heap; a run during which any
+    // GC ran counts as +Infinity. A layer that really allocates does so in every run: one 32-byte object per
+    // update of one layer is 1.6 MB here.
+    forceGc();
+    for (let w = 0; w < 10; w++) steps50k();
+    const LIMIT = 1_048_576;
+    let best = heapGrowth(steps50k);
+    for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(steps50k));
+    expect(best).toBeLessThan(LIMIT);
+  });
+
+  it('both meters have teeth (positive controls)', () => {
+    expect(countAllocations(() => void new Float32Array(1))).toBe(1);
+    expect(countAllocations(() => void Array.from({ length: 3 }))).toBeGreaterThan(0);
+    const kept: number[][] = [];
+    const growth = heapGrowth(() => {
+      for (let n = 0; n < 10_000; n++) kept.push(Array.from({ length: 64 }, (_, j) => j + 0.5));
+    });
+    expect(kept).toHaveLength(10_000);
+    expect(growth).toBeGreaterThanOrEqual(1_048_576);
   });
 });
