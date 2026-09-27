@@ -17,19 +17,30 @@ The orchestrator keeps the live status on GitHub, as `ORCH-STATE` comments on ea
 
 ## Phase 0 — one-time setup (you)
 
-- [ ] **Open and merge the planning follow-up PR** (branch `claude/talking-bear-planning-k6a0vj`). PR #2 (the research spikes) is already merged. The follow-up carries the plan corrections that the issues rely on (Kaiser β = 6.0, the Silero parity tiers, the proximity gate, the escalation windows), plus the `.claude/` orchestration package. The orchestrator refuses to start until both are on `main`.
-- [ ] **Environment check** (Claude Code on the web → your environment's settings).
-  - **Network policy** must allow:
-    - `registry.npmjs.org`;
-    - `github.com`, `api.github.com`, `codeload.github.com`, `objects.githubusercontent.com`, `raw.githubusercontent.com`;
-    - for M7, the Go proxy (`proxy.golang.org`, `sum.golang.org`) and the container registries (`registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com`, `gcr.io`, `ghcr.io`);
-    - for T39 (espeak-ng), the Debian/Ubuntu package mirrors.
-  - **Docker, Go 1.27 and espeak-ng** are probably *not* available in the sandbox. That's fine: those tasks validate through CI (draft PR), or ask you. If you'd rather have them local, add them to the environment's setup script.
+- [ ] **Merge the planning follow-up PR** (branch `claude/talking-bear-planning-k6a0vj`). It carries the plan corrections the issues rely on (Kaiser β = 6.0, the Silero parity tiers, the proximity gate, the escalation windows) and this `.claude/` orchestration package. The orchestrator refuses to start until both are on `main`. (The planning session opens and merges it for you.)
+- [ ] **Environment setup script** (Claude Code on the web → the cloud environment menu in the session's title bar → Edit → Setup script). The default container has Node 22, pnpm 10 and a Chromium build for an older Playwright; the repo pins Node 24.21.0, pnpm 12.6.0 and Playwright 1.63.0. Without this, most browser tests can only validate in CI, which is much slower. Suggested script:
+
+  ```bash
+  set -eu
+  # Node 24.21.0 + pnpm 12.6.0, first on PATH
+  mkdir -p /opt/node24 /root/.local/bin
+  curl -fsSL https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz | tar -xJ -C /opt/node24 --strip-components=1
+  /opt/node24/bin/npm install -g pnpm@12.6.0 --ignore-scripts
+  ln -sf /opt/node24/bin/node /opt/node24/bin/npm /opt/node24/bin/npx /opt/node24/bin/pnpm /root/.local/bin/
+  # Chromium for Playwright 1.63 (needs the Playwright download hosts allowed, below)
+  env -u PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+    /opt/node24/bin/npx -y playwright@1.63.0 install chromium || echo "Playwright browser download failed: browser tests will validate in CI"
+  # espeak-ng for T39 (the one-off TTS corpus)
+  apt-get update -qq && apt-get install -y -qq espeak-ng || echo "espeak-ng unavailable: T39 will ask you"
+  ```
+
+  Go needs nothing: `server/go.mod` asks for Go 1.27.1, and the installed Go downloads it through `proxy.golang.org`. There is **no Docker daemon** in the sandbox; Docker tasks (T95–T99) validate through their CI jobs.
+- [ ] **Network access** (same Edit screen). Allowed today: npm, `proxy.golang.org`, GitHub, `nodejs.org`, `archive.ubuntu.com`. Add the Playwright browser hosts `cdn.playwright.dev` and `playwright.download.prss.microsoft.com` for the script above. For T32 (Silero weights), allow the host the issue fetches from if the task reports it blocked.
 - [ ] **Optional labels:** create `task`, `agent`, `owner-device`, `blocked` and `needs-human` in the repo's Labels page. The issue tooling can't create labels, so the tasks currently carry only `m1`–`m8`.
-- [ ] **Decide the merge policy.** `human` (default): you review and merge every PR. `auto`: the orchestrator squash-merges when CI is green, all review threads are resolved, and a high-effort Opus review finds no blockers. Set it in the start prompt.
-- [ ] **Decide parallelism.** Default is 3 concurrent tasks. More means more merge conflicts on shared files.
+- [ ] **Merge policy.** `auto` (recommended; you asked not to be the bottleneck): the orchestrator squash-merges green, up-to-date, in-scope, Opus-reviewed PRs, and leaves release and workflow-permission changes to you. `human`: you merge every PR.
+- [ ] **Parallelism.** Default is 3 concurrent tasks. More means more merge conflicts on shared files.
 - [ ] **Start the orchestrator:** a new Claude Code session on this repo, model **Opus 5.5**, with the start message in [`README.md`](README.md) (`/orchestrate …`).
-- [ ] **Keep notifications on.** The orchestrator pings you through push notifications when an owner task is ready, a task is blocked on a question, or a PR is ready for you to merge.
+- [ ] **Keep an eye on the session or the dashboard.** The orchestrator push-notifies you when an owner task is ready, a task is blocked on a question, or a PR needs your merge. If push notifications aren't available in the session, it says so, and the "Waiting on you" list on #3 is the place to look.
 
 ## Owner checkpoints (plan your device time)
 
@@ -37,19 +48,19 @@ Each owner task becomes *ready* when its blockers close. The orchestrator tells 
 
 | Owner task | Issue | Ready after | Gates (agent work waiting on you) | What you do |
 |---|---|---|---|---|
-| T31 m1-device | #42 | T26 #37, T27 #38, T28 #39, T29 #40, T30 #41 | — (milestone exit only) | ~2–3 h: M1 lab experiments on D1 (routing, latency, continuity, platform), plus the 50-loop self-trigger check |
+| T31 m1-device | #42 | T26 #37, T27 #38, T28 #39, T29 #40, T30 #41 | — (milestone exit only) | ~2–3 h: M1 lab experiments on D1 (routing, latency, continuity, platform), plus the 50-loop self-trigger check. Do T108 in the same sitting. |
 | T47 vad-session-a | #58 | T44 #55, T43 #54, T40 #51 | T48 #59 | ~1.5 h: X-V2 bench; record session-A feature traces (180 phrases + noise); idle CPU |
 | T49 vad-session-b | #60 | T48 #59, T46 #57 | T50 #61 | ~1.5 h on a *different day*: session-B traces; live VAD check |
 | T59 m3-listening | #70 | T56 #67, T57 #68, T58 #69, T55 #66 | T60 #71 | ~1 h + listeners (≥ 5, kids if possible): voice A/B/X votes, spectrum, voice-chain timing |
 | T65 bear-review | #76 | T64 #75 | T73 #84 | 10 min: approve Juni's first render (or list changes) |
 | T73 m4-device | #84 | T70 #81, T71 #82, T72 #83, T65 #76 | — (milestone exit only) | ~1.5 h: perf, lip-sync constant L, mouth features, heap check |
 | T84 m5-device | #95 | T82 #93, T83 #94 | T85 #96 | ~1.5 h + ≥ 5 people: gesture traces, long-press hygiene, sfx never records |
-| T91 m6-device | #102 | T89 #100, T90 #101 | — (milestone exit only) | ~1 h: install WebAPK, airplane-mode start, permission behaviour |
-| T101 release-v010 | #112 | T100 #111, T98 #109 | — (milestone exit only) | 20 min: tag v0.1.0, make the GHCR package public, verify |
-| T108 x-e8-e4 | #119 | T104 #115 | T109 #120 | ~45 min: phone call/alarm behaviour, Bluetooth headset |
+| T91 m6-device | #102 | T101 #112 (plus T89, T90) | — (milestone exit only) | ~1 h, **same sitting as T101**, on the deployed origin: install the WebAPK, airplane-mode cold start, permissions, update propagation |
+| T101 release-v010 | #112 | T100 #111, T98 #109 | T91 #102 | 20 min: tag v0.1.0, make the GHCR package public, verify; then deploy and do T91 |
+| T108 x-e8-e4 | #119 | same as T31 | T109 #120 | ~45 min, **same sitting as T31**: phone call/alarm during listening and playback, Bluetooth headset (remote DevTools snippets in the issue) |
 | T112 m8-final | #123 | T110 #121, T111 #122, T103 #114 | — (milestone exit only) | ~half day: full §10 checklist, battery/thermal runs, budgets, tag v1.0.0 |
 
-**Critical path:** T47 → T48 → T49 → T50 (VAD tuning) and T108 → T109 → T110 → T112 (M8) are gated by device sessions. Schedule T47 (session A) as soon as it's ready, and session B at least a day later.
+**Critical path:** with 3 tasks in parallel, throughput (112 tasks) matters more than any single chain. The device-gated chains still set the pace late in the project: T47 → T48 → T49 → T50 (VAD tuning; session B at least a day after session A) and T101 → T91 (release, then the M6 phone checks). Do T47 as soon as it's ready.
 
 ## Milestone checklists
 

@@ -183,7 +183,7 @@ Before `ci.yml` exists on `main` (T01, T02), a PR with no check runs counts as g
 ## §3 Startup and resume (idempotent; run it on every start)
 
 1. **Preconditions.** Stop and tell the human if any of these fails:
-   - `origin/main` contains `.claude/agents/task-owner.md`, `.claude/skills/orchestrate/SKILL.md`, `tasks.json` and `sched.py`;
+   - `origin/main` contains `.claude/agents/task-owner.md`, `.claude/skills/orchestrate/SKILL.md`, `tasks.json`, `sched.py` and `heavy.sh`;
    - `git show origin/main:docs/plan.md | grep -q 'β = 6.0'` succeeds, i.e. the plan corrections are merged;
    - the permissions grant is present (§0).
 
