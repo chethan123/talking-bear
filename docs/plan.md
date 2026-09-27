@@ -486,7 +486,7 @@ stateDiagram-v2
   - P4: "big" reaction (laugh fit, dizzy, hug)
 - **Interruption rule:** a new reaction interrupts only if its priority ≥ the current one. Otherwise it is queued (queue length 1, dropped after 500 ms).
 - **Cooldown:** 800 ms per (region, gesture).
-- **Escalation:** the same reaction ×3 within 4 s escalates to its P4 variant.
+- **Escalation:** by default, the same reaction ×3 within 4 s escalates to its P4 variant. The specific windows in [§4.6.4](#464-gesture--region--reaction) take precedence: a head flick ×3 in 3 s → dizzy, and a belly tickle continuous for > 3 s → laugh fit. The nose's big sneeze comes from the recogniser's multi-poke count. A higher-priority reaction is never blocked by the 800 ms cooldown.
 - **While `Talking`:** P2 is additive flinch only; P3 and above emit `requestStopPlayback` (session rows 29–30).
 
 ---
