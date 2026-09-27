@@ -262,6 +262,14 @@ describe('createVoicing: the formula', () => {
     expect(createVoicing().score(pulses(WIN, [200, 300]))).toBeCloseTo(0.5, 9);
   });
 
+  it('is clamped to at least 0 when every lag correlates negatively', () => {
+    // 27 samples: the only lag is 26, and r(26) = (1 · −1) / sqrt(1 · 1 + 1e-12) ≈ −1.
+    const x = pulses(27, [0, 26]);
+    x[26] = -1;
+    expect(referenceScore(x)).toBe(0);
+    expect(createVoicing().score(x)).toBe(0);
+  });
+
   it('is 1, clamped to at most 1, for exactly periodic windows', () => {
     // 1000 windows repeating a random cycle. Rounding puts the unclamped peak r(period) at 1 + 2.2e-16 for a few
     // of them (8 of these 1000), so this also exercises the upper clamp.
