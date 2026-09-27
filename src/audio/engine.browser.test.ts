@@ -466,7 +466,7 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(workers).toHaveLength(workerCount + 1);
   }, 15_000);
 
-  test('15: suspend() and resume(); a suspend() while ctx.resume() is pending wins, with no ctxRunning', async () => {
+  test('15: suspend() and resume(); a suspend() that lands while ctx.resume() is pending wins', async () => {
     const ctx = engine.context();
     if (ctx === null) throw new Error('no context');
     await engine.suspend();
@@ -476,21 +476,34 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(ctx.state).toBe('running');
     expect(log.slice(from)).toContainEqual({ t: 'ctxRunning', sampleRate: sr });
 
+    // The race is scripted on this instance: ctx.resume() stays pending until a suspend() has landed. (A real
+    // ctx.resume() overtaken by a suspend() may never settle in Chrome, or may settle with the context running.)
     await engine.suspend();
-    const resumeContext = ctx.resume.bind(ctx);
-    ctx.resume = (): Promise<void> => {
-      const running = resumeContext();
-      void engine.suspend(); // lands while the engine awaits ctx.resume()
-      return running;
+    const pending: { settle?: () => void } = {};
+    let suspendCalls = 0;
+    const suspendContext = ctx.suspend.bind(ctx);
+    ctx.resume = (): Promise<void> =>
+      new Promise<void>((resolve) => {
+        pending.settle = resolve;
+      });
+    ctx.suspend = (): Promise<void> => {
+      suspendCalls++;
+      return suspendContext();
     };
     from = log.length;
     try {
-      await engine.resume();
+      const resuming = engine.resume();
+      for (let i = 0; pending.settle === undefined && i < 100; i++) await sleep(1);
+      if (pending.settle === undefined) throw new Error('resume() never reached ctx.resume()');
+      await engine.suspend();
+      pending.settle();
+      await resuming;
     } finally {
       Reflect.deleteProperty(ctx, 'resume');
+      Reflect.deleteProperty(ctx, 'suspend');
     }
-    await sleep(100);
     expect(count('ctxRunning', from)).toBe(0);
+    expect(suspendCalls).toBe(2); // the suspend() itself, then the engine's re-suspend after the raced resume
     expect(ctx.state).toBe('suspended');
   }, 10_000);
 
