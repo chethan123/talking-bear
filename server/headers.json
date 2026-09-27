@@ -1,0 +1,38 @@
+{
+  "common": {
+    "Content-Security-Policy": "default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; style-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+    "Permissions-Policy": "microphone=(self), screen-wake-lock=(self), autoplay=(self), fullscreen=(self), camera=(), geolocation=(), display-capture=(), usb=(), serial=(), midi=(), payment=(), accelerometer=(), gyroscope=(), magnetometer=(), idle-detection=(), publickey-credentials-get=(), browsing-topics=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer"
+  },
+  "htmlOnly": {},
+  "cacheControl": [
+    { "match": "/assets/**", "value": "public, max-age=31536000, immutable" },
+    { "match": "/", "value": "no-cache" },
+    { "match": "/index.html", "value": "no-cache" },
+    { "match": "/sw.js", "value": "no-cache" },
+    { "match": "/manifest.webmanifest", "value": "no-cache" },
+    { "match": "**", "value": "no-cache" }
+  ],
+  "errorCacheControl": "no-store",
+  "mime": {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
+    ".wasm": "application/wasm",
+    ".bin": "application/octet-stream",
+    ".onnx": "application/octet-stream",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".woff2": "font/woff2",
+    ".wav": "audio/wav",
+    ".ico": "image/x-icon",
+    ".txt": "text/plain; charset=utf-8"
+  }
+}
