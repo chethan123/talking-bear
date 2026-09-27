@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: sound effects</title>
+    <script type="module" src="./sfx.ts"></script>
+  </head>
+  <body>
+    <h1>Sound effects</h1>
+    <p>
+      One button per reaction sound (plan §4.6.4). Each plays through the master bus (gain 0.7) and the sfx
+      scheduler, as in the app. Beside each: its duration and its sample peak, from an offline render at this
+      context's sample rate (the cap is −9 dBFS). Tune a recipe's constants in
+      <code>src/audio/sfx-synths.ts</code>; the page reloads.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Sound</th>
+          <th>Duration</th>
+          <th>Peak</th>
+        </tr>
+      </thead>
+      <tbody id="sfx-rows"></tbody>
+    </table>
+    <p id="sfx-status" aria-live="polite"></p>
+  </body>
+</html>
