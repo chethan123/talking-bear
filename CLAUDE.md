@@ -73,7 +73,15 @@ talking-bear/
 
 ## Commands
 
-_Filled in by T02._
+- `pnpm dev`: starts the Vite dev server.
+- `pnpm build`: builds the production bundle into `dist/`.
+- `pnpm preview`: serves `dist/` with `vite preview` on port 4173 (fails if the port is taken).
+- `pnpm lint`: runs oxlint with the type-aware rules (oxlint-tsgolint) across all five TypeScript projects.
+- `pnpm format`: rewrites every file Prettier handles (`.prettierignore` skips `docs/`, `.claude/`, root Markdown and generated files).
+- `pnpm format:check`: checks formatting without writing.
+- `pnpm typecheck`: runs `tsc -b` over the five project references (app, worklet, worker, node, test).
+- `pnpm test`: runs the Vitest `node` project once.
+- `pnpm verify`: runs lint, format:check, typecheck and test in that order; it must pass before every PR.
 
 ## Rules
 
@@ -87,6 +95,7 @@ _Filled in by T02._
 8. One task = one branch `task/tNN-slug` = one PR titled `[TNN] …` containing `Closes #<issue>`.
 9. Run the task's **Validation** commands before opening the PR. Never skip, disable or weaken tests or thresholds.
 10. If blocked or anything is ambiguous, comment on the issue with the exact question or output and stop.
+11. Relative imports inside `src/dsp`, `src/workers` and `src/audio/constants.ts` always end in `.ts`, and only erasable TypeScript syntax is used (no enums, no parameter properties, no namespaces), so Node scripts can import them with type stripping.
 
 ## Glossary
 
