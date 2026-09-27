@@ -36,3 +36,15 @@ export function emptyEnvelope(): Envelope {
     teeth: new Float32Array(0),
   };
 }
+
+/**
+ * The voice chain's result (plan §4.3.4): the processed clip `pcm`, which plays at rate 1, its mouth envelope
+ * (computed from exactly that buffer), its duration `pcm.length / fs` in seconds, and `clipped`, whether the
+ * input take was clipped (at least 0.1 % of samples with |x| > 0.99, plan §4.4), for M8's "too loud" reaction.
+ */
+export interface VoiceResult {
+  pcm: Float32Array;
+  envelope: Envelope;
+  durationSec: number;
+  clipped: boolean;
+}
