@@ -3,11 +3,16 @@ import { runInNewContext } from 'node:vm';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
+import { BASE } from './base-poses.ts';
+import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
 import type { Clip, Key } from './clip.ts';
 import { Ch, CH_COUNT, createPose } from './pose.ts';
 
 type Ease = Key['ease'];
+const DEG = Math.PI / 180;
+/** The mouth channels, which only the mouth layer writes (#79's `evaluate` never touches them). */
+const MOUTH = [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth] as const;
 /** Every ease, including the default (`undefined` = linear). */
 const EASES: readonly Ease[] = ['linear', 'inOut', 'in', 'out', undefined];
 
@@ -355,5 +360,85 @@ describe('sampleClip: validation 5, no allocation (10 000 samples, heap growth <
     });
     expect(kept).toHaveLength(SAMPLES);
     expect(growth).toBeGreaterThanOrEqual(1_048_576);
+  });
+});
+
+describe('BASE: the base-state poses', () => {
+  const NAMES: readonly BaseName[] = ['asleep', 'idle', 'attentive', 'thinking', 'talking', 'dozing'];
+  /**
+   * The issue's table: [channel, value, radians?]. Radians are the issue's 4-decimal values and match
+   * within 1e-4; every other value matches exactly (as float32).
+   */
+  const EXPECTED: Record<BaseName, readonly (readonly [ch: number, v: number, rad: boolean])[]> = {
+    attentive: [
+      [Ch.HeadTilt, 0.1396, true],
+      [Ch.EarRotL, -0.1745, true],
+      [Ch.EarRotR, -0.1745, true],
+      [Ch.BrowL, 6, false],
+      [Ch.BrowR, 6, false],
+      [Ch.BodyLean, 0.0524, true],
+    ],
+    asleep: [
+      [Ch.LidL, 1, false],
+      [Ch.LidR, 1, false],
+      [Ch.HeadTilt, -0.1047, true],
+      [Ch.BodySquash, -0.02, false],
+      [Ch.EarFoldL, 0.3, false],
+      [Ch.EarFoldR, 0.3, false],
+    ],
+    dozing: [
+      [Ch.LidL, 0.6, false],
+      [Ch.LidR, 0.6, false],
+      [Ch.HeadTilt, -0.0524, true],
+    ],
+    thinking: [
+      [Ch.IrisY, -6, false],
+      [Ch.IrisX, 4, false],
+      [Ch.BrowL, 4, false],
+      [Ch.HeadRot, 0.0698, true],
+    ],
+    idle: [],
+    talking: [],
+  };
+
+  it('has exactly the six director base states', () => {
+    expect(Object.keys(BASE).toSorted()).toEqual(NAMES.toSorted());
+  });
+
+  it('gives every state its own Float32Array of CH_COUNT channels', () => {
+    for (const name of NAMES) {
+      expect(BASE[name], name).toBeInstanceOf(Float32Array);
+      expect(BASE[name], name).toHaveLength(CH_COUNT);
+    }
+    expect(new Set(NAMES.map((name) => BASE[name].buffer)).size).toBe(NAMES.length);
+  });
+
+  it.each(NAMES)('%s has the issue table values and 0 on every other channel', (name) => {
+    const p = BASE[name];
+    const listed = new Map(EXPECTED[name].map(([ch, v, rad]) => [ch, { v, rad }]));
+    for (let ch = 0; ch < CH_COUNT; ch++) {
+      const e = listed.get(ch);
+      if (e === undefined) expect(p[ch], `${name} channel ${ch}`).toBe(0);
+      else if (e.rad) expect(Math.abs(p[ch]! - e.v), `${name} channel ${ch}`).toBeLessThanOrEqual(1e-4);
+      else expect(p[ch], `${name} channel ${ch}`).toBe(Math.fround(e.v));
+    }
+  });
+
+  it('idle and talking are neutral', () => {
+    expect(Array.from(BASE.idle)).toEqual(Array.from(createPose()));
+    expect(Array.from(BASE.talking)).toEqual(Array.from(createPose()));
+  });
+
+  it('no base pose writes a mouth channel', () => {
+    for (const name of NAMES) for (const ch of MOUTH) expect(BASE[name][ch], `${name} channel ${ch}`).toBe(0);
+  });
+
+  it('the radians are the issue degrees converted exactly (8°, −10°, 3°, −6°, −3°, 4°)', () => {
+    expect(BASE.attentive[Ch.HeadTilt]).toBe(Math.fround(8 * DEG));
+    expect(BASE.attentive[Ch.EarRotL]).toBe(Math.fround(-10 * DEG));
+    expect(BASE.attentive[Ch.BodyLean]).toBe(Math.fround(3 * DEG));
+    expect(BASE.asleep[Ch.HeadTilt]).toBe(Math.fround(-6 * DEG));
+    expect(BASE.dozing[Ch.HeadTilt]).toBe(Math.fround(-3 * DEG));
+    expect(BASE.thinking[Ch.HeadRot]).toBe(Math.fround(4 * DEG));
   });
 });
