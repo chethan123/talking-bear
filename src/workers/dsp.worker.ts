@@ -34,9 +34,16 @@ function onFrame(e: MessageEvent<WorkletToWorker>): void {
   }
 }
 
-/** A new VadCore on the given channel. A later init replaces both; the previous port is closed. */
+/** A new VadCore on the given channel. A later init replaces both; the previous port is closed. On failure
+ *  (a bad ctxRate) the new port is closed and the previous wiring stays. */
 function init(ctxRate: number, next: MessagePort): void {
-  const nextCore = new VadCore(ctxRate, post); // throws on a bad ctxRate: the previous wiring stays
+  let nextCore: VadCore;
+  try {
+    nextCore = new VadCore(ctxRate, post);
+  } catch (err) {
+    next.close();
+    throw err;
+  }
   if (port !== null) {
     port.removeEventListener('message', onFrame);
     port.close();

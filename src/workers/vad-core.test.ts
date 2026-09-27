@@ -199,16 +199,20 @@ describe('VadCore epochs and reset', () => {
 
   it('reset clears the hop remainder, segmenter, gate and epoch start', () => {
     const frames = frames16k(fixture('vowel_f0-140'));
+    // Epoch 2 has speech from its first frame, so only a fresh epoch start gives the full onset block.
+    const cut = frames16k(fixture('vowel_f0-140').subarray(SPEECH_START));
     const a = newCore();
     a.core.reset(1, 'energy');
-    feed(a, 1, frames.slice(0, 70)); // stop mid-utterance, with a hop remainder pending
+    // Stop mid-utterance (2.27 s), with a hop remainder pending: 71 · 512 = 227 · 160 + 32 samples.
+    feed(a, 1, frames.slice(0, 71));
     a.core.reset(2, 'energy');
     a.msgs.length = 0;
-    feed(a, 2, frames, 777);
+    feed(a, 2, cut, 777);
     const b = newCore();
     b.core.reset(2, 'energy');
-    feed(b, 2, frames, 777);
+    feed(b, 2, cut, 777);
     expect(a.msgs).toEqual(b.msgs);
+    expect(segs(a.msgs)[0]).toEqual({ kind: 'start', frame: 777 + ONSET_BLOCK_FRAMES });
   });
 
   it("reset(e, 'silero') posts the M1 error and continues with energy", () => {
@@ -340,10 +344,26 @@ describe('dsp.worker glue', () => {
     expect(second.listeners).toHaveLength(1);
   });
 
+  it('a failed init closes the new port and keeps the previous wiring', () => {
+    const good = new FakePort();
+    const bad = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: good });
+    self.dispatch({ t: 'init', ctxRate: Number.NaN, port: bad });
+    expect(bad.closed).toBe(true);
+    expect(bad.listeners).toHaveLength(0);
+    expect(good.closed).toBe(false);
+    expect(good.listeners).toHaveLength(1);
+    const errors = ofType(
+      self.posted.map((p) => p.msg),
+      'error',
+    );
+    expect(errors.map((m) => m.where)).toEqual(['vad']);
+  });
+
   it('turns handler exceptions into error messages', () => {
     self.dispatch({ t: 'reset', epoch: 1, vad: 'energy' });
+    self.dispatch({ t: 'init', ctxRate: Number.NaN, port: new FakePort() });
     const port = new FakePort();
-    self.dispatch({ t: 'init', ctxRate: Number.NaN, port });
     self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
     self.dispatch({ t: 'reset', epoch: 1, vad: 'energy' });
     port.dispatch({ t: 'frame', epoch: 1, firstFrame: 0, pcm16k: new Float32Array(3) });
