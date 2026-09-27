@@ -4,7 +4,8 @@
 // STFT basis is the periodic-Hann DFT that the TS port regenerates in code. Reruns are byte-identical.
 //
 // Usage: pnpm silero:extract (node scripts/extract-silero-weights.ts). Downloads and verifies the ONNX
-// file first if .cache/silero/ doesn't hold it (see scripts/fetch-silero-onnx.ts).
+// file first if .cache/silero/ doesn't hold it (see scripts/fetch-silero-onnx.ts). Exits 1 if the written
+// weights.bin doesn't match WEIGHTS_SHA256 in src/dsp/silero/weights.ts.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -157,9 +158,12 @@ async function main(): Promise<number> {
   );
   console.log('wrote src/dsp/silero/weights.provenance.json');
   if (result.provenance.weightsSha256 !== WEIGHTS_SHA256) {
+    // The pinned source is verified, so this only happens when the extractor or the layout changed.
     console.error(
-      `note: set WEIGHTS_SHA256 in src/dsp/silero/weights.ts to '${result.provenance.weightsSha256}'`,
+      `silero:extract: weights.bin changed (SHA-256 ${result.provenance.weightsSha256}), but WEIGHTS_SHA256 in ` +
+        `src/dsp/silero/weights.ts is ${WEIGHTS_SHA256}. Review why, then update WEIGHTS_SHA256.`,
     );
+    return 1;
   }
   return 0;
 }
