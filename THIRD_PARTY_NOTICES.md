@@ -1,0 +1,35 @@
+# Third-party notices
+
+Talking Bear itself is MIT licensed (see `LICENSE`). It ships the following third-party material.
+
+## Silero VAD (model weights)
+
+- Upstream: https://github.com/snakers4/silero-vad
+- Commit: `5cd7945676eb32225748052e2e6a0580e4686a08` (tag `v6.2.3`)
+- Source file: `src/silero_vad/data/silero_vad_16k_op15.onnx` (SHA-256 `7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49`)
+- Shipped as: `src/dsp/silero/weights.bin`, the model weights converted to fp16 by `scripts/extract-silero-weights.ts` (details in `src/dsp/silero/weights.provenance.json`)
+- Licence: MIT. The full licence text, copied verbatim from https://github.com/snakers4/silero-vad/blob/5cd7945676eb32225748052e2e6a0580e4686a08/LICENSE:
+
+```text
+MIT License
+
+Copyright (c) 2020-present Silero Team
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
