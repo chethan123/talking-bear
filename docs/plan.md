@@ -1,4 +1,4 @@
-# Juni, the talking bear (repo `talking-bear`): implementation plan
+# Talking Bear: implementation plan
 
 **Status:** plan only. No application code exists yet.
 **Date:** 2026-09-26.
@@ -1066,7 +1066,7 @@ All sound effects are **synthesised with Web Audio** (oscillators, filtered nois
 - The colours are unlike the brown, golden, white, black, pink or lavender of famous bears. Gummibär is lime.
 - There is no hat, bow tie, coat, shirt, crescent or belly emblem. That rules out Paddington, Pooh, the Care Bears, Rilakkuma, Freddy Fazbear and Fozzie.
 - No panda or polar colouring.
-- A reverse-image search and a light IP review are still an M8 task [M].
+- For personal use (Q8), a reverse-image search of the first render is optional (X-L1).
 
 **Rig and geometry** (design box 1000 × 1400, y down; `~` marks a spring):
 
@@ -1139,7 +1139,7 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
 ```json
 {
   "id": "/", "start_url": "/", "scope": "/",
-  "name": "Juni", "short_name": "Juni", "lang": "en",
+  "name": "Talking Bear", "short_name": "Talking Bear", "lang": "en",
   "description": "Talk to Juni the bear and hear yourself back in a funny bear voice. Works offline; audio never leaves your device.",
   "display": "standalone", "orientation": "portrait",
   "theme_color": "#2F7A6D", "background_color": "#FFF4E0",
@@ -1159,7 +1159,7 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
 
 Field notes:
 
-- **`name`: "Juni"** is the Q8 default (trademark risk of "Talking …"; see X-L1).
+- **`name`: "Talking Bear"** (Q8: this is personal-use software). `short_name` is the same; at 12 characters it fits under the launcher icon. The character inside the app is Juni.
 - **`launch_handler: focus-existing`** avoids a second window holding the mic. Support is Chrome 110 on desktop [V R30]; Android support is unverified.
 - **Left out:**
   - `shortcuts`: any change forces a WebAPK update.
@@ -1195,7 +1195,6 @@ VitePWA({
   - any `data:text/javascript` appears in `dist/**/*.js`;
   - any `__bearTest` appears in a production build;
   - the worklet chunk isn't self-contained (contains `import`, `import.meta`, `document` or `self`);
-  - the strings "Talking Tom" or "Outfit7" appear in the public bundle (see X-L1);
   - `dist/lab/**` exists: lab pages, including their trace and download flows, must never ship.
 
   It runs inside the Dockerfile's `web` stage **before** precompression ([§9](#9-ci-outline)). `index.html` also links `<link rel="icon" href="/icons/icon-192.png">`, so Chrome doesn't request `/favicon.ico` and log a 404.
@@ -1640,7 +1639,7 @@ The lab pages are **dev-only Vite entry points** under `lab/`, never shipped in 
 | X-T1 | TypeScript 7 tool compatibility | Skeleton project: `tsc -b`, `oxlint --type-aware`, Vitest, Vite build. If anything needs the TS JS API, pin TS 6.0.3. | Toolchain | M1 |
 | X-T2 | Rolldown output for `?worker&url` worklets | Build and assert the worklet chunk has no `import`, `import.meta`, `document` or `self` references; load it with `addModule` in Browser Mode. | Worklet bundling | M1 |
 | X-D1 | Only one test device (Pixel). OEM audio behaviour (routing, input processing, Bluetooth) and low-end CPU are unverified. | Before v1.0, repeat X-E1, X-E2, X-E4, X-V2 and the §10 checklist on at least one non-Pixel phone (borrowed, or a cheap second-hand Galaxy A-series). Until then: CPU-throttle proxy, and field reports from anyone who tries the app. | Confidence beyond Pixel | M8 (recommended) |
-| X-L1 | Character **and name** too close to existing IP. Outfit7 holds a family of "TALKING …" marks (TALKING TOM, TALKING TOM CAT, TALKING FRIENDS, TALKING REX, …) for mobile game software [S, search snippets only]. | Trademark search (USPTO, EUIPO) for the product name and "Juni"; reverse-image search of renders; brief IP review. Not legal advice. | Product name (Q8); launch readiness | **before M6** (the manifest `name` feeds WebAPK updates) and again at M8 |
+| X-L1 | Character looks too close to an existing character (low stakes: personal use, Q8) | Optional: a reverse-image search of the first render. | Peace of mind | M4 (optional) |
 
 ---
 
@@ -1898,7 +1897,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 **Build**
 
-- **Manifest and icons:** manifest per [§4.7](#47-pwa), with the product name settled (**Q8** and X-L1 are resolved *before* M6, because `name` is a WebAPK-update field); icons generated and committed; screenshots.
+- **Manifest and icons:** manifest per [§4.7](#47-pwa) (`name` "Talking Bear", Q8; never renamed afterwards, because `name` is a WebAPK-update field); icons generated and committed; screenshots.
 - **Install UI:** `beforeinstallprompt` is suppressed, and "Install" is offered only inside settings (Q3).
 - **Service worker:** `vite-plugin-pwa` config, `pwa/register.ts` with an idle-and-hidden update policy, `storage.persist()`.
 - **Build check:** `check-dist.mjs` (the full rule list in [§4.7](#47-pwa)).
@@ -1975,7 +1974,6 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
   - reduced motion and Gentle mode verified.
 - **Licensing and security:** an in-app licences screen inside settings, rendering the `licenses.txt` that has shipped since M2; enforce Trusted Types if X-P5 is clean.
 - **Performance and budgets:** performance pass against [§4.10](#410-performance-and-battery-budget-reference-device-d1-the-mid-range-pixel-q7); battery measurement; `size-limit` budgets enforced in CI.
-- **IP review:** final character and name review (X-L1; the name search already happened before M6).
 - **Second device:** X-D1 if a non-Pixel phone can be borrowed.
 
 **Tests**
@@ -2208,7 +2206,7 @@ The M2 corpus uses espeak-ng output (the tool is GPL-3.0 [V R75]). Program outpu
 
 ## 12. Open questions (asked one at a time)
 
-These are decisions that are yours and that change the plan. Each has my recommendation first. **Q1–Q7 were decided on 2026-09-26 and are folded into the plan. Q8 came out of the adversarial review and is open.** It is applied in the plan as my default until you answer.
+These are decisions that are yours and that change the plan. Each has my recommendation first. **All eight are decided and folded into the plan:** Q1–Q7 on 2026-09-26, and Q8, which came out of the adversarial review, on 2026-09-27.
 
 | # | Question | My recommendation | Affects |
 |---|---|---|---|
@@ -2219,7 +2217,7 @@ These are decisions that are yours and that change the plan. Each has my recomme
 | **Q5** ✅ | Should the **app image own all app headers**, with the sidecar Caddy a plain `reverse_proxy` (no `header`, no `encode`) and the front Caddy doing TLS and HSTS only? | **Decided 2026-09-26: yes.** The image owns every app header. The sidecar is a plain `reverse_proxy` (no `header`, no `encode`). The front does TLS, redirect and HSTS only; any shared baseline header uses `?Header`/`>Header`. | §4.8.3, your Caddy configs |
 | **Q6** ✅ | Should the **GHCR package be public or private**? | **Decided 2026-09-26: public.** The image only contains the web bundle that `bear.<domain>` serves publicly anyway, and it saves managing pull tokens on the host. The source repo stays private. | release.yml, host pull config |
 | **Q7** ✅ | Which **Android phone(s)** can you test on? The plan assumes D1 = a Pixel-class mid-range phone. | **Decided 2026-09-26: a mid-range Pixel (6a/7a/8a class) is D1.** No second device yet, so OEM variance is open risk X-D1. | M1+ exit criteria |
-| **Q8** (open) | What should the **user-facing product name** be (manifest `name`/`short_name`, launcher label)? "Talking Bear" sits inside Outfit7's registered "TALKING …" family of marks for mobile game software (TALKING TOM, TALKING TOM CAT, TALKING FRIENDS, TALKING REX, …). That comes from search snippets only (X-L1), and it's a litigation risk, not a certainty. | **Default applied in this plan: "Juni"** (the character) for the manifest and UI. `talking-bear` stays as the repo and image name you specified; it's not user-facing in the launcher. Decide before M6, because `name` feeds WebAPK updates. Not legal advice. | §4.7 manifest, X-L1, M6 |
+| **Q8** ✅ | What should the **user-facing product name** be (manifest `name`/`short_name`, launcher label)? The review flagged that "Talking Bear" sits near Outfit7's "TALKING …" marks (search snippets only). | **Decided 2026-09-27: "Talking Bear".** This is personal-use software, so the trademark concern doesn't apply. The character stays Juni; the repo and image stay `talking-bear`. *(My earlier default had been "Juni".)* | §4.7 manifest, X-L1 (reduced to optional), M6 |
 
 ---
 
