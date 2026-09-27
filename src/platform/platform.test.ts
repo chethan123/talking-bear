@@ -2,6 +2,30 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { FakeClock } from '../../test/fake-clock.ts';
 import { realClock } from '../app/clock.ts';
+import { createVisibility, type VisEvent } from './visibility.ts';
+
+// ---- fakes built on the global EventTarget ----------------------------------------------------
+
+/** The parts of `Document` that visibility.ts uses: `visibilityState` and its events. */
+class FakeDocument extends EventTarget {
+  visibilityState: DocumentVisibilityState;
+  constructor(initial: DocumentVisibilityState = 'visible') {
+    super();
+    this.visibilityState = initial;
+  }
+  /** A real-style `visibilitychange`: the state flips first, then the event fires. */
+  setVisibility(v: DocumentVisibilityState): void {
+    this.visibilityState = v;
+    this.dispatchEvent(new Event('visibilitychange'));
+  }
+}
+
+function makeVisibility(initial: DocumentVisibilityState = 'visible') {
+  const doc = new FakeDocument(initial);
+  const win = new EventTarget();
+  const vis = createVisibility(doc, win);
+  return { doc, win, vis };
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -105,5 +129,75 @@ describe('realClock', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(fired).toEqual(['kept']);
     expect(realClock.now()).toBeGreaterThanOrEqual(t0);
+  });
+});
+
+// ---- 2. Visibility -----------------------------------------------------------------------------
+
+describe('createVisibility', () => {
+  it('starts from document.visibilityState', () => {
+    expect(makeVisibility('hidden').vis.current()).toBe('hidden');
+    expect(makeVisibility('visible').vis.current()).toBe('visible');
+  });
+
+  it('maps real-style events to subscribers synchronously, and current() tracks visibilitychange', () => {
+    const { doc, win, vis } = makeVisibility();
+    const seen: VisEvent[] = [];
+    vis.subscribe((e) => seen.push(e));
+
+    doc.setVisibility('hidden');
+    expect(seen).toEqual(['hidden']); // synchronous: no await between dispatch and assertion
+    expect(vis.current()).toBe('hidden');
+
+    win.dispatchEvent(new Event('pagehide'));
+    doc.dispatchEvent(new Event('freeze'));
+    doc.dispatchEvent(new Event('resume'));
+    expect(seen).toEqual(['hidden', 'pagehide', 'freeze', 'resume']);
+    expect(vis.current()).toBe('hidden'); // only visibilitychange changes current()
+
+    doc.setVisibility('visible');
+    expect(seen.at(-1)).toBe('visible');
+    expect(vis.current()).toBe('visible');
+  });
+
+  it('simulate() notifies like a real event and updates current() without touching the document', () => {
+    const { doc, vis } = makeVisibility();
+    const seen: VisEvent[] = [];
+    vis.subscribe((e) => seen.push(e));
+
+    vis.simulate('hidden');
+    expect(seen).toEqual(['hidden']);
+    expect(vis.current()).toBe('hidden');
+    expect(doc.visibilityState).toBe('visible');
+
+    vis.simulate('visible');
+    expect(seen).toEqual(['hidden', 'visible']);
+    expect(vis.current()).toBe('visible');
+  });
+
+  it('notifies every subscriber in order; unsubscribe, even mid-round, stops delivery; a throwing subscriber is logged', () => {
+    const { vis } = makeVisibility();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const seen: string[] = [];
+    let offC: (() => void) | undefined;
+    const offA = vis.subscribe((e) => {
+      seen.push(`a:${e}`);
+      offC?.(); // removed during the round: must not be called in it
+    });
+    vis.subscribe(() => {
+      throw new Error('boom');
+    });
+    offC = vis.subscribe((e) => seen.push(`c:${e}`));
+    const offD = vis.subscribe((e) => seen.push(`d:${e}`));
+
+    vis.simulate('hidden');
+    expect(seen).toEqual(['a:hidden', 'd:hidden']);
+    expect(error).toHaveBeenCalledTimes(1);
+
+    offA();
+    offD();
+    offD(); // idempotent
+    vis.simulate('visible');
+    expect(seen).toEqual(['a:hidden', 'd:hidden']);
   });
 });
