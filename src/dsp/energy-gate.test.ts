@@ -128,6 +128,20 @@ describe('energyGateStep: digital silence (validation 1)', () => {
     energyGateStep(s, hop(Number.NaN), P);
     expect(s).toStrictEqual({ floorDb: -60, active: false, initialized: true });
   });
+
+  it('treats a non-finite level (+-Infinity) as digital silence (decision D8)', () => {
+    for (const v of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const fresh = initialEnergyGateState();
+      energyGateStep(fresh, hop(v), P);
+      expect(fresh).toStrictEqual({ floorDb: Number.NaN, active: false, initialized: false });
+      const s = activeAt(-60);
+      energyGateStep(s, hop(v), P);
+      expect(s).toStrictEqual({ floorDb: -60, active: false, initialized: true });
+      // The floor stays usable: the next finite hop updates it normally.
+      energyGateStep(s, hop(-70), P);
+      expect(s.floorDb).toBe(-60 + alpha(45) * (-70 - -60));
+    }
+  });
 });
 
 describe('energyGateStep: initialisation (validation 2)', () => {
@@ -444,6 +458,14 @@ describe('createGateFilter (validation 7)', () => {
     a.process(noise(1000, 3));
     const x = noise(800, 5);
     expect(b.process(x)).toStrictEqual(createGateFilter(16_000).process(x));
+  });
+
+  it('keeps the same corners at 48 kHz: >= 20 dB down at 100 Hz, 1 kHz within +-0.5 dB, <= -12 dB at 7 kHz', () => {
+    expect(gainDb(createGateFilter(48_000), 48_000, 100)).toBeLessThanOrEqual(-20);
+    expect(Math.abs(gainDb(createGateFilter(48_000), 48_000, 1000))).toBeLessThanOrEqual(0.5);
+    // The 7 kHz check is what catches a low-pass designed for 16 kHz regardless of fs (its corner would sit at
+    // 10.2 kHz here, and 7 kHz would read about -0.6 dB instead of about -13.7 dB).
+    expect(gainDb(createGateFilter(48_000), 48_000, 7000)).toBeLessThanOrEqual(-12);
   });
 
   it('throws RangeError when 3400 Hz is not below fs/2', () => {

@@ -29,7 +29,7 @@ export interface EnergyGateParams {
   floorUpTauMs: number;
   /** Floor time constant when db > floor and the gate is open (drift during speech). */
   floorInSpeechTauMs: number;
-  /** Hops below this level are digital silence: they never touch the floor. */
+  /** Hops below this level (and non-finite levels) are digital silence: they never touch the floor. */
   ignoreBelowDb: number;
   /** The hop size the time constants are applied at (addition to plan §3.3). */
   hopMs: number;
@@ -68,7 +68,7 @@ export function initialEnergyGateState(restoreFloorDb?: number): EnergyGateState
 
 /**
  * Mutates and returns s (no allocation). Uses f.db only. In order:
- * 1. digital silence (db < ignoreBelowDb, or NaN): close the gate, leave the floor;
+ * 1. digital silence (db < ignoreBelowDb, or non-finite): close the gate, leave the floor;
  * 2. the first other hop initialises the floor to db and is never an onset;
  * 3. hysteresis against the floor as it was before this step;
  * 4. floor += α·(db − floor), α = 1 − exp(−hopMs/τ), τ = down if db <= floor, else in-speech if the gate is
@@ -76,8 +76,9 @@ export function initialEnergyGateState(restoreFloorDb?: number): EnergyGateState
  */
 export function energyGateStep(s: EnergyGateState, f: FrameFeatures, p: EnergyGateParams): EnergyGateState {
   const db = f.db;
-  // 1. Digital silence. `!(db >= …)` also sends NaN here, so a NaN level can never poison the floor.
-  if (!(db >= p.ignoreBelowDb)) {
+  // 1. Digital silence. `!(db >= …)` also sends NaN (and −Infinity) here, and +Infinity is excluded explicitly,
+  //    so a non-finite level can never poison the floor.
+  if (!(db >= p.ignoreBelowDb) || db === Number.POSITIVE_INFINITY) {
     if (s.active) s.active = false;
     return s;
   }
