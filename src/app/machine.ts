@@ -320,7 +320,7 @@ const sleepTimerToAsleep: Handler<'timer'> = (s, e, cfg) =>
 // Reactions (rows 11, 14, 15, 23, 27, 29–33, 36, 37; C4). Every emitted sfx gets seq = ++sfxSeq.
 const reactionAnim = (e: EventOf<'reaction'>): Effect =>
   anim({ e: 'reaction', name: e.name, priority: e.priority });
-const animOnlyReaction: Handler<'reaction'> = (s, e) => stay(s, {}, [reactionAnim(e)]); // rows 23, 27, 31, 33, 37
+const animOnlyReaction: Handler<'reaction'> = (s, e) => stay(s, {}, [reactionAnim(e)]); // rows 23, 27
 const micDeniedReaction: Handler<'reaction'> = (s, e, cfg) =>
   e.sfx === null
     ? stay(s, {}, [reactionAnim(e), timer('sleep', cfg.tSleepMs)])

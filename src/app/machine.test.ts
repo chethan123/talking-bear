@@ -982,6 +982,56 @@ describe('clarifications C1–C12', () => {
     expect(bySleep.effects.some((f) => f.k === 'applyUpdate')).toBe(false);
   });
 
+  it('C3–C12: events owned by specific rows are ignored everywhere else (plan decision D20)', () => {
+    const handledIn: Partial<Record<EventType, StateName[]>> = {
+      parentContinue: ['NeedsParent'],
+      settingsRetry: ['MicDenied'],
+      micGranted: ['Waking'],
+      micDenied: ['Waking'],
+      noDevice: ['Waking'],
+      ctxResumeFailed: ['Waking'],
+      seg: ['Listening', 'Recording'],
+      clipReady: ['Processing'],
+      takeFailed: ['Processing'],
+      processed: ['Processing'],
+      fxError: ['Processing'],
+      playbackAtSpeakerEnded: ['Playing'],
+      visible: ['Paused'],
+      timer: [
+        'NeedsParent',
+        'Waking',
+        'MicDenied',
+        'Listening',
+        'Recording',
+        'Processing',
+        'Cooldown',
+        'Error',
+      ],
+    };
+    for (const t of EVENT_TYPES) {
+      const states = handledIn[t];
+      if (states === undefined) continue;
+      for (const name of STATES) {
+        expect(TABLE[name][t] === 'ignore', `${name} × ${t}`).toBe(!states.includes(name));
+      }
+    }
+    // Field updates apply in every state (C5, C6, C8, C10, C11), so they are never 'ignore'.
+    const everywhere: EventType[] = [
+      'permissionChanged',
+      'ctxRunning',
+      'armed',
+      'floorSnapshot',
+      'sfxAtSpeakerEnded',
+      'trackMuted',
+      'trackUnmuted',
+      'updateReady',
+      'hidden',
+      'pagehide',
+      'freeze',
+    ];
+    for (const t of everywhere) for (const name of STATES) expect(TABLE[name][t]).not.toBe('ignore');
+  });
+
   it('C12: devices and failures', () => {
     for (const name of STATES) {
       const handles = ARMED.has(name) || GATED.has(name);
