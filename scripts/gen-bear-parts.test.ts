@@ -1,6 +1,51 @@
-import { describe, expect, it } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-import { parsePathData, pathBBox } from './gen-bear-parts.ts';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  OUT_FILE,
+  SVG_FILE,
+  checkGenerated,
+  compileBearSvg,
+  generate,
+  main,
+  parsePathData,
+  pathBBox,
+} from './gen-bear-parts.ts';
+
+// A tiny SVG in the art/README.md subset: a mirrored part whose right bone exists (furL → armR), one whose
+// right bone does not (padL stays on pawL), a skipped path, bones without data-pivot (pawL inherits from
+// armL, head from root), a clip path with arcs, and a Q / T path with fill-opacity.
+const FIXTURE = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1400">
+  <g id="root" data-pivot="500,1340">
+    <path id="shadow" d="M 400 1300 L 600 1300 L 600 1360 L 400 1360 Z" fill="#225A51" data-parent="root"/>
+    <g id="armL" data-pivot="300,700" data-parent="root">
+      <path id="furL" d="M 250 700 C 250 650 350 650 350 700 L 350 900 Z" fill="#2F7A6D" data-parent="armL" data-mirror="furR"/>
+      <g id="pawL" data-parent="armL">
+        <path id="padL" d="M 280 880   h 40
+          v 30 h -40 z" fill="#7B4B5A" data-parent="pawL" data-mirror="padR"/>
+      </g>
+    </g>
+    <g id="armR" data-pivot="700,700" data-parent="root"/>
+    <g id="head" data-parent="root">
+      <path id="mouthPreview" d="M 480 520 L 520 520 L 500 540 Z" fill="#5A1E2E" data-parent="head" data-skip="true"/>
+      <g id="eyeL" data-pivot="405,385" data-parent="head">
+        <path id="scleraL" d="M 367 385 A 38 46 0 0 1 443 385 A 38 46 0 0 1 367 385 Z" fill="#FFFFFF" data-parent="eyeL" data-clip="true"/>
+        <path id="irisL" d="M 375 385 Q 405 345 435 385 T 375 385 Z" fill="#E3A43A" fill-opacity="0.5" data-parent="eyeL"></path>
+      </g>
+    </g>
+  </g>
+</svg>
+`;
+
+/** Replaces exactly one occurrence of `from` in the fixture. */
+function edit(from: string, to: string): string {
+  expect(FIXTURE.split(from), `fixture contains ${from} once`).toHaveLength(2);
+  return FIXTURE.replace(from, to);
+}
 
 function expectClose(actual: readonly number[], expected: readonly number[], digits = 9): void {
   expect(actual).toHaveLength(expected.length);
@@ -94,5 +139,287 @@ describe('pathBBox: all path coordinates, control points included', () => {
     expectClose(bbox('M10 10 a50 50 0 0 1 100 0'), [10, -40, 110, 10]);
     expect(bbox('M0 0 A0 50 0 0 1 100 0')).toEqual([0, 0, 100, 0]); // zero radius: a straight line
     expect(bbox('M5 5 A20 20 0 0 1 5 5')).toEqual([5, 5, 5, 5]); // same end point: omitted
+  });
+});
+
+describe('compileBearSvg: the tiny fixture', () => {
+  const { bones, parts } = compileBearSvg(FIXTURE);
+
+  it('lists bones in document order, parents before children, inheriting missing pivots', () => {
+    expect(bones).toEqual([
+      { id: 'root', parent: -1, pivot: [500, 1340] },
+      { id: 'armL', parent: 0, pivot: [300, 700] },
+      { id: 'pawL', parent: 1, pivot: [300, 700] },
+      { id: 'armR', parent: 0, pivot: [700, 700] },
+      { id: 'head', parent: 0, pivot: [500, 1340] },
+      { id: 'eyeL', parent: 4, pivot: [405, 385] },
+    ]);
+    for (const [i, b] of bones.entries()) expect(b.parent, b.id).toBeLessThan(i);
+  });
+
+  it('emits parts in draw order, each mirrored copy right after its source, and skips data-skip paths', () => {
+    expect(parts.map((p) => [p.id, bones[p.bone]?.id, p.mirror])).toEqual([
+      ['shadow', 'root', false],
+      ['furL', 'armL', false],
+      ['furR', 'armR', true], // the mirrored bone exists
+      ['padL', 'pawL', false],
+      ['padR', 'pawL', true], // no pawR: the copy stays on the same bone
+      ['scleraL', 'eyeL', false],
+      ['irisL', 'eyeL', false],
+    ]);
+  });
+
+  it('gives a mirrored copy the same d, fill, opacity and bbox as its source', () => {
+    const [furL, furR] = [parts[1], parts[2]];
+    expect(furR).toEqual({ ...furL, id: 'furR', bone: 3, mirror: true });
+  });
+
+  it('rounds bbox values to 0.001 and never emits -0', () => {
+    const svg = edit(
+      '<g id="armR"',
+      '<path id="noise" d="M 0.1 0.2 l 0.2 0.1 Z" fill="#225A51" data-parent="root"/>\n' +
+        '    <path id="speck" d="M -0.0001 -0 L 1 1" fill="#225A51" data-parent="root"/>\n' +
+        '    <g id="armR"',
+    );
+    expect(bbox('M 0.1 0.2 l 0.2 0.1 Z')[2]).not.toBe(0.3); // 0.1 + 0.2 is 0.30000000000000004
+    const compiled = compileBearSvg(svg).parts;
+    const noise = compiled.find((p) => p.id === 'noise');
+    const speck = compiled.find((p) => p.id === 'speck');
+    expect(noise?.bbox).toEqual([0.1, 0.2, 0.3, 0.3]);
+    expect(speck?.bbox).toEqual([0, 0, 1, 1]);
+    expect(speck?.bbox.map((v) => Object.is(v, -0))).toEqual([false, false, false, false]);
+    const text = generate(svg);
+    expect(text).toContain('    bbox: [0.1, 0.2, 0.3, 0.3],\n');
+    expect(text).toContain('    bbox: [0, 0, 1, 1],\n');
+  });
+
+  it('maps fill, fill-opacity, data-clip and the bbox; whitespace in d collapses to single spaces', () => {
+    expect(parts[3]).toEqual({
+      id: 'padL',
+      bone: 2,
+      d: 'M 280 880 h 40 v 30 h -40 z',
+      fill: '#7B4B5A',
+      opacity: 1,
+      mirror: false,
+      clip: false,
+      bbox: [280, 880, 320, 910],
+    });
+    expect(parts[5]).toMatchObject({ id: 'scleraL', clip: true, opacity: 1, bbox: [367, 339, 443, 431] });
+    expect(parts[6]).toMatchObject({ id: 'irisL', clip: false, opacity: 0.5, bbox: [375, 345, 465, 425] });
+  });
+});
+
+describe('the generated module text', () => {
+  const text = generate(FIXTURE);
+
+  it('is deterministic, starts with the header and uses 2-space indentation', () => {
+    expect(generate(FIXTURE)).toBe(text);
+    expect(
+      text.startsWith('// AUTO-GENERATED by scripts/gen-bear-parts.ts from art/bear.svg — do not edit.\n'),
+    ).toBe(true);
+    expect(text.endsWith('};\n')).toBe(true);
+    for (const line of text.split('\n'))
+      expect(line).toMatch(/^(?:(?: {2})*[^ \t].*[^ \t]|(?: {2})*[^ \t]|)$/);
+  });
+
+  it('writes BONES, PARTS, BONE and PART in a fixed layout', () => {
+    expect(text).toContain(
+      [
+        'export const BONES: readonly Bone[] = [',
+        "  { id: 'root', parent: -1, pivot: [500, 1340] },",
+        "  { id: 'armL', parent: 0, pivot: [300, 700] },",
+      ].join('\n'),
+    );
+    expect(text).toContain(
+      [
+        '  {',
+        "    id: 'furR',",
+        '    bone: 3,',
+        "    d: 'M 250 700 C 250 650 350 650 350 700 L 350 900 Z',",
+        "    fill: '#2F7A6D',",
+        '    opacity: 1,',
+        '    mirror: true,',
+        '    clip: false,',
+        '    bbox: [250, 650, 350, 900],',
+        '  },',
+      ].join('\n'),
+    );
+    expect(text).toContain(
+      [
+        'export const PART: Readonly<Record<string, number>> = {',
+        '  shadow: 0,',
+        '  furL: 1,',
+        '  furR: 2,',
+        '  padL: 3,',
+        '  padR: 4,',
+        '  scleraL: 5,',
+        '  irisL: 6,',
+        '};',
+      ].join('\n'),
+    );
+  });
+
+  describe('as a module', () => {
+    let dir = '';
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gen-bear-parts-'));
+    });
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('loads, and BONE / PART map every id to its index', async () => {
+      const file = join(dir, 'bear-parts.gen.ts');
+      writeFileSync(file, text);
+      const mod: unknown = await import(pathToFileURL(file).href);
+      const { bones, parts } = compileBearSvg(FIXTURE);
+      expect(mod).toHaveProperty('BONES', bones);
+      expect(mod).toHaveProperty('PARTS', parts);
+      expect(mod).toHaveProperty('BONE', Object.fromEntries(bones.map((b, i) => [b.id, i])));
+      expect(mod).toHaveProperty('PART', Object.fromEntries(parts.map((p, i) => [p.id, i])));
+    });
+  });
+});
+
+describe('compileBearSvg: anything outside the subset throws', () => {
+  it.each([
+    ['text content', () => edit('<g id="armR"', 'hello <g id="armR"'), 'unexpected content'],
+    ['a declaration', () => `<?xml version="1.0"?>\n${FIXTURE}`, 'unexpected content'],
+    ['a single-quoted attribute', () => edit('fill="#225A51"', "fill='#225A51'"), 'unexpected content'],
+    ['an unclosed element', () => FIXTURE.replace(/<\/g>\n<\/svg>/, '</svg>'), 'unbalanced </svg>'],
+    [
+      'another root',
+      () => edit('viewBox="0 0 1000 1400"', 'viewBox="0 0 1000 1000"'),
+      'the root must be <svg',
+    ],
+    [
+      'another element',
+      () => edit('<g id="armR"', '<circle id="c"/><g id="armR"'),
+      '<circle> is not allowed',
+    ],
+    [
+      'an element named like an object property',
+      () => edit('<g id="armR"', '<constructor/><g id="armR"'),
+      '<constructor> is not allowed',
+    ],
+    [
+      'a transform',
+      () => edit('<g id="head"', '<g id="head" transform="scale(2)"'),
+      'transform is not allowed',
+    ],
+    ['a duplicate id', () => edit('data-mirror="padR"', 'data-mirror="shadow"'), 'duplicate id "shadow"'],
+    ['an id outside the pattern', () => edit('id="shadow"', 'id="2shadow"'), 'id must match'],
+    ['a wrong data-parent', () => edit('data-parent="pawL"', 'data-parent="armL"'), 'enclosing bone "pawL"'],
+    ['a missing data-parent', () => edit(' data-parent="head">', '>'), 'enclosing bone "head"'],
+    [
+      'a path outside every bone',
+      () => edit('  <g id="root"', '  <path id="x" d="M0 0" fill="#225A51"/>\n  <g id="root"'),
+      'must be inside a bone',
+    ],
+    [
+      'a second root bone',
+      () => edit('</svg>', '<g id="extra" data-pivot="0,0"/></svg>'),
+      'exactly one root bone',
+    ],
+    ['a root bone without a pivot', () => edit(' data-pivot="500,1340"', ''), 'root bone needs a data-pivot'],
+    [
+      'a malformed pivot',
+      () => edit('data-pivot="300,700"', 'data-pivot="300 700"'),
+      'data-pivot must be "x,y"',
+    ],
+    [
+      'a lower-case fill',
+      () => edit('fill="#7B4B5A"', 'fill="#7b4b5a"'),
+      'fill must be an upper-case #RRGGBB',
+    ],
+    ['a missing fill', () => edit(' fill="#7B4B5A"', ''), 'fill must be an upper-case #RRGGBB'],
+    ['fill-opacity above 1', () => edit('fill-opacity="0.5"', 'fill-opacity="1.5"'), 'fill-opacity must be'],
+    ['invalid path data', () => edit('h -40 z', 'h -40 k'), 'unexpected "k"'],
+    [
+      'data-clip other than "true"',
+      () => edit('data-clip="true"', 'data-clip="yes"'),
+      'data-clip must be "true"',
+    ],
+    [
+      'data-skip other than "true"',
+      () => edit('data-skip="true"', 'data-skip="1"'),
+      'data-skip must be "true"',
+    ],
+    [
+      'a mirrored clip path',
+      () => edit('data-clip="true"', 'data-clip="true" data-mirror="scleraR"'),
+      'cannot have data-mirror',
+    ],
+    [
+      'a mirrored skipped path',
+      () => edit('data-skip="true"', 'data-skip="true" data-mirror="mouthR"'),
+      'cannot have data-clip or data-mirror',
+    ],
+    [
+      'content inside <defs>',
+      () => edit('  <g id="root"', '  <defs id="defs"><g id="x" data-pivot="0,0"/></defs>\n  <g id="root"'),
+      '<defs> must not have children',
+    ],
+  ])('%s', (_name, make, message) => {
+    expect(() => compileBearSvg(make())).toThrow(message);
+  });
+
+  it('accepts an empty <defs>', () => {
+    expect(() => compileBearSvg(edit('  <g id="root"', '  <defs id="defs"/>\n  <g id="root"'))).not.toThrow();
+  });
+});
+
+describe('main: the gen:bear CLI', () => {
+  let root = '';
+  let errors: string[] = [];
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'gen-bear-parts-'));
+    mkdirSync(join(root, 'art'));
+    writeFileSync(join(root, SVG_FILE), FIXTURE);
+    errors = [];
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation((message: string) => {
+      errors.push(message);
+    });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('writes the module; --check then passes, and fails once a colour changes, never writing', () => {
+    const out = join(root, OUT_FILE);
+    expect(main(['--check'], root)).toBe(1);
+    expect(errors.join('\n')).toContain(`${OUT_FILE} is missing`);
+    expect(existsSync(out)).toBe(false);
+    expect(main([], root)).toBe(0);
+    expect(readFileSync(out, 'utf8')).toBe(generate(FIXTURE));
+    expect(main([], root)).toBe(0);
+    expect(main(['--check'], root)).toBe(0);
+    writeFileSync(join(root, SVG_FILE), FIXTURE.replace('#2F7A6D', '#3F9282'));
+    errors = [];
+    expect(main(['--check'], root)).toBe(1);
+    expect(errors.join('\n')).toMatch(/is stale[\s\S]*committed: {5}fill: '#2F7A6D',[\s\S]*pnpm gen:bear/);
+    expect(readFileSync(out, 'utf8')).toBe(generate(FIXTURE));
+  });
+
+  it('exits 1 on an invalid SVG and 2 on unknown arguments', () => {
+    writeFileSync(join(root, SVG_FILE), FIXTURE.replace('<g id="armR"', '<circle/><g id="armR"'));
+    expect(main([], root)).toBe(1);
+    expect(errors.join('\n')).toContain('<circle> is not allowed');
+    expect(existsSync(join(root, OUT_FILE))).toBe(false);
+    expect(main(['--fix'], root)).toBe(2);
+    expect(main(['--check', '--check'], root)).toBe(2);
+  });
+});
+
+describe('checkGenerated', () => {
+  it('names the first differing line', () => {
+    expect(checkGenerated('a\nb\n', 'a\nb\n')).toBeUndefined();
+    expect(checkGenerated('a\nb\n', 'a\nc\n')).toContain('first difference at line 2');
+    expect(checkGenerated('a\nb\n', 'a')).toContain('committed: (end of file)');
+    expect(checkGenerated('a\nb\n', 'a\r\nb\r\n')).toBe(
+      `${OUT_FILE} differs only in line endings (CRLF): check core.autocrlf.`,
+    );
   });
 });
