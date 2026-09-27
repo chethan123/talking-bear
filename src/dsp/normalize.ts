@@ -31,7 +31,7 @@ const RLB_Q = 0.5003270373238773;
 const LOUDNESS_OFFSET = -0.691;
 const ABSOLUTE_GATE_LUFS = -70;
 const RELATIVE_GATE_LU = -10;
-/** Gating block length and step, in seconds (400 ms blocks, 75 % overlap). */
+/** Gating block length in seconds (400 ms); blocks start every quarter block (75 % overlap). */
 const BLOCK_SECONDS = 0.4;
 
 /**
