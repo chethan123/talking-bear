@@ -113,8 +113,6 @@ function lastWorker(): RecordingWorker {
 let engine: Engine;
 let sr = 0;
 let armFrame = 0;
-/** log.length when test 9 finished: tests 1–9 must not have produced any failure event. */
-let healthyUntil = 0;
 
 beforeAll(() => {
   globalThis.Worker = RecordingWorker;
@@ -259,7 +257,6 @@ describe('engine (Browser Mode, fake media)', () => {
     for (const bad of ['ctxResumeFailed', 'workerFailed', 'vadError'] as const) {
       expect(count(bad, 0), `${bad} during tests 1–9`).toBe(0);
     }
-    healthyUntil = log.length;
   });
 
   test('10: after restartWorker() + arm(2), level events with epoch 2 arrive', async () => {
@@ -302,7 +299,6 @@ describe('engine (Browser Mode, fake media)', () => {
     await engine.resume();
     expect(workers).toHaveLength(workerCount + 2);
     expect(failedAgain.terminated).toBe(true);
-    expect(healthyUntil).toBeGreaterThan(0);
   }, 10_000);
 
   test('12: suspend() suspends the context; resume() runs it again and emits ctxRunning', async () => {
