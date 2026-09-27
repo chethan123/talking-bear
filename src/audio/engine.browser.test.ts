@@ -564,4 +564,22 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(d.count('processed', from)).toBe(0);
     expect(d.engine.getProcessed(2)).toBeUndefined();
   }, 10_000);
+
+  test('19: releaseProcessed(id) drops the processed result of that id only', async () => {
+    const d = freshEngine();
+    await d.engine.resume();
+    d.engine.openMic(1);
+    await d.waitFor('micGranted', 0, 5000);
+    d.engine.arm(1);
+    const { event } = await d.waitFor('armed', 0, 3000, (e) => e.epoch === 1);
+    d.engine.take(1, 2, event.armFrame, event.armFrame + Math.round(0.1 * sr));
+    await d.waitFor('clipReady', 0, 3000, (e) => e.id === 2);
+    d.engine.process(2, PRESETS.cub);
+    await d.waitFor('processed', 0, 3000, (e) => e.id === 2);
+    expect(d.engine.getProcessed(2)).toBeDefined();
+    d.engine.releaseProcessed(3);
+    expect(d.engine.getProcessed(2)).toBeDefined();
+    d.engine.releaseProcessed(2);
+    expect(d.engine.getProcessed(2)).toBeUndefined();
+  }, 10_000);
 });
