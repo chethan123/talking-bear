@@ -122,7 +122,7 @@ A short parent-readable version of this lives in the settings sheet (M8).
 **Capture worklet, per 128-frame quantum:**
 
 - **Clip path:** 80 Hz high-pass → **ring buffer of 12 s at the context rate**. The ring is written **continuously, even while disarmed**, so a `take` whose end is a few ms in the future can still be served.
-- **VAD feed (only while armed):** anti-aliased decimation to 16 kHz with the same sinc kernel as the voice effect. Each 512-sample frame is posted to the worker, tagged with the current `epoch` and the **context-rate frame index of its first sample**, with the decimator's group delay already subtracted.
+- **VAD feed (only while armed):** anti-aliased decimation to 16 kHz with the same sinc kernel as the voice effect. The decimator runs continuously, and frames are *posted* only while armed. That avoids a filter start-up transient at every arm, for ≈ 4 µs per quantum. Each 512-sample frame is posted to the worker, tagged with the current `epoch` and the **context-rate frame index of its first sample**, with the decimator's group delay already subtracted.
 - **Commands:**
   - `arm{epoch}` starts the VAD feed and answers `armed{epoch, armFrame}`.
   - `disarm{epoch}` stops it.
@@ -293,6 +293,14 @@ export function directorReduce(s: DirectorState, e: AnimEvent): DirectorState;  
 export function render(g: CanvasRenderingContext2D, rig: Rig, pose: Pose): void; // no allocation
 ```
 
+**Refinements settled while writing the M1 tasks** (the sketch above stays illustrative):
+
+- **`init` messages:** `init{port}` to the worklet and `init{ctxRate, port}` to the worker hand over the worklet↔worker `MessagePort`. A new `init` is also how the worker is restarted.
+- **In-place state:** `segmenterStep` and `energyGateStep` mutate their state in place, so the per-frame path doesn't allocate.
+- **Effects:**
+  - `sfx` effects carry a sequence number, and `sfxAtSpeakerEnded{seq}` means that every sfx scheduled so far has left the speaker.
+  - An `applyUpdate` effect implements the §4.7 update policy.
+
 Design rules:
 
 1. **DSP and state are pure.** Side effects happen only in effect runners and the DOM, worklet and worker adapters.
@@ -342,6 +350,14 @@ stateDiagram-v2
     A ctx error or an unexpected track end goes to Error.
   end note
 ```
+
+**Clarifications** (settled while writing the M1 `machine` task, which has the full list C1–C12):
+
+- **Derived effects:** `wakeLock` and overlay `ui` effects are derived from group and state changes, not emitted per row.
+- **Disarm:** `disarm` happens on leaving {Listening, Recording} for any other state.
+- **Sfx still audible:** if an sfx started in `MicDenied` (row 11) is still audible when Waking would enter Listening, the machine goes to `SfxGated` instead, so `arm` never overlaps sound.
+- **Worker failure in Waking:** a first worker failure in `Waking` stays in `Waking` (restart only), because Cooldown would arm before the mic is granted.
+- **Tapping an awake bear:** `tapBear` is handled only in Asleep and Error. Taps on an awake bear arrive as reactions.
 
 **State groups.**
 
@@ -655,15 +671,19 @@ Cost: 10 µs per frame at 16 kHz, plus 86 µs for voicing [E].
 
 **No VAD rejects TV speech.** Every method false-triggered 7–10 times/min on it [E]. This is a product problem, handled by:
 
-- a proximity gate: the utterance's active level must be ≥ background + X dB;
+- **A proximity gate:** the utterance's active level must be ≥ background + X dB. Concretely, the power-mean band-limited level over the segment minus the noise floor at onset must be ≥ X, or the segment becomes a misfire. X is tuned in the M2 grid, and raised by the too-noisy logic in §4.4.
 - the "too noisy" hint;
 - an optional hold-to-talk fallback ([§4.4](#44-feedback-loop), [§7 M8](#m8--polish)).
 
 #### 4.2.3 Decision
 
 - **Primary: Silero v6 16k, TS port, in the DSP worker**, fed 512-sample 16 kHz frames from the worklet over a transferred `MessagePort`.
-  - The weights are extracted at dev time by `scripts/extract-silero-weights.ts` from a **pinned** upstream file (commit plus SHA-256), stored as fp16 and committed with a provenance JSON. That keeps builds hermetic.
-  - `onnxruntime-web` is a **devDependency only**: it is the parity oracle in CI (`max|Δp| < 1e-3` and 0 flips on the fixtures).
+  - The weights are extracted at dev time by `scripts/extract-silero-weights.ts` from a **pinned** upstream file (commit plus SHA-256), stored as fp16 and committed with a provenance JSON. That keeps builds hermetic. The pin is `snakers4/silero-vad` commit `5cd7945676eb32225748052e2e6a0580e4686a08` (tag v6.2.3), file `src/silero_vad/data/silero_vad_16k_op15.onnx`, 1,289,603 bytes, SHA-256 `7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49`.
+  - `onnxruntime-web` is a **devDependency only**: it is the parity oracle in CI. Parity has two tiers:
+    - the TS port with **fp32** weights: `max|Δp| < 1e-4`;
+    - the shipped **fp16** weights: `max|Δp| < 5e-3`. The spike measured 1.9e-3.
+
+    Both tiers require 0 decision flips at 0.5 and 0.35, excluding frames within ±5e-3 of the threshold.
 - **Level meter, fallback and optional pre-gate: the energy VAD, also in the DSP worker.**
   - **Fallback:** while the model loads, or if Silero throws, `reset{vad:'energy'}` switches the shared segmenter's input to the energy gate, with an 800 ms hangover.
   - **Optional pre-gate (CPU optimisation, off in the MVP):**
@@ -757,7 +777,7 @@ Perceived size is driven jointly by glottal pulse rate and vocal-tract length [S
 
 **MVP: offline windowed-sinc resampling in TS, in the DSP worker.**
 
-- 8 zero-crossings, Kaiser window. Voice calls `resampleOffline(pcm, 1/p)`: `ratio = 1/p` in the §3.3 convention, cutoff `0.9 · min(1, ratio)` of the input Nyquist.
+- 8 zero-crossings, Kaiser window with **β = 6.0**. With β = 7, a 9 kHz tone leaks through the 48k→16k decimator at −56 dBFS and fails the −60 dBFS alias test in §4.9.1; β = 6 gives −77 dBFS [E, numerical prototype while writing the tasks]. Voice calls `resampleOffline(pcm, 1/p)`: `ratio = 1/p` in the §3.3 convention, cutoff `0.9 · min(1, ratio)` of the input Nyquist.
 - Polyphase table cached per ratio.
 - **The same kernel** as the streaming VAD decimator.
 
@@ -1178,7 +1198,7 @@ VitePWA({
   includeManifestIcons: false,
   manifest: { /* above */ },
   workbox: {
-    globPatterns: ['**/*.{html,js,css,webmanifest,png,svg,webp,bin,json}'], // default is js,wasm,css,html only [V R57]
+    globPatterns: ['**/*.{html,js,css,webmanifest,png,svg,webp,bin,json,txt}'], // default is js,wasm,css,html only [V R57]; txt = licenses.txt
     globIgnores: ['**/*.{br,gz,map}', 'screenshots/**'],                      // screenshots only matter to the installer
     maximumFileSizeToCacheInBytes: 2 * 1024 * 1024, // default; fail the build if anything exceeds it (see check-dist)
     inlineWorkboxRuntime: true,     // single sw.js, no importScripts [V R56]
@@ -1419,7 +1439,7 @@ The Caddy constraints have two causes:
   - an 80→400 Hz log chirp
   - a "synthetic vowel": a jittered impulse train through F1/F2/F3 resonators (700/1220/2600 Hz) with a 4 Hz syllabic envelope
   - mixes at a set SNR
-  - knock bursts
+  - knock bursts, 1.5 s apart: more than the 800 ms energy hangover, so each is its own too-short event
 - Every fixture **starts with ≥ 1 s of silence and ends with ≥ 300 ms of digital zeros** (see [§4.9.3](#493-end-to-end-playwright--chromium-fake-media)).
 - **No real-voice audio is ever stored (Q2, amended).** Real voices tune the VAD through **feature traces**: per-frame probabilities, energies and voicing scores, not audio. The synthetic/TTS corpus is the CI regression suite ([§7 M2](#m2--vad-tuning)).
 
@@ -1427,7 +1447,7 @@ The Caddy constraints have two causes:
 
 | Module | Properties |
 |---|---|
-| Resampler (`ratio = outRate/inRate`) | output length `round(n·ratio) ± 1`; RMS of sines below `0.9·min(1, ratio)` × Nyquist preserved within ±0.5 dB; a sine at f comes out at f/ratio within 1 %; **alias tests on the real downsampling cases**: an 18 kHz tone at `ratio = 0.5` (pitch ×2) and a 9 kHz tone through the 48k→16k decimator (`ratio = 1/3`) must both land below −60 dBFS |
+| Resampler (`ratio = outRate/inRate`) | output length `round(n·ratio) ± 1`; RMS of sines up to 0.8 × the cutoff (cutoff = `0.9·min(1, ratio)` × the input Nyquist) preserved within ±0.5 dB; at the cutoff itself the response is ≈ −1.4 dB; a sine at f comes out at f/ratio within 1 %; **alias tests on the real downsampling cases**: an 18 kHz tone at `ratio = 0.5` (pitch ×2) and a 9 kHz tone through the 48k→16k decimator (`ratio = 1/3`) must both land below −60 dBFS |
 | Segmenter | events alternate start/end, and end never comes first; every segment ≥ `minSpeech`; all-zero input never triggers; appending silence after `end` never yields `start` |
 | Ring buffer | model-based test against an array model across wrap-around |
 | Session reducer | on random event sequences with an injected clock: **no `arm` while any gated state is active or any sfx or playback is audible**; no `sfx` effect outside transitions into `SfxGated` or within `MicDenied`; in `Listening` the sleep and doze timers are always armed; with no `seg.start` or `reaction`, every trace reaches `Asleep` within `T_sleep` + maximum utterance + processing timeout + playback + cooldown; stale-epoch events and stale-`req` mic results never change state; a worker failure in any mic-open state leads to `Cooldown` or `Error`, never a stall; no `arm` happens while a `reselectPending` input change is outstanding; the mic stream is open iff the state is mic-open; the full (state × event) cross product is handled explicitly |
@@ -1439,7 +1459,7 @@ The Caddy constraints have two causes:
 - Instead, stub `sampleRate`, `currentFrame`, `AudioWorkletProcessor` (with a `MessageChannel` port) and a capturing `registerProcessor` in a **`setupFiles`** entry, or inside `vi.hoisted()`.
 - Then load the module with `await import('../audio/capture.worklet')` inside the test, and drive `process()` quantum by quantum.
 
-**Silero parity.** The TS port is compared against `onnxruntime-web` in Node: `max|Δp| < 1e-3` and 0 decision flips across all fixtures. That's the same check I reproduced on one file (max error 2.4 × 10⁻⁶ over 1875 frames [E]), applied to a wider corpus.
+**Silero parity.** The TS port is compared against `onnxruntime-web` in Node, with the two tiers from [§4.2.3](#423-decision): fp32 weights `max|Δp| < 1e-4`, and the shipped fp16 weights `max|Δp| < 5e-3`, with 0 decision flips across all fixtures. That's the same check I reproduced on one file (max error 2.4 × 10⁻⁶ over 1875 frames [E]), applied to a wider corpus.
 
 **Coverage.** v8 provider, with ≥ 90 % line and branch thresholds **scoped by glob to the pure modules**: `src/dsp/**`, `src/app/machine.ts`, `src/app/settings.ts`, `src/input/recognizer.ts`, `src/anim/director.ts`. Vitest supports per-glob thresholds [V R61]. The adapters (`effects.ts`, `pointer-adapter.ts`) are covered by Browser Mode and e2e instead.
 
@@ -1758,7 +1778,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 - **Harness:** `scripts/vad-eval.ts` runs the **same modules** on two input kinds: WAVs from the synthetic/TTS corpus, and real-voice **feature traces** (below). It reports hit, miss and split counts, truncation, end-of-speech latency (defined in [§4.2.3](#423-decision)), and false triggers per minute.
 - **Debug overlay:** probability trace, floor and per-frame timings.
 - **`lab/bench`:** X-V2, plus worklet-DSP timing.
-- **Regression corpus: synthetic + text-to-speech, no real voices.** It is built by `scripts/gen-corpus.ts` and committed; labels are exact because they come from the clean signal.
+- **Regression corpus: synthetic + text-to-speech, no real voices.** The clean TTS speech (16 kHz) and its labels are committed. The noise mixes are regenerated bit-exactly by `scripts/gen-corpus.ts` from a seed, with a hash list committed, because committing every SNR × noise mix would add more than 100 MB. Labels are exact because they come from the clean signal.
   - **Speech:** espeak-ng [V R75], run **once** on a dev machine or in a pinned container, with the WAVs committed. It is not a CI dependency, and program output is generally not covered by the GPL [M].
     - Several voices and variants, including the `whisper` variant [V R75].
     - Pitch and speed sweeps, including high-pitch "child-like" settings. These are a proxy, not a child's voice [M].
@@ -1792,11 +1812,12 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
   - positive threshold {0.4, 0.5, 0.6};
   - negative = positive − {0.1, 0.15, 0.2};
   - hangover 400–800 ms in 100 ms steps;
-  - minimum speech {100, 150, 200, 250} ms.
+  - minimum speech {100, 150, 200, 250} ms;
+  - proximity-gate X {0, 3, 6, 9, 12} dB.
 
 **Tests**
 
-- Parity: TS port vs `onnxruntime-web` in CI (`max|Δp| < 1e-3`, 0 flips).
+- Parity: TS port vs `onnxruntime-web` in CI, with the two tiers from [§4.2.3](#423-decision) and 0 flips.
 - Metric regression in CI on the TTS corpus (hard) and on the committed session-B traces (hard unless stale; see above). A fast subset runs on every PR; the full grid runs nightly or on demand.
 - Trace-format tests: the round trip is lossless; the harness flags traces whose config hash doesn't match the build.
 - Decimator anti-aliasing property test.
