@@ -113,6 +113,8 @@ export interface SessionState {
   capHits: number;
   sfxSeq: number;
   sfxEndedSeq: number;
+  /** A MicDenied reaction played an sfx since the last Waking completion (D22). */
+  micDeniedSfx: boolean;
   updateReady: boolean;
   preset: VoicePreset;
 }

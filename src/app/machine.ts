@@ -71,6 +71,7 @@ export function initialSessionState(permission: Permission): SessionState {
     capHits: 0,
     sfxSeq: 0,
     sfxEndedSeq: 0,
+    micDeniedSfx: false,
     updateReady: false,
     preset: PRESETS.cub,
   };
@@ -202,6 +203,7 @@ function entryActions(to: StateName, st: SessionState, cfg: SessionConfig): [Ses
         micGranted: false,
         playingId: null,
         sfxEndedSeq: st.sfxSeq,
+        micDeniedSfx: false,
         reselectPending: false,
       };
       return [to === 'Error' ? next : { ...next, workerRestarts: 0 }, fx];
@@ -254,17 +256,20 @@ const goTo =
  * Rows 1–3, 39, 42: wake by permission. Row 42 uses it too (approved deviation D4), so a tap never opens the
  * mic while permission is `prompt`: the mic is never requested straight from a child's tap (§4.5).
  */
-function wakeByPermission(s: SessionState, cfg: SessionConfig): Out {
+function wakeByPermission(s: SessionState, cfg: SessionConfig, p: Partial<SessionState> = {}): Out {
   switch (s.permission) {
     case 'granted':
-      return transitionTo(s, 'Waking', cfg, [{ k: 'resumeCtx' }, anim({ e: 'wake' })]);
+      return transitionTo(s, 'Waking', cfg, [{ k: 'resumeCtx' }, anim({ e: 'wake' })], p);
     case 'prompt':
-      return transitionTo(s, 'NeedsParent', cfg, [{ k: 'resumeCtx' }]);
+      return transitionTo(s, 'NeedsParent', cfg, [{ k: 'resumeCtx' }], p);
     default: // denied
-      return transitionTo(s, 'MicDenied', cfg, [{ k: 'resumeCtx' }, anim({ e: 'wake' })]);
+      return transitionTo(s, 'MicDenied', cfg, [{ k: 'resumeCtx' }, anim({ e: 'wake' })], p);
   }
 }
 const onWakeTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out => wakeByPermission(s, cfg);
+/** Row 42: tap to retry from Error starts a fresh wake, as row 1 does (approved deviations D4, D25). */
+const onErrorTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out =>
+  wakeByPermission(s, cfg, { workerRestarts: 0 });
 
 /** Row 10: MicDenied → Waking, as row 1. */
 const retryFromMicDenied = (s: SessionState, cfg: SessionConfig, p: Partial<SessionState> = {}): Out =>
@@ -289,7 +294,10 @@ const onHideAsleepOrPaused = (s: SessionState): Out => same(s);
 function wakingFlag(s: SessionState, p: Partial<SessionState>, cfg: SessionConfig): Out {
   const next = { ...s, ...p };
   if (next.micGranted && next.ctxRunning) {
-    return transitionTo(s, sfxAudible(s) ? 'SfxGated' : 'Listening', cfg, [], p); // row 6, C5
+    // Row 6, C5. A MicDenied sfx that has already left the speaker still gets its cooldown before the
+    // first arm (§4.4.3, §4.4.5; approved deviation D22).
+    const to = sfxAudible(s) ? 'SfxGated' : s.micDeniedSfx ? 'Cooldown' : 'Listening';
+    return transitionTo(s, to, cfg, [], { ...p, micDeniedSfx: false });
   }
   return stay(s, p); // row 7
 }
@@ -324,7 +332,7 @@ const animOnlyReaction: Handler<'reaction'> = (s, e) => stay(s, {}, [reactionAni
 const micDeniedReaction: Handler<'reaction'> = (s, e, cfg) =>
   e.sfx === null
     ? stay(s, {}, [reactionAnim(e), timer('sleep', cfg.tSleepMs)])
-    : stay(s, { sfxSeq: s.sfxSeq + 1 }, [
+    : stay(s, { sfxSeq: s.sfxSeq + 1, micDeniedSfx: true }, [
         { k: 'sfx', id: e.sfx, seq: s.sfxSeq + 1 },
         reactionAnim(e),
         timer('sleep', cfg.tSleepMs),
@@ -372,10 +380,12 @@ const listeningTimer: Handler<'timer'> = (s, e, cfg) => {
   if (e.name === 'sleep') return transitionTo(s, 'Asleep', cfg); // row 17 (anim sleep is the Asleep entry)
   return same(s);
 };
+// Row 19: re-enter, only after a mute. An unmute while already unmuted changes nothing (approved deviation D24).
 const listeningUnmuted: Handler<'trackUnmuted'> = (s, _e, cfg) =>
-  transitionTo(s, 'Listening', cfg, [], { micMuted: false, floorDb: undefined }, true); // row 19: re-enter
+  s.micMuted ? transitionTo(s, 'Listening', cfg, [], { micMuted: false, floorDb: undefined }, true) : same(s);
+// Row 40. A floor measured on the previous input is not restored on the new one (approved deviation D26).
 const armedInputsChanged: Handler<'inputsChanged'> = (s, _e, cfg) =>
-  transitionTo(s, 'Waking', cfg, [{ k: 'closeMic' }, { k: 'reselectInput' }]); // row 40
+  transitionTo(s, 'Waking', cfg, [{ k: 'closeMic' }, { k: 'reselectInput' }], { floorDb: undefined });
 const gatedInputsChanged: Handler<'inputsChanged'> = (s) => stay(s, { reselectPending: true }); // row 40b
 
 // Recording (rows 20–22).
@@ -442,6 +452,7 @@ const cooldownTimer: Handler<'timer'> = (s, e, cfg) => {
   if (s.reselectPending) {
     return transitionTo(s, 'Waking', cfg, [{ k: 'closeMic' }, { k: 'reselectInput' }], {
       reselectPending: false,
+      floorDb: undefined, // D26: the saved floor belongs to the previous input
     }); // row 35b
   }
   return transitionTo(s, sfxAudible(s) ? 'SfxGated' : 'Listening', cfg); // row 35, C5
@@ -457,9 +468,9 @@ function workerFailure(s: SessionState, cfg: SessionConfig): Out {
   if (s.name === 'Cooldown') {
     return stay(s, { workerRestarts }, [restart, confused, timer('cooldown', cfg.cooldownMs)]); // row 45, no entry
   }
-  if (s.name === 'Playing') {
-    // Abort the replay too, so the re-arm after cooldown never overlaps audible playback (plan §4.4, §4.9.1).
-    // Approved deviation D2 (issue #28 ORCH-ANSWER).
+  if (s.name === 'Playing' || s.name === 'SfxGated') {
+    // Abort the replay and every sfx too, so the cooldown (and a row 35b reselect) never starts while audio
+    // is still audible (plan §4.4, §4.9.1, row 40b). Approved deviations D2 (Playing) and D23 (SfxGated).
     return transitionTo(s, 'Cooldown', cfg, [{ k: 'stopPlayback' }, restart, confused], {
       workerRestarts,
       sfxEndedSeq: s.sfxSeq,
@@ -840,7 +851,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     updateReady: onUpdateReady,
   },
   Error: {
-    tapBear: onWakeTap, // row 42
+    tapBear: onErrorTap, // row 42
     parentContinue: 'ignore',
     settingsRetry: 'ignore',
     permissionChanged: onPermissionChanged,

@@ -176,6 +176,7 @@ function stopFields(s: SessionState, to: 'Asleep' | 'Paused' | 'Error'): Partial
     micGranted: false,
     playingId: null,
     sfxEndedSeq: s.sfxSeq,
+    micDeniedSfx: false,
     reselectPending: false,
     workerRestarts: to === 'Error' ? s.workerRestarts : 0,
   };
@@ -311,6 +312,7 @@ describe('plan §3.4 rows', () => {
     const s = stateIn('MicDenied', { permission: 'denied' });
     expectStep(s, reaction(2, true), 'MicDenied', [sfx(SEQ + 1), reactionAnim(2), SLEEP_T], {
       sfxSeq: SEQ + 1,
+      micDeniedSfx: true, // D22
     });
     expectStep(s, reaction(2, false), 'MicDenied', [reactionAnim(2), SLEEP_T]);
   });
@@ -377,6 +379,8 @@ describe('plan §3.4 rows', () => {
       [cancel('sleep'), cancel('doze'), ...listenEntry(EPOCH + 1), ui(null)],
       { micMuted: false, floorDb: undefined, epoch: EPOCH + 1, armFrame: null, onsetFrame: null },
     );
+    // D24: an unmute while already unmuted changes nothing.
+    expectIgnored(stateIn('Listening'), { t: 'trackUnmuted' });
   });
 
   it('row 20: Recording + seg.end → Processing with the clamped take', () => {
@@ -522,7 +526,7 @@ describe('plan §3.4 rows', () => {
       tmr('cooldown'),
       'Waking',
       [cancel('cooldown'), CLOSE_MIC, RESELECT, ...wakingEntry(REQ + 1)],
-      { reselectPending: false, micReq: REQ + 1, micGranted: false },
+      { reselectPending: false, micReq: REQ + 1, micGranted: false, floorDb: undefined }, // D26
     );
   });
 
@@ -586,7 +590,7 @@ describe('plan §3.4 rows', () => {
         { t: 'inputsChanged' },
         'Waking',
         [...EXIT[from], CLOSE_MIC, RESELECT, disarm(EPOCH), ...wakingEntry(REQ + 1)],
-        { micReq: REQ + 1, micGranted: false }, // ctxRunning stays true (C6)
+        { micReq: REQ + 1, micGranted: false, floorDb: undefined }, // ctxRunning stays true (C6); D26
       );
     }
   });
@@ -663,9 +667,14 @@ describe('plan §3.4 rows', () => {
   });
 
   it('row 45: first worker failure in a mic-open state → Cooldown (restart once)', () => {
-    const into = (from: StateName, row: Effect[], extra: Partial<SessionState> = {}) =>
+    const into = (
+      from: StateName,
+      row: Effect[],
+      extra: Partial<SessionState> = {},
+      over: Partial<SessionState> = {},
+    ) =>
       expectStep(
-        stateIn(from),
+        stateIn(from, over),
         { t: 'workerFailed' },
         'Cooldown',
         [...EXIT[from], ...row, ...(ARMED.has(from) ? [disarm(EPOCH)] : []), COOLDOWN_T],
@@ -675,7 +684,8 @@ describe('plan §3.4 rows', () => {
     into('Recording', [RESTART, anim('confused')]);
     into('Processing', [RESTART, anim('confused')]);
     into('Playing', [STOP, RESTART, anim('confused')], { playingId: null, sfxEndedSeq: SEQ });
-    into('SfxGated', [RESTART, anim('confused')]);
+    // D23: an audible sfx is stopped too, so the cooldown never starts while it plays.
+    into('SfxGated', [STOP, RESTART, anim('confused')], { sfxEndedSeq: SEQ }, { sfxEndedSeq: SEQ - 1 });
     // Cooldown stays in Cooldown: no exit or entry, the row's own timer cooldown restarts the wait.
     expectStep(
       stateIn('Cooldown'),
@@ -1053,7 +1063,7 @@ describe('clarifications C1–C12', () => {
   });
 });
 
-// ---- Plan decisions: approved deviations D2, D3, D4, D6 (ORCH-ANSWER on #28) and the literal rows 32/36 ----
+// ---- Plan decisions: approved deviations D2–D4, D6, D22–D26 (ORCH-ANSWERs on #28); literal rows 32/36 ----
 describe('plan decisions', () => {
   it('rows 32 and 36 emit no anim (C4: as in the plan)', () => {
     for (const from of ['SfxGated', 'Cooldown'] as const) {
@@ -1121,6 +1131,73 @@ describe('plan decisions', () => {
     expect(r.state.name).toBe('Listening');
     expect(r.effects).toContainEqual(DOZE_T);
     expect(r.effects.some((f) => f.k === 'cancelTimer')).toBe(false); // the sleep timer keeps running
+  });
+
+  it('D22: a MicDenied sfx that already left the speaker still gets its cooldown before the first arm', () => {
+    let s = run(initialSessionState('denied'), { t: 'tapBear' }).state; // row 3 → MicDenied
+    s = run(s, reaction(2, true)).state; // row 11: sfx seq 1
+    expect(s).toMatchObject({ name: 'MicDenied', sfxSeq: 1, micDeniedSfx: true });
+    s = run(s, { t: 'ctxRunning', sampleRate: 48_000 }).state;
+    s = run(s, { t: 'settingsRetry' }).state; // row 10 → Waking
+    s = run(s, { t: 'sfxAtSpeakerEnded', seq: 1 }).state; // the sfx left the speaker while Waking
+    const r = expectStep(s, { t: 'micGranted', req: s.micReq }, 'Cooldown', [cancel('waking'), COOLDOWN_T], {
+      micGranted: true,
+      micDeniedSfx: false,
+    });
+    const rearm = run(r.state, tmr('cooldown'));
+    expect(rearm.state.name).toBe('Listening');
+    expect(rearm.effects.some((f) => f.k === 'arm')).toBe(true);
+    // Entering Asleep, Paused or Error clears the flag.
+    expect(run(stateIn('MicDenied', { micDeniedSfx: true }), { t: 'hidden' }).state.micDeniedSfx).toBe(false);
+  });
+
+  it('D23: a worker failure in SfxGated stops the sfx before the cooldown; a pending reselect waits for it', () => {
+    let s = stateIn('SfxGated', { sfxEndedSeq: SEQ - 1 }); // an sfx is audible
+    s = run(s, { t: 'inputsChanged' }).state; // row 40b
+    const r = run(s, { t: 'workerFailed' });
+    const stopAt = r.effects.findIndex((f) => f.k === 'stopPlayback');
+    const cooldownAt = r.effects.findIndex((f) => f.k === 'timer' && f.name === 'cooldown');
+    expect(stopAt).toBeGreaterThanOrEqual(0);
+    expect(cooldownAt).toBeGreaterThan(stopAt);
+    expect(r.state).toMatchObject({ name: 'Cooldown', reselectPending: true, sfxEndedSeq: SEQ, sfxSeq: SEQ });
+    const reselect = run(r.state, tmr('cooldown')); // row 35b
+    expect(reselect.state.name).toBe('Waking');
+    expect(reselect.effects.map((f) => f.k)).toContain('reselectInput');
+    // Without a pending reselect the same path reaches Listening, arming only on the cooldown timer.
+    const plain = run(stateIn('SfxGated', { sfxEndedSeq: SEQ - 1 }), { t: 'workerFailed' });
+    expect(plain.effects.some((f) => f.k === 'arm')).toBe(false);
+    const listen = run(plain.state, tmr('cooldown'));
+    expect(listen.state.name).toBe('Listening');
+    expect(listen.effects.some((f) => f.k === 'arm')).toBe(true);
+  });
+
+  it('D25: tapping to retry from Error starts a fresh wake (workerRestarts reset)', () => {
+    const error = run(stateIn('Listening', { workerRestarts: 1 }), { t: 'workerFailed' }).state; // row 46
+    expect(error).toMatchObject({ name: 'Error', workerRestarts: 1 });
+    let s = run(error, { t: 'tapBear' }).state; // row 42, permission granted
+    expect(s).toMatchObject({ name: 'Waking', workerRestarts: 0 });
+    s = run(s, { t: 'ctxRunning', sampleRate: 48_000 }).state;
+    s = run(s, { t: 'micGranted', req: s.micReq }).state;
+    expect(s.name).toBe('Listening');
+    const r = run(s, { t: 'workerFailed' }); // a single failure now restarts the worker (row 45), not Error
+    expect(r.state).toMatchObject({ name: 'Cooldown', workerRestarts: 1 });
+    expect(r.effects).toContainEqual(RESTART);
+    for (const permission of ['prompt', 'denied'] as const) {
+      expect(
+        run(stateIn('Error', { permission, workerRestarts: 1 }), { t: 'tapBear' }).state.workerRestarts,
+      ).toBe(0);
+    }
+  });
+
+  it('D26: after an input reselect, the next arm restores no floor from the previous input', () => {
+    const viaRow40 = run(stateIn('Listening'), { t: 'inputsChanged' }).state;
+    const viaRow35b = run(stateIn('Cooldown', { reselectPending: true }), tmr('cooldown')).state;
+    for (const waking of [viaRow40, viaRow35b]) {
+      expect(waking).toMatchObject({ name: 'Waking', floorDb: undefined });
+      const r = run(waking, { t: 'micGranted', req: waking.micReq });
+      expect(r.state.name).toBe('Listening');
+      expect(r.effects.find((f) => f.k === 'arm')).toStrictEqual({ k: 'arm', epoch: r.state.epoch });
+    }
   });
 });
 
@@ -1263,6 +1340,7 @@ function variants(name: StateName): SessionState[] {
       workerRestarts: 1,
       updateReady: true,
       sfxEndedSeq: name === 'SfxGated' || name === 'Cooldown' ? SEQ - 1 : SEQ,
+      micDeniedSfx: name === 'MicDenied' || name === 'Waking',
       floorDb: undefined,
       capHits: 2,
     }),
@@ -1369,6 +1447,7 @@ describe('initial state and config', () => {
       capHits: 0,
       sfxSeq: 0,
       sfxEndedSeq: 0,
+      micDeniedSfx: false,
       updateReady: false,
       preset: PRESETS.cub,
     });
