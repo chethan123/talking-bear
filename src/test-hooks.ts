@@ -66,7 +66,7 @@ export interface TestHookDeps {
 const OUTPUT_RING_SEC = 15;
 /** outputSamples() trims everything before the first and after the last sample above this magnitude. */
 const SILENCE = 1e-4;
-/** Level events kept for maxLevelDb (≈ 4 min at one level event per 32 ms). */
+/** Level events kept for maxLevelDb (≈ 4 min: the worker posts one every third 10 ms hop, ≈ 33 per second). */
 const LEVEL_CAPACITY = 8192;
 
 /** A preallocated ring of the latest `capacity` samples. */
