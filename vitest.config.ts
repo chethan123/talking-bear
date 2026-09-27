@@ -9,7 +9,15 @@ export default defineConfig({
           name: 'node',
           environment: 'node',
           include: ['src/**/*.test.ts', 'scripts/**/*.test.ts', 'test/**/*.test.ts'],
-          exclude: ['**/*.browser.test.ts', 'docs/research/**', 'node_modules/**'],
+          exclude: ['**/*.browser.test.ts', '**/*.worklet.test.ts', 'docs/research/**', 'node_modules/**'],
+        },
+      },
+      {
+        test: {
+          name: 'worklet',
+          environment: 'node',
+          include: ['src/**/*.worklet.test.ts'],
+          setupFiles: ['test/worklet-scope.ts'],
         },
       },
       {
