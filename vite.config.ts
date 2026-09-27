@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vite';
 
-// server/headers.json is the single source of the app's response headers (plan §4.8.3, §4.9.3).
-// Only `vite preview` sends them. The dev server stays header-free: it injects <style> tags,
-// which the production CSP blocks.
+// server/headers.json is the single source of the app's response headers (plan §4.8.3, §4.9.3);
+// the Go server loads the same file. Of Vite's servers only `vite preview` sends them. The dev
+// server stays header-free: it injects <style> tags, which the production CSP blocks.
 function isStringMap(value: unknown): value is Record<string, string> {
   return (
     typeof value === 'object' &&
