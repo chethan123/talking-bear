@@ -107,6 +107,13 @@ describe('RingBuffer examples', () => {
     expect(Array.from(rb.read(9, 13))).toEqual([109, 0, 0, 112]);
   });
 
+  test('a gap overwrites stale samples with zeros', () => {
+    const rb = new RingBuffer(4);
+    rb.write(seq(0, 4), 0);
+    rb.write(seq(6, 1), 6);
+    expect(Array.from(rb.read(3, 7))).toEqual([103, 0, 0, 106]);
+  });
+
   test('a block longer than the capacity keeps its last capacity frames', () => {
     const rb = new RingBuffer(4);
     rb.write(seq(0, 10), 0);

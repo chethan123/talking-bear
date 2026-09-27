@@ -56,7 +56,8 @@ export class RingBuffer {
   /**
    * Appends `block` as frames `[startFrame, startFrame + block.length)`. Must not allocate.
    *
-   * - The first write on an empty buffer sets the base (`startFrame = endFrame = startFrame`).
+   * - The first write on an empty buffer sets the base: `startFrame` and `endFrame` both become the
+   *   `startFrame` argument, then the block is written.
    * - `startFrame < endFrame` throws `RangeError('overlap')`.
    * - `startFrame > endFrame` zero-fills the gap first and counts it in `gapCount` and `gapFrames`.
    * - Blocks and zero-fill runs longer than `capacity` keep only their last `capacity` frames.
