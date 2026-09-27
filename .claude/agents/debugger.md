@@ -13,7 +13,8 @@ You root-cause one failure for a Talking Bear task. You get:
 
 **Work:**
 
-- `cd <worktree>` in every command. Wrap browser, preview, e2e and Docker commands in `flock /tmp/talking-bear-heavy.lock -c '…'`.
+- First read `<worktree>/CLAUDE.md`, if it exists.
+- `cd <worktree>` in every command. Wrap browser, preview, e2e and Docker commands in `flock -w 540 /tmp/talking-bear-heavy.lock -c '…'` (Bash timeout 600000).
 - Reproduce the failure first. Find the **root cause**; "flaky" isn't one.
 - Then apply the **minimal** fix within the task's Scope files, and show that the command passes.
 - If the right fix is outside Scope, or needs a design decision, **don't apply it**. Return the diagnosis and the options.

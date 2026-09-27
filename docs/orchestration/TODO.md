@@ -3,8 +3,9 @@
 This is the checklist for taking the 112 task issues (#12–#123) to a released v1.0.0.
 
 - **Task index:** #3. **Epics:** #4–#11.
-- **Machine-readable graph:** [`tasks.json`](tasks.json).
-- **Agent protocol:** [`ORCHESTRATOR_PROMPT.md`](ORCHESTRATOR_PROMPT.md).
+- **Machine-readable graph:** [`tasks.json`](../../.claude/skills/orchestrate/tasks.json).
+- **How to start:** [`README.md`](README.md).
+- **Protocol:** [`.claude/skills/orchestrate/SKILL.md`](../../.claude/skills/orchestrate/SKILL.md).
 
 The orchestrator keeps the live status on GitHub, as `ORCH-STATE` comments on each issue and an `ORCH-DASHBOARD` comment on #3. This file is the plan; GitHub is the ledger.
 
@@ -16,7 +17,7 @@ The orchestrator keeps the live status on GitHub, as `ORCH-STATE` comments on ea
 
 ## Phase 0 — one-time setup (you)
 
-- [ ] **Merge PR #2.** It carries the plan corrections, the research spikes, `.claude/agents/*` and `docs/orchestration/*`. The agent definitions must be on `main` before the orchestrator starts.
+- [ ] **Merge the planning follow-up PR** (branch `claude/talking-bear-planning-k6a0vj`). PR #2 (the research spikes) is already merged. The follow-up carries the plan corrections that the issues rely on (Kaiser β = 6.0, the Silero parity tiers, the proximity gate, the escalation windows), plus the `.claude/` orchestration package. The orchestrator refuses to start until both are on `main`.
 - [ ] **Environment check** (Claude Code on the web → your environment's settings).
   - **Network policy** must allow:
     - `registry.npmjs.org`;
@@ -27,7 +28,7 @@ The orchestrator keeps the live status on GitHub, as `ORCH-STATE` comments on ea
 - [ ] **Optional labels:** create `task`, `agent`, `owner-device`, `blocked` and `needs-human` in the repo's Labels page. The issue tooling can't create labels, so the tasks currently carry only `m1`–`m8`.
 - [ ] **Decide the merge policy.** `human` (default): you review and merge every PR. `auto`: the orchestrator squash-merges when CI is green, all review threads are resolved, and a high-effort Opus review finds no blockers. Set it in the start prompt.
 - [ ] **Decide parallelism.** Default is 3 concurrent tasks. More means more merge conflicts on shared files.
-- [ ] **Start the orchestrator:** a new Claude Code session on this repo, model **Opus 5.5**, with the start prompt from `ORCHESTRATOR_PROMPT.md` (the "How to start" section).
+- [ ] **Start the orchestrator:** a new Claude Code session on this repo, model **Opus 5.5**, with the start message in [`README.md`](README.md) (`/orchestrate …`).
 - [ ] **Keep notifications on.** The orchestrator pings you through push notifications when an owner task is ready, a task is blocked on a question, or a PR is ready for you to merge.
 
 ## Owner checkpoints (plan your device time)

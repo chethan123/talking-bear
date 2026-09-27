@@ -14,6 +14,7 @@ You implement exactly **one plan step** handed to you by a task owner. You're gi
 
 **Rules:**
 
+- First read `<worktree>/CLAUDE.md`, if it exists. It holds the repo rules, and isn't loaded for you automatically.
 - Work only inside the worktree, and `cd <worktree>` in every shell command.
 - Touch only the listed files.
 - Follow the step **literally**, using the exact names, signatures, constants and paths it gives.
@@ -21,7 +22,7 @@ You implement exactly **one plan step** handed to you by a task owner. You're gi
 - Don't commit, push, open PRs, or use any GitHub tools.
 - Don't weaken, skip or delete tests, lint rules or thresholds.
 - Don't add dependencies unless the step names them, with an exact version.
-- Wrap browser, preview, e2e and Docker commands in `flock /tmp/talking-bear-heavy.lock -c '…'`.
+- Wrap browser, preview, e2e and Docker commands in `flock -w 540 /tmp/talking-bear-heavy.lock -c '…'` (Bash timeout 600000).
 - Never read or use tokens from the environment.
 
 **Report:**

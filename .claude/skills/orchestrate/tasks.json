@@ -11,7 +11,7 @@
   "M7": 10,
   "M8": 11
  },
- "note": "Scheduling data generated from the published issues (2026-09-27). The issues are the source of truth for task content; this file is for scheduling (dependencies, scope files for overlap checks). Issue bodies: #12-#123.",
+ "note": "Scheduling data for the orchestrate skill, generated from the published issues (2026-09-27). Issues are the source of truth for task content; this file holds dependencies and Scope files (for the overlap rule; entries may be globs). Issues created later (follow-ups) are not listed here: the orchestrator parses them from GitHub (intake rule).",
  "tasks": [
   {
    "id": "T01",
@@ -931,7 +931,6 @@
     44
    ],
    "scopeFiles": [
-    ".cache/silero/silero_vad_16k_op15.onnx",
     "THIRD_PARTY_NOTICES.md",
     "package.json",
     "public/licenses.txt",
@@ -1173,7 +1172,6 @@
     66
    ],
    "scopeFiles": [
-    ".json",
     "e2e/fixtures/tts_sentence_{a,b}.wav",
     "e2e/loop-*.spec.ts",
     "e2e/loop-tts-a.spec.ts",
@@ -1564,7 +1562,6 @@
     92
    ],
    "scopeFiles": [
-    "'src/app/settings.ts'",
     "src/app/settings.test.ts",
     "src/app/settings.ts",
     "vitest.config.ts"
@@ -1950,7 +1947,6 @@
     91
    ],
    "scopeFiles": [
-    "'src/anim/director.ts'",
     "src/anim/director.test.ts",
     "src/anim/director.ts",
     "vitest.config.ts"
@@ -2144,7 +2140,6 @@
     90
    ],
    "scopeFiles": [
-    "'src/input/recognizer.ts'",
     "src/input/recognizer.test.ts",
     "src/input/recognizer.ts",
     "vitest.config.ts"
@@ -2610,7 +2605,6 @@
    "scopeFiles": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
-    "/server",
     "github.com/chethan123/talking-bear/server",
     "server/embed.go",
     "server/go.mod",
@@ -2696,7 +2690,6 @@
    ],
    "scopeFiles": [
     ".github/dependabot.yml",
-    "/",
     "docs/image.md"
    ]
   },
@@ -2775,8 +2768,6 @@
     121
    ],
    "scopeFiles": [
-    "/",
-    "/sw.js",
     "e2e/csp.spec.ts",
     "preview.headers",
     "server/headers.json",
@@ -3116,7 +3107,6 @@
     123
    ],
    "scopeFiles": [
-    "/",
     "e2e/csp.spec.ts",
     "scripts/check-compose-headers.sh",
     "scripts/check-headers.sh",

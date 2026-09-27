@@ -7,6 +7,13 @@ description: Repo-specific rules for driving a Talking Bear task PR to mergeable
 
 These rules apply to every pull request from a `task/txx-*` branch. They add to your session's own PR rules and never relax them.
 
+## Who acts (one actor per PR)
+
+- **Orchestrator running:** if issue #3 has a comment starting `ORCH-LOCK: held` with a heartbeat less than 3 h old, the orchestrator (`.claude/skills/orchestrate/SKILL.md`) and its task owners own every task PR.
+  - If you *are* that orchestrator or one of its task owners, follow your own protocol. These rules still apply.
+  - Otherwise, **don't act on task PRs**. Tell the human the orchestrator owns them.
+- **No live orchestrator, or the human explicitly asks you:** you may drive the PR. Record `run: steward` and `owner: steward` in any `ORCH-STATE` you post.
+
 ## Identify the task
 
 - The branch `task/t07-…` means task **T07**. The issue number is in the PR body (`Closes #n`), or in `.claude/skills/orchestrate/tasks.json` (`id` → `issue`).
@@ -52,12 +59,12 @@ After each round, post a status comment on the **issue** (not the PR), using exa
 
 ```
 ORCH-STATE: <pr-open|pr-ready|merged-done|blocked>
-task: <Txx> (#<issue>) · run: <run id from the latest ORCH-STATE, or "manual"> · at: <UTC ISO>
+task: <Txx> (#<issue>) · run: <steward, or your orchestrator run id> · owner: <steward, or your OWNER_ID> · at: <UTC ISO>
 branch: <branch> · pr: #<n>
 note: <one line>
 ```
 
-- **`pr-ready`** means: CI green on the head commit, no conflicts, no unresolved review threads. The human merges, unless the orchestrator runs with `MERGE_POLICY=auto`.
+- **`pr-ready`** means: CI green on the head commit, no conflicts, no unresolved review threads. **Never merge**: the human merges, or the orchestrator does under `MERGE_POLICY=auto`.
 - **After a merge:**
   1. confirm the issue closed; if not, close it with a comment linking the PR;
   2. post `merged-done`;

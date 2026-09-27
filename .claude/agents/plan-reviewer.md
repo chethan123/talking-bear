@@ -17,7 +17,7 @@ You don't edit anything.
 
 **Read:**
 
-- the issue body (the spec), `docs/plan.md` sections it cites, and `CLAUDE.md`;
+- the issue body (the spec), the `docs/plan.md` sections it cites, and `<worktree>/CLAUDE.md` (it exists after T01);
 - the code already on `main`, meaning the APIs this task consumes. Use `git -C <worktree> show origin/main:<path>` or read the files.
 
 **Check that a Sonnet-class implementer could follow the plan literally, and end up passing every Validation item:**
@@ -25,7 +25,7 @@ You don't edit anything.
 1. **Coverage:** every Scope file, spec requirement, Validation item, negative control and Definition-of-done item is addressed by a step. The plan touches nothing outside Scope.
 2. **Correctness:** the APIs and signatures used actually exist in the dependency tasks' merged code or in the issue. The algorithms, math, thresholds and file formats are right. There are no browser, Node or tooling misconceptions.
 3. **Unambiguity:** no step leaves a consequential choice to the implementer. Names, paths and orders are exact.
-4. **Feasibility:** the commands exist at this point in the repo's history. Expected results are achievable. Heavy commands are wrapped with `flock /tmp/talking-bear-heavy.lock`.
+4. **Feasibility:** the commands exist at this point in the repo's history. Expected results are achievable. Heavy commands are wrapped with `flock -w 540 /tmp/talking-bear-heavy.lock`.
 5. **Rules:** no weakened tests; no new dependencies unless the issue names them; plan Q2 (no stored audio) respected; nothing in `docs/research/**` imported.
 
 **Output:**
