@@ -2106,6 +2106,7 @@ Everything runs on GitHub Actions, `ubuntu-24.04`. **Every job sets `timeout-min
 | `docker/metadata-action` | v6.2.0 |
 | `docker/login-action` | v4.6.0 |
 | `docker/build-push-action` | v7.4.0 |
+| `actions/setup-go` | the latest release tag when the `go` CI job is written (M7), resolved the same way; `go-version-file: server/go.mod` |
 
 The exact SHAs are resolved when `ci.yml` is written in M1 (via `git ls-remote --tags`).
 

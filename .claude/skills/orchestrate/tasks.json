@@ -11,7 +11,7 @@
   "M7": 10,
   "M8": 11
  },
- "note": "Scheduling data for the orchestrate skill, generated from the published issues (2026-09-27). Issues are the source of truth for task content; this file holds dependencies and Scope files (for the overlap rule; entries may be globs). Issues created later (follow-ups) are not listed here: the orchestrator parses them from GitHub (intake rule).",
+ "note": "Scheduling data for the orchestrate skill, generated from the published issues. Issues are the source of truth for task content; this file holds dependencies, Scope files (for the overlap rule and the auto-merge scope gate; entries may be globs: ** crosses /, * does not, {a,b} expands) and `demo` (the closure of a talking, animated bear on the phone, scheduled first with PRIORITY=demo). Task ids are fixed by issue number and are only roughly topological. Issues created later are not listed here: the orchestrator parses them from GitHub (intake rule).",
  "tasks": [
   {
    "id": "T01",
@@ -28,11 +28,13 @@
     13,
     72
    ],
+   "demo": true,
    "scopeFiles": [
-    ".gitignore",
     "CLAUDE.md",
-    "docs/adr/0000-template.md",
-    "docs/device-notes.md"
+    ".editorconfig",
+    ".gitignore",
+    "docs/device-notes.md",
+    "docs/adr/0000-template.md"
    ]
   },
   {
@@ -63,28 +65,32 @@
     38,
     43,
     48,
-    74
+    74,
+    86
    ],
+   "demo": true,
    "scopeFiles": [
-    ".npmrc",
-    ".nvmrc",
-    ".oxlintrc.json",
-    ".prettierrc",
-    "CLAUDE.md",
-    "index.html",
     "package.json",
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
-    "src/main.ts",
-    "src/smoke.test.ts",
-    "src/vite-env.d.ts",
-    "tsconfig.app.json",
+    ".npmrc",
+    ".nvmrc",
     "tsconfig.json",
-    "tsconfig.node.json",
-    "tsconfig.worker.json",
+    "tsconfig.app.json",
     "tsconfig.worklet.json",
+    "tsconfig.worker.json",
+    "tsconfig.node.json",
+    "tsconfig.test.json",
     "vite.config.ts",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    ".oxlintrc.json",
+    ".prettierrc",
+    ".prettierignore",
+    "index.html",
+    "src/main.ts",
+    "src/vite-env.d.ts",
+    "src/smoke.test.ts",
+    "CLAUDE.md"
    ]
   },
   {
@@ -106,9 +112,10 @@
     15,
     18
    ],
+   "demo": true,
    "scopeFiles": [
-    ".github/dependabot.yml",
-    ".github/workflows/ci.yml"
+    ".github/workflows/ci.yml",
+    ".github/dependabot.yml"
    ]
   },
   {
@@ -131,14 +138,16 @@
    "unblocks": [
     18,
     26,
-    30
+    30,
+    75
    ],
+   "demo": true,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
-    "CLAUDE.md",
     "package.json",
+    "vitest.config.ts",
     "src/audio-smoke.browser.test.ts",
-    "vitest.config.ts"
+    ".github/workflows/ci.yml",
+    "CLAUDE.md"
    ]
   },
   {
@@ -162,15 +171,17 @@
     44,
     50
    ],
+   "demo": true,
    "scopeFiles": [
-    "*.json",
-    "e2e/fixtures/*.wav",
-    "package.json",
-    "scripts/gen-fixtures.test.ts",
-    "scripts/gen-fixtures.ts",
-    "test/fixtures/*.wav",
+    "test/wav.ts",
     "test/wav.test.ts",
-    "test/wav.ts"
+    "scripts/gen-fixtures.ts",
+    "scripts/gen-fixtures.test.ts",
+    "test/fixtures/*.wav",
+    "test/fixtures/*.json",
+    "e2e/fixtures/*.wav",
+    "e2e/fixtures/*.json",
+    "package.json"
    ]
   },
   {
@@ -192,11 +203,11 @@
     18,
     103
    ],
+   "demo": true,
    "scopeFiles": [
-    "preview.headers",
     "server/headers.json",
-    "src/headers.test.ts",
-    "vite.config.ts"
+    "vite.config.ts",
+    "src/headers.test.ts"
    ]
   },
   {
@@ -223,16 +234,18 @@
    "unblocks": [
     36
    ],
+   "demo": true,
    "scopeFiles": [
+    "package.json",
+    "src/vite-env.d.ts",
+    "playwright.config.ts",
+    "e2e/helpers/flags.ts",
+    "e2e/helpers/csp.ts",
+    "e2e/harness.spec.ts",
+    "e2e/fake-mic.spec.ts",
     ".github/workflows/ci.yml",
     "CLAUDE.md",
-    "e2e/fake-mic.spec.ts",
-    "e2e/harness.spec.ts",
-    "e2e/helpers/csp.ts",
-    "e2e/helpers/flags.ts",
-    "package.json",
-    "playwright.config.ts",
-    "src/vite-env.d.ts"
+    ".env.e2e"
    ]
   },
   {
@@ -256,9 +269,10 @@
     52,
     62
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/biquad.test.ts",
     "src/dsp/biquad.ts",
+    "src/dsp/biquad.test.ts",
     "test/dsp-helpers.ts"
    ]
   },
@@ -280,9 +294,10 @@
    "unblocks": [
     25
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/ring-buffer.test.ts",
-    "src/dsp/ring-buffer.ts"
+    "src/dsp/ring-buffer.ts",
+    "src/dsp/ring-buffer.test.ts"
    ]
   },
   {
@@ -304,11 +319,13 @@
     25,
     27,
     44,
+    50,
     62
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/resample.test.ts",
-    "src/dsp/resample.ts"
+    "src/dsp/resample.ts",
+    "src/dsp/resample.test.ts"
    ]
   },
   {
@@ -330,9 +347,10 @@
     27,
     45
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/energy-gate.test.ts",
-    "src/dsp/energy-gate.ts"
+    "src/dsp/energy-gate.ts",
+    "src/dsp/energy-gate.test.ts"
    ]
   },
   {
@@ -354,9 +372,10 @@
     24,
     27
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/segmenter.test.ts",
-    "src/dsp/segmenter.ts"
+    "src/dsp/segmenter.ts",
+    "src/dsp/segmenter.test.ts"
    ]
   },
   {
@@ -379,14 +398,16 @@
     27,
     28,
     30,
+    64,
     65
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/audio/constants.ts",
-    "src/audio/messages.test.ts",
     "src/audio/messages.ts",
+    "src/audio/constants.ts",
     "src/audio/sfx-ids.ts",
-    "src/dsp/types.ts"
+    "src/dsp/types.ts",
+    "src/audio/messages.test.ts"
    ]
   },
   {
@@ -416,13 +437,13 @@
     33,
     54
    ],
+   "demo": true,
    "scopeFiles": [
-    "*.worklet.test.ts",
-    "package.json",
-    "src/audio/capture.worklet.test.ts",
     "src/audio/capture.worklet.ts",
+    "src/audio/capture.worklet.test.ts",
     "test/worklet-scope.ts",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "package.json"
    ]
   },
   {
@@ -443,6 +464,7 @@
     "T04"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": [
     "src/audio/capture.browser.test.ts"
    ]
@@ -475,10 +497,11 @@
     33,
     46
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/workers/dsp.worker.ts",
+    "src/workers/vad-core.ts",
     "src/workers/vad-core.test.ts",
-    "src/workers/vad-core.ts"
+    "src/workers/dsp.worker.ts"
    ]
   },
   {
@@ -501,10 +524,11 @@
     34,
     79
    ],
+   "demo": true,
    "scopeFiles": [
     "src/app/events.ts",
-    "src/app/machine.test.ts",
-    "src/app/machine.ts"
+    "src/app/machine.ts",
+    "src/app/machine.test.ts"
    ]
   },
   {
@@ -525,9 +549,10 @@
    "unblocks": [
     33
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/app/machine.props.test.ts",
-    "test/session-sim.ts"
+    "test/session-sim.ts",
+    "src/app/machine.props.test.ts"
    ]
   },
   {
@@ -552,13 +577,14 @@
     80,
     88
    ],
+   "demo": true,
    "scopeFiles": [
     "src/audio/bus.ts",
-    "src/audio/output-clock.test.ts",
     "src/audio/output-clock.ts",
-    "src/audio/player.browser.test.ts",
     "src/audio/player.ts",
-    "src/audio/sfx.ts"
+    "src/audio/sfx.ts",
+    "src/audio/output-clock.test.ts",
+    "src/audio/player.browser.test.ts"
    ]
   },
   {
@@ -580,13 +606,14 @@
     34,
     39
    ],
+   "demo": true,
    "scopeFiles": [
     "src/app/clock.ts",
-    "src/platform/permissions.ts",
-    "src/platform/platform.test.ts",
+    "test/fake-clock.ts",
     "src/platform/visibility.ts",
     "src/platform/wake-lock.ts",
-    "test/fake-clock.ts"
+    "src/platform/permissions.ts",
+    "src/platform/platform.test.ts"
    ]
   },
   {
@@ -614,14 +641,15 @@
     41,
     46
    ],
+   "demo": true,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
-    "package.json",
-    "scripts/check-worklet-chunk.ts",
-    "src/audio/engine.browser.test.ts",
     "src/audio/engine.ts",
+    "src/audio/mic.ts",
     "src/audio/mic.test.ts",
-    "src/audio/mic.ts"
+    "src/audio/engine.browser.test.ts",
+    "scripts/check-worklet-chunk.ts",
+    "package.json",
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -644,10 +672,11 @@
     "T14"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
+    "vitest.config.ts",
     "package.json",
-    "vitest.config.ts"
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -672,10 +701,11 @@
    "unblocks": [
     35
    ],
+   "demo": true,
    "scopeFiles": [
+    "src/app/session.ts",
     "src/app/effects.ts",
-    "src/app/session.test.ts",
-    "src/app/session.ts"
+    "src/app/session.test.ts"
    ]
   },
   {
@@ -697,13 +727,14 @@
     36,
     56
    ],
+   "demo": true,
    "scopeFiles": [
-    "index.html",
     "src/main.ts",
     "src/ui/circle.ts",
-    "src/ui/overlay.browser.test.ts",
     "src/ui/overlay.ts",
-    "src/ui/styles.css"
+    "src/ui/styles.css",
+    "src/ui/overlay.browser.test.ts",
+    "index.html"
    ]
   },
   {
@@ -725,18 +756,19 @@
    ],
    "unblocks": [
     37,
-    75
+    50
    ],
+   "demo": true,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
-    "package.json",
-    "scripts/check-no-hooks.ts",
-    "src/audio/engine.ts",
+    "src/test-hooks.ts",
     "src/audio/test-tap.worklet.ts",
-    "src/dsp/yin.test.ts",
     "src/dsp/yin.ts",
+    "src/dsp/yin.test.ts",
     "src/main.ts",
-    "src/test-hooks.ts"
+    "src/audio/engine.ts",
+    "scripts/check-no-hooks.ts",
+    "package.json",
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -756,17 +788,20 @@
    ],
    "unblocks": [
     42,
-    51
+    51,
+    66,
+    119
    ],
+   "demo": true,
    "scopeFiles": [
-    "e2e/deny.spec.ts",
     "e2e/helpers/app.ts",
-    "e2e/hooks.spec.ts",
     "e2e/loop-f0-140.spec.ts",
     "e2e/loop-f0-300.spec.ts",
     "e2e/loop-snr10.spec.ts",
+    "e2e/too-short.spec.ts",
     "e2e/too-long.spec.ts",
-    "e2e/too-short.spec.ts"
+    "e2e/deny.spec.ts",
+    "e2e/hooks.spec.ts"
    ]
   },
   {
@@ -795,17 +830,19 @@
     67,
     68,
     82,
-    83
+    83,
+    119
    ],
+   "demo": false,
    "scopeFiles": [
-    "docs/lab.md",
-    "lab/common.ts",
     "lab/index.html",
     "lab/lab.css",
-    "lab/recorder.worklet.ts",
+    "lab/common.ts",
     "lab/routing.html",
     "lab/routing.ts",
-    "tsconfig.app.json"
+    "lab/recorder.worklet.ts",
+    "tsconfig.app.json",
+    "docs/lab.md"
    ]
   },
   {
@@ -826,12 +863,14 @@
     "T20"
    ],
    "unblocks": [
-    42
+    42,
+    119
    ],
+   "demo": false,
    "scopeFiles": [
-    "lab/index.html",
     "lab/platform.html",
-    "lab/platform.ts"
+    "lab/platform.ts",
+    "lab/index.html"
    ]
   },
   {
@@ -852,12 +891,14 @@
     "T21"
    ],
    "unblocks": [
-    42
+    42,
+    119
    ],
+   "demo": false,
    "scopeFiles": [
-    "lab/index.html",
     "lab/latency.html",
-    "lab/latency.ts"
+    "lab/latency.ts",
+    "lab/index.html"
    ]
   },
   {
@@ -878,8 +919,10 @@
     "T21"
    ],
    "unblocks": [
-    42
+    42,
+    119
    ],
+   "demo": false,
    "scopeFiles": [
     "lab/continuity.html",
     "lab/continuity.ts",
@@ -910,6 +953,7 @@
     "T30"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -930,19 +974,21 @@
    "unblocks": [
     44
    ],
+   "demo": false,
    "scopeFiles": [
-    "THIRD_PARTY_NOTICES.md",
-    "package.json",
-    "public/licenses.txt",
-    "scripts/extract-silero-weights.ts",
     "scripts/fetch-silero-onnx.ts",
-    "scripts/fp16.test.ts",
-    "scripts/fp16.ts",
+    ".cache/silero/silero_vad_16k_op15.onnx",
     "scripts/onnx-reader.ts",
+    "scripts/extract-silero-weights.ts",
     "src/dsp/silero/weights.bin",
     "src/dsp/silero/weights.provenance.json",
+    "src/dsp/silero/weights.ts",
     "src/dsp/silero/weights.test.ts",
-    "src/dsp/silero/weights.ts"
+    "scripts/fp16.ts",
+    "scripts/fp16.test.ts",
+    "THIRD_PARTY_NOTICES.md",
+    "public/licenses.txt",
+    "package.json"
    ]
   },
   {
@@ -968,13 +1014,14 @@
     46,
     54
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
-    "package.json",
-    "scripts/silero-parity.ts",
-    "src/dsp/silero/golden.json",
+    "src/dsp/silero/model.ts",
     "src/dsp/silero/model.test.ts",
-    "src/dsp/silero/model.ts"
+    "src/dsp/silero/golden.json",
+    "scripts/silero-parity.ts",
+    "package.json",
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -996,9 +1043,10 @@
     46,
     64
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/voicing.test.ts",
-    "src/dsp/voicing.ts"
+    "src/dsp/voicing.ts",
+    "src/dsp/voicing.test.ts"
    ]
   },
   {
@@ -1027,14 +1075,15 @@
     49,
     51
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/audio/constants.ts",
-    "src/audio/engine.ts",
-    "src/audio/messages.test.ts",
-    "src/audio/messages.ts",
-    "src/workers/dsp.worker.ts",
+    "src/workers/vad-core.ts",
     "src/workers/vad-core.test.ts",
-    "src/workers/vad-core.ts"
+    "src/workers/dsp.worker.ts",
+    "src/audio/messages.ts",
+    "src/audio/messages.test.ts",
+    "src/audio/engine.ts",
+    "src/audio/constants.ts"
    ]
   },
   {
@@ -1053,16 +1102,18 @@
     "T35"
    ],
    "unblocks": [
+    49,
     53,
     116
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/audio/constants.ts",
-    "src/audio/messages.ts",
-    "src/dsp/proximity.test.ts",
     "src/dsp/proximity.ts",
+    "src/dsp/proximity.test.ts",
+    "src/workers/vad-core.ts",
     "src/workers/vad-core.test.ts",
-    "src/workers/vad-core.ts"
+    "src/audio/constants.ts",
+    "src/audio/messages.ts"
    ]
   },
   {
@@ -1084,10 +1135,11 @@
     49,
     53
    ],
+   "demo": false,
    "scopeFiles": [
+    "src/vad-trace/format.ts",
     "src/vad-trace/config.ts",
-    "src/vad-trace/format.test.ts",
-    "src/vad-trace/format.ts"
+    "src/vad-trace/format.test.ts"
    ]
   },
   {
@@ -1098,89 +1150,105 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 8,
+   "wave": 9,
    "blockedBy": [
     46,
-    48
+    48,
+    47
    ],
    "blockedByIds": [
     "T35",
-    "T37"
+    "T37",
+    "T36"
    ],
    "unblocks": [
     55,
     56
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/audio/engine.ts",
-    "src/audio/messages.test.ts",
     "src/audio/messages.ts",
+    "src/audio/messages.test.ts",
+    "src/workers/vad-core.ts",
     "src/workers/dsp.worker.ts",
     "src/workers/vad-core.test.ts",
-    "src/workers/vad-core.ts"
+    "src/audio/engine.ts"
    ]
   },
   {
    "id": "T39",
    "issue": 50,
    "key": "tts-corpus-speech",
-   "title": "TTS regression speech: espeak-ng generation (pinned), clean 16 kHz WAVs + exact labels, committed",
+   "title": "TTS regression speech: espeak-ng generation (pinned), clean 16 kHz WAVs + exact labels, e2e TTS fixtures, committed",
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 4,
+   "wave": 10,
    "blockedBy": [
-    16
+    16,
+    21,
+    36
    ],
    "blockedByIds": [
-    "T05"
+    "T05",
+    "T10",
+    "T25"
    ],
    "unblocks": [
     51,
-    52
+    52,
+    55,
+    57,
+    67
    ],
+   "demo": false,
    "scopeFiles": [
-    "scripts/gen-tts.ts",
     "scripts/tts/Dockerfile",
-    "test/corpus/PROVENANCE.md",
+    "scripts/gen-tts.ts",
+    "test/corpus/texts.json",
     "test/corpus/speech/*.wav",
     "test/corpus/speech/manifest.json",
-    "test/corpus/texts.json"
+    "test/corpus/PROVENANCE.md",
+    "scripts/gen-e2e-tts-fixtures.ts",
+    "e2e/fixtures/tts_sentence_a.wav",
+    "e2e/fixtures/tts_sentence_a.json",
+    "e2e/fixtures/tts_sentence_b.wav",
+    "e2e/fixtures/tts_sentence_b.json"
    ]
   },
   {
    "id": "T40",
    "issue": 51,
    "key": "silero-default",
-   "title": "Make Silero the default VAD backend; TTS e2e fixtures; keep e2e green",
+   "title": "Make Silero the default VAD backend; TTS e2e specs; keep e2e green",
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 11,
+   "wave": 12,
    "blockedBy": [
     46,
     50,
-    37
+    37,
+    66
    ],
    "blockedByIds": [
     "T35",
     "T39",
-    "T26"
+    "T26",
+    "T55"
    ],
    "unblocks": [
-    58,
-    66
+    58
    ],
+   "demo": false,
    "scopeFiles": [
-    "e2e/fixtures/tts_sentence_{a,b}.wav",
-    "e2e/loop-*.spec.ts",
+    "src/audio/constants.ts",
     "e2e/loop-tts-a.spec.ts",
     "e2e/loop-tts-b.spec.ts",
-    "scripts/gen-e2e-tts-fixtures.ts",
-    "src/audio/constants.ts",
+    "e2e/fixtures/tts_sentence_{a,b}.wav",
+    "e2e/loop-*.spec.ts",
     "src/audio/engine.ts",
-    "src/test-hooks.ts",
-    "test/corpus/speech/manifest.json"
+    "src/test-hooks.ts"
    ]
   },
   {
@@ -1191,7 +1259,7 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 5,
+   "wave": 11,
    "blockedBy": [
     50,
     19
@@ -1203,12 +1271,13 @@
    "unblocks": [
     53
    ],
+   "demo": false,
    "scopeFiles": [
-    "package.json",
-    "scripts/corpus-lib.test.ts",
-    "scripts/corpus-lib.ts",
     "scripts/gen-corpus.ts",
-    "test/corpus/mix-hashes.json"
+    "scripts/corpus-lib.ts",
+    "scripts/corpus-lib.test.ts",
+    "test/corpus/mix-hashes.json",
+    "package.json"
    ]
   },
   {
@@ -1219,7 +1288,7 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 9,
+   "wave": 12,
    "blockedBy": [
     52,
     48,
@@ -1234,16 +1303,17 @@
     59,
     61
    ],
+   "demo": false,
    "scopeFiles": [
+    "scripts/vad-eval.ts",
+    "scripts/vad-metrics.ts",
+    "scripts/vad-metrics.test.ts",
+    "scripts/trace-replay.ts",
+    "scripts/trace-replay.test.ts",
+    "package.json",
     ".github/workflows/ci.yml",
     ".github/workflows/vad-nightly.yml",
-    "package.json",
-    "report.json",
-    "scripts/trace-replay.test.ts",
-    "scripts/trace-replay.ts",
-    "scripts/vad-eval.ts",
-    "scripts/vad-metrics.test.ts",
-    "scripts/vad-metrics.ts"
+    "report.json"
    ]
   },
   {
@@ -1269,6 +1339,7 @@
     58,
     69
    ],
+   "demo": false,
    "scopeFiles": [
     "lab/bench.html",
     "lab/bench.ts",
@@ -1284,23 +1355,26 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 9,
+   "wave": 11,
    "blockedBy": [
     49,
-    38
+    38,
+    50
    ],
    "blockedByIds": [
     "T38",
-    "T27"
+    "T27",
+    "T39"
    ],
    "unblocks": [
     58
    ],
+   "demo": false,
    "scopeFiles": [
-    "lab/index.html",
-    "lab/vad-scripts.ts",
     "lab/vad-trace.html",
-    "lab/vad-trace.ts"
+    "lab/vad-trace.ts",
+    "lab/vad-scripts.ts",
+    "lab/index.html"
    ]
   },
   {
@@ -1311,7 +1385,7 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 9,
+   "wave": 10,
    "blockedBy": [
     49,
     35
@@ -1323,10 +1397,11 @@
    "unblocks": [
     57
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/main.ts",
-    "src/ui/debug-overlay.browser.test.ts",
     "src/ui/debug-overlay.ts",
+    "src/ui/debug-overlay.browser.test.ts",
+    "src/main.ts",
     "src/ui/styles.css"
    ]
   },
@@ -1338,24 +1413,27 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 10,
+   "wave": 11,
    "blockedBy": [
     56,
-    38
+    38,
+    50
    ],
    "blockedByIds": [
     "T45",
-    "T27"
+    "T27",
+    "T39"
    ],
    "unblocks": [
     60
    ],
+   "demo": false,
    "scopeFiles": [
+    "src/main.ts",
     "index.html",
-    "lab/index.html",
     "lab/vad-live.html",
     "lab/vad-live.ts",
-    "src/main.ts"
+    "lab/index.html"
    ]
   },
   {
@@ -1366,7 +1444,7 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "owner",
-   "wave": 12,
+   "wave": 13,
    "blockedBy": [
     55,
     54,
@@ -1380,6 +1458,7 @@
    "unblocks": [
     59
    ],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -1390,7 +1469,7 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 13,
+   "wave": 14,
    "blockedBy": [
     58,
     53
@@ -1402,12 +1481,13 @@
    "unblocks": [
     60
    ],
+   "demo": false,
    "scopeFiles": [
-    "docs/adr/0001-vad-backend-and-params.md",
-    "docs/plan.md",
     "scripts/vad-grid.ts",
+    "src/dsp/segmenter.ts",
     "src/audio/constants.ts",
-    "src/dsp/segmenter.ts"
+    "docs/adr/0001-vad-backend-and-params.md",
+    "docs/plan.md"
    ]
   },
   {
@@ -1418,7 +1498,7 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "owner",
-   "wave": 14,
+   "wave": 15,
    "blockedBy": [
     59,
     57
@@ -1430,6 +1510,7 @@
    "unblocks": [
     61
    ],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -1440,7 +1521,7 @@
    "milestone": "M2",
    "epic": 5,
    "kind": "agent",
-   "wave": 15,
+   "wave": 16,
    "blockedBy": [
     60,
     53
@@ -1450,10 +1531,11 @@
     "T42"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": [
-    ".github/ISSUE_TEMPLATE/retrace.md",
+    "scripts/vad-eval.ts",
     ".github/workflows/ci.yml",
-    "scripts/vad-eval.ts"
+    ".github/ISSUE_TEMPLATE/retrace.md"
    ]
   },
   {
@@ -1478,13 +1560,14 @@
     64,
     68
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/fades.test.ts",
+    "src/dsp/fft.ts",
+    "src/dsp/normalize.ts",
     "src/dsp/fades.ts",
     "src/dsp/fft.test.ts",
-    "src/dsp/fft.ts",
     "src/dsp/normalize.test.ts",
-    "src/dsp/normalize.ts"
+    "src/dsp/fades.test.ts"
    ]
   },
   {
@@ -1506,9 +1589,10 @@
     64,
     80
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/envelope.test.ts",
-    "src/dsp/envelope.ts"
+    "src/dsp/envelope.ts",
+    "src/dsp/envelope.test.ts"
    ]
   },
   {
@@ -1523,12 +1607,14 @@
    "blockedBy": [
     62,
     63,
-    45
+    45,
+    24
    ],
    "blockedByIds": [
     "T51",
     "T52",
-    "T34"
+    "T34",
+    "T13"
    ],
    "unblocks": [
     66,
@@ -1536,10 +1622,11 @@
     69,
     83
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/dsp/types.ts",
+    "src/dsp/voice.ts",
     "src/dsp/voice.test.ts",
-    "src/dsp/voice.ts"
+    "src/dsp/types.ts"
    ]
   },
   {
@@ -1561,9 +1648,10 @@
     66,
     92
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/app/settings.test.ts",
     "src/app/settings.ts",
+    "src/app/settings.test.ts",
     "vitest.config.ts"
    ]
   },
@@ -1575,35 +1663,37 @@
    "milestone": "M3",
    "epic": 6,
    "kind": "agent",
-   "wave": 12,
+   "wave": 11,
    "blockedBy": [
     64,
     65,
-    51
+    37
    ],
    "blockedByIds": [
     "T53",
     "T54",
-    "T40"
+    "T26"
    ],
    "unblocks": [
+    51,
     70,
     81,
     98,
     117
    ],
+   "demo": true,
    "scopeFiles": [
-    "e2e/helpers/app.ts",
+    "src/workers/dsp.worker.ts",
     "messages.ts",
+    "src/audio/bus.ts",
     "src/app/effects.ts",
+    "src/app/machine.ts",
     "src/app/events.ts",
     "src/app/machine.test.ts",
-    "src/app/machine.ts",
-    "src/audio/bus.ts",
-    "src/main.ts",
-    "src/ui/settings-sheet.browser.test.ts",
     "src/ui/settings-sheet.ts",
-    "src/workers/dsp.worker.ts"
+    "src/ui/settings-sheet.browser.test.ts",
+    "src/main.ts",
+    "e2e/helpers/app.ts"
    ]
   },
   {
@@ -1614,24 +1704,27 @@
    "milestone": "M3",
    "epic": 6,
    "kind": "agent",
-   "wave": 7,
+   "wave": 11,
    "blockedBy": [
     64,
-    38
+    38,
+    50
    ],
    "blockedByIds": [
     "T53",
-    "T27"
+    "T27",
+    "T39"
    ],
    "unblocks": [
     70
    ],
+   "demo": false,
    "scopeFiles": [
-    "docs/research/spikes/03-voice-resampling/algos.mjs",
-    "lab/algos/psola.ts",
-    "lab/index.html",
     "lab/voices.html",
-    "lab/voices.ts"
+    "lab/voices.ts",
+    "lab/algos/psola.ts",
+    "docs/research/spikes/03-voice-resampling/algos.mjs",
+    "lab/index.html"
    ]
   },
   {
@@ -1654,11 +1747,12 @@
    "unblocks": [
     70
    ],
+   "demo": false,
    "scopeFiles": [
-    "lab/index.html",
-    "lab/phrases-sibilant.ts",
     "lab/spectrum.html",
-    "lab/spectrum.ts"
+    "lab/spectrum.ts",
+    "lab/phrases-sibilant.ts",
+    "lab/index.html"
    ]
   },
   {
@@ -1681,6 +1775,7 @@
    "unblocks": [
     70
    ],
+   "demo": false,
    "scopeFiles": [
     "lab/bench.ts",
     "lab/bench.worker.ts"
@@ -1694,7 +1789,7 @@
    "milestone": "M3",
    "epic": 6,
    "kind": "owner",
-   "wave": 13,
+   "wave": 12,
    "blockedBy": [
     67,
     68,
@@ -1710,6 +1805,7 @@
    "unblocks": [
     71
    ],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -1720,7 +1816,7 @@
    "milestone": "M3",
    "epic": 6,
    "kind": "agent",
-   "wave": 14,
+   "wave": 13,
    "blockedBy": [
     70
    ],
@@ -1728,12 +1824,12 @@
     "T59"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": [
-    "DEFAULT_SETTINGS.voice",
     "docs/adr/0002-default-voice.md",
-    "docs/plan.md",
     "src/app/settings.ts",
-    "src/dsp/types.ts"
+    "src/dsp/types.ts",
+    "docs/plan.md"
    ]
   },
   {
@@ -1754,9 +1850,10 @@
    "unblocks": [
     73
    ],
+   "demo": true,
    "scopeFiles": [
-    "art/README.md",
-    "art/bear.svg"
+    "art/bear.svg",
+    "art/README.md"
    ]
   },
   {
@@ -1777,12 +1874,14 @@
    "unblocks": [
     75
    ],
+   "demo": true,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
-    "package.json",
-    "scripts/gen-bear-parts.test.ts",
     "scripts/gen-bear-parts.ts",
-    "src/art/bear-parts.gen.ts"
+    "scripts/gen-bear-parts.test.ts",
+    "src/art/bear-parts.gen.ts",
+    "package.json",
+    ".github/workflows/ci.yml",
+    ".prettierignore"
    ]
   },
   {
@@ -1806,12 +1905,13 @@
     78,
     80
    ],
+   "demo": true,
    "scopeFiles": [
     "src/anim/pose.ts",
-    "src/anim/springs.test.ts",
     "src/anim/springs.ts",
-    "src/anim/stepper.test.ts",
-    "src/anim/stepper.ts"
+    "src/anim/stepper.ts",
+    "src/anim/springs.test.ts",
+    "src/anim/stepper.test.ts"
    ]
   },
   {
@@ -1822,16 +1922,16 @@
    "milestone": "M4",
    "epic": 7,
    "kind": "agent",
-   "wave": 10,
+   "wave": 5,
    "blockedBy": [
     73,
     74,
-    36
+    15
    ],
    "blockedByIds": [
     "T62",
     "T63",
-    "T25"
+    "T04"
    ],
    "unblocks": [
     76,
@@ -1839,14 +1939,14 @@
     82,
     85
    ],
+   "demo": true,
    "scopeFiles": [
-    "e2e/screenshots.spec.ts",
-    "e2e/screenshots.spec.ts-snapshots/*.png",
-    "src/anim/poses.ts",
-    "src/anim/renderer.ts",
-    "src/anim/rig.test.ts",
     "src/anim/rig.ts",
-    "src/test-hooks.ts"
+    "src/anim/renderer.ts",
+    "src/anim/poses.ts",
+    "src/anim/rig.test.ts",
+    "src/anim/renderer.browser.test.ts",
+    "src/anim/__screenshots__/renderer.browser.test.ts/"
    ]
   },
   {
@@ -1857,7 +1957,7 @@
    "milestone": "M4",
    "epic": 7,
    "kind": "owner",
-   "wave": 11,
+   "wave": 6,
    "blockedBy": [
     75
    ],
@@ -1867,6 +1967,7 @@
    "unblocks": [
     84
    ],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -1888,11 +1989,12 @@
     79,
     89
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/anim/base-poses.ts",
-    "src/anim/clip.test.ts",
     "src/anim/clip.ts",
-    "src/anim/clips/session.ts"
+    "src/anim/clip.test.ts",
+    "src/anim/clips/session.ts",
+    "src/anim/base-poses.ts"
    ]
   },
   {
@@ -1914,13 +2016,14 @@
     81,
     82
    ],
+   "demo": true,
    "scopeFiles": [
-    "breathing.ts",
-    "ear-twitch.ts",
-    "gaze.ts",
-    "index.ts",
-    "mood.ts",
     "src/anim/layers/blink.ts",
+    "src/anim/layers/breathing.ts",
+    "src/anim/layers/gaze.ts",
+    "src/anim/layers/ear-twitch.ts",
+    "src/anim/layers/mood.ts",
+    "src/anim/layers/index.ts",
     "src/anim/layers/layers.test.ts",
     "src/anim/rng.ts"
    ]
@@ -1946,9 +2049,10 @@
     81,
     91
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/anim/director.test.ts",
     "src/anim/director.ts",
+    "src/anim/director.test.ts",
     "vitest.config.ts"
    ]
   },
@@ -1974,10 +2078,11 @@
    "unblocks": [
     81
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/anim/constants.ts",
+    "src/anim/layers/mouth.ts",
     "src/anim/layers/mouth.test.ts",
-    "src/anim/layers/mouth.ts"
+    "src/anim/constants.ts"
    ]
   },
   {
@@ -1988,7 +2093,7 @@
    "milestone": "M4",
    "epic": 7,
    "kind": "agent",
-   "wave": 13,
+   "wave": 12,
    "blockedBy": [
     75,
     78,
@@ -2005,16 +2110,24 @@
    ],
    "unblocks": [
     84,
+    89,
     93,
     97,
     122
    ],
+   "demo": true,
    "scopeFiles": [
-    "src/anim/bear-view.ts",
     "src/anim/loop.ts",
+    "src/anim/bear-view.ts",
+    "src/anim/springs-map.ts",
     "src/main.ts",
-    "src/test-hooks.ts",
     "src/ui/circle.ts",
+    "src/ui/styles.css",
+    "src/test-hooks.ts",
+    "e2e/screenshots.spec.ts",
+    "e2e/screenshots.spec.ts-snapshots/*.png",
+    "e2e/mouth-sync.spec.ts",
+    "src/anim/bear-view.browser.test.ts",
     "src/ui/debug-overlay.ts"
    ]
   },
@@ -2026,7 +2139,7 @@
    "milestone": "M4",
    "epic": 7,
    "kind": "agent",
-   "wave": 11,
+   "wave": 6,
    "blockedBy": [
     75,
     38,
@@ -2041,10 +2154,11 @@
     84,
     94
    ],
+   "demo": false,
    "scopeFiles": [
-    "lab/index.html",
     "lab/rig.html",
-    "lab/rig.ts"
+    "lab/rig.ts",
+    "lab/index.html"
    ]
   },
   {
@@ -2067,6 +2181,7 @@
    "unblocks": [
     84
    ],
+   "demo": false,
    "scopeFiles": [
     "lab/envelope.html",
     "lab/envelope.ts",
@@ -2081,7 +2196,7 @@
    "milestone": "M4",
    "epic": 7,
    "kind": "owner",
-   "wave": 14,
+   "wave": 13,
    "blockedBy": [
     81,
     82,
@@ -2095,6 +2210,7 @@
     "T65"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -2105,19 +2221,22 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 11,
+   "wave": 6,
    "blockedBy": [
-    75
-   ],
-   "blockedByIds": [
-    "T64"
-   ],
-   "unblocks": [
+    75,
     86
    ],
+   "blockedByIds": [
+    "T64",
+    "T75"
+   ],
+   "unblocks": [
+    93
+   ],
+   "demo": false,
    "scopeFiles": [
-    "src/input/regions.test.ts",
-    "src/input/regions.ts"
+    "src/input/regions.ts",
+    "src/input/regions.test.ts"
    ]
   },
   {
@@ -2128,20 +2247,23 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 12,
+   "wave": 3,
    "blockedBy": [
-    85
+    13
    ],
    "blockedByIds": [
-    "T74"
+    "T02"
    ],
    "unblocks": [
+    85,
     87,
     90
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/input/recognizer.test.ts",
+    "src/input/region-ids.ts",
     "src/input/recognizer.ts",
+    "src/input/recognizer.test.ts",
     "vitest.config.ts"
    ]
   },
@@ -2153,7 +2275,7 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 13,
+   "wave": 4,
    "blockedBy": [
     86
    ],
@@ -2165,9 +2287,10 @@
     93,
     94
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/input/pointer-adapter.browser.test.ts",
-    "src/input/pointer-adapter.ts"
+    "src/input/pointer-adapter.ts",
+    "src/input/pointer-adapter.browser.test.ts"
    ]
   },
   {
@@ -2188,13 +2311,14 @@
    "unblocks": [
     90
    ],
+   "demo": false,
    "scopeFiles": [
-    "lab/index.html",
+    "src/audio/sfx-ids.ts",
+    "src/audio/sfx-synths.ts",
+    "src/audio/sfx-synths.browser.test.ts",
     "lab/sfx.html",
     "lab/sfx.ts",
-    "src/audio/sfx-ids.ts",
-    "src/audio/sfx-synths.browser.test.ts",
-    "src/audio/sfx-synths.ts"
+    "lab/index.html"
    ]
   },
   {
@@ -2205,22 +2329,25 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 5,
+   "wave": 13,
    "blockedBy": [
-    77
+    77,
+    81
    ],
    "blockedByIds": [
-    "T66"
+    "T66",
+    "T70"
    ],
    "unblocks": [
     90
    ],
+   "demo": false,
    "scopeFiles": [
-    "lab/rig.ts",
-    "src/anim/clip.ts",
-    "src/anim/clips/reactions.test.ts",
     "src/anim/clips/reactions.ts",
-    "src/anim/springs-map.ts"
+    "src/anim/clips/reactions.test.ts",
+    "src/anim/springs-map.ts",
+    "src/anim/clip.ts",
+    "lab/rig.ts"
    ]
   },
   {
@@ -2231,7 +2358,7 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 13,
+   "wave": 14,
    "blockedBy": [
     86,
     88,
@@ -2245,9 +2372,10 @@
    "unblocks": [
     91
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/reactions/table.test.ts",
-    "src/reactions/table.ts"
+    "src/reactions/table.ts",
+    "src/reactions/table.test.ts"
    ]
   },
   {
@@ -2258,7 +2386,7 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 14,
+   "wave": 15,
    "blockedBy": [
     79,
     90
@@ -2270,9 +2398,10 @@
    "unblocks": [
     93
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/anim/director.test.ts",
-    "src/anim/director.ts"
+    "src/anim/director.ts",
+    "src/anim/director.test.ts"
    ]
   },
   {
@@ -2283,7 +2412,7 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 14,
+   "wave": 6,
    "blockedBy": [
     87,
     65
@@ -2296,9 +2425,10 @@
     93,
     113
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/platform/haptics.test.ts",
-    "src/platform/haptics.ts"
+    "src/platform/haptics.ts",
+    "src/platform/haptics.test.ts"
    ]
   },
   {
@@ -2309,38 +2439,38 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 15,
+   "wave": 16,
    "blockedBy": [
     91,
     87,
     92,
-    81
+    81,
+    85
    ],
    "blockedByIds": [
     "T80",
     "T76",
     "T81",
-    "T70"
+    "T70",
+    "T74"
    ],
    "unblocks": [
     95,
     113
    ],
+   "demo": false,
    "scopeFiles": [
-    "e2e/fixtures",
+    "src/anim/bear-view.ts",
+    "src/main.ts",
+    "src/app/session.ts",
+    "effects.ts",
+    "sfx-synths.ts",
+    "src/test-hooks.ts",
+    "src/ui/debug-overlay.ts",
+    "scripts/gen-fixtures.ts",
     "e2e/fixtures/silence_2s.{wav,json}",
     "e2e/gestures.spec.ts",
-    "e2e/sfx-gating.spec.ts",
-    "effects.ts",
-    "haptics.play",
-    "scripts/gen-fixtures.ts",
-    "session.dispatch",
-    "sfx-synths.ts",
-    "sfx.play",
-    "src/anim/bear-view.ts",
-    "src/app/session.ts",
-    "src/main.ts",
-    "src/test-hooks.ts"
+    "e2e/sfx-gating.spec.ts"
    ]
   },
   {
@@ -2351,7 +2481,7 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 14,
+   "wave": 7,
    "blockedBy": [
     87,
     82
@@ -2363,14 +2493,14 @@
    "unblocks": [
     95
    ],
+   "demo": false,
    "scopeFiles": [
-    "docs/lab.md",
-    "lab/gestures",
     "lab/gestures.html",
     "lab/gestures.ts",
     "lab/index.html",
+    "scripts/gesture-eval.ts",
     "scripts/gesture-eval.test.ts",
-    "scripts/gesture-eval.ts"
+    "docs/lab.md"
    ]
   },
   {
@@ -2381,7 +2511,7 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "owner",
-   "wave": 16,
+   "wave": 17,
    "blockedBy": [
     93,
     94
@@ -2393,6 +2523,7 @@
    "unblocks": [
     96
    ],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -2403,7 +2534,7 @@
    "milestone": "M5",
    "epic": 8,
    "kind": "agent",
-   "wave": 17,
+   "wave": 18,
    "blockedBy": [
     95
    ],
@@ -2411,11 +2542,12 @@
     "T84"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": [
-    "docs/adr/0003-gesture-thresholds.md",
-    "scripts/gesture-eval.test.ts",
+    "src/input/recognizer.ts",
     "src/input/recognizer.test.ts",
-    "src/input/recognizer.ts"
+    "scripts/gesture-eval.test.ts",
+    "docs/adr/0003-gesture-thresholds.md"
    ]
   },
   {
@@ -2426,7 +2558,7 @@
    "milestone": "M6",
    "epic": 9,
    "kind": "agent",
-   "wave": 14,
+   "wave": 13,
    "blockedBy": [
     81
    ],
@@ -2436,18 +2568,19 @@
    "unblocks": [
     98
    ],
+   "demo": false,
    "scopeFiles": [
-    "art/bear.svg",
     "art/icon.svg",
-    "desktop-1.webp",
-    "docs/icons.md",
-    "index.html",
-    "phone-2.webp",
+    "art/bear.svg",
     "public/icons/icon-192.png",
     "public/icons/icon-512.png",
     "public/icons/maskable-512.png",
+    "scripts/gen-screenshots.ts",
     "public/screenshots/phone-1.webp",
-    "scripts/gen-screenshots.ts"
+    "public/screenshots/phone-2.webp",
+    "public/screenshots/desktop-1.webp",
+    "index.html",
+    "docs/icons.md"
    ]
   },
   {
@@ -2458,7 +2591,7 @@
    "milestone": "M6",
    "epic": 9,
    "kind": "agent",
-   "wave": 15,
+   "wave": 14,
    "blockedBy": [
     97,
     66
@@ -2471,16 +2604,20 @@
     99,
     113
    ],
+   "demo": false,
    "scopeFiles": [
     "package.json",
-    "src/main.ts",
-    "src/platform/storage.ts",
-    "src/pwa/register.test.ts",
+    "vite.config.ts",
+    "src/pwa-manifest.ts",
+    "tsconfig.node.json",
+    "scripts/manifest.test.ts",
     "src/pwa/register.ts",
-    "src/ui/debug-overlay.ts",
+    "src/pwa/register.test.ts",
+    "src/platform/storage.ts",
+    "src/main.ts",
     "src/ui/settings-sheet.ts",
-    "src/vite-env.d.ts",
-    "vite.config.ts"
+    "src/ui/debug-overlay.ts",
+    "src/vite-env.d.ts"
    ]
   },
   {
@@ -2491,7 +2628,7 @@
    "milestone": "M6",
    "epic": 9,
    "kind": "agent",
-   "wave": 16,
+   "wave": 15,
    "blockedBy": [
     98
    ],
@@ -2504,11 +2641,12 @@
     104,
     105
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
-    "package.json",
     "scripts/check-dist.mjs",
-    "scripts/check-dist.test.ts"
+    "scripts/check-dist.test.ts",
+    "package.json",
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -2519,7 +2657,7 @@
    "milestone": "M6",
    "epic": 9,
    "kind": "agent",
-   "wave": 17,
+   "wave": 16,
    "blockedBy": [
     99
    ],
@@ -2527,13 +2665,15 @@
     "T88"
    ],
    "unblocks": [
+    101,
     102,
     107
    ],
+   "demo": false,
    "scopeFiles": [
-    "e2e/fixtures/bad-manifest/",
-    "e2e/installability.spec.ts",
     "e2e/offline.spec.ts",
+    "e2e/installability.spec.ts",
+    "e2e/fixtures/bad-manifest/make.mjs",
     "playwright.config.ts"
    ]
   },
@@ -2547,20 +2687,23 @@
    "kind": "agent",
    "wave": 17,
    "blockedBy": [
-    99
+    99,
+    100
    ],
    "blockedByIds": [
-    "T88"
+    "T88",
+    "T89"
    ],
    "unblocks": [
     102,
     108
    ],
+   "demo": false,
    "scopeFiles": [
     "e2e/update-proxy.mjs",
+    "scripts/build-update-variants.mjs",
     "e2e/update.spec.ts",
     "playwright.config.ts",
-    "scripts/build-update-variants.mjs",
     "vite.config.ts"
    ]
   },
@@ -2572,16 +2715,19 @@
    "milestone": "M6",
    "epic": 9,
    "kind": "owner",
-   "wave": 18,
+   "wave": 22,
    "blockedBy": [
     100,
-    101
+    101,
+    112
    ],
    "blockedByIds": [
     "T89",
-    "T90"
+    "T90",
+    "T101"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -2602,17 +2748,18 @@
    "unblocks": [
     106
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/dependabot.yml",
-    ".github/workflows/ci.yml",
-    "github.com/chethan123/talking-bear/server",
-    "server/embed.go",
     "server/go.mod",
+    "server/main.go",
     "server/handler.go",
     "server/headers.go",
-    "server/main.go",
+    "server/embed.go",
+    "server/noembed.go",
     "server/main_test.go",
-    "server/noembed.go"
+    ".github/workflows/ci.yml",
+    "server/",
+    ".github/dependabot.yml"
    ]
   },
   {
@@ -2623,7 +2770,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 17,
+   "wave": 16,
    "blockedBy": [
     99
    ],
@@ -2633,6 +2780,7 @@
    "unblocks": [
     106
    ],
+   "demo": false,
    "scopeFiles": [
     "scripts/precompress.mjs",
     "scripts/precompress.test.ts"
@@ -2646,7 +2794,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 17,
+   "wave": 16,
    "blockedBy": [
     99
    ],
@@ -2657,13 +2805,14 @@
     106,
     122
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
-    ".size-limit.cjs",
-    "check-dist.mjs",
-    "dist/sw.js",
     "package.json",
-    "scripts/precache-list.mjs"
+    ".size-limit.cjs",
+    "scripts/precache-list.mjs",
+    "dist/sw.js",
+    "check-dist.mjs",
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -2674,7 +2823,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 18,
+   "wave": 17,
    "blockedBy": [
     103,
     104,
@@ -2688,8 +2837,12 @@
    "unblocks": [
     107
    ],
+   "demo": false,
    "scopeFiles": [
+    "Dockerfile",
+    ".dockerignore",
     ".github/dependabot.yml",
+    ".github/workflows/ci.yml",
     "docs/image.md"
    ]
   },
@@ -2701,7 +2854,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 19,
+   "wave": 18,
    "blockedBy": [
     106,
     100
@@ -2715,11 +2868,12 @@
     109,
     110
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
+    "scripts/check-headers.sh",
     "e2e/smoke/smoke.spec.ts",
     "playwright.smoke.config.ts",
-    "scripts/check-headers.sh"
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -2730,7 +2884,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 20,
+   "wave": 19,
    "blockedBy": [
     107,
     101
@@ -2742,10 +2896,12 @@
    "unblocks": [
     111
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
+    "playwright.config.ts",
+    "make.mjs",
     "e2e/update-proxy.mjs",
-    "playwright.config.ts"
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -2756,7 +2912,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 20,
+   "wave": 19,
    "blockedBy": [
     107
    ],
@@ -2767,16 +2923,17 @@
     112,
     121
    ],
+   "demo": false,
    "scopeFiles": [
-    "e2e/csp.spec.ts",
-    "preview.headers",
     "server/headers.json",
-    "server/main_test.go",
     "src/headers.test.ts",
-    "src/main.ts",
+    "server/main_test.go",
+    "vite.config.ts",
     "src/security/tt-policy.ts",
-    "text/html",
-    "vite.config.ts"
+    "src/main.ts",
+    "e2e/csp.spec.ts",
+    ".github/workflows/ci.yml",
+    "test-results/xp5-report-only.json"
    ]
   },
   {
@@ -2787,7 +2944,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 20,
+   "wave": 19,
    "blockedBy": [
     107
    ],
@@ -2797,12 +2954,13 @@
    "unblocks": [
     111
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
+    "deploy/compose/compose.yml",
     "deploy/compose/Caddyfile.front",
     "deploy/compose/Caddyfile.sidecar",
-    "deploy/compose/compose.yml",
-    "scripts/check-compose-headers.sh"
+    "scripts/check-compose-headers.sh",
+    ".github/workflows/ci.yml"
    ]
   },
   {
@@ -2813,7 +2971,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "agent",
-   "wave": 21,
+   "wave": 20,
    "blockedBy": [
     108,
     110
@@ -2825,9 +2983,10 @@
    "unblocks": [
     112
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/ci.yml",
     "docs/release.md"
    ]
   },
@@ -2839,7 +2998,7 @@
    "milestone": "M7",
    "epic": 10,
    "kind": "owner",
-   "wave": 22,
+   "wave": 21,
    "blockedBy": [
     111,
     109
@@ -2848,7 +3007,10 @@
     "T100",
     "T98"
    ],
-   "unblocks": [],
+   "unblocks": [
+    102
+   ],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -2859,7 +3021,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 16,
+   "wave": 17,
    "blockedBy": [
     98,
     93,
@@ -2874,14 +3036,15 @@
     114,
     120
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/anim/bear-view.ts",
-    "src/app/effects.ts",
-    "src/app/session.ts",
-    "src/audio/engine.ts",
-    "src/main.ts",
+    "src/ui/settings-sheet.ts",
     "src/ui/settings-sheet.browser.test.ts",
-    "src/ui/settings-sheet.ts"
+    "src/main.ts",
+    "src/app/session.ts",
+    "src/app/effects.ts",
+    "src/audio/engine.ts",
+    "src/anim/bear-view.ts"
    ]
   },
   {
@@ -2892,7 +3055,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 17,
+   "wave": 18,
    "blockedBy": [
     113
    ],
@@ -2903,10 +3066,11 @@
     115,
     123
    ],
+   "demo": false,
    "scopeFiles": [
+    "src/ui/settings-sheet.ts",
     "src/ui/licences-screen.ts",
-    "src/ui/overlay.ts",
-    "src/ui/settings-sheet.ts"
+    "src/ui/overlay.ts"
    ]
   },
   {
@@ -2917,7 +3081,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 18,
+   "wave": 19,
    "blockedBy": [
     114
    ],
@@ -2927,18 +3091,20 @@
    "unblocks": [
     116,
     117,
-    118,
-    119
+    118
    ],
+   "demo": false,
    "scopeFiles": [
+    "src/ui/overlay.ts",
+    "src/ui/icons.ts",
+    "src/ui/styles.css",
+    "src/anim/clips/reactions.ts",
+    "src/anim/director.ts",
+    "src/anim/director.test.ts",
     "e2e/screenshots.spec.ts",
     "e2e/screenshots.spec.ts-snapshots/asleep-overlay*.png",
-    "src/anim/bear-view.ts",
-    "src/anim/clips/reactions.ts",
     "src/main.ts",
-    "src/ui/icons.ts",
-    "src/ui/overlay.ts",
-    "src/ui/styles.css"
+    "src/anim/bear-view.ts"
    ]
   },
   {
@@ -2949,7 +3115,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 19,
+   "wave": 20,
    "blockedBy": [
     115,
     47
@@ -2959,21 +3125,25 @@
     "T36"
    ],
    "unblocks": [
+    117,
     121
    ],
+   "demo": false,
    "scopeFiles": [
-    "e2e/fixtures/noise_pink_-30dbfs_20s.{wav,json}",
+    "src/dsp/segmenter.ts",
+    "src/dsp/segmenter.test.ts",
+    "src/workers/vad-core.ts",
+    "src/audio/messages.ts",
+    "src/app/events.ts",
+    "src/app/machine.ts",
+    "src/app/machine.test.ts",
+    "src/app/machine.props.test.ts",
+    "test/session-sim.ts",
+    "src/app/effects.ts",
+    "src/ui/overlay.ts",
     "e2e/noisy.spec.ts",
     "scripts/gen-fixtures.ts",
-    "src/app/effects.ts",
-    "src/app/events.ts",
-    "src/app/machine.props.test.ts",
-    "src/app/machine.test.ts",
-    "src/app/machine.ts",
-    "src/audio/messages.ts",
-    "src/dsp/segmenter.ts",
-    "src/ui/overlay.ts",
-    "src/workers/vad-core.ts"
+    "e2e/fixtures/noise_pink_-20dbfs_20s.{wav,json}"
    ]
   },
   {
@@ -2984,28 +3154,32 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 19,
+   "wave": 21,
    "blockedBy": [
     115,
-    66
+    66,
+    116
    ],
    "blockedByIds": [
     "T104",
-    "T55"
+    "T55",
+    "T105"
    ],
    "unblocks": [
     121
    ],
+   "demo": false,
    "scopeFiles": [
-    "e2e/fixtures/vowel_clipped.{wav,json}",
-    "e2e/too-loud.spec.ts",
-    "machine.ts",
-    "scripts/gen-fixtures.ts",
-    "src/anim/clips/reactions.ts",
-    "src/anim/director.ts",
-    "src/app/effects.ts",
     "src/app/events.ts",
-    "src/audio/engine.ts"
+    "machine.ts",
+    "src/app/effects.ts",
+    "src/audio/engine.ts",
+    "src/anim/clips/reactions.ts",
+    "src/anim/bear-view.ts",
+    "src/anim/director.test.ts",
+    "scripts/gen-fixtures.ts",
+    "e2e/fixtures/vowel_clipped.{wav,json}",
+    "e2e/too-loud.spec.ts"
    ]
   },
   {
@@ -3016,7 +3190,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 19,
+   "wave": 20,
    "blockedBy": [
     115
    ],
@@ -3026,30 +3200,42 @@
    "unblocks": [
     121
    ],
+   "demo": false,
    "scopeFiles": [
-    "src/anim/bear-view.ts",
     "src/ui/a11y.ts",
-    "src/ui/overlay.ts"
+    "src/ui/overlay.ts",
+    "src/anim/bear-view.ts",
+    "src/test-hooks.ts",
+    "e2e/a11y.spec.ts"
    ]
   },
   {
    "id": "T108",
    "issue": 119,
    "key": "x-e8-e4",
-   "title": "Owner: X-E8 phone call/alarm during capture & playback, X-E4 Bluetooth (if not done in M1), optional X-P6",
+   "title": "Owner: X-E8 phone call/alarm during capture & playback, X-E4 Bluetooth, optional X-P6 (in the M1 device session)",
    "milestone": "M8",
    "epic": 11,
    "kind": "owner",
-   "wave": 19,
+   "wave": 11,
    "blockedBy": [
-    115
+    37,
+    38,
+    39,
+    40,
+    41
    ],
    "blockedByIds": [
-    "T104"
+    "T26",
+    "T27",
+    "T28",
+    "T29",
+    "T30"
    ],
    "unblocks": [
     120
    ],
+   "demo": false,
    "scopeFiles": []
   },
   {
@@ -3060,7 +3246,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 20,
+   "wave": 18,
    "blockedBy": [
     119,
     113
@@ -3069,15 +3255,14 @@
     "T108",
     "T102"
    ],
-   "unblocks": [
-    121
-   ],
+   "unblocks": [],
+   "demo": false,
    "scopeFiles": [
-    "src/app/machine.ts",
-    "src/app/settings.ts",
     "src/audio/engine.ts",
     "src/audio/mic.ts",
-    "src/ui/settings-sheet.ts"
+    "src/app/settings.ts",
+    "src/ui/settings-sheet.ts",
+    "src/app/machine.ts"
    ]
   },
   {
@@ -3088,33 +3273,32 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 21,
+   "wave": 22,
    "blockedBy": [
     109,
     118,
     116,
-    117,
-    120
+    117
    ],
    "blockedByIds": [
     "T98",
     "T107",
     "T105",
-    "T106",
-    "T109"
+    "T106"
    ],
    "unblocks": [
     123
    ],
+   "demo": false,
    "scopeFiles": [
-    "e2e/csp.spec.ts",
-    "scripts/check-compose-headers.sh",
-    "scripts/check-headers.sh",
-    "server/headers.go",
     "server/headers.json",
+    "server/headers.go",
     "server/main_test.go",
+    "vite.config.ts",
     "src/headers.test.ts",
-    "vite.config.ts"
+    "scripts/check-headers.sh",
+    "scripts/check-compose-headers.sh",
+    "e2e/csp.spec.ts"
    ]
   },
   {
@@ -3125,7 +3309,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "agent",
-   "wave": 18,
+   "wave": 17,
    "blockedBy": [
     81,
     105
@@ -3137,15 +3321,16 @@
    "unblocks": [
     123
    ],
+   "demo": false,
    "scopeFiles": [
-    ".github/workflows/lighthouse.yml",
-    "e2e/perf.spec.ts",
-    "lighthouserc.json",
+    "src/perf.ts",
+    "src/main.ts",
     "src/anim/bear-view.ts",
     "src/app/effects.ts",
-    "src/main.ts",
-    "src/perf.ts",
-    "src/ui/debug-overlay.ts"
+    "src/ui/debug-overlay.ts",
+    "e2e/perf.spec.ts",
+    ".github/workflows/lighthouse.yml",
+    "lighthouserc.json"
    ]
   },
   {
@@ -3156,7 +3341,7 @@
    "milestone": "M8",
    "epic": 11,
    "kind": "owner",
-   "wave": 22,
+   "wave": 23,
    "blockedBy": [
     121,
     122,
@@ -3168,6 +3353,7 @@
     "T103"
    ],
    "unblocks": [],
+   "demo": false,
    "scopeFiles": []
   }
  ]
