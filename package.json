@@ -16,6 +16,7 @@
     "typecheck": "tsc -b",
     "test": "vitest run --project node",
     "test:browser": "vitest run --project browser",
+    "fixtures": "node scripts/gen-fixtures.ts",
     "verify": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
