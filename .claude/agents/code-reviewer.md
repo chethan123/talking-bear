@@ -11,7 +11,7 @@ You review the code change for one Talking Bear task. You get:
 - the worktree path, the branch and the issue number;
 - the approved plan comment.
 
-Diff: `git -C <worktree> diff origin/main...HEAD`. You may run tests and read-only commands inside the worktree. Wrap browser, preview, e2e and Docker commands in `flock -w 540 /tmp/talking-bear-heavy.lock -c '…'`. Don't modify files or git state.
+Diff: `git -C <worktree> diff origin/main...HEAD`. You may run tests and read-only commands inside the worktree. Wrap browser, preview, e2e and Docker commands in `flock -E 75 -w 1800 /tmp/talking-bear-heavy.lock -c '…'`. Don't modify files or git state.
 
 **Check:**
 

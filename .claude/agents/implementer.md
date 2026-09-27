@@ -22,7 +22,7 @@ You implement exactly **one plan step** handed to you by a task owner. You're gi
 - Don't commit, push, open PRs, or use any GitHub tools.
 - Don't weaken, skip or delete tests, lint rules or thresholds.
 - Don't add dependencies unless the step names them, with an exact version.
-- Wrap browser, preview, e2e and Docker commands in `flock -w 540 /tmp/talking-bear-heavy.lock -c '…'` (Bash timeout 600000).
+- Wrap browser, preview, e2e and Docker commands in `flock -E 75 -w 1800 /tmp/talking-bear-heavy.lock -c '…'` (use Bash `run_in_background: true` when a command may exceed about 5 minutes; exit 75 means lock timeout).
 - Never read or use tokens from the environment.
 
 **Report:**

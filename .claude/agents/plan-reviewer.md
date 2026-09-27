@@ -25,7 +25,7 @@ You don't edit anything.
 1. **Coverage:** every Scope file, spec requirement, Validation item, negative control and Definition-of-done item is addressed by a step. The plan touches nothing outside Scope.
 2. **Correctness:** the APIs and signatures used actually exist in the dependency tasks' merged code or in the issue. The algorithms, math, thresholds and file formats are right. There are no browser, Node or tooling misconceptions.
 3. **Unambiguity:** no step leaves a consequential choice to the implementer. Names, paths and orders are exact.
-4. **Feasibility:** the commands exist at this point in the repo's history. Expected results are achievable. Heavy commands are wrapped with `flock -w 540 /tmp/talking-bear-heavy.lock`.
+4. **Feasibility:** the commands exist at this point in the repo's history. Expected results are achievable. Heavy commands are wrapped with `flock -E 75 -w 1800 /tmp/talking-bear-heavy.lock`.
 5. **Rules:** no weakened tests; no new dependencies unless the issue names them; plan Q2 (no stored audio) respected; nothing in `docs/research/**` imported.
 
 **Output:**

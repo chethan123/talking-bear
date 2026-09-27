@@ -35,7 +35,7 @@ Delegate reading in bulk, running commands, editing and GitHub mechanics. Keep y
    - Work only in `WORKTREE`, and only on `BRANCH`. Every shell command must `cd <WORKTREE>` first, because the shell's working directory resets between calls.
    - The one exception is `git -C /home/user/talking-bear fetch` or `worktree add/remove`, wrapped in `flock -w 300 /tmp/talking-bear-git.lock -c '…'`.
    - Never touch other worktrees, other branches, or other tasks' issues and PRs.
-3. **Serialise heavy commands.** Wrap every command that starts a browser, `vite preview`, Playwright, `vitest --project browser` or Docker in `flock -w 540 /tmp/talking-bear-heavy.lock -c '<command>'`, with the Bash timeout at 600000. Other tasks share the machine and ports 4173–4175 and 8080–8082.
+3. **Serialise heavy commands.** Wrap every command that starts a browser, `vite preview`, Playwright, `vitest --project browser` or Docker in `flock -E 75 -w 1800 /tmp/talking-bear-heavy.lock -c '<command>'` (see rule 11). Other tasks share the machine and ports 4173–4175 and 8080–8082.
 4. **Branch and PR.**
    - You may push `BRANCH`, and open and update **one** PR for this task.
    - Push after every completed plan step, so a restart never loses work.
@@ -44,7 +44,9 @@ Delegate reading in bulk, running commands, editing and GitHub mechanics. Keep y
 5. **Durable state is on GitHub.**
    - Post a fixed-format `ORCH-STATE` comment on the issue at every phase change.
    - Keep the plan in an issue comment, and tick its checkboxes as steps complete, editing it with `update_issue_comment`.
-6. **Fencing.** Before **every** push and every GitHub write, re-read the issue's latest `ORCH-STATE`: page to the last page, oldest-first ordering, `perPage: 100`. If it names a different `owner:` than your `OWNER_ID`, stop immediately, without writing anything, and report `fenced`.
+6. **Fencing.** Before **every** push and every GitHub write, re-read the issue's latest `ORCH-STATE`: page to the last page, oldest-first ordering, `perPage: 100`.
+   - It's yours if it names your `OWNER_ID`. That includes the orchestrator's handover entry with the note `adopted`, which it posts before spawning you.
+   - If it names a different `owner:`, stop immediately, without writing anything, and report `fenced`.
 7. **GitHub text rules.**
    - Never write `<!`, including HTML comments and `<!doctype`; spell such things out.
    - No `<` or `>` in titles.
@@ -65,6 +67,11 @@ Delegate reading in bulk, running commands, editing and GitHub mechanics. Keep y
    - **Wait for your children:** run sub-agents in the foreground, or wait for their completion notifications, **before** you end your turn. Never end a turn while a child is still running.
    - **Short ledger comments:** post the fixed-format `ORCH-STATE` comments yourself.
 10. **Commit before checks.** Commit and push **before** every `validator` or `code-reviewer` run, because they require a clean tree. Implementers and debuggers never commit; you do, with messages like `T07 S3: <what>`.
+    - Before every commit, read `git diff`, and make sure it holds only intended changes: no leftover negative-control mutation, no stray files.
+11. **Long and heavy commands.**
+    - Run anything that may take more than about 5 minutes (e2e suites, Docker builds, the corpus) with Bash `run_in_background: true`, and wait for its completion notification.
+    - The heavy-lock form is `flock -E 75 -w 1800 /tmp/talking-bear-heavy.lock -c '…'`. Exit code **75** means lock timeout, not a test failure: retry later.
+12. **Ids for intake issues.** Issues created after #123 have no `Txx`: use `I<issue>` (for example `I131`) wherever this file says `<Txx>`.
 
 ## Ledger format
 
@@ -100,7 +107,10 @@ The states you set:
 ### A. Setup (every mode)
 
 1. **Worktree:**
-   1. If `<WORKTREE>` exists, reuse it: `git -C <WORKTREE> status`, then `git -C <WORKTREE> fetch origin`.
+   1. **If `<WORKTREE>` exists,** reuse it:
+      - `git -C <WORKTREE> fetch origin`;
+      - if `git status --porcelain` is dirty, read `git diff`. Keep the changes only if they belong to the first unticked plan step. Otherwise `git stash push -u -m orch-dirty-<UTC>`, which is reversible, and note it in your report;
+      - then `git merge --ff-only origin/<BRANCH>` if the remote branch exists. If it isn't a fast-forward, report `blocked` (diverged branch). Never force.
    2. Otherwise, under the git lock:
       - `git -C /home/user/talking-bear fetch origin`;
       - `git -C /home/user/talking-bear worktree add <WORKTREE> -B <BRANCH> <origin/BRANCH if it exists, else origin/main>`.
@@ -109,7 +119,9 @@ The states you set:
    - `<WORKTREE>/CLAUDE.md`, once T01 has merged. It is **not** loaded automatically for you.
    - The issue body, all its comments (paged), and every **Blocked by** issue's state. If a blocker is still open, post `released` and report `not-ready`.
    - The plan sections under **References**, and any spike the issue cites. Delegate long mechanical reads.
-3. **Resume** (MODE `resume`, `pr-followup` or `device-notes`): find the latest `ORCH-PLAN`, `ORCH-STATE`, `ORCH-DONE` and `git log origin/main..<BRANCH>`. Continue from the first unticked step, and verify the ticked ones quickly instead of redoing them.
+3. **Fresh start** (MODE `fresh`): right after setup, post `ORCH-STATE: planning`, so the claim shows progress.
+4. **Resume** (MODE `resume`, `pr-followup` or `device-notes`): find the latest `ORCH-PLAN`, `ORCH-STATE`, `ORCH-DONE` and `git log origin/main..<BRANCH>`. Continue from the first unticked step, and verify the ticked ones quickly instead of redoing them.
+   - **Latest state `ci-wait`,** or an `EVENT: ci-result`: go to E.5.
    - **`pr-followup`:** go straight to H.
    - **`device-notes`:** go to the device-notes section.
 
@@ -162,6 +174,9 @@ Post it as `ORCH-PLAN v1 (draft)`, and set the state to `planning`.
    4. report `ci-wait` and end your turn.
 
    The orchestrator resumes you with the CI result. Never hack configs to pass locally, and never run `playwright install`.
+5. **After a CI result** (`EVENT: ci-result`, or resuming in `ci-wait`): read the PR's head checks. Use `github-clerk` to fetch logs of failed jobs.
+   - **Green:** tick the CI-only items in the plan, and continue at **F**, then **G**. G turns the draft into a ready PR.
+   - **Red:** go to E.3 (root-cause, fix, push), then back to E.4.
 
 ### F. Code review
 
@@ -197,7 +212,7 @@ Look at the whole PR on its current head: merge state, CI on the latest commit, 
    - implement small, local asks, push, and reply on each thread;
    - Scope, cross-task interface or plan changes: reply with a proposal and ask the human.
 4. **Green, conflict-free, no unresolved threads:** update the CI-pending rows in `ORCH-DONE`, and set the state to `pr-ready`. Report back. **Never merge.**
-5. **Merged** (reported by the orchestrator):
+5. **Merged** (reported by the orchestrator; this is H.5, the "On merge" step):
    1. confirm the issue closed; if not, close it with a comment linking the PR;
    2. set the state to `merged-done`;
    3. remove the worktree under the git lock;
@@ -211,7 +226,7 @@ The human posted device notes as a comment and asked for them to be committed.
 2. An `implementer` appends the notes **verbatim** to `docs/device-notes.md`, under `## Results`, with a heading `### <Txx> — <date>`.
 3. Run `pnpm exec prettier --write docs/device-notes.md`. That changes formatting only, never wording. Then run `pnpm verify`.
 4. `github-clerk` opens a PR titled `[<Txx>] device notes: <short>`, with `Refs #<issue>` (**not** `Closes`).
-5. Follow H, but **never** close the issue and never merge. After the merge, report `notes-merged`.
+5. Follow H.1–H.3 for CI and reviews. On this owner issue, **don't** post `pr-open`, `pr-ready` or `merged-done`: its state stays `waiting-owner`. Never close the issue, and never merge. When the orchestrator reports the merge, remove the worktree and report `notes-merged`.
 
 Skip plan review and code review for this mode.
 

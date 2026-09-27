@@ -17,7 +17,7 @@ The orchestrator keeps the live status on GitHub, as `ORCH-STATE` comments on ea
 
 ## Phase 0 — one-time setup (you)
 
-- [ ] **Merge the planning follow-up PR** (branch `claude/talking-bear-planning-k6a0vj`). PR #2 (the research spikes) is already merged. The follow-up carries the plan corrections that the issues rely on (Kaiser β = 6.0, the Silero parity tiers, the proximity gate, the escalation windows), plus the `.claude/` orchestration package. The orchestrator refuses to start until both are on `main`.
+- [ ] **Open and merge the planning follow-up PR** (branch `claude/talking-bear-planning-k6a0vj`). PR #2 (the research spikes) is already merged. The follow-up carries the plan corrections that the issues rely on (Kaiser β = 6.0, the Silero parity tiers, the proximity gate, the escalation windows), plus the `.claude/` orchestration package. The orchestrator refuses to start until both are on `main`.
 - [ ] **Environment check** (Claude Code on the web → your environment's settings).
   - **Network policy** must allow:
     - `registry.npmjs.org`;
