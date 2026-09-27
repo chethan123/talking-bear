@@ -696,10 +696,11 @@ describe('tickle', () => {
     const { steps, all } = run(trace, on('belly'));
     expect(kinds(all)).toEqual(['tap:down', 'stroke:start', 'stroke:end']);
     expect(steps.at(-1)!.out).toBe(NO_GESTURES);
-    // After a tickle: a fast 30 px scrub (1000 px/s when it enters tickle handling), released at 70 ms.
+    // After a tickle: a fast 30 px scrub, released at 70 ms. Too fast for a stroke while pending, it becomes
+    // tentative tickle handling at 30 ms, starts a stroke at stroke speed, and the next reversal ends it.
     const fast = [30, 0, 30, 0, 30, 0].map((dx, k) => mv(10 * (k + 1), 500 + dx, 500));
     const tickled = run([dn(0, 500, 500), ...fast, up(70, 500, 500)], on('belly'));
-    expect(kinds(tickled.all)).toEqual(['tap:down', 'tickle']);
+    expect(kinds(tickled.all)).toEqual(['tap:down', 'stroke:start', 'stroke:end', 'tickle']);
     expect(tickled.steps.at(-1)!.out).toBe(NO_GESTURES);
   });
 
@@ -709,6 +710,46 @@ describe('tickle', () => {
     const { steps, all } = run([dn(0, 500, 500), ...moves, up(90, 510, 500)], on('belly'));
     expect(kinds(all)).toEqual(['tap:down', 'stroke:start', 'stroke:end', 'tickle']);
     expect(timesOf(steps, 'tickle')).toEqual([90]);
+  });
+
+  it('a wiggle inside the slop, then a drag past 10 px at stroke speed, is a stroke', () => {
+    // The wiggle is fast (1333 px/s at 3 ms), so only a fresh velocity puts the 300 px/s drag in stroke range.
+    const wiggle = [dn(0, 500, 500), mv(1, 504, 500), mv(2, 500, 500), mv(3, 504, 500)];
+    const drag = line(1, 10, 504, 500, 624, 500, 20, 20);
+    const { steps, all } = run([...wiggle, ...drag, up(420, 624, 500)], on('headTop'));
+    expect(shape(all)).toEqual(['tap:down', 'stroke:start', 'stroke:update', 'stroke:end']);
+    expect(timesOf(steps, 'stroke:start')).toEqual([50]);
+    expect(find(all, 'stroke', 'end')).toMatchObject({ dir: 0, against: false });
+  });
+
+  it('a ±8 px scrub tickles without ever starting a stroke', () => {
+    for (const periodMs of [150, 175]) {
+      const ks = kinds(run(steadyScrub(8, periodMs, 20).trace, on('belly')).all);
+      expect(ks.filter((k) => k === 'tickle').length).toBeGreaterThanOrEqual(4);
+      expect(ks).not.toContain('stroke:start');
+    }
+    const quick = [
+      dn(0, 500, 500),
+      ...path(1, 0, zigzag(500, 500, 8, 8, 60, 500), 4, 10),
+      up(2500, 500, 500),
+    ];
+    expect(new Set(kinds(run(quick, on('belly')).all))).toEqual(new Set(['tap:down', 'tickle']));
+  });
+
+  it('a wiggle that grows into a wide scrub starts one stroke, then tickles (no flapping)', () => {
+    // Reversals at 10 and 20 ms (tentative), then 20 px legs of 150 ms: a stroke from 90 ms, ended by the
+    // next reversal; stroke-entered tickle handling never starts another stroke.
+    const wiggle = [dn(0, 500, 500), mv(10, 504, 500), mv(20, 500, 500), mv(30, 504, 500)];
+    const legs: PointerSample[] = [];
+    for (let k = 0; k < 12; k++) {
+      const [from, to] = k % 2 === 0 ? [504, 524] : [524, 504];
+      for (let j = 1; j <= 5; j++) legs.push(mv(30 + k * 150 + j * 30, from + ((to - from) * j) / 5, 500));
+    }
+    const { steps, all } = run([...wiggle, ...legs], on('belly'));
+    expect(shape(all)).toEqual(['tap:down', 'stroke:start', 'stroke:update', 'stroke:end', 'tickle']);
+    expect(timesOf(steps, 'stroke:start')).toEqual([90]);
+    expect(timesOf(steps, 'stroke:end')).toEqual([210]);
+    expect(timesOf(steps, 'tickle').length).toBeGreaterThanOrEqual(2);
   });
 
   it('a still finger in tickle handling never long-presses', () => {
@@ -848,6 +889,15 @@ describe('flick', () => {
       'tap:down',
       'flick',
     ]);
+  });
+
+  it('a fast back-and-forth released at flick speed is no flick (it reversed twice within 300 ms)', () => {
+    // 4000 px/s out, back, out again (tentative tickle handling, too fast for a stroke), then released at
+    // 2000 px/s: neither a tap (40 px) nor a flick.
+    const trace = [dn(0, 500, 500), mv(5, 520, 500), mv(10, 500, 500), mv(15, 520, 500), up(20, 540, 500)];
+    const { steps, all } = run(trace, on('headTop'));
+    expect(kinds(all)).toEqual(['tap:down']);
+    expect(steps.at(-1)!.out).toBe(NO_GESTURES);
   });
 
   it('keeps the whole 80 ms window with 1000 Hz samples', () => {

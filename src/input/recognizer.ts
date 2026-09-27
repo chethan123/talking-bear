@@ -8,8 +8,8 @@
  * itself, so an idle tick allocates no gestures array and no state.
  *
  * **One contact** (one pointer from down to up) reports every gesture with the region under its down point.
- * It starts `pending` and moves on to one of these modes; a `stroke` can still turn into `tickle` handling,
- * and any contact can still be `claimed`:
+ * It starts `pending` and moves on to one of these modes; a `stroke` can still turn into `tickle` handling
+ * (and tentative tickle handling into a `stroke` or a `longPress`), and any contact can still be `claimed`:
  * - `longPress`: a tick or move ≥ 500 ms after down with < 10 px of movement. It owns the contact: later
  *   moves change nothing, and the up emits `longPress end`.
  * - `stroke`: movement > 10 px at a windowed speed in [40, 1200] px/s. `update` every ≥ 50 ms of moves;
@@ -17,10 +17,10 @@
  * - `tickle` handling: two reversals less than 300 ms apart (a stroke emits `end` first). `tickle` is
  *   emitted once ≥ 4 reversals whose segments are 4–40 px fall within 600 ms. While the scrub continues (the
  *   latest reversal is < 600 ms old), a move or tick re-emits it every 600 ms, so a sustained tickle arrives
- *   at a steady ~600 ms cadence instead of waiting for the next reversal. Until its first `tickle`, tickle
- *   handling is tentative: a small wiggle inside the slop still ends as a `tap up`, or becomes a `longPress`
- *   once its run has lapsed (no reversal for 600 ms), because the tap and long-press rules have no reversal
- *   exception.
+ *   at a steady ~600 ms cadence instead of waiting for the next reversal. Tickle handling entered from
+ *   `pending` is tentative until its first `tickle`, because the tap, long-press and stroke rules have no
+ *   reversal exception: a small wiggle inside the slop still ends as a `tap up`, becomes a `longPress` once
+ *   its run has lapsed (no reversal for 600 ms), or starts a `stroke` once it moves > 10 px at stroke speed.
  * - `claimed` by a multi-pointer gesture (pinch/hug pair, all-over): any stroke or long-press ends at once,
  *   and nothing else is emitted for that contact.
  * The up sample is a last move (it can complete a reversal or a tickle). A `pending` or `stroke` up may add a
@@ -169,6 +169,8 @@ interface Track {
   readonly revT: number;
   /** Times of the current run of tickle-sized reversals, within TICKLE_WINDOW_MS of the latest. */
   readonly revs: readonly number[];
+  /** Tickle handling was entered from `pending` (not from a stroke): it can be tentative. */
+  readonly fromPending: boolean;
 }
 
 /** A pinch or hug candidate: exactly two pointers are down, started on cheekL/cheekR or flankL/flankR. */
@@ -241,12 +243,13 @@ function without(pointers: readonly Track[], i: number): Track[] {
 }
 
 /**
- * Tickle handling that has not tickled yet. Its contact still obeys the tap rule on up, and the long-press
- * rule once its reversal run has lapsed: the issue's "more than 1 reversal per 300 ms" switch belongs to the
- * stroke rule, and a wiggle inside the slop is neither a stroke nor a tickle.
+ * Tickle handling entered from `pending` that has not tickled yet. The issue's "more than 1 reversal per 300 ms"
+ * switch belongs to the stroke rule, and a wiggle before any stroke is neither a stroke nor a tickle: the
+ * contact still obeys the tap rule on up, the long-press rule once its reversal run has lapsed, and the stroke
+ * rule. Tickle handling entered from a stroke is never tentative, so a scrub cannot flap back into a stroke.
  */
 function tentative(p: Track): boolean {
-  return p.mode === 'tickle' && p.tickleT === -Infinity;
+  return p.mode === 'tickle' && p.fromPending && p.tickleT === -Infinity;
 }
 
 /** Held ≥ LONG_PRESS_MS within the slop: pending, or tentative with no reversal for TICKLE_WINDOW_MS. */
@@ -327,6 +330,7 @@ function newTrack(smp: PointerSample, region: RegionId, count: number): Track {
     uy: 0,
     revT: -Infinity,
     revs: [],
+    fromPending: false,
   };
 }
 
@@ -398,7 +402,7 @@ function down(s: RecState, smp: PointerSample, hit: Hit, out: Gesture[]): RecSta
 function advance(p: Track, smp: PointerSample, hit: Hit): Track {
   const { t, x, y } = smp;
   const maxDist = Math.max(p.maxDist, Math.hypot(x - p.x0, y - p.y0));
-  if (p.mode !== 'pending' && p.mode !== 'stroke') return { ...p, x, y, maxDist };
+  if (p.mode !== 'pending' && p.mode !== 'stroke' && !tentative(p)) return { ...p, x, y, maxDist };
   const pathPx = hit(x, y) === p.region ? p.pathPx + Math.hypot(x - p.x, y - p.y) : p.pathPx;
   // Velocity over the last FLICK_WINDOW_MS. The position then is the latest sample at or before it: a pointer
   // reports every movement, so it did not move between samples. A younger contact measures from its down point.
@@ -447,7 +451,7 @@ function reversals(p: Track, t: number, x: number, y: number, out: Gesture[]): T
   };
   if (at - p.revT < STROKE_REVERSAL_MS && q.mode !== 'tickle') {
     if (q.mode === 'stroke') out.push(strokeGesture(q, 'end'));
-    q = { ...q, mode: 'tickle' };
+    q = { ...q, mode: 'tickle', fromPending: q.mode === 'pending' };
   }
   return q;
 }
@@ -459,15 +463,12 @@ function move(s: RecState, i: number, smp: PointerSample, hit: Hit, out: Gesture
   if (tickleDue(p, smp.t)) {
     out.push({ g: 'tickle', region: p.region });
     p = { ...p, tickleT: smp.t };
-  } else if (p.mode === 'tickle' && longPressDue(p, smp.t)) {
+  } else if (longPressDue(p, smp.t)) {
     p = { ...p, mode: 'longPress' };
     out.push({ g: 'longPress', region: p.region, phase: 'start' });
-  } else if (p.mode === 'pending') {
+  } else if (p.mode === 'pending' || tentative(p)) {
     const speed = Math.hypot(p.vx, p.vy);
-    if (longPressDue(p, smp.t)) {
-      p = { ...p, mode: 'longPress' };
-      out.push({ g: 'longPress', region: p.region, phase: 'start' });
-    } else if (p.maxDist > SLOP && speed >= STROKE_MIN_SPEED && speed <= STROKE_MAX_SPEED) {
+    if (p.maxDist > SLOP && speed >= STROKE_MIN_SPEED && speed <= STROKE_MAX_SPEED) {
       p = { ...p, mode: 'stroke', strokeT: smp.t };
       out.push(strokeGesture(p, 'start'));
     }
