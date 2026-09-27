@@ -1,0 +1,1 @@
+{ "name": "spike-plan-checks", "private": true, "devDependencies": { "mermaid": "11", "playwright": "1.63.0" } }

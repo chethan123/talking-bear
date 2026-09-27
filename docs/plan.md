@@ -47,7 +47,7 @@ I re-checked the following against source or by running them myself.
 - The fake-microphone Playwright loop, including the `%noloop` behaviour at end of file [E].
 - The CSP behaviour of AudioWorklet and WASM [E].
 
-The research scratch scripts live in the (ephemeral) session scratchpad, not in this repo.
+The research scripts behind the `[E]` results are committed as throwaway spikes under [`docs/research/spikes/`](research/spikes/): the fake-mic loop, the Silero port and parity test, resampling and aliasing benchmarks, the Go server prototype, the Vite/PWA/CSP experiments and the plan consistency checks.
 
 ---
 
@@ -1693,6 +1693,7 @@ talking-bear/
 ├── e2e/                            # Playwright specs + fixtures/*.wav
 ├── docs/
 │   ├── plan.md                     # this document
+│   ├── research/spikes/            # throwaway planning experiments (excluded from lint/build; delete as modules land)
 │   ├── device-notes.md             # experiment results per device / Chrome version
 │   └── adr/                        # one short ADR per gated decision (VAD backend, default voice, …)
 ├── package.json  pnpm-lock.yaml  pnpm-workspace.yaml (onlyBuiltDependencies allow-list)  .npmrc
@@ -1717,7 +1718,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 **Build**
 
-- **Repo scaffold:** Vite 8.3, TypeScript 7 project references (app, worklet, worker, node), oxlint (type-aware), Prettier, Vitest 5 (node + browser projects), Playwright 1.63, pnpm 12, Node 24.
+- **Repo scaffold:** Vite 8.3, TypeScript 7 project references (app, worklet, worker, node), oxlint (type-aware), Prettier, Vitest 5 (node + browser projects), Playwright 1.63, pnpm 12, Node 24. `docs/research/**` is excluded from oxlint, Prettier, tsconfig, Vitest and `.dockerignore`. The spikes in it are reference material; the fake-mic harness (spike 01) is the starting point for the M1 e2e specs.
 - **CI `verify` job:** lint, format check, typecheck and unit tests. The `ci.yml` skeleton goes in now.
 - **`audio/engine.ts`:** context lifecycle, `getUserMedia` with the §4.1 constraints, and `statechange`/`onerror` handling.
 - **`capture.worklet.ts`:** 80 Hz HPF, ring buffer, streaming decimator, 16 kHz framing with `{epoch, firstFrame}` tags, deferred and chunked `take`, and a zero output whose `destination` connection is a runtime flag (default off until X-R4).

@@ -1,0 +1,16 @@
+import pw from 'playwright'; const { chromium } = pw;
+const port = process.argv[2]; const label = process.argv[3];
+const browser = await chromium.launch({ args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'] });
+const ctx = await browser.newContext(); const page = await ctx.newPage();
+const logs = [];
+page.on('console', m => logs.push(`[console.${m.type()}] ${m.text()}`));
+page.on('pageerror', e => logs.push(`[pageerror] ${e.message}`));
+await page.addInitScript(() => { window.__v = []; document.addEventListener('securitypolicyviolation', e => window.__v.push({ d: e.violatedDirective, u: e.blockedURI, disp: e.disposition, sample: (e.sample||'').slice(0,60), src: (e.sourceFile||'').split('/').pop(), line: e.lineNumber })); });
+await page.goto(`http://localhost:${port}/`);
+await page.waitForTimeout(1500);
+await page.locator('#c').click();
+await page.waitForTimeout(2500);
+const swState = await page.evaluate(async () => { const r = await navigator.serviceWorker.getRegistration(); return r ? { active: !!r.active, waiting: !!r.waiting, installing: !!r.installing, controller: !!navigator.serviceWorker.controller } : null; });
+const v = await page.evaluate(() => window.__v);
+console.log(`\n##### ${label} #####`); console.log('SW:', JSON.stringify(swState)); console.log('violations:', JSON.stringify(v, null, 0)); console.log(logs.join('\n'));
+await browser.close();

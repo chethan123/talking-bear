@@ -1,0 +1,2 @@
+{ "name": "spike-vad-silero-port", "private": true, "type": "module",
+  "dependencies": { "onnxruntime-web": "1.30.0", "auditok-webrtcvad": "0.1.0" } }

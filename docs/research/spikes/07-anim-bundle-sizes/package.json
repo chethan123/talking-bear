@@ -1,0 +1,5 @@
+{ "name": "spike-anim-bundle-sizes", "private": true,
+  "dependencies": {
+    "@lottiefiles/dotlottie-web": "0.80.0", "@rive-app/canvas-lite": "2.43.1",
+    "@use-gesture/vanilla": "10.3.1", "lottie-web": "5.13.0", "three": "0.186.1", "esbuild": "0.28.2"
+  } }

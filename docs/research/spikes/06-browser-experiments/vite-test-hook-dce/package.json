@@ -1,0 +1,1 @@
+{ "name": "spike-vite-test-hook-dce", "private": true, "type": "module", "dependencies": { "vite": "8.3.1" } }
