@@ -187,3 +187,138 @@ export function resampleOffline(x: Float32Array, ratio: number, opts?: ResampleO
   }
   return y;
 }
+
+/** Zeros appended per step by flush(). */
+const FLUSH_BLOCK = 1024;
+
+/**
+ * Streaming resampler over a preallocated history buffer. buf[q] holds absolute input index bufStart + q;
+ * indices below 0 are the zeros before the stream, and flush() appends zeros after it. Output j reads inputs
+ * floor(j / ratio) − L + 1 … floor(j / ratio) + L, exactly like resampleOffline, so the two agree bit for bit.
+ */
+class StreamingResampler implements Resampler {
+  readonly ratio: number;
+  readonly groupDelayInputFrames: number;
+  private readonly coeffs: Float32Array;
+  private readonly taps: number;
+  private readonly half: number;
+  private readonly buf: Float32Array;
+  /** Absolute input index of buf[0]. */
+  private bufStart = 0;
+  /** Absolute end (exclusive) of the buffered samples: real input plus flush zeros. */
+  private filled = 0;
+  /** Real input samples since construction or reset(). */
+  private nIn = 0;
+  /** Output samples emitted since construction or reset(). */
+  private nOut = 0;
+  private flushed = false;
+
+  constructor(ratio: number, table: KernelTable) {
+    this.ratio = ratio;
+    this.coeffs = table.coeffs;
+    this.taps = table.taps;
+    this.half = table.half;
+    this.groupDelayInputFrames = table.half;
+    // After emitting, the span still needed is at most max(2L − 1, L + 0.5 / ratio + 1) samples, so a
+    // compaction always frees at least FLUSH_BLOCK slots.
+    this.buf = new Float32Array(2 * table.half + Math.ceil(0.5 / ratio) + 4 + FLUSH_BLOCK);
+    this.reset();
+  }
+
+  processInto(input: Float32Array, out: Float32Array): number {
+    if (this.flushed) throw new Error('flush() ended the stream; call reset()');
+    const len = input.length;
+    if (out.length < Math.ceil(len * this.ratio) + 2) {
+      throw new RangeError(`out.length must be >= Math.ceil(input.length * ratio) + 2 (got ${out.length})`);
+    }
+    const buf = this.buf;
+    const cap = buf.length;
+    let written = 0;
+    let off = 0;
+    while (off < len) {
+      if (this.filled - this.bufStart === cap) this.compact();
+      const base = this.filled - this.bufStart;
+      const n = Math.min(cap - base, len - off);
+      for (let i = 0; i < n; i++) buf[base + i] = input[off + i]!;
+      off += n;
+      this.filled += n;
+      this.nIn += n;
+      written = this.emit(out, written, Math.round(this.nIn * this.ratio));
+    }
+    return written;
+  }
+
+  process(input: Float32Array): Float32Array {
+    const out = new Float32Array(Math.ceil(input.length * this.ratio) + 2);
+    const n = this.processInto(input, out);
+    return out.slice(0, n);
+  }
+
+  flush(): Float32Array {
+    if (this.flushed) return new Float32Array(0);
+    const total = Math.round(this.nIn * this.ratio);
+    const out = new Float32Array(total - this.nOut);
+    const buf = this.buf;
+    const cap = buf.length;
+    let written = 0;
+    while (this.nOut < total) {
+      if (this.filled - this.bufStart === cap) this.compact();
+      const base = this.filled - this.bufStart;
+      const n = Math.min(cap - base, FLUSH_BLOCK);
+      buf.fill(0, base, base + n); // slots past `filled` may hold stale samples after compact()
+      this.filled += n;
+      written = this.emit(out, written, total);
+    }
+    this.flushed = true;
+    return out;
+  }
+
+  reset(): void {
+    this.buf.fill(0);
+    this.bufStart = 1 - this.half; // the first L − 1 slots stand for the zeros before input 0
+    this.filled = 0;
+    this.nIn = 0;
+    this.nOut = 0;
+    this.flushed = false;
+  }
+
+  /** Emits outputs nOut … limit − 1 while every input their kernel reads has arrived. No allocation. */
+  private emit(out: Float32Array, written: number, limit: number): number {
+    const ratio = this.ratio;
+    const half = this.half;
+    const filled = this.filled;
+    let w = written;
+    let j = this.nOut;
+    while (j < limit) {
+      const pos = j / ratio; // computed directly, never accumulated
+      const k = Math.floor(pos);
+      if (k + half >= filled) break; // the last tap, input k + L, has not arrived yet
+      if (w >= out.length) throw new RangeError('out is too short for the computable outputs');
+      out[w++] = kernelDot(this.coeffs, this.taps, this.buf, k - half + 1 - this.bufStart, pos - k);
+      j++;
+    }
+    this.nOut = j;
+    return w;
+  }
+
+  /** Drops history older than the first input that output nOut reads. No allocation. */
+  private compact(): void {
+    const oldest = Math.floor(this.nOut / this.ratio) - this.half + 1;
+    const keepFrom = Math.min(oldest, this.filled);
+    this.buf.copyWithin(0, keepFrom - this.bufStart, this.filled - this.bufStart);
+    this.bufStart = keepFrom;
+  }
+}
+
+/**
+ * Streaming resampler from inRate to outRate (ratio = outRate / inRate). The history buffer is preallocated
+ * here; processInto never allocates. Throws RangeError on non-finite or non-positive rates or bad options.
+ */
+export function createResampler(inRate: number, outRate: number, opts?: ResampleOpts): Resampler {
+  if (!Number.isFinite(inRate) || inRate <= 0 || !Number.isFinite(outRate) || outRate <= 0) {
+    throw new RangeError(`rates must be finite and > 0 (got ${inRate} -> ${outRate})`);
+  }
+  const ratio = outRate / inRate;
+  checkRatio(ratio);
+  return new StreamingResampler(ratio, getTable(resolveKernel(ratio, opts)));
+}
