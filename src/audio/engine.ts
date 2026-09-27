@@ -1,0 +1,532 @@
+// The audio engine (plan §3.1–§3.3): the imperative adapter the session's effect runner drives. It owns the
+// AudioContext, the microphone stream (through the mic manager), the capture worklet node, the DSP worker and
+// the MessageChannel between those two, and turns their messages into `EngineEvent`s.
+//
+//   mic → MediaStreamAudioSourceNode → capture worklet ──frames (channel)──→ DSP worker
+//                                          │  armed / clip chunks / takeFailed      │ seg / level / floorSnapshot /
+//                                          ▼                                        ▼ processed / error
+//                                        engine (main thread) ───── onEvent ─────→ session
+//
+// The graph is built on the first successful resume(). The worklet's output is connected to `destination` only
+// when `connectWorkletOutput` is set (plan §3.2: a runtime flag, off until X-R4 shows no capture gaps).
+
+import type { SessionEvent } from '../app/events.ts';
+import type { Envelope, VoicePreset } from '../dsp/types.ts';
+import workerUrl from '../workers/dsp.worker.ts?worker&url';
+import { createMasterBus, type MasterBus } from './bus.ts';
+import workletUrl from './capture.worklet.ts?worker&url';
+import {
+  transferList,
+  type MainToWorker,
+  type MainToWorklet,
+  type WorkerToMain,
+  type WorkletToMain,
+} from './messages.ts';
+import { createMicManager, type MicResult } from './mic.ts';
+
+export type EngineEvent =
+  | Extract<
+      SessionEvent,
+      {
+        t:
+          | 'ctxRunning'
+          | 'ctxResumeFailed'
+          | 'ctxError'
+          | 'micGranted'
+          | 'micDenied'
+          | 'noDevice'
+          | 'armed'
+          | 'seg'
+          | 'floorSnapshot'
+          | 'clipReady'
+          | 'takeFailed'
+          | 'processed'
+          | 'fxError'
+          | 'workerFailed'
+          | 'trackMuted'
+          | 'trackUnmuted'
+          | 'trackEnded'
+          | 'inputsChanged';
+      }
+    >
+  | { t: 'level'; epoch: number; frame: number; db: number; floorDb: number }
+  | { t: 'vadError'; message: string };
+
+export interface Engine {
+  resume(): Promise<void>;
+  suspend(): Promise<void>;
+  openMic(req: number): void;
+  closeMic(): void;
+  arm(epoch: number, restoreFloorDb?: number): void;
+  disarm(epoch: number): void;
+  /**
+   * Cuts `[fromFrame, toFrame)` from the capture ring; emits `clipReady{epoch, id}` or `takeFailed{epoch, id}`.
+   * Only the latest take is kept: a take superseded by a newer take() emits neither clipReady nor takeFailed.
+   */
+  take(epoch: number, id: number, fromFrame: number, toFrame: number): void;
+  process(id: number, preset: VoicePreset): void;
+  getProcessed(
+    id: number,
+  ): { pcm: Float32Array; sampleRate: number; envelope: Envelope; durationSec: number } | undefined;
+  /**
+   * The assembled clip of the latest completed take, if (epoch, id) matches it. Used by lab pages; process()
+   * transfers it away. A take superseded by a newer take() never completes (no clipReady, no takeFailed).
+   */
+  getClip(epoch: number, id: number): Float32Array | undefined;
+  restartWorker(): void;
+  reselectInput(): void;
+  context(): AudioContext | null;
+  masterBus(): AudioNode | null;
+}
+
+type Processed = NonNullable<ReturnType<Engine['getProcessed']>>;
+type ClipChunk = Extract<WorkletToMain, { t: 'clipChunk' }>;
+
+/** The latest completed take. */
+interface Clip {
+  epoch: number;
+  id: number;
+  pcm: Float32Array;
+  sampleRate: number;
+}
+
+/** The take being collected from its clip chunks. */
+interface Assembly {
+  epoch: number;
+  id: number;
+  chunks: Float32Array[];
+  length: number;
+  nextSeq: number;
+}
+
+/** `navigator.mediaDevices`, which only exists in secure contexts. */
+function mediaDevices(): MediaDevices | undefined {
+  return 'mediaDevices' in navigator ? navigator.mediaDevices : undefined;
+}
+
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
+
+function postToWorklet(n: AudioWorkletNode, msg: MainToWorklet): void {
+  n.port.postMessage(msg, transferList(msg));
+}
+
+function postToWorker(w: Worker, msg: MainToWorker): void {
+  w.postMessage(msg, transferList(msg));
+}
+
+function concat(chunks: readonly Float32Array[], length: number): Float32Array {
+  const [first] = chunks;
+  if (chunks.length === 1 && first !== undefined) return first;
+  const out = new Float32Array(length);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
+
+export function createEngine(opts: {
+  connectWorkletOutput: boolean;
+  onEvent: (e: EngineEvent) => void;
+}): Engine {
+  const { connectWorkletOutput, onEvent } = opts;
+  const emit = (e: EngineEvent): void => {
+    onEvent(e);
+  };
+
+  // Plan §4.1.1 constraints; the lookup happens per call, so a missing mediaDevices becomes noDevice.
+  const mic = createMicManager((c) => navigator.mediaDevices.getUserMedia(c));
+
+  // The graph: all null until the first successful resume() has built it (context, worklet, bus, node, worker).
+  let ctx: AudioContext | null = null;
+  let bus: MasterBus | null = null;
+  let node: AudioWorkletNode | null = null;
+  let setup: Promise<AudioContext> | null = null;
+  /** Set by resume(), cleared by suspend(): the latest call wins when they race with the first build. */
+  let wantRunning = false;
+
+  let worker: Worker | null = null;
+  /** The worker failed (error / messageerror, or could not be created) since its last init (T17 D25). */
+  let workerDead = false;
+
+  let source: MediaStreamAudioSourceNode | null = null;
+  let sourceStream: MediaStream | null = null;
+  /** req of the last micGranted, for a connect failure while the graph is built later (review F6). */
+  let grantedReq: number | null = null;
+
+  let asm: Assembly | null = null;
+  let clip: Clip | null = null;
+  let lastProcessId: number | null = null;
+  /** The sample rate each in-flight process request was sent with (the worker's reply carries none). */
+  const processRates = new Map<number, number>();
+  let processed: { id: number; result: Processed } | null = null;
+
+  /** Non-empty audioinput deviceIds at the last enumeration; null until the first one. */
+  let inputs: ReadonlySet<string> | null = null;
+  let enumSeq = 0;
+  let enumApplied = 0;
+
+  // ---- worklet -----------------------------------------------------------------------------------------------
+
+  function onWorkletMessage(e: MessageEvent<WorkletToMain>): void {
+    const m = e.data;
+    switch (m.t) {
+      case 'armed':
+        emit({ t: 'armed', epoch: m.epoch, armFrame: m.armFrame });
+        break;
+      case 'clipChunk':
+        onClipChunk(m);
+        break;
+      case 'takeFailed':
+        if (asm !== null && asm.epoch === m.epoch && asm.id === m.id) asm = null;
+        emit({ t: 'takeFailed', epoch: m.epoch, id: m.id });
+        break;
+    }
+  }
+
+  /** Collects the chunks of the take being assembled, in seq order; other takes' chunks are ignored. */
+  function onClipChunk(m: ClipChunk): void {
+    const a = asm;
+    if (a === null || a.epoch !== m.epoch || a.id !== m.id) return;
+    if (m.seq !== a.nextSeq) {
+      asm = null; // a gap would give a wrong clip; the reducer's processing timeout recovers
+      return;
+    }
+    a.chunks.push(m.pcm);
+    a.length += m.pcm.length;
+    a.nextSeq++;
+    if (!m.last) return;
+    asm = null;
+    clip = { epoch: a.epoch, id: a.id, pcm: concat(a.chunks, a.length), sampleRate: m.sampleRate };
+    emit({ t: 'clipReady', epoch: a.epoch, id: a.id });
+  }
+
+  // ---- worker ------------------------------------------------------------------------------------------------
+
+  function onWorkerMessage(e: MessageEvent<WorkerToMain>): void {
+    const m = e.data;
+    switch (m.t) {
+      case 'seg':
+        emit({ t: 'seg', epoch: m.epoch, ev: m.ev });
+        break;
+      case 'level':
+        emit({ t: 'level', epoch: m.epoch, frame: m.frame, db: m.db, floorDb: m.floorDb });
+        break;
+      case 'floorSnapshot':
+        emit({ t: 'floorSnapshot', epoch: m.epoch, floorDb: m.floorDb });
+        break;
+      case 'processed': {
+        const sampleRate = processRates.get(m.id);
+        if (sampleRate === undefined) return; // not a request of this worker
+        processRates.delete(m.id);
+        processed = {
+          id: m.id,
+          result: { pcm: m.pcm, sampleRate, envelope: m.envelope, durationSec: m.durationSec },
+        };
+        emit({ t: 'processed', id: m.id, durationSec: m.durationSec });
+        break;
+      }
+      case 'error':
+        if (m.where === 'fx') {
+          if (lastProcessId !== null) emit({ t: 'fxError', id: lastProcessId });
+        } else {
+          emit({ t: 'vadError', message: m.message });
+        }
+        break;
+      case 'vadStats':
+        break; // M2 (T35) forwards it
+    }
+  }
+
+  function onWorkerFailure(): void {
+    workerDead = true;
+    emit({ t: 'workerFailed' });
+  }
+
+  /** A new worker and a fresh worklet↔worker channel; `init` goes to both ends with its port transferred. */
+  function startWorker(c: AudioContext, n: AudioWorkletNode): void {
+    let w: Worker;
+    try {
+      w = new Worker(workerUrl, { type: 'module' });
+    } catch {
+      onWorkerFailure();
+      return;
+    }
+    w.addEventListener('message', onWorkerMessage);
+    w.addEventListener('error', onWorkerFailure);
+    w.addEventListener('messageerror', onWorkerFailure);
+    worker = w;
+    workerDead = false;
+    const ch = new MessageChannel();
+    postToWorklet(n, { t: 'init', port: ch.port1 });
+    postToWorker(w, { t: 'init', ctxRate: c.sampleRate, port: ch.port2 });
+  }
+
+  /** Terminates the worker; its listeners go first, so nothing it still has queued is forwarded. */
+  function stopWorker(): void {
+    const w = worker;
+    if (w === null) return;
+    w.removeEventListener('message', onWorkerMessage);
+    w.removeEventListener('error', onWorkerFailure);
+    w.removeEventListener('messageerror', onWorkerFailure);
+    w.terminate();
+    worker = null;
+    processRates.clear();
+  }
+
+  function restartWorker(): void {
+    // Before the graph exists this is a no-op: the first resume() starts a worker. The worklet stays armed;
+    // the new worker drops every frame until the next arm() sends it a reset.
+    if (ctx === null || node === null) return;
+    stopWorker();
+    startWorker(ctx, node);
+  }
+
+  // ---- context -----------------------------------------------------------------------------------------------
+
+  function onCtxError(): void {
+    emit({ t: 'ctxError' });
+  }
+
+  async function buildGraph(): Promise<AudioContext> {
+    // Plan §4.1.3: never pass sampleRate (a forced rate resamples the output); 'interactive' = low latency.
+    const c = new AudioContext({ latencyHint: 'interactive' });
+    c.addEventListener('error', onCtxError); // ctx.onerror (render errors, Chrome 128+)
+    try {
+      await c.audioWorklet.addModule(workletUrl);
+      const b = createMasterBus(c);
+      const n = new AudioWorkletNode(c, 'capture', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      n.port.addEventListener('message', onWorkletMessage);
+      n.port.start(); // addEventListener, unlike the onmessage setter, doesn't start the port
+      if (connectWorkletOutput) n.connect(c.destination); // plan §3.2: runtime flag, default unconnected
+      ctx = c;
+      bus = b;
+      node = n;
+      startWorker(c, n);
+    } catch (err) {
+      c.removeEventListener('error', onCtxError);
+      stopWorker();
+      ctx = null;
+      bus = null;
+      node = null;
+      void c.close().catch(() => undefined);
+      throw err;
+    }
+    // A mic granted before the graph existed is connected now, before ctxRunning (so before any arm).
+    try {
+      connectSource();
+    } catch {
+      closeMicStream();
+      if (grantedReq !== null) emit({ t: 'noDevice', req: grantedReq });
+    }
+    return c;
+  }
+
+  function ensureSetup(): Promise<AudioContext> {
+    setup ??= buildGraph().catch((err: unknown) => {
+      setup = null; // the next resume() retries from scratch
+      throw err;
+    });
+    return setup;
+  }
+
+  async function resume(): Promise<void> {
+    wantRunning = true;
+    const built = ctx !== null; // recreate a dead worker only if the graph existed before this call
+    let c: AudioContext;
+    try {
+      c = await ensureSetup();
+      if (built && workerDead) restartWorker();
+      if (!wantRunning) {
+        await c.suspend().catch(() => undefined); // a suspend() arrived during the first build
+        return;
+      }
+      await c.resume();
+    } catch {
+      emit({ t: 'ctxResumeFailed' });
+      return;
+    }
+    if (!wantRunning) return; // a suspend() raced this resume: no ctxRunning for a suspended context
+    emit({ t: 'ctxRunning', sampleRate: c.sampleRate });
+  }
+
+  async function suspend(): Promise<void> {
+    wantRunning = false;
+    const c = ctx;
+    if (c === null) return;
+    try {
+      await c.suspend();
+    } catch {
+      // A closed context has nothing to suspend.
+    }
+  }
+
+  // ---- mic ---------------------------------------------------------------------------------------------------
+
+  function connectSource(): void {
+    const stream = mic.current();
+    if (ctx === null || node === null || stream === null || stream === sourceStream) return;
+    disconnectSource();
+    const s = ctx.createMediaStreamSource(stream);
+    s.connect(node);
+    source = s;
+    sourceStream = stream;
+  }
+
+  function disconnectSource(): void {
+    source?.disconnect();
+    source = null;
+    sourceStream = null;
+  }
+
+  function closeMicStream(): void {
+    mic.close();
+    disconnectSource();
+    grantedReq = null;
+  }
+
+  function onMicResult(r: MicResult | { t: 'stale'; req: number }): void {
+    switch (r.t) {
+      case 'stale':
+        return;
+      case 'micDenied':
+        emit({ t: 'micDenied', req: r.req });
+        return;
+      case 'noDevice':
+        emit({ t: 'noDevice', req: r.req });
+        return;
+      case 'micGranted': {
+        if (mic.current() !== r.stream) return; // closed or replaced before this ran: stale
+        grantedReq = r.req;
+        try {
+          connectSource();
+        } catch {
+          closeMicStream();
+          emit({ t: 'noDevice', req: r.req });
+          return;
+        }
+        emit({ t: 'micGranted', req: r.req });
+        // T17 F6/D24: report the new track's initial mute state, so micMuted can't go stale across a reopen.
+        const muted = r.stream.getAudioTracks().some((track) => track.muted);
+        emit(muted ? { t: 'trackMuted' } : { t: 'trackUnmuted' });
+        void refreshInputs(false); // the devicechange baseline, now that deviceIds are exposed
+        return;
+      }
+    }
+  }
+
+  mic.onTrackEvent((e) => {
+    switch (e) {
+      case 'mute':
+        emit({ t: 'trackMuted' });
+        break;
+      case 'unmute':
+        emit({ t: 'trackUnmuted' });
+        break;
+      case 'endedExternally':
+        emit({ t: 'trackEnded' });
+        break;
+    }
+  });
+
+  // ---- devicechange (plan §4.5: compare the set of input ids; never pick inputs by position or label) ------
+
+  async function refreshInputs(report: boolean): Promise<void> {
+    const devices = mediaDevices();
+    if (devices === undefined) return;
+    const seq = ++enumSeq;
+    let list: MediaDeviceInfo[];
+    try {
+      list = await devices.enumerateDevices();
+    } catch {
+      return;
+    }
+    if (seq < enumApplied) return; // a later enumeration already landed
+    enumApplied = seq;
+    const next = new Set<string>();
+    for (const d of list) if (d.kind === 'audioinput' && d.deviceId !== '') next.add(d.deviceId);
+    const prev = inputs;
+    inputs = next;
+    if (report && prev !== null && !sameSet(prev, next)) emit({ t: 'inputsChanged' });
+  }
+
+  mediaDevices()?.addEventListener('devicechange', () => {
+    void refreshInputs(true);
+  });
+
+  // ---- the Engine --------------------------------------------------------------------------------------------
+
+  return {
+    resume,
+    suspend,
+    openMic(req: number): void {
+      void mic.open(req).then(onMicResult);
+    },
+    closeMic(): void {
+      closeMicStream();
+      asm = null;
+      clip = null;
+    },
+    arm(epoch: number, restoreFloorDb?: number): void {
+      // Epochs come from the reducer's integer counter. The worker's reset goes out before the worklet's arm.
+      if (worker !== null) postToWorker(worker, { t: 'reset', epoch, vad: 'energy', restoreFloorDb });
+      if (node !== null) postToWorklet(node, { t: 'arm', epoch });
+    },
+    disarm(epoch: number): void {
+      if (node !== null) postToWorklet(node, { t: 'disarm', epoch });
+    },
+    take(epoch: number, id: number, fromFrame: number, toFrame: number): void {
+      clip = null;
+      asm = null;
+      const valid =
+        Number.isSafeInteger(epoch) &&
+        Number.isSafeInteger(id) &&
+        Number.isSafeInteger(fromFrame) &&
+        Number.isSafeInteger(toFrame);
+      // The worklet ignores a malformed take silently, so fail it here instead of leaving the reducer waiting.
+      if (!valid || node === null) {
+        emit({ t: 'takeFailed', epoch, id });
+        return;
+      }
+      asm = { epoch, id, chunks: [], length: 0, nextSeq: 0 };
+      postToWorklet(node, { t: 'take', epoch, id, fromFrame, toFrame });
+    },
+    process(id: number, preset: VoicePreset): void {
+      lastProcessId = id;
+      const c = clip;
+      const w = worker;
+      if (c === null || c.id !== id || w === null || workerDead) {
+        emit({ t: 'fxError', id });
+        return;
+      }
+      clip = null; // the pcm is transferred to the worker
+      processRates.set(id, c.sampleRate);
+      postToWorker(w, { t: 'process', id, pcm: c.pcm, sampleRate: c.sampleRate, preset });
+    },
+    getProcessed(id: number): Processed | undefined {
+      return processed !== null && processed.id === id ? processed.result : undefined;
+    },
+    getClip(epoch: number, id: number): Float32Array | undefined {
+      return clip !== null && clip.epoch === epoch && clip.id === id ? clip.pcm : undefined;
+    },
+    restartWorker,
+    reselectInput(): void {
+      // M8: Bluetooth policy (X-E4)
+    },
+    context(): AudioContext | null {
+      return ctx;
+    },
+    masterBus(): AudioNode | null {
+      return bus === null ? null : bus.input;
+    },
+  };
+}
