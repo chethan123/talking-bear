@@ -7,7 +7,8 @@
  *
  * `sampleClip` runs every frame, so it never allocates: indexed `for` loops only, and no closures, array
  * or object literals, destructuring, spreads, `for…of` or string building on its path (`sampleKeys`,
- * `ease`). `out.fill(0)` doesn't allocate.
+ * `ease`). `out.fill(0)` doesn't allocate. (That holds once V8 has optimised it: V8's interpreter and
+ * baseline tiers box every intermediate double, in any code.)
  */
 import type { Pose } from './pose.ts';
 
