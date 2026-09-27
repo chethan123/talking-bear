@@ -120,6 +120,8 @@ describe('pathBBox: all path coordinates, control points included', () => {
     expect(bbox('M10 20 h30 v-5 H0 V100 z l5 5')).toEqual([0, 15, 40, 100]);
     expect(bbox('m10 10 l5 5 z m-20 0 l1 1')).toEqual([-10, 10, 15, 15]);
     expect(bbox('m10 10 c1 -20 2 30 5 0 s10 10 10 0')).toEqual([10, -20, 25, 40]); // s reflects (12, 40) to (18, -20)
+    expect(bbox('m10 10 q5 -20 10 0 t10 0')).toEqual([10, -10, 30, 30]); // q control (15, -10); t reflects it to (25, 30)
+    expect(bbox('m10 10 c0 0 0 0 5 0 s5 -20 10 0')).toEqual([10, -10, 25, 10]); // s control (20, -10), end (25, 10)
   });
 
   it('includes explicit control points and the reflected ones of S and T', () => {
@@ -128,6 +130,7 @@ describe('pathBBox: all path coordinates, control points included', () => {
     expect(bbox('M0 0 Q10 20 20 0 T40 0')).toEqual([0, -20, 40, 20]); // T reflects (10, 20) to (30, -20)
     expect(bbox('M0 0 Q10 20 20 0 T40 0 T60 0')).toEqual([0, -20, 60, 20]); // then (30, -20) to (50, 20)
     expect(bbox('M0 0 T10 0')).toEqual([0, 0, 10, 0]);
+    expect(bbox('M0 0 Q10 20 20 0 L30 0 T40 0')).toEqual([0, 0, 40, 20]); // after L, T's control is the current point
   });
 
   it('bounds arcs by their end points and their extreme points on the ellipse', () => {
@@ -169,6 +172,23 @@ describe('compileBearSvg: the tiny fixture', () => {
       ['scleraL', 'eyeL', false],
       ['irisL', 'eyeL', false],
     ]);
+  });
+
+  it('replaces only a trailing L when it looks for the mirrored bone', () => {
+    // Lap has no trailing L, so its copy stays on Lap, although Rap (first L swapped) and LaR (last letter swapped) exist.
+    const svg = edit(
+      '<g id="armR"',
+      '<g id="Lap" data-pivot="0,0" data-parent="root">\n' +
+        '      <path id="lapFur" d="M 0 0 L 10 10" fill="#2F7A6D" data-parent="Lap" data-mirror="lapFurCopy"/>\n' +
+        '    </g>\n' +
+        '    <g id="Rap" data-pivot="0,0" data-parent="root"/>\n' +
+        '    <g id="LaR" data-pivot="0,0" data-parent="root"/>\n' +
+        '    <g id="armR"',
+    );
+    const compiled = compileBearSvg(svg);
+    const copy = compiled.parts.find((p) => p.id === 'lapFurCopy');
+    expect(copy?.mirror).toBe(true);
+    expect(compiled.bones[copy?.bone ?? -1]?.id).toBe('Lap');
   });
 
   it('gives a mirrored copy the same d, fill, opacity and bbox as its source', () => {
@@ -465,6 +485,13 @@ describe('checkGenerated', () => {
     expect(checkGenerated('a\nb\n', 'a\nb\n')).toBeUndefined();
     expect(checkGenerated('a\nb\n', 'a\nc\n')).toContain('first difference at line 2');
     expect(checkGenerated('a\nb\n', 'a')).toContain('committed: (end of file)');
+    expect(checkGenerated('a\n', 'a')).toBeDefined();
+    expect(checkGenerated('a\n', 'a\n\n')).toBeDefined();
+    for (const committed of ['a', 'a\n\n', 'a \n']) {
+      expect(checkGenerated('a\n', committed)).toBe(
+        `${OUT_FILE} differs only at the end of the file (trailing newline or whitespace).`,
+      );
+    }
     expect(checkGenerated('a\nb\n', 'a\r\nb\r\n')).toBe(
       `${OUT_FILE} differs only in line endings (CRLF): check core.autocrlf.`,
     );

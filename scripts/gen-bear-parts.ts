@@ -691,6 +691,9 @@ export function checkGenerated(generated: string, committed: string | undefined)
   if (committed.replace(/\r\n/g, '\n') === generated) {
     return `${OUT_FILE} differs only in line endings (CRLF): check core.autocrlf.`;
   }
+  if (committed.trimEnd() === generated.trimEnd()) {
+    return `${OUT_FILE} differs only at the end of the file (trailing newline or whitespace).`;
+  }
   const want = generated.split('\n');
   const have = committed.split('\n');
   let line = 0;
