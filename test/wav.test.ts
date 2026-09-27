@@ -348,6 +348,7 @@ describe('writeWav', () => {
     ['sample rate 2^32', () => writeWav([new Float32Array(1)], 2 ** 32, 'pcm16'), /sample rate/],
     [
       'an unknown format',
+      // Reflect.apply bypasses the WavWriteFormat type, as an untyped (JavaScript) caller would.
       () => Reflect.apply(writeWav, undefined, [[new Float32Array(1)], 48000, 'pcm24']),
       /unknown WAV format 'pcm24'/,
     ],
