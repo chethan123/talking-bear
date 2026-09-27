@@ -80,8 +80,11 @@ talking-bear/
 - `pnpm format`: rewrites every file Prettier handles (`.prettierignore` skips `docs/`, `.claude/`, root Markdown and generated files).
 - `pnpm format:check`: checks formatting without writing.
 - `pnpm typecheck`: runs `tsc -b` over the five project references (app, worklet, worker, node, test).
-- `pnpm test`: runs the Vitest `node` project once.
+- `pnpm test`: runs the Vitest `node` and `worklet` projects once.
 - `pnpm test:browser`: runs the Vitest `browser` project once (`src/**/*.browser.test.ts` in headless Chromium via Playwright, `channel: 'chromium'`, fake-media flags). It is not part of `pnpm verify`; CI runs it as its own step. It needs a Playwright Chromium (`pnpm exec playwright install --no-shell chromium`).
+- `pnpm build:e2e`: builds the e2e-mode bundle into `dist-e2e/` (`vite build --mode e2e`, which loads `.env.e2e`: `VITE_BEAR_TEST_HOOKS=1`).
+- `pnpm preview:e2e`: serves `dist-e2e/` with `vite preview` on port 4173 (fails if the port is taken), with the production headers from `server/headers.json`.
+- `pnpm e2e`: runs `build:e2e`, then the Playwright specs in `e2e/` (`playwright.config.ts`: `channel: 'chromium'`, one worker, no retries). Playwright starts `preview:e2e` itself; locally it reuses whatever already listens on port 4173, so stop other preview servers first. It is not part of `pnpm verify`; CI runs it as the `e2e` job. It needs a Playwright Chromium (`pnpm exec playwright install --no-shell chromium`).
 - `pnpm verify`: runs lint, format:check, typecheck and test in that order; it must pass before every PR.
 
 ## Rules
