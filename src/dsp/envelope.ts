@@ -76,6 +76,9 @@ function bandEnergy(re: Float32Array, im: Float32Array, first: number, last: num
  * when 0.01·fs is an integer, as at 44.1 and 48 kHz; at other rates (22.05 kHz: H = 221) the true hop
  * differs slightly from 10 ms.
  *
+ * Precondition: `x` must contain only finite samples (processVoice guarantees this upstream); non-finite samples
+ * give NaN tracks.
+ *
  * Throws RangeError when fs is not finite or gives a hop below one sample (fs below 50), or when pitchRatio is
  * not a positive finite number.
  */
