@@ -14,7 +14,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc -b",
-    "test": "vitest run --project node",
+    "test": "vitest run --project node --project worklet",
     "test:browser": "vitest run --project browser",
     "fixtures": "node scripts/gen-fixtures.ts",
     "verify": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test"
