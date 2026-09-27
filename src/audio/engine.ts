@@ -70,6 +70,11 @@ export interface Engine {
     id: number,
   ): { pcm: Float32Array; sampleRate: number; envelope: Envelope; durationSec: number } | undefined;
   /**
+   * Drops the stored processed result if it belongs to `id`, so no captured audio outlives its replay (plan §2);
+   * any other id is a no-op.
+   */
+  releaseProcessed(id: number): void;
+  /**
    * The assembled clip of the latest completed take, if (epoch, id) matches it. Used by lab pages; process()
    * transfers it away. A take superseded by a newer take() never completes: no clipReady (a takeFailed from the
    * worklet may still arrive for it).
@@ -529,6 +534,9 @@ export function createEngine(opts: {
     },
     getProcessed(id: number): Processed | undefined {
       return processed !== null && processed.id === id ? processed.result : undefined;
+    },
+    releaseProcessed(id: number): void {
+      if (processed !== null && processed.id === id) processed = null;
     },
     getClip(epoch: number, id: number): Float32Array | undefined {
       return clip !== null && clip.epoch === epoch && clip.id === id ? clip.pcm : undefined;
