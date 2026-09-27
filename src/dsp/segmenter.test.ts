@@ -68,6 +68,11 @@ const end = (
 ): Emitted => ({ step, ev: { kind: 'end', frame, lastSpeechFrame, reason } });
 const misfire = (step: number, frame = step): Emitted => ({ step, ev: { kind: 'misfire', frame } });
 
+/** Frame labels that are not step indices: a ctx-rate-like ramp (1536 = 512 samples at 16 kHz, in 48 kHz frames)
+ *  and a non-uniform sequence. */
+const linear = (i: number): number => 1000 + 1536 * i;
+const square = (i: number): number => i * i + 7;
+
 describe('segmenter examples (32 ms steps, frame = step index)', () => {
   it('1: five speech steps, then a silence end on the step where 19 silent steps have elapsed', () => {
     expect(run(P, seq([0.9, 5], [0, 40]))).toEqual([start(0), end(23, 4, 'silence')]);
@@ -129,8 +134,6 @@ describe('segmenter rules', () => {
 
   it('counts durations in steps, never from frame-label differences', () => {
     const probs = seq([0.9, 5], [0, 40]);
-    const linear = (i: number): number => 1000 + 1536 * i;
-    const square = (i: number): number => i * i + 7;
     expect(
       run(
         P,
@@ -205,9 +208,9 @@ function probsArb(p: SegParams): fc.Arbitrary<number[]> {
     fc.double({ min: 0, max: 1, noNaN: true }),
   );
   const runs = fc
-    .array(fc.tuple(level, fc.integer({ min: 1, max: 80 })), { maxLength: 40 })
+    .array(fc.tuple(level, fc.integer({ min: 1, max: 80 })), { maxLength: 40, size: 'max' })
     .map((r) => seq(...r));
-  const iid = fc.array(fc.double({ min: 0, max: 1, noNaN: true }), { maxLength: 500 });
+  const iid = fc.array(fc.double({ min: 0, max: 1, noNaN: true }), { maxLength: 500, size: 'max' });
   return fc.oneof({ arbitrary: runs, weight: 3 }, { arbitrary: iid, weight: 1 });
 }
 
@@ -218,7 +221,7 @@ interface Labels {
 }
 const labelsArb: fc.Arbitrary<Labels> = fc.record({
   offset: fc.integer({ min: 0, max: 2 ** 31 - 1 }),
-  incs: fc.array(fc.integer({ min: 1, max: 3000 }), { minLength: 1, maxLength: 16 }),
+  incs: fc.array(fc.integer({ min: 1, max: 3000 }), { minLength: 1, maxLength: 16, size: 'max' }),
 });
 function labelsFor({ offset, incs }: Labels, n: number): number[] {
   const out: number[] = [];
@@ -339,7 +342,8 @@ describe('segmenter properties (fast-check)', () => {
   it('an all-zero sequence emits nothing', () => {
     fc.assert(
       fc.property(paramsArb, fc.integer({ min: 0, max: 3000 }), labelsArb, (p, n, labels) => {
-        expect(run(p, new Array<number>(n).fill(0), labelsFor(labels, n))).toEqual([]);
+        const zeros = Array.from({ length: n }, () => 0);
+        expect(run(p, zeros, labelsFor(labels, n))).toEqual([]);
       }),
       { numRuns: NUM_RUNS },
     );
