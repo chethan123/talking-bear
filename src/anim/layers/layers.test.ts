@@ -1002,8 +1002,11 @@ const CONTINUITY: { name: keyof LayerWeights; make: () => Clocked }[] = [
   },
 ];
 
-/** Steps at weight 0 before the switch to weight 1 in `weightSwitch` (20 s). */
-const SWITCH_AT = 1200;
+/**
+ * Steps at weight 0 before the switch to weight 1 in `weightSwitch`: 20.5 s, deliberately not a whole number
+ * of breaths, so a breathing phase frozen at weight 0 can't line up again by chance.
+ */
+const SWITCH_AT = 1230;
 
 /**
  * Runs a layer at weight 1 throughout (the reference) beside the same layer, with the same seed, at weight 0
@@ -1122,7 +1125,7 @@ describe('weights', () => {
     expect(r.breathErr).toBeLessThanOrEqual(1e-7);
   });
 
-  it('has the gaze head on its springs on the first step at weight 1, after 20 s at weight 0', () => {
+  it('has the gaze head on its springs on the first step at weight 1, after 20.5 s at weight 0', () => {
     const r = weightSwitch(CONTINUITY.find((e) => e.name === 'gaze')!);
     expect(r.firstHead).toEqual(r.firstSprings);
     expect(Math.abs(r.firstHead[0]) + Math.abs(r.firstHead[1])).toBeGreaterThan(1e-4);
