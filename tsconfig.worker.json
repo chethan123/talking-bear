@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.worker.tsbuildinfo",
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "WebWorker"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/workers/**/*.ts", "src/dsp/**/*.ts"],
+  "exclude": ["**/*.test.ts", "**/*.browser.test.ts"],
+  // Keeps `tsc -b` from failing with TS18003 (no inputs) before the first src/workers or src/dsp file exists.
+  "references": []
+}

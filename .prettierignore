@@ -1,0 +1,11 @@
+docs/
+/*.md
+docs/research/
+pnpm-lock.yaml
+dist*
+coverage
+test-results
+playwright-report
+*.wav
+*.bin
+.claude/
