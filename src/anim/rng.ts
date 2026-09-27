@@ -29,7 +29,8 @@ export function uniform(rng: Rng, lo: number, hi: number): number {
 
 /**
  * An exponentially distributed draw with the given mean (the waiting time of a Poisson process with rate
- * 1/mean): `−mean·ln(1 − u)`, u = `rng()`, computed as `mean·(−log1p(−u))`, so u = 0 gives +0. Since u ∈ [0, 1), the result is finite and ≥ 0. One `rng` call.
+ * 1/mean): `−mean·ln(1 − u)`, u = `rng()`, computed as `mean·(−log1p(−u))` so that u = 0 gives +0. Since
+ * u ∈ [0, 1), the result is finite and ≥ 0. One `rng` call.
  */
 export function exponential(rng: Rng, mean: number): number {
   return mean * -Math.log1p(-rng());

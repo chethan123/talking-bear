@@ -24,7 +24,9 @@ export const EAR_SPRING = { freqHz: 6, zeta: 0.35 } as const;
 export const EAR_TWITCH_MIN = 6;
 /** Longest interval between twitches, in seconds. */
 export const EAR_TWITCH_MAX = 15;
-/** Size of a twitch's velocity impulse, in rad/s (`EarRotR` gets +, `EarRotL` −): a ≈ 12° flick at 1/120 s. */
+/**
+ * Size of a twitch's velocity impulse, in rad/s (`EarRotR` gets +, `EarRotL` −): a ≈ 12° flick at 1/120 s.
+ */
 export const EAR_TWITCH_DV = 15.1;
 
 /** SpringBank indices of the ear springs. */

@@ -39,7 +39,9 @@ export interface BlinkLayer extends Layer {
   readonly count: number;
   /** How many of those events were doubles. */
   readonly doubles: number;
-  /** Seconds from the latest event's exact onset to the end of the last update; `Infinity` before the first. */
+  /**
+   * Seconds from the latest event's exact onset to the end of the last update; `Infinity` before the first.
+   */
   readonly sinceOnset: number;
 }
 

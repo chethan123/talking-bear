@@ -224,7 +224,9 @@ describe('rng', () => {
   });
 });
 
-/** The lid of one blink `p` seconds after its onset, from the spec's numbers: close 60, hold 40, open 80 ms. */
+/**
+ * The lid of one blink `p` seconds after its onset, from the spec's numbers: close 60, hold 40, open 80 ms.
+ */
 function specSingleLid(p: number): number {
   if (p < 0 || p >= 0.18) return 0;
   if (p < 0.06) return p / 0.06;
@@ -232,7 +234,9 @@ function specSingleLid(p: number): number {
   return 1 - (p - 0.1) / 0.08;
 }
 
-/** The lid of a blink event `p` seconds after its onset: a double repeats the blink after `BLINK_DOUBLE_GAP`. */
+/**
+ * The lid of a blink event `p` seconds after its onset: a double repeats the blink after `BLINK_DOUBLE_GAP`.
+ */
 function specLid(p: number, double: boolean): number {
   const second = 0.18 + BLINK_DOUBLE_GAP;
   return double && p >= second ? specSingleLid(p - second) : specSingleLid(p);
@@ -316,7 +320,8 @@ describe('blink', () => {
       expect(skipped).toBe(0);
       expect(events.length).toBeGreaterThan(2500);
       expect(Math.abs(mean(intervals) - 3.5)).toBeLessThanOrEqual(0.1);
-      // An exponential has std = mean (CV 1) and P(x < mean) = 1 − 1/e ≈ 0.632: fixed or uniform intervals fail.
+      // An exponential has std = mean (CV 1) and P(x < mean) = 1 − 1/e ≈ 0.632: fixed or uniform intervals
+      // fail.
       expect(Math.abs(sampleStd(intervals) / mean(intervals) - 1)).toBeLessThanOrEqual(0.1);
       expect(
         Math.abs(intervals.filter((x) => x < 3.5).length / intervals.length - 0.632),
@@ -1249,9 +1254,9 @@ describe('allocation: no layer allocates per update', () => {
       for (let n = 0; n < 50_000; n++) stepAll(h, i++);
     };
     // As in src/anim/clip.test.ts: warm up so V8's optimising tiers take over (the interpreter boxes every
-    // double), then take the best of up to 20 runs, each from a freshly collected heap; a run during which any
-    // GC ran counts as +Infinity. A layer that really allocates does so in every run: one 32-byte object per
-    // update of one layer is 1.6 MB here.
+    // double), then take the best of up to 20 runs, each from a freshly collected heap; a run during which
+    // any GC ran counts as +Infinity. A layer that really allocates does so in every run: one 32-byte object
+    // per update of one layer is 1.6 MB here.
     forceGc();
     for (let w = 0; w < 10; w++) steps50k();
     const LIMIT = 1_048_576;
