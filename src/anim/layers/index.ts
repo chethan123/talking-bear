@@ -54,6 +54,17 @@ export interface Layer {
 }
 
 export {
+  BLINK_CLOSE,
+  BLINK_DOUBLE_GAP,
+  BLINK_DOUBLE_RATIO,
+  BLINK_HOLD,
+  BLINK_MEAN_INTERVAL,
+  BLINK_OPEN,
+  createBlink,
+} from './blink.ts';
+export type { BlinkLayer } from './blink.ts';
+export { BELLY_PHASE, BREATH_AMP, BREATH_HZ, createBreathing } from './breathing.ts';
+export {
   EYES_CENTER,
   GAZE_MAX,
   GAZE_SPRING,
@@ -68,3 +79,5 @@ export {
 export type { GazeLayer, GazeSprings } from './gaze.ts';
 export { EAR_SPRING, EAR_TWITCH_DV, EAR_TWITCH_MAX, EAR_TWITCH_MIN, createEarTwitch } from './ear-twitch.ts';
 export type { EarTwitchLayer, EarTwitchSprings } from './ear-twitch.ts';
+export { MOOD_BLUSH, MOOD_BROW, MOOD_TAU, createMood } from './mood.ts';
+export type { MoodKind, MoodLayer } from './mood.ts';

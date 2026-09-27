@@ -1,12 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { mulberry32 as referenceMulberry32 } from '../../../test/dsp-helpers.ts';
-import { Ch, createPose } from '../pose.ts';
+import { Ch, CH_COUNT, createPose } from '../pose.ts';
 import type { Pose } from '../pose.ts';
 import { exponential, mulberry32, uniform } from '../rng.ts';
 import { SpringBank } from '../springs.ts';
 import { SUBSTEP } from '../stepper.ts';
 import {
+  BELLY_PHASE,
+  BLINK_CLOSE,
+  BLINK_DOUBLE_GAP,
+  BLINK_DOUBLE_RATIO,
+  BLINK_HOLD,
+  BLINK_MEAN_INTERVAL,
+  BLINK_OPEN,
+  BREATH_AMP,
+  BREATH_HZ,
   EAR_SPRING,
   EAR_TWITCH_DV,
   EAR_TWITCH_MAX,
@@ -17,10 +26,16 @@ import {
   HEAD_FOLLOW,
   HEAD_FULL_ANGLE,
   LOOK_SATURATE,
+  MOOD_BLUSH,
+  MOOD_BROW,
+  MOOD_TAU,
   SACCADE_MAX,
   SACCADE_MIN,
+  createBlink,
+  createBreathing,
   createEarTwitch,
   createGaze,
+  createMood,
 } from './index.ts';
 import type { AnimContext, Layer, LayerWeights, LookAt } from './index.ts';
 
@@ -33,6 +48,8 @@ const DT = 1 / 60;
  * check (the tolerance is ≈ 1.5 standard errors); the 100-seed pooled test below doesn't depend on it.
  */
 const SEED = 0x7467;
+
+const TAU = 2 * Math.PI;
 
 /**
  * SpringBank indices of this test's own bank: deliberately scattered, with unused springs 2 and 5, so a layer
@@ -139,6 +156,282 @@ describe('rng', () => {
     expect(Math.abs(mean(xs) / 3.5 - 1)).toBeLessThan(0.02);
     expect(Math.abs(sampleStd(xs) / 3.5 - 1)).toBeLessThan(0.03);
     expect(Math.abs(xs.filter((x) => x < 3.5).length / xs.length - (1 - 1 / Math.E))).toBeLessThan(0.01);
+  });
+});
+
+/** The lid of one blink `p` seconds after its onset, from the spec's numbers: close 60, hold 40, open 80 ms. */
+function specSingleLid(p: number): number {
+  if (p < 0 || p >= 0.18) return 0;
+  if (p < 0.06) return p / 0.06;
+  if (p < 0.1) return 1;
+  return 1 - (p - 0.1) / 0.08;
+}
+
+/** The lid of a blink event `p` seconds after its onset: a double repeats the blink after `BLINK_DOUBLE_GAP`. */
+function specLid(p: number, double: boolean): number {
+  const second = 0.18 + BLINK_DOUBLE_GAP;
+  return double && p >= second ? specSingleLid(p - second) : specSingleLid(p);
+}
+
+interface BlinkEvent {
+  /** Exact onset time (seconds from the start of the run). */
+  onset: number;
+  double: boolean;
+  /** Index of the step in which it started. */
+  step: number;
+}
+
+/** Runs a blink layer for `steps` steps and returns its events and the per-step `LidL`/`LidR` values. */
+function runBlink(
+  seed: number,
+  steps: number,
+  weight = 1,
+): { events: BlinkEvent[]; lidL: Float64Array; lidR: Float64Array; skipped: number } {
+  const layer = createBlink();
+  const ctx = makeCtx(seed, { ...FULL, blink: weight });
+  const events: BlinkEvent[] = [];
+  const lidL = new Float64Array(steps);
+  const lidR = new Float64Array(steps);
+  let count = 0;
+  let doubles = 0;
+  /** Steps in which `count` rose by more than one (events the test couldn't see). */
+  let skipped = 0;
+  run(layer, ctx, steps, (i, t, pose) => {
+    lidL[i] = pose[Ch.LidL]!;
+    lidR[i] = pose[Ch.LidR]!;
+    if (layer.count !== count) {
+      if (layer.count !== count + 1) skipped++;
+      const double = layer.doubles !== doubles;
+      events.push({ onset: t - layer.sinceOnset, double, step: i });
+      count = layer.count;
+      doubles = layer.doubles;
+    }
+  });
+  return { events, lidL, lidR, skipped };
+}
+
+/**
+ * A lean 10 000 s blink run at `DT` (no lid arrays): the span from the first to the last onset, the number
+ * of events and of doubles.
+ */
+function blinkStats(seed: number): { span: number; n: number; doubles: number } {
+  const layer = createBlink();
+  const ctx: AnimContext = { rng: mulberry32(seed), weights: FULL, lookAt: null, springs: new SpringBank(0) };
+  const pose = createPose();
+  let count = 0;
+  let first = 0;
+  let last = 0;
+  for (let i = 0; i < 600_000; i++) {
+    pose.fill(0);
+    layer.update(DT, pose, ctx);
+    if (layer.count !== count) {
+      count = layer.count;
+      last = (i + 1) * DT - layer.sinceOnset;
+      if (count === 1) first = last;
+    }
+  }
+  return { span: last - first, n: count, doubles: layer.doubles };
+}
+
+describe('blink', () => {
+  it('uses the spec constants: mean 3.5 s, 15 % doubles, 60/40/80 ms close/hold/open', () => {
+    expect(BLINK_MEAN_INTERVAL).toBe(3.5);
+    expect(BLINK_DOUBLE_RATIO).toBe(0.15);
+    expect(BLINK_CLOSE).toBe(0.06);
+    expect(BLINK_HOLD).toBe(0.04);
+    expect(BLINK_OPEN).toBe(0.08);
+    expect(BLINK_DOUBLE_GAP).toBe(0.08);
+  });
+
+  describe('over 10 000 s at dt = 1/60 (seed 0x7467)', () => {
+    const { events, lidL, lidR, skipped } = runBlink(SEED, 600_000);
+    const intervals = diffs(events.map((e) => e.onset));
+
+    it('has a mean interval of 3.5 s ± 0.1, exponentially distributed', () => {
+      expect(skipped).toBe(0);
+      expect(events.length).toBeGreaterThan(2500);
+      expect(Math.abs(mean(intervals) - 3.5)).toBeLessThanOrEqual(0.1);
+      // An exponential has std = mean (CV 1) and P(x < mean) = 1 − 1/e ≈ 0.632: fixed or uniform intervals fail.
+      expect(Math.abs(sampleStd(intervals) / mean(intervals) - 1)).toBeLessThanOrEqual(0.1);
+      expect(
+        Math.abs(intervals.filter((x) => x < 3.5).length / intervals.length - 0.632),
+      ).toBeLessThanOrEqual(0.03);
+    });
+
+    it('makes 15 % ± 1.5 of the blinks doubles', () => {
+      const ratio = events.filter((e) => e.double).length / events.length;
+      expect(Math.abs(ratio - 0.15)).toBeLessThanOrEqual(0.015);
+    });
+
+    it('never starts an event before the previous one has ended', () => {
+      for (let j = 1; j < events.length; j++) {
+        const prev = events[j - 1]!;
+        expect(events[j]!.onset - prev.onset).toBeGreaterThanOrEqual((prev.double ? 0.44 : 0.18) - 1e-9);
+      }
+    });
+
+    it('drives LidL and LidR together, and closes the lids once per blink and twice per double', () => {
+      let closures = 0;
+      let wasShut = false;
+      let apart = 0;
+      for (let i = 0; i < lidL.length; i++) {
+        if (lidR[i] !== lidL[i]) apart++;
+        const shut = lidL[i]! >= 1 - 1e-6;
+        if (shut && !wasShut) closures++;
+        wasShut = shut;
+      }
+      expect(apart).toBe(0);
+      expect(closures).toBe(events.length + events.filter((e) => e.double).length);
+    });
+
+    it('follows the 60/40/80 ms trajectory at every step, for singles and doubles', () => {
+      let checked = 0;
+      let maxErr = 0;
+      for (let j = 0; j < events.length - 1; j++) {
+        const e = events[j]!;
+        for (let i = e.step; i < events[j + 1]!.step; i++) {
+          const p = (i + 1) * DT - e.onset;
+          maxErr = Math.max(maxErr, Math.abs(lidL[i]! - specLid(p, e.double)));
+          checked++;
+        }
+      }
+      expect(checked).toBeGreaterThan(590_000);
+      expect(maxErr).toBeLessThanOrEqual(1e-6);
+    });
+  });
+
+  it('shuts a single blink within 60 ms ± one step, and reopens it by 180 ms', () => {
+    const { events, lidL } = runBlink(SEED, 6000);
+    const e = events.find((ev) => !ev.double)!;
+    const phase = (i: number): number => (i + 1) * DT - e.onset;
+    let i = e.step;
+    while (lidL[i]! < 1 - 1e-6) i++;
+    expect(Math.abs(phase(i) - 0.06)).toBeLessThanOrEqual(DT);
+    for (let k = e.step; k < i; k++) expect(lidL[k]).toBeGreaterThan(0);
+    while (phase(i) < 0.18) {
+      expect(lidL[i]).toBeGreaterThan(0);
+      i++;
+    }
+    expect(phase(i) - 0.18).toBeLessThan(DT);
+    expect(lidL[i]).toBeLessThanOrEqual(1e-6);
+  });
+
+  it('shuts a double twice: at 60 ms and at 0.18 + gap + 0.06 s, each ± one step, open from 0.44 s', () => {
+    const { events, lidL } = runBlink(SEED, 60_000);
+    const e = events.find((ev) => ev.double)!;
+    const phase = (i: number): number => (i + 1) * DT - e.onset;
+    const shutAt: number[] = [];
+    let wasShut = false;
+    let i = e.step;
+    for (; phase(i) < 0.44; i++) {
+      const shut = lidL[i]! >= 1 - 1e-6;
+      if (shut && !wasShut) shutAt.push(phase(i));
+      wasShut = shut;
+    }
+    expect(shutAt).toHaveLength(2);
+    expect(Math.abs(shutAt[0]! - 0.06)).toBeLessThanOrEqual(DT);
+    expect(Math.abs(shutAt[1]! - (0.18 + BLINK_DOUBLE_GAP + 0.06))).toBeLessThanOrEqual(DT);
+    expect(lidL[i]).toBeLessThanOrEqual(1e-6);
+  });
+
+  it('keeps its statistics over seeds 1–100 × 10 000 s: pooled mean 3.5 s ± 0.03, doubles 15 % ± 0.5, and ≥ 70 % of the seeds pass the single-run checks', () => {
+    let span = 0;
+    let intervals = 0;
+    let n = 0;
+    let doubles = 0;
+    let pass = 0;
+    for (let seed = 1; seed <= 100; seed++) {
+      const r = blinkStats(seed);
+      span += r.span;
+      intervals += r.n - 1;
+      n += r.n;
+      doubles += r.doubles;
+      if (Math.abs(r.span / (r.n - 1) - 3.5) <= 0.1 && Math.abs(r.doubles / r.n - 0.15) <= 0.015) pass++;
+    }
+    // Pooled standard errors ≈ 0.0066 s and 0.0007; the no-overlap floor adds ≈ +0.007 s to the mean.
+    expect(Math.abs(span / intervals - 3.5)).toBeLessThanOrEqual(0.03);
+    expect(Math.abs(doubles / n - 0.15)).toBeLessThanOrEqual(0.005);
+    // About 83 % of seeds pass both of the issue's single-run tolerances.
+    expect(pass).toBeGreaterThanOrEqual(70);
+  });
+});
+
+/** Direct DFT bin k of x: Σ x[n]·e^(−i·2π·k·n/N), as [re, im]. */
+function dft(x: Float64Array, k: number): [number, number] {
+  let re = 0;
+  let im = 0;
+  for (let n = 0; n < x.length; n++) {
+    const a = (TAU * ((k * n) % x.length)) / x.length;
+    re += x[n]! * Math.cos(a);
+    im -= x[n]! * Math.sin(a);
+  }
+  return [re, im];
+}
+
+/** The bin in 1 … N/2 with the largest magnitude. */
+function dominantBin(x: Float64Array): number {
+  let best = 0;
+  let bestMag = -1;
+  for (let k = 1; k <= x.length / 2; k++) {
+    const [re, im] = dft(x, k);
+    const mag = Math.hypot(re, im);
+    if (mag > bestMag) {
+      bestMag = mag;
+      best = k;
+    }
+  }
+  return best;
+}
+
+describe('breathing', () => {
+  it('uses the spec constants: 0.012 at 0.25 Hz, belly 0.2 cycles ahead', () => {
+    expect(BREATH_AMP).toBe(0.012);
+    expect(BREATH_HZ).toBe(0.25);
+    expect(BELLY_PHASE).toBe(0.2);
+  });
+
+  /** 80 s at dt = 1/60: exactly 20 breaths, so 0.25 Hz falls on DFT bin 20 of N = 4800. */
+  const N = 4800;
+  const body = new Float64Array(N);
+  const belly = new Float64Array(N);
+  run(createBreathing(), makeCtx(), N, (i, _t, pose) => {
+    body[i] = pose[Ch.BodySquash]!;
+    belly[i] = pose[Ch.BellyJiggle]!;
+  });
+
+  it('makes 0.25 Hz the dominant frequency of BodySquash and BellyJiggle (direct DFT)', () => {
+    expect(dominantBin(body) / (N * DT)).toBe(0.25);
+    expect(dominantBin(belly) / (N * DT)).toBe(0.25);
+  });
+
+  it('has an amplitude of 0.012 ± 0.0005 (DFT and peak)', () => {
+    for (const x of [body, belly]) {
+      const [re, im] = dft(x, 20);
+      expect(Math.abs((2 * Math.hypot(re, im)) / N - 0.012)).toBeLessThanOrEqual(0.0005);
+      const peak = x.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+      expect(Math.abs(peak - 0.012)).toBeLessThanOrEqual(0.0005);
+    }
+  });
+
+  it('puts the belly 0.2 cycles ahead of the body', () => {
+    const [br, bi] = dft(body, 20);
+    const [lr, li] = dft(belly, 20);
+    // arg(belly / body) = arg(belly · conj(body))
+    const lead = Math.atan2(li * br - lr * bi, lr * br + li * bi);
+    expect(Math.abs(lead - 0.2 * TAU)).toBeLessThanOrEqual(0.01);
+  });
+
+  it('follows 0.012·sin(2π·0.25·t) and 0.012·sin(2π·0.25·t + 0.2·2π) at every step', () => {
+    let maxErr = 0;
+    for (let i = 0; i < N; i++) {
+      const t = (i + 1) * DT;
+      maxErr = Math.max(
+        maxErr,
+        Math.abs(body[i]! - 0.012 * Math.sin(TAU * 0.25 * t)),
+        Math.abs(belly[i]! - 0.012 * Math.sin(TAU * 0.25 * t + 0.2 * TAU)),
+      );
+    }
+    expect(maxErr).toBeLessThanOrEqual(1e-7);
   });
 });
 
@@ -436,5 +729,62 @@ describe('ear twitch', () => {
     expect(() => createEarTwitch({ earL: 0, earR: Number.NaN })).toThrow(RangeError);
     const layer = createEarTwitch({ earL: BANK_SIZE, earR: 0 });
     expect(() => layer.update(DT, createPose(), makeCtx())).toThrow(RangeError);
+  });
+});
+
+describe('mood', () => {
+  it('uses the spec constants: τ = 8 s, Blush ×0.3, brows ×(−3)', () => {
+    expect(MOOD_TAU).toBe(8);
+    expect(MOOD_BLUSH).toBe(0.3);
+    expect(MOOD_BROW).toBe(-3);
+  });
+
+  it('decays joy and annoy to 1/e in 8 s ± 0.1, in the scalars and in the pose', () => {
+    const mood = createMood();
+    mood.bump('joy', 1);
+    mood.bump('annoy', 1);
+    const ctx = makeCtx();
+    const crossed = { joy: Number.NaN, annoy: Number.NaN, blush: Number.NaN, brow: Number.NaN };
+    run(mood, ctx, 900, (_i, t, pose) => {
+      if (Number.isNaN(crossed.joy) && mood.joy <= 1 / Math.E) crossed.joy = t;
+      if (Number.isNaN(crossed.annoy) && mood.annoy <= 1 / Math.E) crossed.annoy = t;
+      if (Number.isNaN(crossed.blush) && pose[Ch.Blush]! <= 0.3 / Math.E) crossed.blush = t;
+      if (Number.isNaN(crossed.brow) && pose[Ch.BrowL]! >= -3 / Math.E) crossed.brow = t;
+    });
+    for (const t of Object.values(crossed)) expect(Math.abs(t - 8)).toBeLessThanOrEqual(0.1);
+  });
+
+  it('adds Blush = 0.3·joy and BrowL = BrowR = −3·annoy, whatever the weights', () => {
+    const mood = createMood();
+    mood.bump('joy', 0.5);
+    mood.bump('annoy', 0.25);
+    const ctx = makeCtx(SEED, { blink: 0, breathing: 0, gaze: 0, ears: 0 });
+    const pose = createPose();
+    pose[Ch.Blush] = 0.1;
+    pose[Ch.BrowL] = 2;
+    mood.update(DT, pose, ctx);
+    const decay = Math.exp(-DT / 8);
+    expect(mood.joy).toBeCloseTo(0.5 * decay, 12);
+    expect(mood.annoy).toBeCloseTo(0.25 * decay, 12);
+    expect(pose[Ch.Blush]).toBeCloseTo(0.1 + 0.3 * 0.5 * decay, 6);
+    expect(pose[Ch.BrowL]).toBeCloseTo(2 - 3 * 0.25 * decay, 6);
+    expect(pose[Ch.BrowR]).toBeCloseTo(-3 * 0.25 * decay, 6);
+    for (let c = 0; c < CH_COUNT; c++) {
+      if (c !== Ch.Blush && c !== Ch.BrowL && c !== Ch.BrowR) expect(pose[c]).toBe(0);
+    }
+  });
+
+  it('clamps joy and annoy to [0, 1] and rejects a non-finite bump', () => {
+    const mood = createMood();
+    mood.bump('joy', 5);
+    expect(mood.joy).toBe(1);
+    mood.bump('joy', -3);
+    expect(mood.joy).toBe(0);
+    mood.bump('annoy', 0.4);
+    mood.bump('annoy', 0.4);
+    expect(mood.annoy).toBeCloseTo(0.8, 12);
+    expect(mood.joy).toBe(0);
+    expect(() => mood.bump('joy', Number.NaN)).toThrow(RangeError);
+    expect(() => mood.bump('annoy', Number.POSITIVE_INFINITY)).toThrow(RangeError);
   });
 });
