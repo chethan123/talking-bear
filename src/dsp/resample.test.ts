@@ -377,3 +377,16 @@ describe('createResampler', () => {
     expect(bits(y)).toEqual(bits(resampleOffline(x, 0.5, opts)));
   });
 });
+
+describe('[9] timing (informational, not a gate)', () => {
+  it('logs the time to resampleOffline 5 s of 48 kHz noise at ratio 1/1.6', () => {
+    const ratio = 1 / 1.6;
+    const x = noise(5 * 48_000, 9);
+    resampleOffline(x.subarray(0, 4800), ratio); // warm-up: JIT and the table cache
+    const t0 = performance.now();
+    const y = resampleOffline(x, ratio);
+    const ms = performance.now() - t0;
+    console.log(`[T10 timing] resampleOffline, 5 s of 48 kHz noise at ratio 1/1.6: ${ms.toFixed(1)} ms`);
+    expect(y.length).toBe(Math.round(x.length * ratio)); // sanity only; the time is not asserted
+  });
+});
