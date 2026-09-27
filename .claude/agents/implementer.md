@@ -22,7 +22,7 @@ You implement exactly **one plan step** handed to you by a task owner. You're gi
 - Don't commit, push, open PRs, or use any GitHub tools.
 - Don't weaken, skip or delete tests, lint rules or thresholds.
 - Don't add dependencies unless the step names them, with an exact version.
-- Wrap browser, preview, e2e and Docker commands in `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after) (use Bash `run_in_background: true` when a command may exceed about 5 minutes; exit 75 means lock timeout).
+- Wrap browser, preview, e2e and Docker commands in `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after) (always with Bash `run_in_background: true`, then wait for it; exit 75 means lock timeout).
 - Never read or use tokens from the environment.
 
 **Report:**

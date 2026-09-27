@@ -14,7 +14,7 @@ You root-cause one failure for a Talking Bear task. You get:
 **Work:**
 
 - First read `<worktree>/CLAUDE.md`, if it exists.
-- `cd <worktree>` in every command. Wrap browser, preview, e2e and Docker commands in `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after) (use Bash `run_in_background: true` when a command may exceed about 5 minutes; exit 75 means lock timeout).
+- `cd <worktree>` in every command. Wrap browser, preview, e2e and Docker commands in `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after) (always with Bash `run_in_background: true`, then wait for it; exit 75 means lock timeout).
 - Reproduce the failure first. Find the **root cause**; "flaky" isn't one.
 - Then apply the **minimal** fix within the task's Scope files, and show that the command passes.
 - If the right fix is outside Scope, or needs a design decision, **don't apply it**. Return the diagnosis and the options.

@@ -1717,8 +1717,8 @@ talking-bear/
 │   ├── device-notes.md             # experiment results per device / Chrome version
 │   └── adr/                        # one short ADR per gated decision (VAD backend, default voice, …)
 ├── package.json  pnpm-lock.yaml  pnpm-workspace.yaml (onlyBuiltDependencies allow-list)  .npmrc
-├── tsconfig.json                   # references: app, worklet, worker, node
-├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json
+├── tsconfig.json                   # references: app, worklet, worker, node, test
+├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json  tsconfig.test.json
 ├── vite.config.ts  vitest.config.ts  playwright.config.ts
 ├── .oxlintrc.json  .prettierrc  .size-limit.json
 └── LICENSE  README.md  THIRD_PARTY_NOTICES.md   # Silero (MIT) weights notice, etc.
@@ -1738,7 +1738,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 **Build**
 
-- **Repo scaffold:** Vite 8.3, TypeScript 7 project references (app, worklet, worker, node), oxlint (type-aware), Prettier, Vitest 5 (node + browser projects), Playwright 1.63, pnpm 12, Node 24. `docs/research/**` is excluded from oxlint, Prettier, tsconfig, Vitest and `.dockerignore`. The spikes in it are reference material; the fake-mic harness (spike 01) is the starting point for the M1 e2e specs.
+- **Repo scaffold:** Vite 8.3, TypeScript 7 project references (app, worklet, worker, node, test; the test project type-checks `*.test.ts` with DOM, Node and audioworklet types), oxlint (type-aware), Prettier, Vitest 5 (node + browser projects), Playwright 1.63, pnpm 12, Node 24. `docs/research/**` is excluded from oxlint, Prettier, tsconfig, Vitest and `.dockerignore`. The spikes in it are reference material; the fake-mic harness (spike 01) is the starting point for the M1 e2e specs.
 - **CI `verify` job:** lint, format check, typecheck and unit tests. The `ci.yml` skeleton goes in now.
 - **`audio/engine.ts`:** context lifecycle, `getUserMedia` with the §4.1 constraints, and `statechange`/`onerror` handling.
 - **`capture.worklet.ts`:** 80 Hz HPF, ring buffer, streaming decimator, 16 kHz framing with `{epoch, firstFrame}` tags, deferred and chunked `take`, and a zero output whose `destination` connection is a runtime flag (default off until X-R4).

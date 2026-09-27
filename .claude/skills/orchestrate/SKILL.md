@@ -52,7 +52,7 @@ Always use these `subagent_type`s, and **never pass `model`**: the definitions p
 
 - **Ledger comments:** you post and edit the short fixed-format `ORCH-*` comments yourself. Bulk reads, the dashboard and content-heavy writes go to `github-clerk`, which saves results under `/tmp/orch/` and returns a short summary. Keep your own context lean: read the saved files with `python3`/`jq` filters, not whole.
 - **Tools** (load deferred ones at startup with `ToolSearch`, `select:<name>`):
-  - `SendMessage`; `PushNotification` (may be missing, see §2.9);
+  - `SendMessage`, `TaskStop`; `PushNotification` (may be missing, see §2.9);
   - Claude Code Remote MCP: `subscribe_pr_activity`, `unsubscribe_pr_activity`, `send_later`, `list_triggers`, `delete_trigger`, `get_session`;
   - GitHub MCP: `issue_read`, `add_issue_comment`, `update_issue_comment`, `issue_write`, `pull_request_read`, `merge_pull_request`, `update_pull_request_branch`, `list_branches`.
 
@@ -82,7 +82,7 @@ A comment counts as human only if **all** hold:
 - its first line does **not** start with `ORCH-`;
 - its author login does **not** end in `[bot]`.
 
-Agent writes use the human's own account, so the login alone can't tell them apart. Apply this definition everywhere: event filtering, blocked scans, owner-task scans. An `ORCH-ANSWER` comment (§5.5) carries a human's answer relayed by you: owners treat it as human input.
+Agent writes use the human's own account, so the login alone can't tell them apart. Apply this definition everywhere: event filtering, blocked scans, owner-task scans. **Exception:** an `ORCH-ANSWER` comment (§5.5) carries a human's answer relayed by you; you and the owners treat it as human everywhere.
 
 ### §2.4 Reading the latest ledger entry (paging recipe)
 
@@ -92,7 +92,7 @@ Comments are listed oldest first.
 2. Read `get_comments` with `perPage: 100`, `page: ceil(n/100)`. Take the **last** comment whose first line starts with the marker.
 3. Not found and the page isn't 1: read the previous page, and so on.
 
-**#3's `ORCH-LOCK` and `ORCH-DASHBOARD`** are created once and edited in place. At startup, scan all of #3's pages once, and record their comment ids and page numbers in the registry. Later reads fetch just that page.
+**#3's `ORCH-LOCK` and `ORCH-DASHBOARD`** are created once and edited in place. At startup, scan all of #3's pages once. If there's more than one `ORCH-LOCK` comment, the one with the **lowest comment id** is the lock (the canonical one); ignore the others. Record the canonical lock's and the dashboard's comment ids and page numbers in the registry. Later reads fetch just that page and find the comment by id.
 
 ### §2.5 Lock (one comment on #3, edited in place)
 
@@ -105,7 +105,8 @@ settings: MAX_PARALLEL=<n> MERGE_POLICY=<human|auto> PRIORITY=<demo|path>
 
 - `RUN_ID` = `run-<YYYYMMDD-HHMM>-<4 hex>`. `session_id` comes from `get_session` with no arguments.
 - On a clean stop, edit the first line to `ORCH-LOCK: released`.
-- **Fence** = re-read the lock (§2.4). If its `run` isn't your `RUN_ID`, you've been replaced: stand down (§5.3 step 2).
+- **Fence** = re-read the canonical lock comment (§2.4). If its `run` isn't your `RUN_ID`, or its first line says `released`, you've been replaced or stopped: stand down (§5.3 step 2).
+- **Stale** = heartbeat older than **4 h**. Check-ins never back off beyond 120 minutes, so a live run always looks fresh.
 
 ### §2.6 Task state (issue comments; the latest one wins)
 
@@ -130,11 +131,11 @@ note: <one line>
 | `waiting-owner` | orchestrator | no | An owner task (🧑) is ready for the human |
 | `released` | owner or orchestrator | — | Claim dropped; the task is schedulable again |
 
-**Working states** = `claimed`, `planning`, `plan-approved`, `implementing`, `validating`, `validated`.
+**Working states** = `claimed`, `planning`, `plan-approved`, `implementing`, `validating`, `validated`. For liveness (§5.3 step 4), a `blocked` entry whose note starts `adopted — answer` also counts as working: an owner was sent the answer.
 
 **Posting a state yourself:** keep the `owner:` of the latest entry (the owner of record), except for a claim or a handover, which name the new owner, and `released`, which names `none`. Put `by orchestrator` in the note.
 
-**Handover.** Before you spawn an owner for a task that already has an `ORCH-STATE` (resume, pr-followup, ci-result, device-notes, crash respawn, adoption after a restart), post an `ORCH-STATE` with the **same state**, `owner: <new OWNER_ID>`, and `note: adopted — <reason>`. The previous owner is fenced out from that moment. Resuming an existing owner with `SendMessage` needs no handover, as long as the latest entry still names it.
+**Handover.** Before you spawn an owner for a task that already has an `ORCH-STATE` (resume, pr-followup, ci-result, device-notes, crash respawn, adoption after a restart), post an `ORCH-STATE` with the **same state**, `owner: <new OWNER_ID>`, and `note: adopted — <reason>`. The previous owner is fenced out from that moment. If the registry says the previous owner's agent may still be running, `TaskStop` it **before** the handover, so two owners never share a worktree. Resuming an existing owner with `SendMessage` needs no handover, as long as the latest entry still names it.
 
 **Other markers:**
 
@@ -168,9 +169,9 @@ A PR's CI is **green** on head SHA `S` when:
 2. `get_status` has no `failure`, `error` or `pending` status; and
 3. once `origin/main` has `.github/workflows/ci.yml`, a check run named `verify` is among them.
 
-Before `ci.yml` exists on `main` (T01, T02), a PR with no check runs counts as green iff its `ORCH-DONE` table is all `PASS`.
+Before `ci.yml` exists on `main` (T01, T02), a PR with no check runs counts as green iff its `ORCH-DONE` table is all `PASS`. Owners use `ci-wait` only when the PR's head contains `.github/workflows/ci.yml` (T03 onwards).
 
-**CI missing:** `ci.yml` is on `main`, the head was pushed more than 30 minutes ago, and there are no check runs. Handle it in §5.3.
+**CI missing:** the PR's head contains `ci.yml`, the head was pushed more than 30 minutes ago, and there are no check runs. Handle it in §5.3.
 
 ### §2.9 Notifying the human
 
@@ -191,8 +192,9 @@ Before `ci.yml` exists on `main` (T01, T02), a PR with no check runs counts as g
 2. **Tools.** `ToolSearch` for the tools in §1. Note whether `PushNotification` exists (§2.9).
 3. **Lock.** Get your `session_id` (`get_session`). Scan #3 (§2.4) for `ORCH-LOCK` and `ORCH-DASHBOARD`.
    - **Held by your own `session_id`:** you're the same session, restarted or compacted. Reuse its `RUN_ID`.
-   - **Held by another session with a heartbeat under 3 h:** **stop** and tell the human, unless `FORCE_TAKEOVER=yes`.
-   - **Otherwise** (none, `released`, stale, or forced): create a new `RUN_ID`, take the lock (edit it, or create it), and post a comment on #3 noting any takeover.
+   - **Held by another session and not stale (§2.5):** **stop** and tell the human, unless `FORCE_TAKEOVER=yes`.
+   - **Otherwise** (none, `released`, stale, or forced): create a new `RUN_ID`, take the lock (edit the canonical comment, or create it), and post a comment on #3 noting any takeover.
+   - **If you created it:** re-scan #3. If an `ORCH-LOCK` with a lower comment id exists, it is canonical: mark yours `released`, and repeat step 3 against the canonical one.
    - If a previous `trigger:` id is present and isn't yours, `delete_trigger` it: a replaced run's wake-ups must not fire.
 4. **Container sentinel.** `mkdir -p /tmp/orch`. If `/tmp/orch/registry.json` exists with your `RUN_ID`, owners it lists may still be alive. Otherwise (missing, or a different run) the container is new: **every owner is dead.** Write `{ "run": RUN_ID, "session": …, "boot": <UTC ISO>, "lock": {…ids}, "owners": {} }`.
 5. **Rebuild state.** One `github-clerk` call, saving to `/tmp/orch/`:
@@ -202,11 +204,13 @@ Before `ci.yml` exists on `main` (T01, T02), a PR with no check runs counts as g
    4. `states.json`: the latest `ORCH-STATE` (full text) of **every open task issue** with comments, via §2.4. This is the claim check, so it has to be complete;
    5. for open issues above #123: their bodies, for the intake rule.
 
-   Then write `/tmp/orch/state.json` (the format is in `sched.py`'s header): closed → `done`; no entry → `none`; otherwise the latest state, with its PR, `since`, note, and `branch: true` if a `task/` branch exists.
-6. **Re-attach** each task that isn't `done`, `none` or `released`. **Fence (§2.5) before the first spawn.**
-   - **With a PR** (`ci-wait`, `pr-open`, `pr-ready`, or any state with an open PR): `subscribe_pr_activity` (§5.4), then run the PR check of §5.3 step 6 on it. That decides whether an owner is needed.
-   - **Working state, no PR:** handover, then spawn `MODE: resume`. It uses a slot. Respect `MAX_OWNERS`, and queue the rest.
-   - **`blocked`:** if a human comment exists after the blocked entry, handover and spawn `MODE: resume` with the answer as `EVENT`.
+   Then write `/tmp/orch/state.json` (the format is in `sched.py`'s header): closed → `done`; no entry → `none`; otherwise the latest state, with its PR, `since`, note, and `branch: true` if a `task/` branch exists. List every closed issue number in `closedIssues` (intake blockers resolve against it).
+
+   Device-notes PRs: an open PR whose head is `task/<txx>-device-notes-<k>` belongs to that owner task. If its issue's latest state is still `waiting-owner`, record the task as `pr-open` with that PR.
+6. **Re-attach** each task that isn't `done`, `none` or `released`. **Fence (§2.5) before the first spawn.** Skip any task whose registry entry (same `RUN_ID` and `boot`) has an agent that is still running: it's already owned.
+   - **`ci-wait`, `pr-open`, `pr-ready`** (including device-notes PRs): `subscribe_pr_activity` (§5.4), then run the PR check of §5.3 step 6 on it. That decides whether an owner is needed.
+   - **Working state** (with or without a draft PR): handover, then spawn `MODE: resume` (never `pr-followup`); if it has a PR, subscribe too. It uses a slot. Respect `MAX_OWNERS`, and queue the rest.
+   - **`blocked`:** if a human comment (or `ORCH-ANSWER`) exists after the latest `ORCH-STATE` entry that isn't a handover, handover (note `adopted — answer`) and spawn `MODE: resume` with the answer as `EVENT`.
    - **`waiting-owner`:** if a human comment after it asks to commit notes (§4.4) and no notes PR is open, start device-notes.
 7. **Wake-up chain:** `send_later` 60 minutes, message `orchestrator check-in <RUN_ID>`; store its `trigger_id` in the lock. Then `list_triggers` and delete every pending trigger whose message is an orchestrator check-in for a different `RUN_ID`, or an older one of yours.
 8. Update the dashboard, then schedule (§4).
@@ -236,12 +240,12 @@ Before `ci.yml` exists on `main` (T01, T02), a PR with no check runs counts as g
    EVENT: <resume/pr-followup only: the event, CI result, review findings or human answer>
    Follow .claude/agents/task-owner.md. The issue body is your spec. End with the JSON report.
    ```
-3. Record `task → {agentId, OWNER_ID, state, since, nudges: 0, crashes: 0}` in `/tmp/orch/registry.json`.
+3. Record `task → {agentId, OWNER_ID, state, since, nudges: 0, crashes: 0, notReady: 0, dispatched: []}` in `/tmp/orch/registry.json`.
 4. **One live owner per task.** While an owner is running, queue new events for that task, and deliver them with `SendMessage` when it reports.
 
 ### §4.3 Branch names
 
-Use the branch given in the issue's Working agreement, e.g. `task/t07-playwright-e2e-harness-against-vite-prev`. For device notes: `task/<txx>-device-notes-<k>`.
+Use the branch given in the issue's Working agreement, e.g. `task/t07-playwright-e2e-harness-against-vite-prev`. For device notes: `task/<txx>-device-notes-<k>`, where `k` is 1 + the number of existing `task/<txx>-device-notes-*` branches (`list_branches`).
 
 ### §4.4 Owner tasks (🧑) are never run by agents
 
@@ -253,7 +257,7 @@ When one becomes ready:
 
 **Human comments on a `waiting-owner` issue:**
 
-- One containing `please commit` (any case): handover (keep `waiting-owner`, new owner) and spawn `MODE: device-notes`, with the comment's URL as `EVENT`. When its PR merges, post `waiting-owner` again with owner `none`.
+- One containing `please commit` (any case): handover (keep `waiting-owner`, new owner) and spawn `MODE: device-notes`, with the comment's URL and the branch (§4.3) as `EVENT`. The owner posts no `ORCH-STATE`. When it reports `pr-open` with the PR number, **you** post `ORCH-STATE: pr-open` on the owner issue (owner of record = that owner, `pr: #n`), subscribe, and from then on the PR goes through §5.3 step 6 and §6 like any task PR. After it merges, §6.3 posts `waiting-owner` again.
 - Anything else is a question or a progress note. Answer questions briefly on the issue from the issue body and plan; don't spawn.
 - Binary files, such as traces under `test/traces/` and gesture JSON, are committed by the human, or handed to an agent explicitly.
 - The issue closed → done.
@@ -266,32 +270,34 @@ When one becomes ready:
 
 Parse the final JSON block. Update the registry, `state.json` and the dashboard. Reset the task's `nudges` and `crashes` whenever its state advances.
 
-- **`ci-wait`:** `subscribe_pr_activity` for the PR at once. When CI completes on the head (an event, or a check-in sees it), resume the owner with `SendMessage("EVENT: ci-result <green|red> · head <sha> · <failed check names>")`. If the agent is gone, handover and spawn `MODE: resume` with that `EVENT`.
+- **`ci-wait`:** `subscribe_pr_activity` for the PR at once. When CI completes on the head (an event, or a check-in sees it), resume the owner with `SendMessage("EVENT: ci-result <green|red> · head <sha> · <failed check names>")`. If the agent is gone, handover and spawn `MODE: resume` with that `EVENT`. Send each `ci-result` once per head SHA, and drop a queued one if the task is no longer `ci-wait` or the head moved.
 - **`pr-open`:** subscribe (§5.4), then run the PR check (§5.3 step 6) at once. The owner is idle; wake it only for work.
 - **`blocked`:** notify (§2.9) with the question and its link. The slot is freed.
 - **`fenced`** (a newer owner or run took the task): drop this owner from the registry. Do nothing else.
-- **`not-ready`** or **`released`:** free the slot and recompute.
+- **`not-ready`** (the owner found an open blocker that `sched.py` thought was done): free the slot, fix `state.json` from the owner's evidence, and recompute. The second `not-ready` for the same task → post `blocked` with the evidence and notify.
+- **`released`:** free the slot and recompute.
 - **A working state** (the owner ended its turn early): `SendMessage("continue")`, at most **3** times for the same state. Then handover and respawn `MODE: resume`, counting it as a crash.
 - **A crash, or no JSON:** handover and respawn `MODE: resume` with a new `OWNER_ID`. After **2** crashes without state progress, post `ORCH-STATE: blocked` with the evidence, and notify.
 
 ### §5.2 PR activity events
 
 1. Map the head branch (`task/txx-…`) to the task.
-2. **Comment events** (issue comments, review comments, reviews): skip those that aren't human (§2.3), and duplicates. **CI and check events are never echoes:** always process them.
+2. **Comment events** (issue comments, review comments, reviews): skip agent echoes (a `_Generated by [Claude Code]` footer or an `ORCH-` first line, except `ORCH-ANSWER`) and duplicates. Bot review comments are not echoes: route them. **CI and check events are never echoes:** always process them.
 3. Route:
    - **CI finished on a `ci-wait` PR:** resume the owner with `ci-result` (§5.1).
    - **CI green on a `pr-open` PR:** run the PR check (§5.3 step 6), which may flip it to `pr-ready`.
-   - **CI red, a conflict, or a human review comment:** the owner acts, `EVENT: <kind> · <link> · <text excerpt>`. If a `pr-ready` PR gets one, post `pr-open` first.
-4. Deliver to the owner:
+   - **CI red, a conflict, or a review comment** (human or bot): the owner acts, `EVENT: <kind> · <link> · <text excerpt>`. If a `pr-ready` PR gets one, post `pr-open` first.
+4. **Dedupe:** the dispatch key is (head SHA, kind, the failing check names or thread ids). Never dispatch the same key twice (keep them in the registry's `dispatched`). After 3 dispatches on the same head SHA, or when the owner reports a check that is red on `main` too, post `blocked` with the evidence and notify.
+5. Deliver to the owner:
    - **running:** queue it (§4.2 item 4);
    - **idle, and the latest entry names it:** `SendMessage`;
-   - **gone:** handover, then spawn `MODE: pr-followup` with the event.
+   - **gone:** handover, then spawn `MODE: pr-followup` with the event (`MODE: resume` if the task is in a working state).
 
 ### §5.3 Check-in (the `send_later` wake-up)
 
 Do these in order:
 
-1. **Re-arm first:** `send_later` 60 minutes (180 when every open task is human-gated: `blocked`, `waiting-owner`, or `pr-ready` under `MERGE_POLICY=human`). Keep the new id.
+1. **Re-arm first:** `send_later` 60 minutes (120 when every open task is human-gated: `blocked`, `waiting-owner`, or `pr-ready` under `MERGE_POLICY=human`; never more). Keep the new id.
 2. **Fence:** re-read the lock. If its `run` isn't yours, **stand down**:
    1. `delete_trigger` the trigger you just created;
    2. `unsubscribe_pr_activity` from every PR you subscribed to;
@@ -300,20 +306,20 @@ Do these in order:
 3. **Heartbeat:** edit the lock with the new `trigger` and heartbeat, then `delete_trigger` the previous id if it's still pending.
 4. **Liveness:**
    - If `/tmp/orch/registry.json` is missing, or its `boot` differs from the one you wrote, the container restarted: every owner is dead. Rewrite the registry (same `RUN_ID`, new `boot`), then handover and respawn every working-state task (`MODE: resume`), subject to `MAX_OWNERS`.
-   - Separately, any working-state task with no live owner in the registry, whose latest `ORCH-STATE` **and** branch head are both older than 2 h: handover and respawn it.
+   - Separately, any working-state task (§2.6, including an answered `blocked`) with no live owner in the registry, whose latest `ORCH-STATE` **and** branch head are both older than 2 h: handover and respawn it.
 5. **One `github-clerk` call:** "what changed since `<last check-in UTC>`", saving `/tmp/orch/checkin.json`:
-   - for each task in `ci-wait`, `pr-open` or `pr-ready`: the PR's `get` (`merged`, `merged_at`, `state`, `draft`, `mergeable`, `mergeable_state`, head SHA, head push time), its check runs and status on the head, and its review threads (unresolved count, and whether each one's last comment is human);
-   - for each `blocked` or `waiting-owner` issue: its state, and human comments after the latest `ORCH-STATE`;
+   - for each task in `ci-wait`, `pr-open` or `pr-ready` (device-notes PRs included): the PR's `get` (`merged`, `merged_at`, `state`, `draft`, `mergeable`, `mergeable_state`, head SHA, head push time), its check runs and status on the head, and its unresolved review threads (id, and whether the last comment is an agent's);
+   - for each `blocked` or `waiting-owner` issue: its state, and human comments (and `ORCH-ANSWER`s) after the latest `ORCH-STATE`;
    - open issues above #123 not yet in `state.json` (intake).
 6. **PR check**, for each PR in the file:
    - **merged** (`merged: true`): after-merge steps (§6.3).
    - **closed without merging:** post `blocked`, and ask the human.
-   - **conflicted** (`mergeable: false` or `mergeable_state: dirty`), **CI red**, or an unresolved thread whose last comment is human: make sure an owner is acting (§5.2 step 4).
+   - **conflicted** (`mergeable: false` or `mergeable_state: dirty`), **CI red**, **a draft in `pr-open`** (G wasn't finished), or **any unresolved review thread**: make sure an owner is acting (§5.2 steps 4–5). Owners reply to and resolve every thread they handle; a thread they leave open for the human comes with a `blocked` state.
    - **`ci-wait` with finished CI:** resume the owner with the result.
-   - **CI missing** (§2.8): conflicted → as above; head not containing `origin/main` → `update_pull_request_branch` with `expectedHeadSha`; otherwise notify the human once ("CI didn't start on PR #n").
+   - **CI missing** (§2.8): conflicted → as above; head not containing `origin/main` → `update_pull_request_branch` with `expectedHeadSha` (once per head); otherwise post `blocked` ("CI didn't start on PR #n") and notify.
    - **`pr-open`, not a draft, CI green (§2.8), no conflict, no unresolved threads:** post `pr-ready` (by orchestrator, with the head SHA in the note).
    - **`pr-ready`:** `MERGE_POLICY=auto` → §6.2; `human` → keep it in "Waiting on you", and include it in the batched notification.
-7. **`blocked` and `waiting-owner` issues:** a new human comment → handover and resume the owner with it (`blocked`), or §4.4 (`waiting-owner`). A closed issue → done.
+7. **`blocked` and `waiting-owner` issues:** a new human comment or `ORCH-ANSWER` → handover (note `adopted — answer`) and resume the owner with it (`blocked`), or §4.4 (`waiting-owner`). A closed issue → done.
 8. **Intake** (§2.1).
 9. Fill free slots (§4.1). Update the dashboard.
 
@@ -331,9 +337,9 @@ The `subscribe_pr_activity` result says so if a Claude **PR Steward** is already
 
 Answer them.
 
-- **An answer to a `blocked` question:** post it on the issue **verbatim**, as a comment whose first line is `ORCH-ANSWER` (then the text, then the footer). Handover and resume the owner with it as `EVENT`.
+- **An answer to a `blocked` question:** post it on the issue **verbatim**, as a comment whose first line is `ORCH-ANSWER` (then the text, then the footer). Handover (note `adopted — answer`) and resume the owner with it as `EVENT`.
 - **Pause:** stop spawning and merging, let running owners report, and keep check-ins going.
-- **Stop:** as pause; then release the lock, delete your trigger, and unsubscribe from all PRs.
+- **Stop:** as pause; then release the lock, delete your trigger, and unsubscribe from all PRs. (Closing the session without saying stop does **not** stop the run: its check-in trigger wakes it again.)
 - **Status:** answer from `state.json`, and link the dashboard.
 
 ## §6 Merging
@@ -348,23 +354,25 @@ Answer them.
   - PRs for owner-task issues, except a device-notes PR whose only changed file is `docs/device-notes.md`;
   - a diff that touches `.github/workflows/release.yml`, or whose workflow changes add `pull_request_target`, `workflow_run`, a `secrets.` reference other than `secrets.GITHUB_TOKEN`, or a `write` permission.
 
-### §6.2 Auto-merge gate (all re-checked right before merging, pinned to one head SHA)
+### §6.2 Auto-merge gate (pinned to one head SHA, re-checked right before merging)
 
-1. **Fence.** Read the PR (`get`). Let `S` be its head SHA. Every check below must be about `S`.
-2. **Mergeable:** not a draft, `mergeable: true`, and CI green on `S` (§2.8).
-3. **Up to date:** `git fetch`, then `git merge-base --is-ancestor origin/main S`. If `main` isn't an ancestor, call `update_pull_request_branch` with `expectedHeadSha: S`, post `pr-open` (note: updated with main), and stop here. The next green CI brings it back.
-4. **Threads:** no unresolved review threads, and no human comment after the last push without a reply.
-5. **Scope gate:** write `git diff --name-only origin/main...S` to `/tmp/orch/names-<txx>.txt`, then run `sched.py scope <Txx> …`. Any out-of-scope file → don't merge. Resume the owner with `EVENT: out-of-scope <files>`: it either reverts them or asks the human.
-6. **Workflow gate** (§6.1): read `git diff origin/main...S -- .github/workflows`. If the gate matches → human merge, and notify.
-7. **Review:** compute `P = git diff origin/main...S | git patch-id --stable | cut -d' ' -f1`.
-   - A device-notes PR (only `docs/device-notes.md`) needs no review: go on.
-   - If the `ORCH-DONE` line `code-review: ship … patch-id <id>` has the same `P`, the reviewed diff is unchanged: go on.
-   - Otherwise, make sure `/home/user/wt/<txx>` is at `S` (create it under the git lock with `git worktree prune` first, or `git merge --ff-only S` in a clean existing one), and spawn a `code-reviewer` on `origin/main...S` there, with the issue, the approved plan, and `CLAUDE.md`.
+1. **Fence.** Read the PR (`get`). Let `S` be its head SHA. Every check below must be about `S`. `git fetch` (under the git lock).
+2. **Changed files:** `git diff --name-only --no-renames origin/main...S > /tmp/orch/names-<txx>.txt` (`--no-renames`, so a rename can't hide a deletion).
+   - **Device-notes PR** (the only file is `docs/device-notes.md`): skip steps 6–8.
+3. **Mergeable:** not a draft, `mergeable: true`, and CI green on `S` (§2.8).
+4. **Up to date:** `git merge-base --is-ancestor origin/main S`. If `main` isn't an ancestor, call `update_pull_request_branch` with `expectedHeadSha: S`, post `pr-open` (note: updated with main), and stop here. The next green CI brings it back.
+5. **Threads:** no unresolved review threads, and no human comment after the last push without a reply.
+6. **Scope gate:** `sched.py scope <Txx> /tmp/orch/names-<txx>.txt --state /tmp/orch/state.json`. Exit 1 → don't merge; resume the owner with `EVENT: out-of-scope <files>` (it reverts them, or asks the human). Exit 2 → a script error: fix `state.json`, never treat it as out of scope.
+7. **Workflow gate** (§6.1): read `git diff origin/main...S -- .github/workflows`. If the gate matches → human merge, and notify.
+8. **Review:** compute `P = git diff origin/main...S | git patch-id --verbatim | cut -d' ' -f1` (`--verbatim`: whitespace changes count, which matters for YAML).
+   - If the `ORCH-DONE` line `code-review: ship · head <sha> · patch-id <id>` has the same `P`, the reviewed diff is unchanged: go on.
+   - Otherwise create a **separate, detached review worktree**: `git worktree prune && git worktree add --detach /home/user/wt/review-<txx> S` (under the git lock). Spawn a `code-reviewer` on `origin/main...S` there, with the issue, the approved plan and `CLAUDE.md`. Remove the review worktree afterwards.
      - `ship` → go on.
      - `fix-then-ship` → post the findings as a PR comment, post `pr-open`, and resume the owner with `EVENT: review-fixes <link>`. After 2 such rounds, post `blocked` and notify.
      - `rework` → post `blocked` with the findings, and notify.
-8. **Merge:** `merge_pull_request` with `merge_method: squash`, `expectedHeadSha: S`, and `commit_title: <PR title> (#<n>)`. If it fails because the head moved, start again at step 1.
-9. Then run §6.3.
+9. **Re-check** (the review can take a while, and `main` may have moved): fence, `git fetch`, read the PR again. The head must still be `S`, CI green on `S`, and `origin/main` an ancestor of `S`. Anything else → back to step 1.
+10. **Merge:** `merge_pull_request` with `merge_method: squash`, `expectedHeadSha: S`, and `commit_title: <PR title> (#<n>)`. If it fails because the head moved, start again at step 1.
+11. Then run §6.3.
 
 ### §6.3 After a merge (task PR or device-notes PR)
 
@@ -373,7 +381,7 @@ Answer them.
 3. `unsubscribe_pr_activity`. Drop the owner from the registry.
 4. Remove the worktree: `flock -w 300 /tmp/talking-bear-git.lock -c 'git -C /home/user/talking-bear worktree remove --force /home/user/wt/<txx>; git -C /home/user/talking-bear worktree prune'`.
 5. If the epic's sub-issues are all closed, close the epic with a comment.
-6. Recompute, fill slots, and update the dashboard.
+6. Write `done` for the task into `state.json` (and add the issue to `closedIssues`), then recompute, fill slots, and update the dashboard.
 
 ## §7 Completion
 
@@ -384,7 +392,7 @@ Answer them.
 3. Post a final summary on #3.
 4. Release the lock, delete the trigger, and notify.
 
-If only human-gated work remains, keep the check-ins running (§5.3 step 1 backs off to 180 minutes), and say so on the dashboard.
+If only human-gated work remains, keep the check-ins running (§5.3 step 1 backs off to 120 minutes), and say so on the dashboard.
 
 ## §8 Safety (you and every agent)
 
@@ -395,7 +403,7 @@ If only human-gated work remains, keep the check-ins running (§5.3 step 1 backs
 - **Shared-machine locks:**
   - Git admin (`fetch`, `worktree prune/add/remove`) runs under `flock -w 300 /tmp/talking-bear-git.lock -c '…'`.
   - Heavy commands (browser, `vite preview`, Playwright, `vitest --project browser`, Docker) run under `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after). Exit 75 means lock timeout, not a failure.
-  - Anything that may take more than about 5 minutes runs with Bash `run_in_background: true`.
+  - Every `heavy.sh` call, and anything else that may take more than about 5 minutes, runs with Bash `run_in_background: true` (waiting for the heavy lock can outlast a foreground call's timeout).
   - Ports 4173–4175 and 8080–8082 are shared.
 - **Sandbox limits** (see `TODO.md` Phase 0 for the environment setup):
   - Don't run `playwright install`.

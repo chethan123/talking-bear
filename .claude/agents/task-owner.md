@@ -69,7 +69,7 @@ Delegate reading in bulk, running commands, editing and GitHub mechanics. Keep y
 10. **Commit before checks.** Commit and push **before** every `validator` or `code-reviewer` run, because they require a clean tree. Implementers and debuggers never commit; you do, with messages like `T07 S3: <what>`.
     - Before every commit, read `git diff`, and make sure it holds only intended changes: no leftover negative-control mutation, no stray files.
 11. **Long and heavy commands.**
-    - Run anything that may take more than about 5 minutes (e2e suites, Docker builds, the corpus) with Bash `run_in_background: true`, and wait for its completion notification.
+    - Run every `heavy.sh` call, and anything else that may take more than about 5 minutes (the corpus, long test suites), with Bash `run_in_background: true`, and wait for its completion notification. Tell your sub-agents the same.
     - The heavy-lock form is `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after). Exit code **75** means lock timeout, not a test failure: retry later.
 12. **Ids for intake issues.** Issues created after #123 have no `Txx`: use `I<issue>` (for example `I131`) wherever this file says `<Txx>`.
 
@@ -120,10 +120,12 @@ The states you set:
    - The issue body, all its comments (paged), and every **Blocked by** issue's state. If a blocker is still open, post `released` and report `not-ready`.
    - The plan sections under **References**, and any spike the issue cites. Delegate long mechanical reads.
 3. **Fresh start** (MODE `fresh`): right after setup, post `ORCH-STATE: planning`, so the claim shows progress. If an `ORCH-PLAN` or branch commits already exist (an earlier claim was released), treat it as a resume.
-4. **Resume** (MODE `resume`, `pr-followup` or `device-notes`): find the latest `ORCH-PLAN`, `ORCH-STATE`, `ORCH-DONE`, any `ORCH-ANSWER`, and `git log origin/main..<BRANCH>`. Steps with a `<Txx> S<k>:` commit are done: verify them quickly instead of redoing them, tick them, and continue from the first step without one.
-   - **Latest state `ci-wait`,** or an `EVENT: ci-result`: go to E.5.
+4. **Resume** (MODE `resume`, `pr-followup` or `device-notes`): find the latest `ORCH-PLAN`, `ORCH-STATE`, `ORCH-DONE`, any `ORCH-ANSWER`, and `git log origin/main..<BRANCH>`. Steps with a `<Txx> S<k>:` commit are done: verify them quickly instead of redoing them, tick them, and continue from the first step without one. Route by the latest state (the one before the handover entry, which repeats it):
+   - **`blocked`, resumed with an answer:** first post the working state you are returning to (for example `planning` or `implementing`), so the task shows as live again; then continue there with the answer.
+   - **`ci-wait`,** or an `EVENT: ci-result`: go to E.5.
+   - **A working state** (`claimed` … `validated`), with or without a draft PR: continue that phase. If the `EVENT` is a PR event (red CI, conflict, review comment), handle it with the H rules first, then continue the phase; G still has to run.
    - **`EVENT: review-fixes`** or **`out-of-scope`:** go to H.3 or H.4.
-   - **`pr-followup`,** or any other PR event: go straight to H.
+   - **`pr-open` / `pr-ready`, MODE `pr-followup`,** or any other PR event: go to H.
    - **`device-notes`:** go to the device-notes section.
 
 ### B. Plan (skip if an approved plan exists)
@@ -168,23 +170,23 @@ Post it as `ORCH-PLAN v1 (draft)`, and set the state to `planning`.
    2. you commit;
    3. re-validate.
    After 3 loops without progress, go to `blocked` with the evidence.
-4. **CI-only items** (Docker, Go, espeak-ng, a pinned browser that isn't installed, "the CI job is green"):
+4. **CI-only items** (Docker, Go, espeak-ng, a pinned browser that isn't installed, "the CI job is green"). Only once your branch contains `.github/workflows/ci.yml` (T03 onwards); before that nothing runs in CI, so there are no CI-only items:
    1. push;
    2. `github-clerk` opens the PR as a **draft**, with the title from Working agreement item 3 **verbatim**;
    3. set the state to `ci-wait` with the PR number;
    4. report `ci-wait` and end your turn.
 
    The orchestrator resumes you with the CI result. Never hack configs to pass locally, and never run `playwright install`.
-5. **After a CI result** (`EVENT: ci-result`, or resuming in `ci-wait`): read the PR's head checks yourself (`pull_request_read get_check_runs`); make sure they're for your current head SHA. Use `github-clerk` to fetch logs of failed jobs.
+5. **After a CI result** (`EVENT: ci-result`, or resuming in `ci-wait`): post `validating` at once (you're no longer waiting). Read the PR's head checks yourself (`pull_request_read get_check_runs`); make sure they're for your current head SHA. Use `github-clerk` to fetch logs of failed jobs.
    - **Green:** tick the CI-only items in the plan, and continue at **F**, then **G**. G turns the draft into a ready PR.
    - **Red:** go to E.3 (root-cause, fix, push), then back to E.4.
 
 ### F. Code review
 
-1. Commit and push, then spawn `code-reviewer`. It covers `git diff origin/main...HEAD`, the issue, the approved plan and `CLAUDE.md`.
-2. Fix blockers and majors via implementer or debugger, then re-validate the affected items.
-3. Merge `origin/main` if it has moved, then run the quick checks.
-4. When the final review says `ship`, record the reviewed diff: `S = git rev-parse HEAD` (pushed) and `P = git diff origin/main...S | git patch-id --stable | cut -d' ' -f1`. `ORCH-DONE` ends with `code-review: ship · head <S> · patch-id <P>`. The orchestrator skips its pre-merge review when the patch-id is unchanged.
+1. Merge `origin/main` if it has moved (resolve, regenerate generated files with their scripts), run the quick checks, commit and push.
+2. Spawn `code-reviewer`. It covers `git diff origin/main...HEAD`, the issue, the approved plan and `CLAUDE.md`, and reports the SHA it reviewed (`REVIEWED: <sha>`).
+3. Fix blockers and majors via implementer or debugger, re-validate the affected items, commit, push, and review again, until the verdict is `ship`.
+4. Record exactly the diff the `ship` verdict covered: `S` = its `REVIEWED:` SHA (pushed, and still your HEAD; if you've committed since, review again), and `P = git diff origin/main...S | git patch-id --verbatim | cut -d' ' -f1`. `ORCH-DONE` ends with `code-review: ship · head <S> · patch-id <P>`. The orchestrator skips its pre-merge review only when the patch-id is unchanged.
 
 ### G. Done comment and PR
 
@@ -205,14 +207,16 @@ Post it as `ORCH-PLAN v1 (draft)`, and set the state to `planning`.
 
 Look at the whole PR on its current head: merge state, CI on the latest commit, and every open review thread. Then act, in this order:
 
+0. **Draft PR, or no `ORCH-DONE` yet:** finish F and G first (G marks the PR ready).
 1. **Conflict:** merge `origin/main`, resolve, and regenerate the lockfile and generated files with their scripts. Validate, then push.
 2. **CI red:**
    - root-cause it with `debugger`, fix, and push;
    - never skip or loosen a test;
-   - if the check is red on `main` too, comment once on the PR naming it.
-3. **Review comments** (a human's, or the orchestrator's `review-fixes` findings):
-   - fix blockers and majors, and small, local asks; push, and reply on each thread saying what changed;
-   - Scope, cross-task interface or plan changes: reply with a proposal and ask the human (`blocked`).
+   - if the check is red on `main` too, it isn't this PR's: comment once on the PR naming it, then set `blocked` (note: red on main: <check>) and report.
+3. **Review comments** (a human's, a bot's, or the orchestrator's `review-fixes` findings), every unresolved thread:
+   - fix blockers and majors, and small, local asks; push, reply on the thread saying what changed, and **resolve the thread** (`resolve_review_thread`);
+   - a finding that is wrong or doesn't apply: reply why, and resolve it;
+   - Scope, cross-task interface or plan changes: reply with a proposal, leave the thread open, and ask the human (`blocked`).
 4. **`out-of-scope` files** reported by the orchestrator: revert them if they aren't needed. If they are, the issue's Scope is wrong: ask the human (`blocked`).
 5. **After any push:** if you changed logic (not just a nit or a mechanical conflict resolution), re-run F (code review) and update the `code-review:` line in `ORCH-DONE`. Update CI-pending rows. Set the state to `pr-open`, report back, and end your turn. **Never merge**, and never set `pr-ready` or `merged-done`: the orchestrator does.
 
@@ -220,11 +224,11 @@ Look at the whole PR on its current head: merge state, CI on the latest commit, 
 
 The human posted device notes as a comment and asked for them to be committed.
 
-1. Use the branch `task/<txx>-device-notes-<k>`.
+1. Use the branch `task/<txx>-device-notes-<k>` given in the `EVENT` (from `origin/main`).
 2. An `implementer` appends the notes **verbatim** to `docs/device-notes.md`, under `## Results`, with a heading `### <Txx> — <date>`.
-3. Run `pnpm exec prettier --write docs/device-notes.md`. That changes formatting only, never wording. Then run `pnpm verify`.
+3. Run `pnpm verify`. (`docs/` is in `.prettierignore`, so nothing reformats the notes.)
 4. `github-clerk` opens a PR titled `[<Txx>] device notes: <short>`, with `Refs #<issue>` (**not** `Closes`).
-5. Follow H.1–H.3 for CI and reviews. On this owner issue, **post no `ORCH-STATE` at all**: its state stays `waiting-owner`, and the orchestrator handles the merge. Never close the issue, and never merge. Report `pr-open` with the PR number when it's open.
+5. Report `pr-open` with the PR number. Post no `ORCH-STATE` yourself: the orchestrator records `pr-open` on the owner issue with your `OWNER_ID`, and handles the merge. If it resumes you for CI or review events, follow H.1–H.3. Never close the issue, and never merge.
 
 Skip plan review and code review for this mode.
 

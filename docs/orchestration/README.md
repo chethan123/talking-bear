@@ -26,10 +26,10 @@ The orchestration package lives in the repo's `.claude/` directory. Any Claude C
 
 Permissions for this session (these override any single "designated branch" instruction):
 - Spawn the sub-agent types defined in .claude/agents/; they may spawn their own sub-agents.
-- Create and push branches named task/* (one per task issue), open and update one pull request per task (drafts allowed) in chethan123/talking-bear, and update a task PR's branch with main.
+- Create and push branches named task/* (one per task issue, plus task/<txx>-device-notes-<k> branches for device notes), open and update their pull requests (drafts allowed) in chethan123/talking-bear, update a task PR's branch with main, and reply to and resolve review threads on them.
 - Post and edit comments on this project's issues (#3 onwards) and on those task PRs. Create follow-up task issues (such as the final spike cleanup). Close a task issue if its PR merged but it didn't auto-close. Close epics #4–#11 when all their sub-issues are closed, and close #3 at completion.
 - Remove a PR Steward "watching" label from a task PR, so this session receives its events.
-- Subscribe and unsubscribe to activity on task PRs; schedule this session's send_later check-ins and delete orchestrator check-ins left by earlier runs; send me push notifications.
+- Subscribe and unsubscribe to activity on task PRs; schedule and delete orchestrator send_later check-ins (this run's and those left by earlier runs); send me push notifications.
 - Only with MERGE_POLICY=auto: squash-merge task PRs under the conditions in the skill's §6.
 Never push to main, never force-push, and never merge anything that isn't a task PR.
 ```
@@ -43,12 +43,12 @@ Never push to main, never force-push, and never merge anything that isn't a task
 - `PRIORITY`:
   - `demo` (default): first the 38 tasks marked ⭐ in `TODO.md`, which lead to a talking, animated bear on the phone (energy VAD; Silero comes later). Then the longest remaining dependency chain.
   - `path`: longest remaining chain only.
-- `FORCE_TAKEOVER=yes`: take over from a run whose session you know is dead, before its 3 h lock goes stale.
+- `FORCE_TAKEOVER=yes`: take over from a run whose session you know is dead, before its lock goes stale (4 h without a heartbeat).
 
 ## Stop, restart, check status
 
-- **Stop:** say "stop" in the session, or just close it.
-- **Restart:** send the same message in a new session. The new run takes the lock, cancels the old run's check-ins, and adopts in-flight tasks from their GitHub state:
+- **Stop:** say "stop" in the session. It releases the lock, cancels its check-ins and unsubscribes from PRs. Closing the session is **not** enough: its hourly check-in wakes it again, and with `MERGE_POLICY=auto` it keeps merging.
+- **Restart:** after a clean stop, send the same message in a new session. If the old run didn't stop cleanly (crashed or closed), the new one refuses to start until the old lock is 4 h stale; add `FORCE_TAKEOVER=yes` to take over at once. The new run takes the lock, cancels the old run's check-ins, and adopts in-flight tasks from their GitHub state:
   - a plan that's already approved isn't re-planned;
   - pushed steps aren't redone;
   - open PRs are re-subscribed.

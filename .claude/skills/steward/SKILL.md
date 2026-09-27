@@ -9,7 +9,7 @@ These rules apply to every pull request from a `task/txx-*` branch. They add to 
 
 ## Who acts (one actor per PR)
 
-- **Orchestrator running:** if issue #3 has a comment starting `ORCH-LOCK: held` with a heartbeat less than 3 h old, the orchestrator (`.claude/skills/orchestrate/SKILL.md`) and its task owners own every task PR.
+- **Orchestrator running:** if issue #3's canonical `ORCH-LOCK` comment (the lowest-id one) starts `ORCH-LOCK: held` with a heartbeat less than 4 h old, the orchestrator (`.claude/skills/orchestrate/SKILL.md`) and its task owners own every task PR.
   - If you *are* that orchestrator or one of its task owners, follow your own protocol. It already includes these rules; the Ledger section's after-merge steps don't apply to you.
   - Otherwise, **don't act on task PRs**. Tell the human the orchestrator owns them.
 - **No live orchestrator, or the human explicitly asks you:** you may drive the PR. Record `run: steward` and `owner: steward` in any `ORCH-STATE` you post.
@@ -23,7 +23,7 @@ These rules apply to every pull request from a `task/txx-*` branch. They add to 
 
 1. Work in the task's own worktree, `/home/user/wt/<txx>`. If it's missing, create it from `origin/<branch>` under `flock -w 300 /tmp/talking-bear-git.lock -c 'git -C /home/user/talking-bear worktree add …'`. Never work in `/home/user/talking-bear` itself, and never in another task's worktree.
 2. Run the issue's **Validation** commands that the change affects, plus `pnpm verify` (lint, format, typecheck and unit tests).
-3. Wrap browser, `vite preview`, Playwright, `vitest --project browser` and Docker commands in `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after), run in the background if they're long. Exit 75 means lock timeout. Other tasks share the machine and ports 4173–4175 and 8080–8082.
+3. Wrap browser, `vite preview`, Playwright, `vitest --project browser` and Docker commands in `bash .claude/skills/orchestrate/heavy.sh '<command>'` (run from the worktree; it takes the shared heavy lock and frees ports 4173–4175 and 8080–8082 before and after), always with Bash `run_in_background: true`. Exit 75 means lock timeout. Other tasks share the machine and ports 4173–4175 and 8080–8082.
 4. **Can't run it here?** If a validation can't run in the sandbox (Docker, Go, espeak-ng, the pinned Playwright browser), rely on this PR's CI run and cite it. Don't run `playwright install`, and don't edit configs to make it pass locally.
 
 ## CI red
@@ -44,7 +44,7 @@ These rules apply to every pull request from a `task/txx-*` branch. They add to 
 
 ## Review comments
 
-- Small, local asks (nits, renames, an added test, a one-function refactor): implement, push, and reply on the thread saying what changed.
+- Small, local asks (nits, renames, an added test, a one-function refactor): implement, push, reply on the thread saying what changed, and resolve it.
 - Anything that changes the task's Scope, an interface other tasks use, or the plan: reply with a proposal and ask the human. Don't push it.
 
 ## Scope
