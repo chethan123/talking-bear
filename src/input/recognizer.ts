@@ -4,11 +4,12 @@
  * fires without movement. Time comes only from the samples: no clock, no timers, no DOM.
  *
  * `recognize` never mutates its input. A call that emits nothing returns the shared frozen `NO_GESTURES`;
- * a tick that changes nothing (no pointer reaches the long-press time) also returns the input state object
+ * a tick that changes nothing (no long-press or sustained tickle is due) also returns the input state object
  * itself, so an idle tick allocates no gestures array and no state.
  *
  * **One contact** (one pointer from down to up) reports every gesture with the region under its down point.
- * It starts `pending` and becomes at most one of:
+ * It starts `pending` and moves on to one of these modes; a `stroke` can still turn into `tickle` handling,
+ * and any contact can still be `claimed`:
  * - `longPress`: a tick or move ≥ 500 ms after down with < 10 px of movement. It owns the contact: later
  *   moves change nothing, and the up emits `longPress end`.
  * - `stroke`: movement > 10 px at a windowed speed in [40, 1200] px/s. `update` every ≥ 50 ms of moves;
