@@ -202,7 +202,12 @@ describe('sfx', () => {
     // An offline context renders the graph; allEnded() is not used, so its output timestamp can be empty.
     // The never-resolving sleep keeps the ring-out disconnect out of this render.
     const offCtx = Object.assign(off, { getOutputTimestamp: () => ({}) });
-    const sfx = createSfx(offCtx, off.destination, { testBeep: ringing }, () => new Promise(() => {}));
+    const sfx = createSfx(
+      offCtx,
+      off.destination,
+      { ...M1_SYNTHS, testBeep: ringing },
+      () => new Promise(() => {}),
+    );
     const { endCtxTime } = sfx.play('testBeep'); // when 0.02, end 0.07
     // Pause at the first render-quantum boundary after the end, once the `ended` events have been handled.
     const pauseAt = ((Math.floor((endCtxTime * sampleRate) / 128) + 1) * 128) / sampleRate;

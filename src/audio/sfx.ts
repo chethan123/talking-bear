@@ -1,5 +1,6 @@
 import { minEndWaitMs, outputContextTimeNow, type OutputClockCtx } from './output-clock.ts';
 import type { SfxId } from './sfx-ids.ts';
+import { SYNTHS } from './sfx-synths.ts';
 
 /** Schedules one sound effect's nodes at context time `when`, connected to `out`; returns its exact duration (s). */
 export type SfxSynth = (ctx: BaseAudioContext, out: AudioNode, when: number) => number;
@@ -134,26 +135,5 @@ export function createSfx(
   return { play, stopAll, allEnded };
 }
 
-const BEEP_HZ = 880;
-const BEEP_SEC = 0.15;
-const BEEP_ATTACK_SEC = 0.005;
-const BEEP_RELEASE_SEC = 0.05;
-const BEEP_PEAK = 0.25; // −12 dBFS
-
-/** 880 Hz sine, 150 ms: 5 ms linear attack to 0.25 (−12 dBFS), hold, 50 ms linear release to 0. */
-const testBeep: SfxSynth = (ctx, out, when) => {
-  const osc = new OscillatorNode(ctx, { type: 'sine', frequency: BEEP_HZ });
-  const env = new GainNode(ctx, { gain: 0 });
-  env.gain.setValueAtTime(0, when);
-  env.gain.linearRampToValueAtTime(BEEP_PEAK, when + BEEP_ATTACK_SEC);
-  env.gain.setValueAtTime(BEEP_PEAK, when + BEEP_SEC - BEEP_RELEASE_SEC);
-  env.gain.linearRampToValueAtTime(0, when + BEEP_SEC);
-  osc.connect(env).connect(out);
-  osc.addEventListener('ended', () => env.disconnect(), { once: true });
-  osc.start(when);
-  osc.stop(when + BEEP_SEC);
-  return BEEP_SEC;
-};
-
-/** The M1 sound effects; M5 replaces them with `SYNTHS` from `sfx-synths.ts`. */
-export const M1_SYNTHS: Record<SfxId, SfxSynth> = { testBeep };
+/** Kept as an alias of `SYNTHS` (`sfx-synths.ts`) for existing callers. */
+export const M1_SYNTHS: Record<SfxId, SfxSynth> = SYNTHS;
