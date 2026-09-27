@@ -81,6 +81,7 @@ talking-bear/
 - `pnpm format:check`: checks formatting without writing.
 - `pnpm typecheck`: runs `tsc -b` over the five project references (app, worklet, worker, node, test).
 - `pnpm test`: runs the Vitest `node` project once.
+- `pnpm test:browser`: runs the Vitest `browser` project once (`src/**/*.browser.test.ts` in headless Chromium via Playwright, `channel: 'chromium'`, fake-media flags). It is not part of `pnpm verify`; CI runs it as its own step. It needs a Playwright Chromium (`pnpm exec playwright install --no-shell chromium`).
 - `pnpm verify`: runs lint, format:check, typecheck and test in that order; it must pass before every PR.
 
 ## Rules
