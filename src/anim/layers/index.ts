@@ -44,7 +44,10 @@ export interface AnimContext {
   /** Uniform source on [0, 1); seeded (`mulberry32`, ../rng.ts) so runs are reproducible. */
   rng: () => number;
   weights: LayerWeights;
-  /** When set, the gaze looks toward this point instead of making random saccades. */
+  /**
+   * When set, the gaze looks toward this point instead of making random saccades. A point with a non-finite
+   * coordinate counts as unset.
+   */
   lookAt?: LookAt | null;
   springs: SpringBank;
 }

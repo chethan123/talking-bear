@@ -46,9 +46,10 @@ import type { AnimContext, Layer, LayerWeights, LookAt, MoodLayer } from './inde
 const DT = 1 / 60;
 
 /**
- * The seed of the single-seed statistical tests ("T67"); fixed, so each run replays the same draws. It is
- * central, not lucky: 3.5066 s and 15.47 % doubles, where 171 of seeds 1–200 pass the issue's ±0.1 s mean
- * check (the tolerance is ≈ 1.5 standard errors); the 100-seed pooled test below doesn't depend on it.
+ * The seed of the single-seed statistical tests ("T67"); fixed, so each run replays the same draws. It was
+ * chosen after evaluating it alongside six other seeds (plan D12). It is central, not lucky: 3.5066 s and
+ * 15.47 % doubles, where 171 of seeds 1–200 pass the issue's ±0.1 s mean check (the tolerance is ≈ 1.5
+ * standard errors); the 100-seed pooled test below doesn't depend on it.
  */
 const SEED = 0x7467;
 
@@ -404,6 +405,12 @@ describe('blink', () => {
     expect(lidL[i]).toBeLessThanOrEqual(1e-6);
   });
 
+  it('starts its first blink one exponential interval after its first update', () => {
+    const { events } = runBlink(SEED, 6000);
+    // The layer's first draw from the seeded stream is that interval.
+    expect(events[0]!.onset).toBeCloseTo(exponential(mulberry32(SEED), 3.5), 9);
+  });
+
   it('keeps its statistics over seeds 1–100 × 10 000 s: pooled mean 3.5 s ± 0.03, doubles 15 % ± 0.5, and ≥ 70 % of the seeds pass the single-run checks', () => {
     let span = 0;
     let intervals = 0;
@@ -541,6 +548,8 @@ describe('gaze', () => {
     const moveSteps: number[] = [];
     /** |iris| settled on each random target (read on the step before the next saccade). */
     const radii: number[] = [];
+    /** The settled iris offset (x, y) on each random target, read at the same steps as `radii`. */
+    const targets: [number, number][] = [];
     let count = 0;
     let skipped = 0;
     let maxIris = 0;
@@ -559,7 +568,10 @@ describe('gaze', () => {
         const [rot, tilt, ix, iy] = prevHead;
         if (Math.abs(ix) >= 1) ratios.push(rot / ((ix / 10) * 0.12));
         if (Math.abs(iy) >= 1) ratios.push(tilt / ((iy / 10) * 0.12));
-        if (count >= 2) radii.push(Math.hypot(ix, iy));
+        if (count >= 2) {
+          radii.push(Math.hypot(ix, iy));
+          targets.push([ix, iy]);
+        }
       }
       const x = pose[Ch.IrisX]!;
       const y = pose[Ch.IrisY]!;
@@ -614,6 +626,22 @@ describe('gaze', () => {
       expect(Math.max(...radii)).toBeLessThanOrEqual(10 + 1e-5);
       const inner = radii.filter((r) => r < 10 / Math.SQRT2).length / radii.length;
       expect(Math.abs(inner - 0.5)).toBeLessThanOrEqual(0.03);
+    });
+
+    it('spreads the saccade directions over the whole circle: a quarter of the targets in each quadrant', () => {
+      expect(targets.length).toBeGreaterThan(3000);
+      const quadrants = [0, 0, 0, 0];
+      let sumX = 0;
+      let sumY = 0;
+      for (const [x, y] of targets) {
+        quadrants[(x < 0 ? 1 : 0) + (y < 0 ? 2 : 0)]!++;
+        sumX += x;
+        sumY += y;
+      }
+      // ≈ 3600 targets: standard error ≈ 0.0072 per quadrant share and ≈ 0.083 per mean offset.
+      for (const q of quadrants) expect(Math.abs(q / targets.length - 0.25)).toBeLessThanOrEqual(0.03);
+      expect(Math.abs(sumX / targets.length)).toBeLessThan(0.3);
+      expect(Math.abs(sumY / targets.length)).toBeLessThan(0.3);
     });
 
     it('has the head settled at 30 % ± 3 % of the follow angle before each saccade', () => {
@@ -677,6 +705,61 @@ describe('gaze', () => {
     expect(centre.pose[Ch.IrisX]).toBe(0);
     expect(centre.pose[Ch.IrisY]).toBe(0);
     expect(centre.pose[Ch.HeadRot]).toBe(0);
+  });
+
+  it('ignores a lookAt with a non-finite coordinate: the iris and the head stay finite', () => {
+    for (const bad of [
+      { x: Number.NaN, y: 0 },
+      { x: 0, y: Number.POSITIVE_INFINITY },
+    ]) {
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      const ctx = makeCtx();
+      let finite = true;
+      run(layer, ctx, 600, (i, _t, pose) => {
+        ctx.lookAt = i === 0 ? bad : null;
+        for (const c of [Ch.IrisX, Ch.IrisY, Ch.HeadRot, Ch.HeadTilt]) {
+          if (!Number.isFinite(pose[c]!)) finite = false;
+        }
+      });
+      expect(finite).toBe(true);
+      expect(Number.isFinite(ctx.springs.pos[IDX.headRot]!)).toBe(true);
+      expect(Number.isFinite(ctx.springs.pos[IDX.headTilt]!)).toBe(true);
+    }
+  });
+
+  it('darts the iris to a new target with the 15 ms time constant', () => {
+    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const ctx = makeCtx();
+    ctx.lookAt = { x: 1500, y: EYES_CENTER.y };
+    const irisX: number[] = [];
+    run(layer, ctx, 6, (_i, _t, pose) => {
+      irisX.push(pose[Ch.IrisX]!);
+    });
+    // From rest toward 10: 10·(1 − e^(−t/0.015)) at t = 1/60, 2/60, …
+    irisX.forEach((x, i) => expect(x).toBeCloseTo(10 * (1 - Math.exp(-((i + 1) * DT) / 0.015)), 4));
+  });
+
+  it('keeps the saccade clock running while lookAt is set', () => {
+    const free = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const looking = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const ctxFree = makeCtx();
+    const ctxLooking = makeCtx();
+    let differ = 0;
+    const pose = createPose();
+    for (let i = 0; i < 3600; i++) {
+      ctxLooking.lookAt = i < 1800 ? { x: 900, y: 200 } : null;
+      for (const [layer, ctx] of [
+        [free, ctxFree],
+        [looking, ctxLooking],
+      ] as const) {
+        ctx.springs.step(DT);
+        pose.fill(0);
+        layer.update(DT, pose, ctx);
+      }
+      if (free.count !== looking.count || free.sinceSaccade !== looking.sinceSaccade) differ++;
+    }
+    expect(free.count).toBeGreaterThan(10);
+    expect(differ).toBe(0);
   });
 
   it('rejects bad spring indices', () => {
@@ -887,6 +970,86 @@ function base(): Pose {
   return p;
 }
 
+/** A weighted layer with its event clock (`count` and seconds since the latest event), if it has one. */
+interface Clocked {
+  layer: Layer;
+  count: () => number;
+  since: () => number;
+}
+
+const CONTINUITY: { name: keyof LayerWeights; make: () => Clocked }[] = [
+  {
+    name: 'blink',
+    make: () => {
+      const layer = createBlink();
+      return { layer, count: () => layer.count, since: () => layer.sinceOnset };
+    },
+  },
+  { name: 'breathing', make: () => ({ layer: createBreathing(), count: () => 0, since: () => 0 }) },
+  {
+    name: 'gaze',
+    make: () => {
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      return { layer, count: () => layer.count, since: () => layer.sinceSaccade };
+    },
+  },
+  {
+    name: 'ears',
+    make: () => {
+      const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+      return { layer, count: () => layer.count, since: () => layer.sinceTwitch };
+    },
+  },
+];
+
+/** Steps at weight 0 before the switch to weight 1 in `weightSwitch` (20 s). */
+const SWITCH_AT = 1200;
+
+/**
+ * Runs a layer at weight 1 throughout (the reference) beside the same layer, with the same seed, at weight 0
+ * for `SWITCH_AT` steps and then at weight 1, for 60 s. Counts the steps where their event clocks differ,
+ * and the channel values that differ from the switch on.
+ */
+function weightSwitch(entry: (typeof CONTINUITY)[number]): {
+  events: number;
+  clockDiffs: number;
+  poseDiffs: number;
+  breathErr: number;
+  firstHead: [number, number];
+  firstSprings: [number, number];
+} {
+  const ref = entry.make();
+  const sw = entry.make();
+  const ctxRef = makeCtx();
+  const ctxSw = makeCtx();
+  const poseRef = createPose();
+  const poseSw = createPose();
+  let clockDiffs = 0;
+  let poseDiffs = 0;
+  let breathErr = 0;
+  let firstHead: [number, number] = [Number.NaN, Number.NaN];
+  let firstSprings: [number, number] = [Number.NaN, Number.NaN];
+  for (let i = 0; i < 3600; i++) {
+    ctxSw.weights[entry.name] = i < SWITCH_AT ? 0 : 1;
+    ctxRef.springs.step(DT);
+    poseRef.fill(0);
+    ref.layer.update(DT, poseRef, ctxRef);
+    ctxSw.springs.step(DT);
+    poseSw.fill(0);
+    sw.layer.update(DT, poseSw, ctxSw);
+    if (ref.count() !== sw.count() || ref.since() !== sw.since()) clockDiffs++;
+    if (i < SWITCH_AT) continue;
+    for (let c = 0; c < CH_COUNT; c++) if (poseRef[c] !== poseSw[c]) poseDiffs++;
+    const t = (i + 1) * DT;
+    breathErr = Math.max(breathErr, Math.abs(poseSw[Ch.BodySquash]! - 0.012 * Math.sin(TAU * 0.25 * t)));
+    if (i === SWITCH_AT) {
+      firstHead = [poseSw[Ch.HeadRot]!, poseSw[Ch.HeadTilt]!];
+      firstSprings = [ctxSw.springs.pos[IDX.headRot]!, ctxSw.springs.pos[IDX.headTilt]!];
+    }
+  }
+  return { events: sw.count(), clockDiffs, poseDiffs, breathErr, firstHead, firstSprings };
+}
+
 describe('weights', () => {
   /** Per-step deltas (pose − base) of `layer` at weight `w` for its key, other weights 0.37, over 60 s. */
   function deltas(entry: (typeof WEIGHTED)[number], w: number): Float64Array {
@@ -941,6 +1104,28 @@ describe('weights', () => {
       expect(pose[Ch.HeadRot]).toBe(ctx.springs.pos[IDX.headRot]);
       expect(pose[Ch.HeadTilt]).toBe(ctx.springs.pos[IDX.headTilt]);
     });
+  });
+
+  it.each(CONTINUITY.map((e) => [e.name, e] as const))(
+    '%s keeps running at weight 0: the same events, and the same pose once it switches to weight 1',
+    (_name, entry) => {
+      const r = weightSwitch(entry);
+      // Breathing has no events; its phase is checked through the pose.
+      if (entry.name !== 'breathing') expect(r.events).toBeGreaterThan(0);
+      expect(r.clockDiffs).toBe(0);
+      expect(r.poseDiffs).toBe(0);
+    },
+  );
+
+  it('breathes 0.012·sin(2π·0.25·t) right after switching from weight 0 to 1', () => {
+    const r = weightSwitch(CONTINUITY.find((e) => e.name === 'breathing')!);
+    expect(r.breathErr).toBeLessThanOrEqual(1e-7);
+  });
+
+  it('has the gaze head on its springs on the first step at weight 1, after 20 s at weight 0', () => {
+    const r = weightSwitch(CONTINUITY.find((e) => e.name === 'gaze')!);
+    expect(r.firstHead).toEqual(r.firstSprings);
+    expect(Math.abs(r.firstHead[0]) + Math.abs(r.firstHead[1])).toBeGreaterThan(1e-4);
   });
 });
 
@@ -1188,10 +1373,10 @@ describe('dt robustness: exact timing at any step (the app runs the layers at SU
       expect(maxErr).toBeLessThanOrEqual(1e-7);
     });
 
-    it.each<[string, LookAt]>([
-      ['right', { x: 1500, y: 385 }],
-      ['down', { x: 500, y: 1385 }],
-    ])('settles the head at 30 %% ± 3 %% of the follow with lookAt held to the %s', (_side, lookAt) => {
+    it.each<{ side: string; lookAt: LookAt }>([
+      { side: 'right', lookAt: { x: 1500, y: 385 } },
+      { side: 'down', lookAt: { x: 500, y: 1385 } },
+    ])('settles the head at 0.3 ± 0.03 of the follow with lookAt held to the $side', ({ lookAt }) => {
       const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
       const ctx = makeCtx();
       ctx.lookAt = lookAt;

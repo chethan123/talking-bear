@@ -1,7 +1,7 @@
 /**
  * Gaze layer (plan §4.6.5 "Look-around"): a saccade every U(1.5, 4) s to a random iris offset of magnitude
- * ≤ 10, or, while `ctx.lookAt` is set, a gaze toward that point. The head follows the iris at 30 % through
- * two springs (f = 2 Hz, ζ = 0.8) in `ctx.springs`, whose targets are
+ * ≤ 10, or, while `ctx.lookAt` is set (and finite), a gaze toward that point. The head follows the iris at
+ * 30 % through two springs (f = 2 Hz, ζ = 0.8) in `ctx.springs`, whose targets are
  *
  *     HeadRot  = 0.3·(IrisX / 10)·0.12 rad
  *     HeadTilt = 0.3·(IrisY / 10)·0.12 rad
@@ -122,7 +122,9 @@ class Gaze implements GazeLayer {
     let tx = this.#tx;
     let ty = this.#ty;
     const look = ctx.lookAt;
-    if (look != null) {
+    // A point with a non-finite coordinate (e.g. from a zero-size layout) counts as unset, so it can never
+    // poison the iris or the springs.
+    if (look != null && Number.isFinite(look.x) && Number.isFinite(look.y)) {
       // Toward the point: full offset at LOOK_SATURATE or farther, proportional closer in.
       const dx = look.x - EYES_CENTER.x;
       const dy = look.y - EYES_CENTER.y;
