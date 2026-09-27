@@ -610,9 +610,9 @@ describe('MouthLayer allocation (Validation 5)', () => {
   const START = 100;
 
   /**
-   * 10 000 rAF-like updates at 60 fps: a pass restarts the clip every 200 frames (sample times from 60 ms before
-   * the clip to about 260 ms after its end, L included), re-seeding the pose each frame as the director does. With `withNow` false the
-   * layer extrapolates with its own performance.now.
+   * 10 000 rAF-like updates at 60 fps: a pass restarts the clip every 200 frames (sample times from 60 ms
+   * before the clip to about 260 ms after its end, L included), re-seeding the pose each frame as the director
+   * does. With `withNow` false the layer extrapolates with its own performance.now.
    */
   function makeRun(withNow: boolean): () => void {
     const layer = new MouthLayer();

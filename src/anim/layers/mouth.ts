@@ -26,8 +26,8 @@
  *   misses none, and clock jitter that steps back never re-fires one.
  *
  * Known property of `teeth` (#63): it ignores level, so hiss in a pause can read as sibilant while the mouth is
- * shut (jaw = 0, teeth ≈ 0.85). `Teeth` passes it through as specified; the renderer draws no mouth at all while
- * its opening (110·Jaw) is below 0.5, so those teeth never show. Any sliver of teeth at a small jaw is left to
+ * shut (jaw = 0, teeth ≈ 0.85). `Teeth` passes it through as specified; the renderer (#75) draws no mouth at all
+ * while its opening (110·Jaw) is below 0.5, so those teeth never show. Any sliver of teeth at a small jaw is left to
  * the by-eye check (X-A3, #76).
  *
  * **Channel contract (#81).**
@@ -43,9 +43,11 @@
  * and the brow decay. `now` (milliseconds, `performance.now()` by default) is only passed to `clipTimeNow`,
  * which extrapolates the context's last output timestamp to the present.
  *
- * **Allocation.** Nothing here allocates per call: no object or array literals, closures or spreads. Doubles
- * reach the helpers that V8 may not inline (`writeMouth`, `#fireCrossings`) through preallocated slots instead
- * of arguments, since a double passed to a call that is not inlined is boxed on the heap on every call.
+ * **Allocation.** Nothing here allocates per call: no object or array literals, closures or spreads. The two
+ * larger helpers, which V8 may leave un-inlined once `update` is near its inlining budget (`writeMouth`,
+ * `#fireCrossings`), get their double input through a preallocated slot instead of an argument, since a double
+ * passed to a call that is not inlined is boxed on the heap on every call. The small helpers (`framePos`,
+ * `trackAt`) are inlined.
  */
 import { clipTimeNow } from '../../audio/output-clock.ts';
 import type { OutputClockCtx } from '../../audio/output-clock.ts';
@@ -162,7 +164,7 @@ export class MouthLayer {
   #start = 0;
   #clipTime = Number.NaN;
   #envIndex = -1;
-  /** Frame position of the furthest sample of this clip so far (−∞ before the first); crossings up to it have fired. */
+  /** Frame position of the furthest sample of this clip so far (−∞ before the first); crossings up to it fired. */
   #lastX = Number.NEGATIVE_INFINITY;
   /** Frame position of the current sample, which `#fireCrossings` reads (see **Allocation**). */
   #x = Number.NaN;
@@ -204,7 +206,8 @@ export class MouthLayer {
   /**
    * Samples the clip at t = clipTimeNow(ctx, start, now) + latencyMs / 1000: sets the mouth channels of `pose`
    * and adds the head bob and the brow lift (see the module comment). Without a clip, or when t is not finite,
-   * it sets the mouth channels to 0 and adds nothing. Never allocates.
+   * it sets the mouth channels to 0 and adds nothing. Allocates nothing itself (a real `AudioContext`'s
+   * `getOutputTimestamp()` returns a new object on every call).
    */
   update(pose: Pose, ctx: OutputClockCtx, now?: () => number): void {
     const env = this.#env;
