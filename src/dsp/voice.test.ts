@@ -1,15 +1,15 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { rmsDb, sine } from '../../test/dsp-helpers.ts';
+import { mulberry32, rmsDb, sine } from '../../test/dsp-helpers.ts';
 import { readWav } from '../../test/wav.ts';
 import { butterworthHighpass } from './biquad.ts';
 import { analyzeEnvelope } from './envelope.ts';
 import { applyFades } from './fades.ts';
-import { voiceGainDb } from './normalize.ts';
+import { truePeakDbtp, voiceGainDb } from './normalize.ts';
 import { resampleOffline } from './resample.ts';
-import type { Envelope, VoicePreset } from './types.ts';
+import { PRESETS, type Envelope, type VoicePreset } from './types.ts';
 import {
   applyGain,
   clipDetect,
@@ -117,6 +117,23 @@ function steadyVowel(f0: number, sec: number, peakDb: number, fs = FS, fadeMs = 
   }
   const g = 10 ** (peakDb / 20) / peak;
   return Float32Array.from(y, (v) => v * g);
+}
+
+/** x scaled so that its RMS is `db` dBFS. */
+function atRmsDb(x: Float32Array, db: number): Float32Array {
+  let sum = 0;
+  for (let i = 0; i < x.length; i++) sum += x[i]! * x[i]!;
+  const g = 10 ** (db / 20) / Math.sqrt(sum / x.length);
+  return Float32Array.from(x, (v) => v * g);
+}
+
+/** Seeded uniform white noise of n samples at `db` dBFS RMS. */
+function whiteNoise(seed: number, n: number, db: number): Float32Array {
+  const rng = mulberry32(seed);
+  return atRmsDb(
+    Float32Array.from({ length: n }, () => 2 * rng() - 1),
+    db,
+  );
 }
 
 /** Zeros, then x, then zeros. */
@@ -489,5 +506,386 @@ describe('processVoice', () => {
     for (const p of [0, -1, NaN, Infinity]) {
       expect(() => processVoice(x, FS, preset(p))).toThrow(RangeError);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Validation 1–7 of #64.
+
+const P_VALUES = [0.75, 1.6, 2.0, 2.2] as const;
+
+describe('Validation 1: length', () => {
+  it.each([48000, 44100])(
+    'fs = %s: a continuous vowel (nothing to trim) gives round(n / p) ± 1 samples',
+    (fs) => {
+      const x = steadyVowel(140, 1, -12, fs);
+      expect(trimRange(hpfTrim(x, fs, false), fs)).toEqual({ start: 0, end: x.length });
+      for (const p of P_VALUES) {
+        const out = processVoice(x, fs, preset(p));
+        expect(Math.abs(out.pcm.length - Math.round(x.length / p))).toBeLessThanOrEqual(1);
+      }
+    },
+  );
+});
+
+/** YIN search range. */
+const YIN_FMIN = 60;
+const YIN_FMAX = 1000;
+
+/**
+ * Test-only YIN (de Cheveigné & Kawahara 2002, steps 2–5) on the window x[start, start + w) and lags up to
+ * τmax = ceil(fs / fmin): difference function d(τ) = Σ_{j<w} (x[start+j] − x[start+j+τ])², cumulative mean
+ * normalised difference d'(τ) = d(τ)·τ / Σ_{k=1..τ} d(k), absolute threshold (the first τ ≥ floor(fs / fmax)
+ * with d' below thr, then down to its local minimum) and parabolic interpolation of d' around it. Returns f0
+ * in Hz, or null when no d'(τ) ≤ τmax is below thr. Reads x up to start + w + τmax + 1.
+ */
+function yinF0(x: Float32Array, fs: number, start: number, w: number, thr = 0.1): number | null {
+  const tauMin = Math.max(2, Math.floor(fs / YIN_FMAX));
+  const tauMax = Math.ceil(fs / YIN_FMIN);
+  const d = new Float64Array(tauMax + 2);
+  for (let tau = 1; tau <= tauMax + 1; tau++) {
+    let sum = 0;
+    for (let j = 0; j < w; j++) {
+      const diff = x[start + j]! - x[start + j + tau]!;
+      sum += diff * diff;
+    }
+    d[tau] = sum;
+  }
+  const cmndf = new Float64Array(tauMax + 2);
+  cmndf[0] = 1;
+  let running = 0;
+  for (let tau = 1; tau <= tauMax + 1; tau++) {
+    running += d[tau]!;
+    cmndf[tau] = running > 0 ? (d[tau]! * tau) / running : 1;
+  }
+  let tau = tauMin;
+  while (tau <= tauMax && cmndf[tau]! >= thr) tau++;
+  if (tau > tauMax) return null;
+  while (tau < tauMax && cmndf[tau + 1]! < cmndf[tau]!) tau++;
+  const a = cmndf[tau - 1]!;
+  const b = cmndf[tau]!;
+  const c = cmndf[tau + 1]!;
+  const den = a - 2 * b + c;
+  const shift = den > 0 ? (0.5 * (a - c)) / den : 0;
+  return fs / (tau + shift);
+}
+
+/** Median YIN f0 over 30 ms windows every 10 ms inside [from, to), and how many windows gave an estimate. */
+function medianF0(x: Float32Array, fs: number, from: number, to: number): { f0: number; count: number } {
+  const w = Math.round(0.03 * fs);
+  const hop = Math.round(0.01 * fs);
+  const tauMax = Math.ceil(fs / YIN_FMIN);
+  const estimates: number[] = [];
+  for (let s = from; s + w + tauMax + 1 <= to; s += hop) {
+    const f = yinF0(x, fs, s, w);
+    if (f !== null) estimates.push(f);
+  }
+  const sorted = estimates.toSorted((p, q) => p - q);
+  return { f0: sorted[sorted.length >> 1] ?? NaN, count: sorted.length };
+}
+
+describe('Validation 2: pitch (YIN, trim disabled)', () => {
+  const vowel = fixture('vowel_f0-140');
+  // The fixture's speech span (its sidecar JSON): samples 48000 … 119999.
+  const input = medianF0(vowel, FS, 48000, 120000);
+
+  it('the test YIN is accurate: a 3-harmonic 173.3 Hz tone within ±0.1 %, the fixture vowel at 140 Hz ±1 %', () => {
+    const f0 = 173.3;
+    const x = Float32Array.from({ length: FS }, (_, i) => {
+      const t = (2 * Math.PI * f0 * i) / FS;
+      return 0.3 * Math.sin(t) + 0.2 * Math.sin(2 * t + 1) + 0.1 * Math.sin(3 * t + 2);
+    });
+    const tone = medianF0(x, FS, 0, x.length);
+    expect(tone.count).toBeGreaterThanOrEqual(20);
+    expect(Math.abs(tone.f0 / f0 - 1)).toBeLessThanOrEqual(0.001);
+    expect(input.count).toBeGreaterThanOrEqual(20);
+    expect(Math.abs(input.f0 / 140 - 1)).toBeLessThanOrEqual(0.01);
+  });
+
+  it.each(P_VALUES)('p = %s: output f0 = input f0 × p ± 1 %', (p) => {
+    const out = processVoice(vowel, FS, preset(p), { noTrim: true }).pcm;
+    const measured = medianF0(out, FS, Math.round(48000 / p), Math.round(120000 / p));
+    expect(measured.count).toBeGreaterThanOrEqual(20);
+    expect(Math.abs(measured.f0 / (input.f0 * p) - 1)).toBeLessThanOrEqual(0.01);
+  });
+});
+
+describe('Validation 3: alias on the production path', () => {
+  it('an 18 kHz tone (amplitude 0.5, 48 kHz) through chipmunk (p = 2): unvoiced, gain ≤ 0 dB, ≤ −60 dBFS', () => {
+    const x = sine(18000, FS, 1, 0.5);
+    const out = processVoice(x, FS, { id: 'chipmunk', pitchRatio: 2 });
+    const run = chain(x, FS, 2);
+    expectSameResult(out, run.result);
+    expect(run.voiced).toBe(false);
+    expect(run.gainDb).toBeLessThanOrEqual(0);
+    // Steady state: everything but the 8 ms fades at each end.
+    const fade = Math.round(0.008 * FS);
+    expect(rmsDb(out.pcm, fade, out.pcm.length - fade)).toBeLessThanOrEqual(-60);
+  });
+});
+
+describe('Validation 4: loudness', () => {
+  it.each(P_VALUES)(
+    'p = %s: a whisper-level vowel (−45 dBFS) comes out quieter than a normal one (−25 dBFS)',
+    (p) => {
+      const vowel = steadyVowel(140, 1, -12);
+      const whisper = atRmsDb(vowel, -45);
+      const normal = atRmsDb(vowel, -25);
+      // Both are voiced, so the difference comes from the +12 dB make-up cap.
+      expect(chain(whisper, FS, p).voiced).toBe(true);
+      expect(chain(normal, FS, p).voiced).toBe(true);
+      const whisperOut = processVoice(whisper, FS, preset(p)).pcm;
+      const normalOut = processVoice(normal, FS, preset(p)).pcm;
+      expect(rmsDb(whisperOut)).toBeLessThan(rmsDb(normalOut));
+    },
+  );
+
+  const wavs = readdirSync(FIXTURES)
+    .filter((f) => f.endsWith('.wav'))
+    .toSorted();
+
+  it('finds the fixture WAVs', () => {
+    expect(wavs.length).toBeGreaterThanOrEqual(11);
+  });
+
+  // One test per fixture keeps each well inside the default timeout.
+  it.each(wavs)('%s: true peak ≤ −3 dBTP (+0.05) at every p', (file) => {
+    const x = fixture(file.slice(0, -'.wav'.length));
+    for (const p of P_VALUES) {
+      expect(truePeakDbtp(processVoice(x, FS, preset(p)).pcm)).toBeLessThanOrEqual(-3 + 0.05);
+    }
+  });
+
+  const noises: Record<string, () => Float32Array> = {
+    'noise_white_-60dbfs_3s': () => fixture('noise_white_-60dbfs_3s'),
+    'noise_pink_-40dbfs_5s': () => fixture('noise_pink_-40dbfs_5s'),
+    'white noise at −50 dBFS (1 s)': () => whiteNoise(0x7e53, FS, -50),
+  };
+
+  it.each(Object.keys(noises))('%s: noise-only input is not amplified', (name) => {
+    const x = noises[name]!();
+    for (const p of P_VALUES) {
+      const run = chain(x, FS, p);
+      expect(run.voiced).toBe(false);
+      expect(run.gainDb).toBeLessThanOrEqual(0);
+      const out = processVoice(x, FS, preset(p)).pcm;
+      expect(rmsDb(out)).toBeLessThanOrEqual(rmsDb(run.resampled) + 1e-6);
+    }
+  });
+});
+
+/** Zeroth-order modified Bessel function of the first kind (power series). */
+function besselI0(x: number): number {
+  let sum = 1;
+  let term = 1;
+  for (let k = 1; k < 40; k++) {
+    term *= (x / (2 * k)) ** 2;
+    sum += term;
+  }
+  return sum;
+}
+
+/** Linear-phase high-pass FIR: δ minus a Kaiser(β)-windowed sinc low-pass with cutoff fc (−6 dB at fc). */
+function highpassFir(fc: number, fs: number, taps: number, beta: number): Float64Array {
+  const h = new Float64Array(taps);
+  const m = (taps - 1) / 2;
+  const wc = fc / fs;
+  for (let i = 0; i < taps; i++) {
+    const t = i - m;
+    const lowpass = t === 0 ? 2 * wc : Math.sin(2 * Math.PI * wc * t) / (Math.PI * t);
+    const win = besselI0(beta * Math.sqrt(1 - (t / m) ** 2)) / besselI0(beta);
+    h[i] = -lowpass * win;
+  }
+  h[m] = h[m]! + 1;
+  return h;
+}
+
+/** |H(f)| of the FIR h in dB. */
+function responseDb(h: Float64Array, f: number, fs: number): number {
+  let re = 0;
+  let im = 0;
+  for (let k = 0; k < h.length; k++) {
+    re += h[k]! * Math.cos((2 * Math.PI * f * k) / fs);
+    im -= h[k]! * Math.sin((2 * Math.PI * f * k) / fs);
+  }
+  return 20 * Math.log10(Math.hypot(re, im));
+}
+
+/**
+ * Energy of the zero-delay filtered signal (h ∗ x)[j] = Σ_k h[k]·x[j + m − k] (m = half the length) over j in
+ * [from, to), with x = 0 outside [0, x.length): the clip plays out of and into silence.
+ */
+function filteredEnergy(h: Float64Array, x: Float32Array, from: number, to: number): number {
+  const m = (h.length - 1) / 2;
+  let energy = 0;
+  for (let j = from; j < to; j++) {
+    let s = 0;
+    for (let k = 0; k < h.length; k++) {
+      const i = j + m - k;
+      if (i >= 0 && i < x.length) s += h[k]! * x[i]!;
+    }
+    energy += s * s;
+  }
+  return energy;
+}
+
+function energyOf(x: Float32Array, from: number, to: number): number {
+  let energy = 0;
+  for (let i = from; i < to; i++) energy += x[i]! * x[i]!;
+  return energy;
+}
+
+describe('Validation 5: no clicks (spectral boundary test)', () => {
+  // The 6 kHz–Nyquist band is split off with a 255-tap linear-phase high-pass over the whole zero-padded
+  // output, not with a spectrum of the isolated 20 ms segment: a rectangular window on the segment measures its
+  // own cut at 20 ms (about −30 dB even on a clean clip), and a Hann window weights the boundary sample by 0 and
+  // hides the click. The transition band lies below 6 kHz (−6 dB at 5 kHz), so the filter also counts some
+  // 4–6 kHz energy: stricter than the literal band. The filter's ringing outside the clip is counted too.
+  const h = highpassFir(5000, FS, 255, 10);
+  const half = (h.length - 1) / 2;
+  const segment = Math.round(0.02 * FS);
+
+  /** [first, last] 20 ms: band energy / total energy of the same 20 ms, in dB. */
+  function boundaryRatiosDb(y: Float32Array): [number, number] {
+    const n = y.length;
+    const head = filteredEnergy(h, y, -half, segment) / energyOf(y, 0, segment);
+    const tail = filteredEnergy(h, y, n - segment, n + half) / energyOf(y, n - segment, n);
+    return [10 * Math.log10(head), 10 * Math.log10(tail)];
+  }
+
+  /** A full-scale 1 kHz sine starting at +1 and ending near +0.99: cut abruptly at both ends. */
+  function abruptSine(): Float32Array {
+    return sine(1000, FS, 1, 1, Math.PI / 2);
+  }
+
+  it('the band-split filter passes ≥ 6 kHz at 0 dB and rejects ≤ 4 kHz by ≥ 104 dB', () => {
+    for (const f of [1000, 1600, 3000, 4000]) expect(responseDb(h, f, FS)).toBeLessThanOrEqual(-104);
+    expect(Math.abs(responseDb(h, 5000, FS) + 6.02)).toBeLessThanOrEqual(0.1);
+    for (const f of [6000, 8000, 12000, 20000, 23000]) {
+      expect(Math.abs(responseDb(h, f, FS))).toBeLessThanOrEqual(0.01);
+    }
+  });
+
+  it('a full-scale 1 kHz sine cut abruptly at both ends, at p = 1.6: ≤ −50 dB in the first and last 20 ms', () => {
+    const x = abruptSine();
+    expect(x[0]).toBe(1);
+    expect(x[x.length - 1]).toBeGreaterThan(0.99);
+    const [head, tail] = boundaryRatiosDb(processVoice(x, FS, PRESETS.cub).pcm);
+    expect(head).toBeLessThanOrEqual(-50);
+    expect(tail).toBeLessThanOrEqual(-50);
+  });
+
+  it('negative control: without the fades the same measurement sees the clicks (> −50 dB)', () => {
+    const y = resample(hpfTrim(abruptSine(), FS), 1.6);
+    applyGain(y, FS, isVoiced(y, FS));
+    const [head, tail] = boundaryRatiosDb(y);
+    expect(head).toBeGreaterThan(-50);
+    expect(tail).toBeGreaterThan(-50);
+  });
+});
+
+describe('Validation 6: trim', () => {
+  // A steady vowel with 20 ms raised-cosine fades (as gen-fixtures), aligned to the 10 ms frame grid. The
+  // fixture vowel_f0-140 (4 Hz syllabic envelope) padded to 1 s of zeros trims to exactly ±10.00 ms, on the
+  // tolerance boundary, and a vowel with an abrupt end keeps one more frame of 80 Hz high-pass ring-down
+  // (+10 ms), so neither is used here.
+  it('a vowel with 1 s of leading and trailing zeros is trimmed to the vowel ± 50 ms (±10 ms)', () => {
+    const vowel = steadyVowel(140, 0.5, -12, FS, 20);
+    const x = padded(FS, vowel, FS);
+    const { start, end } = trimRange(hpfTrim(x, FS, false), FS);
+    expect(Math.abs(start - (FS - 2400))).toBeLessThanOrEqual(480);
+    expect(Math.abs(end - (FS + vowel.length + 2400))).toBeLessThanOrEqual(480);
+    const out = processVoice(x, FS, PRESETS.cub);
+    const expected = Math.round((vowel.length + 4800) / 1.6);
+    expect(Math.abs(out.pcm.length - expected)).toBeLessThanOrEqual(Math.round(960 / 1.6) + 1);
+  });
+});
+
+/** `sec` seconds of speech-like input: a 0.4 s vowel every 0.5 s, with 20 % of the slots white noise instead. */
+function speechLike(sec: number): Float32Array {
+  const x = new Float32Array(Math.round(sec * FS));
+  const vowel = steadyVowel(140, 0.4, -12);
+  const rng = mulberry32(0x7e53);
+  for (let s = 0; s + vowel.length <= x.length; s += FS / 2) {
+    x.set(rng() < 0.8 ? vowel : whiteNoise(Math.floor(rng() * 2 ** 32), vowel.length, -26), s);
+  }
+  return x;
+}
+
+/** The median of a non-empty list (the upper one for an even count). */
+function median(a: readonly number[]): number {
+  return a.toSorted((p, q) => p - q)[a.length >> 1]!;
+}
+
+describe('Validation 7: timing (informational)', () => {
+  it('logs the ms per second of audio for a 10 s clip at p = 1.6', { timeout: 60_000 }, () => {
+    const x = speechLike(10);
+    const seconds = x.length / FS;
+    const names = [
+      'clipDetect',
+      'hpfTrim',
+      'resample',
+      'isVoiced',
+      'applyGain',
+      'fades',
+      'envelope',
+    ] as const;
+    const stageMs: Record<(typeof names)[number], number[]> = {
+      clipDetect: [],
+      hpfTrim: [],
+      resample: [],
+      isVoiced: [],
+      applyGain: [],
+      fades: [],
+      envelope: [],
+    };
+    const totalMs: number[] = [];
+    const runs = 5;
+    // Run 0 warms up. Each run starts from the input, and the in-place stages get fresh copies made outside
+    // the timed regions, so the gain and the fades never compound across runs.
+    for (let run = 0; run <= runs; run++) {
+      let t = performance.now();
+      clipDetect(x);
+      const clipMs = performance.now() - t;
+      t = performance.now();
+      const trimmed = hpfTrim(x, FS);
+      const hpfMs = performance.now() - t;
+      t = performance.now();
+      const y = resample(trimmed, 1.6);
+      const resampleMs = performance.now() - t;
+      t = performance.now();
+      const voiced = isVoiced(y, FS);
+      const voicedMs = performance.now() - t;
+      const gained = y.slice();
+      t = performance.now();
+      applyGain(gained, FS, voiced);
+      const gainMs = performance.now() - t;
+      const faded = gained.slice();
+      t = performance.now();
+      fades(faded, FS);
+      const fadesMs = performance.now() - t;
+      t = performance.now();
+      envelope(faded, FS, 1.6);
+      const envelopeMs = performance.now() - t;
+      t = performance.now();
+      processVoice(x, FS, PRESETS.cub);
+      const allMs = performance.now() - t;
+      if (run === 0) continue;
+      stageMs.clipDetect.push(clipMs);
+      stageMs.hpfTrim.push(hpfMs);
+      stageMs.resample.push(resampleMs);
+      stageMs.isVoiced.push(voicedMs);
+      stageMs.applyGain.push(gainMs);
+      stageMs.fades.push(fadesMs);
+      stageMs.envelope.push(envelopeMs);
+      totalMs.push(allMs);
+    }
+    const total = median(totalMs);
+    const stages = names.map((name) => `${name} ${(median(stageMs[name]) / seconds).toFixed(2)}`).join(', ');
+    console.log(
+      `[T53 timing] processVoice, ${seconds} s of 48 kHz speech-like input at p = 1.6: total ${total.toFixed(1)} ms ` +
+        `(${(total / seconds).toFixed(2)} ms per second of audio, median of ${runs}); stages ms/s: ${stages}`,
+    );
+    expect(Number.isFinite(total)).toBe(true);
   });
 });
