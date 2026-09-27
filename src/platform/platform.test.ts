@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
 import { realClock } from '../app/clock.ts';
 import { createVisibility, type VisEvent } from './visibility.ts';
+import { createWakeLock, type WakeLockNavigator } from './wake-lock.ts';
 
 // ---- fakes built on the global EventTarget ----------------------------------------------------
 
@@ -26,6 +27,43 @@ function makeVisibility(initial: DocumentVisibilityState = 'visible') {
   const vis = createVisibility(doc, win);
   return { doc, win, vis };
 }
+
+class FakeSentinel extends EventTarget {
+  released = false;
+  readonly type = 'screen';
+  readonly release = vi.fn(async (): Promise<void> => {
+    this.uaRelease();
+  });
+  /** What the UA does on hide, and what `release()` does: flag, then fire `release` once. */
+  uaRelease(): void {
+    if (this.released) return;
+    this.released = true;
+    this.dispatchEvent(new Event('release'));
+  }
+}
+
+/** `navigator.wakeLock` whose `request()` results the test settles by hand. */
+function makeWakeLockNav() {
+  const calls: Array<{ resolve(s: FakeSentinel): void; reject(err: unknown): void }> = [];
+  const request = vi.fn(
+    (type: string) =>
+      new Promise<FakeSentinel>((resolve, reject) => {
+        expect(type).toBe('screen');
+        calls.push({ resolve, reject });
+      }),
+  );
+  const nav: WakeLockNavigator = { wakeLock: { request } };
+  /** Grants request `i` with a fresh sentinel and returns it. */
+  const grant = (i: number): FakeSentinel => {
+    const s = new FakeSentinel();
+    calls[i]?.resolve(s);
+    return s;
+  };
+  return { nav, request, calls, grant };
+}
+
+/** Lets every pending promise callback run (a macrotask turn drains the microtask queue). */
+const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -199,5 +237,132 @@ describe('createVisibility', () => {
     offD(); // idempotent
     vis.simulate('visible');
     expect(seen).toEqual(['a:hidden', 'd:hidden']);
+  });
+});
+
+// ---- 3. Wake lock ------------------------------------------------------------------------------
+
+describe('createWakeLock', () => {
+  it('does not request while hidden; becoming visible requests while wanted', async () => {
+    const { doc, vis } = makeVisibility('hidden');
+    const { nav, request, grant } = makeWakeLockNav();
+    const wl = createWakeLock(nav, vis, vi.fn());
+
+    wl.set(true);
+    expect(request).not.toHaveBeenCalled();
+    expect(wl.held()).toBe(false);
+
+    doc.setVisibility('visible');
+    expect(request).toHaveBeenCalledTimes(1);
+    grant(0);
+    await flush();
+    expect(wl.held()).toBe(true);
+  });
+
+  it('set(false) releases; visible no longer re-requests', async () => {
+    const { vis } = makeVisibility();
+    const { nav, request, grant } = makeWakeLockNav();
+    const wl = createWakeLock(nav, vis, vi.fn());
+
+    wl.set(true);
+    wl.set(true); // no second request while one is in flight
+    expect(request).toHaveBeenCalledTimes(1);
+    const s = grant(0);
+    await flush();
+    expect(wl.held()).toBe(true);
+
+    wl.set(false);
+    expect(s.release).toHaveBeenCalledTimes(1);
+    expect(wl.held()).toBe(false);
+
+    vis.simulate('hidden');
+    vis.simulate('visible');
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-requests on visible after the UA released the lock on hide', async () => {
+    const { doc, vis } = makeVisibility();
+    const { nav, request, grant } = makeWakeLockNav();
+    const wl = createWakeLock(nav, vis, vi.fn());
+
+    wl.set(true);
+    const first = grant(0);
+    await flush();
+    doc.setVisibility('hidden');
+    first.uaRelease();
+    expect(wl.held()).toBe(false);
+
+    doc.setVisibility('visible');
+    expect(request).toHaveBeenCalledTimes(2);
+    grant(1);
+    await flush();
+    expect(wl.held()).toBe(true);
+  });
+
+  it('releases a lock granted after set(false)', async () => {
+    const { vis } = makeVisibility();
+    const { nav, grant } = makeWakeLockNav();
+    const wl = createWakeLock(nav, vis, vi.fn());
+
+    wl.set(true);
+    wl.set(false);
+    const late = grant(0);
+    await flush();
+    expect(late.release).toHaveBeenCalledTimes(1);
+    expect(wl.held()).toBe(false);
+  });
+
+  it('logs a rejected request and never throws', async () => {
+    const { vis } = makeVisibility();
+    const { nav, request, calls, grant } = makeWakeLockNav();
+    const log = vi.fn();
+    const wl = createWakeLock(nav, vis, log);
+
+    const err = new Error('NotAllowedError: battery saver');
+    expect(() => wl.set(true)).not.toThrow();
+    calls[0]?.reject(err);
+    await flush();
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0]).toContain(err);
+    expect(wl.held()).toBe(false);
+
+    // still wanted: the next visible retries
+    vis.simulate('visible');
+    expect(request).toHaveBeenCalledTimes(2);
+    grant(1);
+    await flush();
+    expect(wl.held()).toBe(true);
+  });
+
+  it('logs a request that throws synchronously', () => {
+    const { vis } = makeVisibility();
+    const err = new Error('sync');
+    const nav: WakeLockNavigator = {
+      wakeLock: {
+        request: () => {
+          throw err;
+        },
+      },
+    };
+    const log = vi.fn();
+    const wl = createWakeLock(nav, vis, log);
+    expect(() => wl.set(true)).not.toThrow();
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0]).toContain(err);
+    expect(wl.held()).toBe(false);
+  });
+
+  it('is a no-op without navigator.wakeLock', () => {
+    const { vis } = makeVisibility();
+    const log = vi.fn();
+    const wl = createWakeLock({}, vis, log);
+    expect(() => {
+      wl.set(true);
+      vis.simulate('hidden');
+      vis.simulate('visible');
+      wl.set(false);
+    }).not.toThrow();
+    expect(wl.held()).toBe(false);
+    expect(log).not.toHaveBeenCalled();
   });
 });
