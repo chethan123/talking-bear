@@ -17,16 +17,21 @@
  * - `tickle` handling: two reversals less than 300 ms apart (a stroke emits `end` first). `tickle` is
  *   emitted once ≥ 4 reversals whose segments are 4–40 px fall within 600 ms. While the scrub continues (the
  *   latest reversal is < 600 ms old), a move or tick re-emits it every 600 ms, so a sustained tickle arrives
- *   at a steady ~600 ms cadence instead of waiting for the next reversal.
+ *   at a steady ~600 ms cadence instead of waiting for the next reversal. Until its first `tickle`, tickle
+ *   handling is tentative: a small wiggle inside the slop still ends as a `tap up`, or becomes a `longPress`
+ *   once its run has lapsed (no reversal for 600 ms), because the tap and long-press rules have no reversal
+ *   exception.
  * - `claimed` by a multi-pointer gesture (pinch/hug pair, all-over): any stroke or long-press ends at once,
  *   and nothing else is emitted for that contact.
- * A `pending` or `stroke` up may add a `flick` (moved ≥ 10 px, < 250 ms, release speed ≥ 800 px/s over the
- * last 80 ms); a `pending` up within < 400 ms and < 10 px is a `tap up`. Anything else ends silently (the
- * 400–500 ms dead zone included).
+ * The up sample is a last move (it can complete a reversal or a tickle). A `pending` or `stroke` up may add a
+ * `flick` (moved ≥ 10 px, < 250 ms, release speed ≥ 800 px/s over the last 80 ms); a `pending` or tentative
+ * up within < 400 ms and < 10 px is a `tap up`. Anything else ends silently (the 400–500 ms dead zone
+ * included).
  *
  * **Multi-poke:** `count` chains only from a confirmed `tap up`: the next down ≤ 300 ms after that up, ≤ 100 px
- * from that tap's down point and on the same region (AOSP double-tap is per view) gets its count + 1. Any other
- * up or a cancel breaks the chain.
+ * from that tap's down point and on the same region (AOSP double-tap is per view) gets its count + 1. The next
+ * down consumes the chain whatever it hits (a chained tap passes it on through its own up), and any other up
+ * or a cancel breaks it.
  *
  * **Tickle by taps:** ≥ 3 `tap up`s within 900 ms on the belly, or on the feet (both feet count together).
  */
@@ -177,7 +182,7 @@ interface Pair {
 export interface RecState {
   /** The pointers that are down, in down order. */
   readonly pointers: readonly Track[];
-  /** The latest confirmed tap (its up time, down point, region and count), while it can chain a multi-poke. */
+  /** The latest confirmed tap (its up time, down point, region and count), until the next down consumes it. */
   readonly lastTap: {
     readonly t: number;
     readonly x: number;
@@ -235,8 +240,22 @@ function without(pointers: readonly Track[], i: number): Track[] {
   return pointers.filter((_, k) => k !== i);
 }
 
+/**
+ * Tickle handling that has not tickled yet. Its contact still obeys the tap rule on up, and the long-press
+ * rule once its reversal run has lapsed: the issue's "more than 1 reversal per 300 ms" switch belongs to the
+ * stroke rule, and a wiggle inside the slop is neither a stroke nor a tickle.
+ */
+function tentative(p: Track): boolean {
+  return p.mode === 'tickle' && p.tickleT === -Infinity;
+}
+
+/** Held ≥ LONG_PRESS_MS within the slop: pending, or tentative with no reversal for TICKLE_WINDOW_MS. */
 function longPressDue(p: Track, t: number): boolean {
-  return p.mode === 'pending' && p.maxDist < SLOP && t - p.t0 >= LONG_PRESS_MS;
+  return (
+    (p.mode === 'pending' || (tentative(p) && t - p.revT >= TICKLE_WINDOW_MS)) &&
+    p.maxDist < SLOP &&
+    t - p.t0 >= LONG_PRESS_MS
+  );
 }
 
 /**
@@ -356,20 +375,21 @@ function down(s: RecState, smp: PointerSample, hit: Hit, out: Gesture[]): RecSta
     const pointers = s.pointers.map((p) => claim(p, out));
     if (!s.allOver) out.push({ g: 'allOver' });
     pointers.push({ ...track, mode: 'claimed' });
-    return { ...s, pointers, pair: null, allOver: true };
+    return { ...s, pointers, lastTap: null, pair: null, allOver: true };
   }
   const tapDown: Gesture = { g: 'tap', phase: 'down', region, x: smp.x, y: smp.y, count: track.count };
   const other = s.pointers[0];
   const kind = other === undefined ? null : pairKind(other.region, region);
   if (other === undefined || kind === null) {
     out.push(tapDown);
-    return { ...s, pointers: [...s.pointers, track] };
+    return { ...s, pointers: [...s.pointers, track], lastTap: null };
   }
   const first = claim(other, out);
   out.push(tapDown);
   return {
     ...s,
     pointers: [first, { ...track, mode: 'claimed' }],
+    lastTap: null,
     pair: { kind, span0: Math.hypot(other.x - smp.x, other.y - smp.y), fired: false },
   };
 }
@@ -439,6 +459,9 @@ function move(s: RecState, i: number, smp: PointerSample, hit: Hit, out: Gesture
   if (tickleDue(p, smp.t)) {
     out.push({ g: 'tickle', region: p.region });
     p = { ...p, tickleT: smp.t };
+  } else if (p.mode === 'tickle' && longPressDue(p, smp.t)) {
+    p = { ...p, mode: 'longPress' };
+    out.push({ g: 'longPress', region: p.region, phase: 'start' });
   } else if (p.mode === 'pending') {
     const speed = Math.hypot(p.vx, p.vy);
     if (longPressDue(p, smp.t)) {
@@ -478,14 +501,21 @@ function flick(p: Track, dt: number, out: Gesture[]): void {
 }
 
 function up(s: RecState, i: number, smp: PointerSample, hit: Hit, out: Gesture[]): RecState {
-  const p = advance(s.pointers[i]!, smp, hit);
+  let p = advance(s.pointers[i]!, smp, hit);
+  // The release point is a last move: it can complete a reversal, and with it a tickle.
+  if (p.mode === 'pending' || p.mode === 'stroke' || p.mode === 'tickle')
+    p = reversals(p, smp.t, smp.x, smp.y, out);
+  if (tickleDue(p, smp.t)) {
+    out.push({ g: 'tickle', region: p.region });
+    p = { ...p, tickleT: smp.t };
+  }
   const dt = smp.t - p.t0;
   let tapped = false;
-  if (p.mode === 'pending') {
+  if (p.mode === 'pending' || tentative(p)) {
     if (dt < TAP_MAX_MS && p.maxDist < SLOP) {
       tapped = true;
       out.push({ g: 'tap', phase: 'up', region: p.region, x: p.x0, y: p.y0, count: p.count });
-    } else {
+    } else if (p.mode === 'pending') {
       flick(p, dt, out);
     }
   } else if (p.mode === 'stroke') {

@@ -347,6 +347,11 @@ describe('tap', () => {
     ]);
   });
 
+  it('a wiggle inside the slop is still a tap (two reversals are not a stroke)', () => {
+    const wiggle = [dn(0, 500, 500), mv(10, 504, 500), mv(20, 500, 500), mv(30, 504, 500), up(100, 504, 500)];
+    expect(kinds(run(wiggle, on('belly')).all)).toEqual(['tap:down', 'tap:up']);
+  });
+
   it('the region is the one under the down point', () => {
     const { all } = run([dn(0, 495, 100), up(50, 504, 100)], split('cheekL', 'cheekR'));
     expect(all.map((g) => ('region' in g ? g.region : null))).toEqual(['cheekL', 'cheekL']);
@@ -404,6 +409,24 @@ describe('multi-poke', () => {
     ]);
   });
 
+  it('the next down consumes the chain: a held eye down in between resets the nose count', () => {
+    const trace = [
+      dn(0, 100, 100),
+      up(40, 100, 100),
+      dn(100, 110, 100),
+      up(140, 110, 100),
+      dn(200, 600, 100, 2), // an eye down, held
+      dn(250, 120, 100),
+    ];
+    const downs = run(trace, split('nose', 'eyeL')).all.filter((g) => g.g === 'tap' && g.phase === 'down');
+    expect(downs.map((g) => (g.g === 'tap' ? `${g.region}${g.count}` : ''))).toEqual([
+      'nose1',
+      'nose2',
+      'eyeL1',
+      'nose1',
+    ]);
+  });
+
   it('only a confirmed tap chains: a dead-zone press, a stroke, a long-press or a flick does not', () => {
     const dead = [dn(0, 100, 100), up(450, 100, 100)];
     const stroke = [dn(0, 100, 100), ...line(1, 0, 100, 100, 160, 100, 10, 20), up(220, 160, 100)];
@@ -458,6 +481,17 @@ describe('long-press', () => {
 
   it('an up is never a long-press trigger: no tick after 500 ms, no long-press', () => {
     expect(kinds(run([dn(0, 100, 100), up(600, 100, 100)], on('belly')).all)).toEqual(['tap:down']);
+  });
+
+  it('a wiggle inside the slop still long-presses once its reversals lapse (600 ms after the last)', () => {
+    // Reversals at 10 and 20 ms (tentative tickle handling), then a still finger.
+    const wiggle = [dn(0, 500, 500), mv(10, 504, 500), mv(20, 500, 500), mv(30, 504, 500)];
+    const { steps, all } = run([...wiggle, ...ticks(46, 700, 16), up(800, 504, 500)], on('belly'));
+    expect(kinds(all)).toEqual(['tap:down', 'longPress:start', 'longPress:end']);
+    expect(timesOf(steps, 'longPress:start')).toEqual([622]);
+    // A move inside the slop starts it too.
+    const moved = run([...wiggle, mv(619, 503, 500), mv(620, 502, 500)], on('belly'));
+    expect(timesOf(moved.steps, 'longPress:start')).toEqual([620]);
   });
 
   it('each pointer long-presses on its own time, with its own region', () => {
@@ -636,6 +670,45 @@ describe('tickle', () => {
       expect(Math.max(...gaps), `${leg} px`).toBeLessThanOrEqual(650);
       expect(t.at(-1)!, `${leg} px`).toBeLessThan(lastReversal + 600);
     }
+  });
+
+  it('ticks never tickle below 4 reversals', () => {
+    // 3 reversals (20, 60, 100 ms) inside the slop, then a still finger: a long-press at 700 ms, no tickle.
+    const trace = [
+      dn(0, 500, 500),
+      ...path(1, 0, zigzag(500, 500, 8, 8, 2, 500), 4, 10),
+      ...ticks(140, 1000, 16),
+    ];
+    const { steps, all } = run(trace, on('belly'));
+    expect(kinds(all)).toEqual(['tap:down', 'longPress:start']);
+    expect(timesOf(steps, 'longPress:start')).toEqual([700]);
+  });
+
+  it('a claim stops a sustained tickle', () => {
+    const { trace } = steadyScrub(20, 150, 20);
+    const claimed = byTime(...trace, dn(700, 100, 100, 2), dn(710, 200, 100, 3));
+    expect(timesOf(run(claimed, on('belly')).steps, 'tickle')).toEqual([630]);
+  });
+
+  it('an up in tickle handling adds no tap and no flick', () => {
+    // Before its first tickle (entered from a stroke).
+    const trace = [dn(0, 500, 500), mv(10, 540, 500), mv(20, 520, 500), mv(30, 560, 500), up(40, 560, 500)];
+    const { steps, all } = run(trace, on('belly'));
+    expect(kinds(all)).toEqual(['tap:down', 'stroke:start', 'stroke:end']);
+    expect(steps.at(-1)!.out).toBe(NO_GESTURES);
+    // After a tickle: a fast 30 px scrub (1000 px/s when it enters tickle handling), released at 70 ms.
+    const fast = [30, 0, 30, 0, 30, 0].map((dx, k) => mv(10 * (k + 1), 500 + dx, 500));
+    const tickled = run([dn(0, 500, 500), ...fast, up(70, 500, 500)], on('belly'));
+    expect(kinds(tickled.all)).toEqual(['tap:down', 'tickle']);
+    expect(tickled.steps.at(-1)!.out).toBe(NO_GESTURES);
+  });
+
+  it('the release point can complete the 4th reversal', () => {
+    const xs = [510, 520, 510, 500, 510, 520, 510, 500];
+    const moves = xs.map((x, k) => mv(10 * (k + 1), x, 500));
+    const { steps, all } = run([dn(0, 500, 500), ...moves, up(90, 510, 500)], on('belly'));
+    expect(kinds(all)).toEqual(['tap:down', 'stroke:start', 'stroke:end', 'tickle']);
+    expect(timesOf(steps, 'tickle')).toEqual([90]);
   });
 
   it('a still finger in tickle handling never long-presses', () => {
@@ -951,6 +1024,35 @@ describe('three or more pointers', () => {
     ]);
   });
 
+  it('the latch holds through a cancel of one of three, and re-arms when cancels leave ≤ 1 pointer', () => {
+    const once = [
+      dn(0, 100, 100, 1),
+      dn(10, 200, 100, 2),
+      dn(20, 300, 100, 3),
+      cancel(30, 3),
+      dn(40, 400, 100, 4),
+    ];
+    expect(kinds(run(once, on('belly')).all)).toEqual(['tap:down', 'tap:down', 'allOver', 'cancel']);
+    const thumb = [
+      dn(0, 10, 10, 1), // the thumb
+      dn(10, 200, 100, 2),
+      dn(20, 300, 100, 3),
+      cancel(30, 2),
+      cancel(40, 3),
+      dn(1000, 200, 100, 4),
+      dn(1010, 300, 100, 5),
+    ];
+    expect(kinds(run(thumb, on('belly')).all)).toEqual([
+      'tap:down',
+      'tap:down',
+      'allOver',
+      'cancel',
+      'cancel',
+      'tap:down',
+      'allOver',
+    ]);
+  });
+
   it('claims every contact: in-flight long-press and stroke end, then allOver', () => {
     const trace = [
       dn(0, 100, 100, 1),
@@ -1001,6 +1103,29 @@ describe('cancel', () => {
     ]);
   });
 
+  it('a cancel clears the multi-poke chain, even of another pointer', () => {
+    // Pointer 2 rests on the paw; pointer 1 taps the nose; pointer 2 is cancelled; pointer 1 taps again.
+    const trace = [dn(0, 800, 100, 2), dn(10, 100, 100), up(50, 100, 100), cancel(100, 2), dn(200, 100, 100)];
+    expect(run(trace, split('nose', 'pawR')).all.at(-1)).toMatchObject({ g: 'tap', phase: 'down', count: 1 });
+    // Without the cancel, it chains.
+    const chained = [dn(0, 800, 100, 2), dn(10, 100, 100), up(50, 100, 100), dn(200, 100, 100)];
+    expect(run(chained, split('nose', 'pawR')).all.at(-1)).toMatchObject({
+      g: 'tap',
+      phase: 'down',
+      count: 2,
+    });
+  });
+
+  it('a cancelled pointer stays silent while another pointer is down', () => {
+    const trace = [dn(0, 100, 100, 1), dn(10, 800, 100, 2), cancel(100, 1), ...ticks(116, 900, 16)];
+    expect(run(trace, split('belly', 'pawR')).all).toEqual([
+      { g: 'tap', phase: 'down', region: 'belly', x: 100, y: 100, count: 1 },
+      { g: 'tap', phase: 'down', region: 'pawR', x: 800, y: 100, count: 1 },
+      { g: 'cancel' },
+      { g: 'longPress', region: 'pawR', phase: 'start' },
+    ]);
+  });
+
   it('a second down for a pointer that is already down cancels the stale contact first', () => {
     expect(kinds(run([dn(0, 100, 100), dn(100, 300, 300)], on('belly')).all)).toEqual([
       'tap:down',
@@ -1031,9 +1156,9 @@ describe('near misses', () => {
     expect(kinds(run(slow, on('headTop')).all)).not.toContain('flick');
   });
 
-  it('3 reversals are not a tickle', () => {
+  it('3 reversals are not a tickle (inside the slop and < 400 ms, it is a tap)', () => {
     const trace = [dn(0, 500, 500), ...path(1, 0, zigzag(500, 500, 8, 8, 2, 500), 4, 10), up(130, 500, 500)];
-    expect(kinds(run(trace, on('belly')).all)).toEqual(['tap:down']);
+    expect(kinds(run(trace, on('belly')).all)).toEqual(['tap:down', 'tap:up']);
   });
 });
 
