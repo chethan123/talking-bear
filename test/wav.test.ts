@@ -68,10 +68,18 @@ function rawPcm16(bytes: Uint8Array): number[] {
 
 /**
  * An empty Float32Array that reports `length` frames, so writeWav's size limits can be tested without
- * allocating gigabytes (writeWav throws before it reads any sample).
+ * allocating gigabytes. This relies on writeWav reading only `.length` (never a sample) before its size
+ * checks throw.
  */
 function hugeChannel(length: number): Float32Array {
   return Object.defineProperty(new Float32Array(0), 'length', { value: length });
+}
+
+/** A copy of a WAV file with its RIFF size field (bytes 4–7) replaced. */
+function withRiffSize(bytes: Uint8Array, riffSize: number): Uint8Array {
+  const copy = bytes.slice();
+  new DataView(copy.buffer).setUint32(4, riffSize, true);
+  return copy;
 }
 
 function float32Bits(x: Float32Array): number[] {
@@ -254,6 +262,34 @@ describe('readWav', () => {
     ['a partial frame', riff([fmt16, dataChunk([0, 0, 0])]), /not a multiple of blockAlign/],
   ])('throws on %s', (_name, bytes, message) => {
     expect(() => readWav(bytes)).toThrow(message);
+  });
+
+  describe('RIFF size', () => {
+    const wav = writeWav([Float32Array.of(0.5, -0.5)], 48000, 'pcm16'); // RIFF size 40, 48 bytes
+
+    test.each<[string, number, RegExp]>([
+      ['a RIFF size of 0', 0, /RIFF size 0 is smaller than the WAVE id/],
+      ['a RIFF size of 3', 3, /RIFF size 3 is smaller than the WAVE id/],
+      ['a truncated RIFF size that ends before the fmt chunk', 4, /missing 'fmt ' chunk/],
+      [
+        'a truncated RIFF size that ends inside the data chunk',
+        38,
+        /'data' at byte 36 runs past the end of the RIFF container/,
+      ],
+      [
+        'an oversized RIFF size (1 byte past the buffer)',
+        41,
+        /RIFF size 41 exceeds the 40 bytes after the RIFF header/,
+      ],
+      ['an oversized RIFF size (2^32 − 1)', 0xffffffff, /RIFF size 4294967295 exceeds/],
+    ])('throws on %s', (_name, riffSize, message) => {
+      expect(() => readWav(withRiffSize(wav, riffSize))).toThrow(message);
+    });
+
+    test('reads chunks only up to the declared RIFF end and ignores bytes after it', () => {
+      const trailing = Uint8Array.from([...wav, ...ascii('data'), ...u32(2), 0x00, 0x40]);
+      expect(readWav(trailing)).toEqual({ sampleRate: 48000, channels: [Float32Array.of(0.5, -0.5)] });
+    });
   });
 });
 

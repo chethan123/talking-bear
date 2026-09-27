@@ -45,17 +45,28 @@ export function readWav(bytes: Uint8Array): WavData {
   if (length < 12) throw new Error(`not a WAV file: ${length} bytes is shorter than the RIFF header`);
   if (fourCC(view, 0) !== 'RIFF') throw new Error('not a WAV file: missing RIFF id');
   if (fourCC(view, 8) !== 'WAVE') throw new Error('not a WAV file: missing WAVE id');
+  // The RIFF size covers everything after its own field: 'WAVE' plus the chunks. Chunks are read only
+  // up to that declared end; bytes after it are ignored.
+  const riffSize = view.getUint32(4, true);
+  if (riffSize < 4) throw new Error(`invalid WAV: RIFF size ${riffSize} is smaller than the WAVE id`);
+  if (8 + riffSize > length) {
+    throw new Error(
+      `invalid WAV: RIFF size ${riffSize} exceeds the ${length - 8} bytes after the RIFF header`,
+    );
+  }
+  const end = 8 + riffSize;
 
   let fmt: FmtChunk | undefined;
   let dataOffset = -1;
   let dataSize = 0;
   let offset = 12;
-  while (offset + 8 <= length) {
+  while (offset + 8 <= end) {
     const id = fourCC(view, offset);
     const size = view.getUint32(offset + 4, true);
     const body = offset + 8;
-    if (body + size > length)
-      throw new Error(`chunk '${id}' at byte ${offset} runs past the end of the file`);
+    if (body + size > end) {
+      throw new Error(`chunk '${id}' at byte ${offset} runs past the end of the RIFF container`);
+    }
     if (id === 'fmt ') {
       if (fmt !== undefined) throw new Error("duplicate 'fmt ' chunk");
       if (size < 16) throw new Error(`'fmt ' chunk is ${size} bytes, expected at least 16`);
