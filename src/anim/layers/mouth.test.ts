@@ -1,0 +1,747 @@
+import { GCProfiler, setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+import fc from 'fast-check';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { outputContextTimeNow } from '../../audio/output-clock.ts';
+import type { OutputClockCtx } from '../../audio/output-clock.ts';
+import type { Envelope } from '../../dsp/types.ts';
+import { DISPLAY_LATENCY_MS } from '../constants.ts';
+import { CH_COUNT, Ch, createPose } from '../pose.ts';
+import type { Pose } from '../pose.ts';
+import {
+  BROW_LIFT,
+  BROW_TAU,
+  BROW_THRESHOLD,
+  HEAD_BOB,
+  HEAD_BOB_RATE,
+  HEAD_BOB_WINDOW,
+  MouthLayer,
+  envelopeIndex,
+  mouthFromEnvelope,
+} from './mouth.ts';
+
+/** The mouth channels, which only the mouth layer writes. */
+const MOUTH = [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth] as const;
+/** The channels the layer adds to. */
+const ADDED = [Ch.HeadY, Ch.BrowL, Ch.BrowR] as const;
+
+/** A `performance.now()` stand-in that always reads 1000 ms. */
+const now1000 = (): number => 1000;
+
+interface Tracks {
+  jaw: readonly number[];
+  width?: readonly number[];
+  round?: readonly number[];
+  teeth?: readonly number[];
+}
+
+/** An envelope from plain arrays; missing tracks are all 0.25 (so they differ from the 0 outside the clip). */
+function makeEnv(tracks: Tracks): Envelope {
+  const len = tracks.jaw.length;
+  const track = (v: readonly number[] | undefined): Float32Array =>
+    v === undefined ? new Float32Array(len).fill(0.25) : Float32Array.from(v);
+  return {
+    hopMs: 10,
+    jaw: Float32Array.from(tracks.jaw),
+    width: track(tracks.width),
+    round: track(tracks.round),
+    teeth: track(tracks.teeth),
+  };
+}
+
+/** An envelope of `len` frames whose tracks are all 0.5. */
+function flatEnv(len: number): Envelope {
+  return makeEnv({ jaw: Array.from({ length: len }, () => 0.5) });
+}
+
+/** A pose whose every channel is `v`. */
+function filledPose(v: number): Pose {
+  return createPose().fill(v);
+}
+
+/**
+ * A fake output clock whose output context time is set directly: its timestamp pairs `contextTime` with
+ * performanceTime 1000 ms, and `now()` returns 1000, so outputContextTimeNow = contextTime exactly.
+ */
+interface FakeClock {
+  ctx: OutputClockCtx;
+  now: () => number;
+  set(outputCtxTime: number): void;
+}
+
+function fakeClock(outputCtxTime: number): FakeClock {
+  const ts = { contextTime: outputCtxTime, performanceTime: 1000 };
+  const ctx: OutputClockCtx = {
+    currentTime: outputCtxTime + 0.1,
+    outputLatency: 0.02,
+    getOutputTimestamp: () => ts,
+  };
+  return {
+    ctx,
+    now: now1000,
+    set(t: number): void {
+      ts.contextTime = t;
+    },
+  };
+}
+
+/** A layer sampling `env` (start at context time 100) at clip time t, with L = 0 so t is the sample time. */
+function layerAt(env: Envelope): { layer: MouthLayer; sample: (t: number, pose?: Pose) => Pose } {
+  const clock = fakeClock(0);
+  const layer = new MouthLayer(0);
+  layer.setClip(env, 100);
+  return {
+    layer,
+    sample: (t: number, pose: Pose = createPose()): Pose => {
+      clock.set(100 + t);
+      layer.update(pose, clock.ctx, clock.now);
+      return pose;
+    },
+  };
+}
+
+/**
+ * Jaw with three upward crossings of 0.8 (frames 2→3, 12→13 and 26→27, the last one reaching fround(0.8), the
+ * float32 nearest 0.8, which is above it), three downward ones (5→6, 17→18, 28→29), a near miss (20→21:
+ * 0.4 → 0.79) and a stretch that dips while staying above 0.8 (13…16). Crossings are ≥ 100 ms apart.
+ */
+const BROW_JAW = [
+  0, 0.3, 0.6, 0.9, 0.95, 0.9, 0.7, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.85, 0.9, 0.82, 0.81, 0.6, 0.4, 0.4, 0.4,
+  0.79, 0.79, 0.5, 0.5, 0.5, 0.5, 0.8, 0.8, 0.5, 0.2, 0, 0, 0,
+];
+
+// Expected values below are written with the issue's numbers as literals (−6, /20, 0.030, 0.8, +5, 0.150),
+// never with the exported constants, so a wrong constant fails the behaviour tests too.
+describe('constants', () => {
+  it('L starts at 40 ms, and a layer uses it by default', () => {
+    expect(DISPLAY_LATENCY_MS).toBe(40);
+    expect(new MouthLayer().latencyMs).toBe(40);
+  });
+
+  it('pins every exported constant to the issue', () => {
+    expect(HEAD_BOB).toBe(6);
+    expect(HEAD_BOB_RATE).toBe(20);
+    expect(HEAD_BOB_WINDOW).toBe(0.03);
+    expect(BROW_THRESHOLD).toBe(0.8);
+    expect(BROW_LIFT).toBe(5);
+    expect(BROW_TAU).toBe(0.15);
+  });
+});
+
+describe('envelopeIndex (Validation 1)', () => {
+  const env = flatEnv(20);
+
+  it('t = 0 → 0; t = 0.0149 → 1', () => {
+    expect(envelopeIndex(env, 0)).toBe(0);
+    expect(envelopeIndex(env, 0.0149)).toBe(1);
+  });
+
+  it('is −1 below 0, at the end, after it, and for NaN', () => {
+    for (const t of [-1e-9, -0.001, -0.0149, -1, Number.NEGATIVE_INFINITY])
+      expect(envelopeIndex(env, t)).toBe(-1);
+    for (const t of [0.2, 0.2 + 1e-9, 0.25, 10, Number.POSITIVE_INFINITY, Number.NaN]) {
+      expect(envelopeIndex(env, t)).toBe(-1);
+    }
+    expect(envelopeIndex(flatEnv(0), 0)).toBe(-1);
+  });
+
+  it('is floor(t / 0.010) on the grid, with frame times written as i·0.01 or i/100 landing on frame i', () => {
+    for (let len = 1; len <= 600; len++) {
+      const e = flatEnv(len);
+      expect(envelopeIndex(e, len * 0.01)).toBe(-1);
+      expect(envelopeIndex(e, len / 100)).toBe(-1);
+      expect(envelopeIndex(e, (len - 0.5) * 0.01)).toBe(len - 1);
+      expect(envelopeIndex(e, len * 0.01 - 1e-7)).toBe(len - 1);
+    }
+    const e = flatEnv(600);
+    for (let i = 0; i < 600; i++) {
+      expect(envelopeIndex(e, i * 0.01)).toBe(i);
+      expect(envelopeIndex(e, i / 100)).toBe(i);
+      expect(envelopeIndex(e, (i + 0.5) * 0.01)).toBe(i);
+      expect(envelopeIndex(e, (i + 0.999) * 0.01)).toBe(i);
+    }
+  });
+
+  it('reads a ctx-time difference that should be a frame time as that frame', () => {
+    expect(10.0 - 9.9 + 0.04).not.toBe(0.14);
+    expect(envelopeIndex(env, 10.0 - 9.9 + 0.04)).toBe(14);
+  });
+});
+
+describe('mouthFromEnvelope (Validation 3)', () => {
+  /** Jaw ramp 0 → 1 over 100 ms (frames 0…10), then held at 1. */
+  const RAMP = makeEnv({ jaw: Array.from({ length: 15 }, (_, i) => Math.min(1, i / 10)) });
+
+  it('a jaw ramp 0 → 1 over 100 ms gives a monotone Jaw that interpolates between frames', () => {
+    const jaws: number[] = [];
+    const out = createPose();
+    for (let j = 0; j <= 200; j++) jaws.push(mouthFromEnvelope(RAMP, j * 0.0005, out)[Ch.Jaw]!);
+    for (let j = 1; j < jaws.length; j++) expect(jaws[j]!).toBeGreaterThanOrEqual(jaws[j - 1]!);
+    expect(jaws[0]).toBe(0);
+    expect(jaws[200]).toBe(1);
+    // Linear between frame centres, so it rises strictly inside every frame of the ramp, not in steps.
+    for (let k = 0; k < 10; k++) {
+      expect(jaws[20 * k + 10]!).toBeCloseTo((k + 0.5) / 10, 6);
+      expect(jaws[20 * k + 10]!).toBeGreaterThan(jaws[20 * k]!);
+      expect(jaws[20 * k + 20]!).toBeGreaterThan(jaws[20 * k + 10]!);
+    }
+  });
+
+  it('width, round, jaw and teeth pass through exactly at frame centres', () => {
+    const unit = fc.float({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true });
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 1, max: 80 }).chain((len) =>
+          fc.record({
+            jaw: fc.array(unit, { minLength: len, maxLength: len }),
+            width: fc.array(unit, { minLength: len, maxLength: len }),
+            round: fc.array(unit, { minLength: len, maxLength: len }),
+            teeth: fc.array(unit, { minLength: len, maxLength: len }),
+          }),
+        ),
+        (tracks) => {
+          const env = makeEnv(tracks);
+          const out = createPose();
+          for (let i = 0; i < env.jaw.length; i++) {
+            for (const t of [i * 0.01, i / 100]) {
+              mouthFromEnvelope(env, t, out);
+              expect(out[Ch.MouthW]).toBe(env.width[i]);
+              expect(out[Ch.MouthRound]).toBe(env.round[i]);
+              expect(out[Ch.Jaw]).toBe(env.jaw[i]);
+              expect(out[Ch.Teeth]).toBe(env.teeth[i]);
+            }
+          }
+        },
+      ),
+      { numRuns: 200 },
+    );
+  });
+
+  it('holds the last frame through the last partial frame, then reads 0', () => {
+    const env = makeEnv({ jaw: [0.2, 0.4, 0.6], width: [0.1, 0.3, 0.9], round: [0.5, 0.7, 0.2] });
+    const out = createPose();
+    for (const t of [0.02, 0.025, 0.0299999]) {
+      mouthFromEnvelope(env, t, out);
+      expect(out[Ch.Jaw]).toBe(env.jaw[2]);
+      expect(out[Ch.MouthW]).toBe(env.width[2]);
+      expect(out[Ch.MouthRound]).toBe(env.round[2]);
+    }
+    mouthFromEnvelope(env, 0.015, out);
+    expect(out[Ch.MouthW]).toBeCloseTo(0.6, 6);
+  });
+
+  it('writes 0 to the mouth channels outside the clip, touches no other channel and returns out', () => {
+    const env = makeEnv({ jaw: [0.5, 0.6, 0.7] });
+    for (const t of [-0.001, 0.03, 0.03 + 1e-6, 1, Number.NaN]) {
+      const out = filledPose(7);
+      expect(mouthFromEnvelope(env, t, out)).toBe(out);
+      for (let c = 0; c < CH_COUNT; c++)
+        expect(out[c]).toBe((MOUTH as readonly number[]).includes(c) ? 0 : 7);
+    }
+    const out = filledPose(7);
+    mouthFromEnvelope(env, 0.01, out);
+    for (let c = 0; c < CH_COUNT; c++) if (!(MOUTH as readonly number[]).includes(c)) expect(out[c]).toBe(7);
+  });
+
+  it('maps Teeth = teeth as the issue says, also while the jaw is 0 (hiss in a pause)', () => {
+    const env = makeEnv({ jaw: [0, 0, 0.3], teeth: [0.85, 0.85, 0.5] });
+    const out = createPose();
+    expect(mouthFromEnvelope(env, 0, out)[Ch.Teeth]).toBe(Math.fround(0.85));
+    expect(out[Ch.Jaw]).toBe(0);
+    expect(mouthFromEnvelope(env, 0.015, out)[Ch.Teeth]).toBeCloseTo(0.675, 6);
+    expect(mouthFromEnvelope(env, 0.02, out)[Ch.Teeth]).toBe(Math.fround(0.5));
+  });
+});
+
+describe('MouthLayer sync (Validation 2)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Frame i has width i/64 and jaw (i mod 7)/7: every frame is distinguishable. */
+  const ENV = makeEnv({
+    jaw: Array.from({ length: 40 }, (_, i) => (i % 7) / 7),
+    width: Array.from({ length: 40 }, (_, i) => i / 64),
+  });
+
+  function expectFrame14(layer: MouthLayer, pose: Pose): void {
+    expect(layer.envIndex).toBe(14);
+    expect(layer.clipTime).toBeCloseTo(0.14, 12);
+    expect(pose[Ch.MouthW]).toBe(ENV.width[14]);
+    expect(pose[Ch.Jaw]).toBe(ENV.jaw[14]);
+  }
+
+  it('output time 10.0, start 9.9, L = 40 ms → samples t = 0.14 s (index 14)', () => {
+    const clock = fakeClock(10.0);
+    expect(outputContextTimeNow(clock.ctx, clock.now)).toBe(10.0);
+    const layer = new MouthLayer();
+    layer.setClip(ENV, 9.9);
+    const pose = createPose();
+    layer.update(pose, clock.ctx, clock.now);
+    expectFrame14(layer, pose);
+  });
+
+  it('the same through the fallback clock (no timestamp yet: currentTime − outputLatency)', () => {
+    const ctx: OutputClockCtx = {
+      currentTime: 10.0,
+      outputLatency: 0,
+      getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 0 }),
+    };
+    expect(outputContextTimeNow(ctx, () => 5)).toBe(10.0);
+    const layer = new MouthLayer();
+    layer.setClip(ENV, 9.9);
+    const pose = createPose();
+    layer.update(pose, ctx, () => 5);
+    expectFrame14(layer, pose);
+  });
+
+  it('without `now`, extrapolates with performance.now()', () => {
+    vi.spyOn(performance, 'now').mockReturnValue(1000);
+    const clock = fakeClock(10.0);
+    const layer = new MouthLayer();
+    layer.setClip(ENV, 9.9);
+    const pose = createPose();
+    layer.update(pose, clock.ctx);
+    expectFrame14(layer, pose);
+  });
+
+  it('applies L (negative control: L = 0 samples index 10; L = 100 ms samples index 20)', () => {
+    const clock = fakeClock(10.0);
+    for (const [l, index] of [
+      [0, 10],
+      [100, 20],
+    ] as const) {
+      const layer = new MouthLayer(l);
+      layer.setClip(ENV, 9.9);
+      layer.update(createPose(), clock.ctx, clock.now);
+      expect(layer.envIndex).toBe(index);
+    }
+  });
+
+  it('reports no sample before the first update and without a clip', () => {
+    const layer = new MouthLayer();
+    expect(layer.envIndex).toBe(-1);
+    expect(layer.clipTime).toBeNaN();
+    layer.setClip(ENV, 9.9);
+    expect(layer.clipTime).toBeNaN();
+    layer.update(createPose(), fakeClock(9.0).ctx, () => 1000);
+    expect(layer.envIndex).toBe(-1);
+    expect(layer.clipTime).toBeCloseTo(-0.86, 12);
+  });
+
+  it('L moves the whole sample, head bob and brows included: L = 40 at T is L = 0 at T + 0.04', () => {
+    const env = makeEnv({ jaw: BROW_JAW });
+    const withL = new MouthLayer(40);
+    const withoutL = new MouthLayer(0);
+    withL.setClip(env, 100);
+    withoutL.setClip(env, 100);
+    const a = fakeClock(0);
+    const b = fakeClock(0);
+    let maxBrow = 0;
+    let maxBob = 0;
+    // T from 99.94 to 100.5 in 7 ms steps: clip times −0.02 … 0.54 s, across the whole 0.34 s fixture.
+    for (let j = 0; j <= 80; j++) {
+      const T = 99.94 + j * 0.007;
+      a.set(T);
+      b.set(T + 0.04);
+      const pa = createPose();
+      const pb = createPose();
+      withL.update(pa, a.ctx, a.now);
+      withoutL.update(pb, b.ctx, b.now);
+      for (let c = 0; c < CH_COUNT; c++) expect(pa[c]).toBeCloseTo(pb[c]!, 5);
+      maxBrow = Math.max(maxBrow, pa[Ch.BrowL]!);
+      maxBob = Math.max(maxBob, Math.abs(pa[Ch.HeadY]!));
+    }
+    // Not vacuous: the brows fired and the head bobbed during the sweep.
+    expect(maxBrow).toBeGreaterThan(4);
+    expect(maxBob).toBeGreaterThan(1);
+  });
+
+  it('envIndex is envelopeIndex at the sampled clip time, between frame centres and at the end', () => {
+    const { layer, sample } = layerAt(ENV);
+    // 0.147 and 0.398 lie past a frame midpoint, where round ≠ floor; (100 + 0.145) − 100 reads as x ≈ 14.4999.
+    for (const [t, index] of [
+      [0.145, 14],
+      [0.147, 14],
+      [0.395, 39],
+      [0.398, 39],
+      [0.4, -1],
+    ] as const) {
+      sample(t);
+      expect(layer.envIndex).toBe(envelopeIndex(ENV, layer.clipTime));
+      expect(layer.envIndex).toBe(index);
+    }
+  });
+});
+
+describe('MouthLayer channels', () => {
+  it('sets the mouth channels, adds only to HeadY and the brows, and leaves every other channel alone', () => {
+    const { sample } = layerAt(makeEnv({ jaw: [0, 0.2, 0.9, 0.9, 0.3], teeth: [0, 0, 0, 0.5, 0.5] }));
+    for (const t of [-0.05, 0, 0.015, 0.025, 0.04, 0.2]) {
+      const pose = sample(t, filledPose(3));
+      for (let c = 0; c < CH_COUNT; c++) {
+        if (!(MOUTH as readonly number[]).includes(c) && !(ADDED as readonly number[]).includes(c)) {
+          expect(pose[c]).toBe(3);
+        }
+      }
+    }
+  });
+
+  it('writes 0 to the mouth channels outside the clip', () => {
+    const { sample } = layerAt(makeEnv({ jaw: [0.5, 0.6, 0.7] }));
+    for (const t of [-0.001, 0.03, 0.5]) {
+      const pose = sample(t, filledPose(0.5));
+      for (const c of MOUTH) expect(pose[c]).toBe(0);
+    }
+  });
+
+  it('setClip(null) (and no clip yet) closes the mouth and adds nothing', () => {
+    const layer = new MouthLayer(0);
+    const clock = fakeClock(100.02);
+    const pose = filledPose(0.5);
+    layer.update(pose, clock.ctx, clock.now);
+    for (const c of MOUTH) expect(pose[c]).toBe(0);
+    for (const c of ADDED) expect(pose[c]).toBe(0.5);
+
+    layer.setClip(makeEnv({ jaw: [0.9, 0.9, 0.9, 0.9] }), 100);
+    layer.update(filledPose(0.5), clock.ctx, clock.now);
+    expect(layer.envIndex).toBe(2);
+    layer.setClip(null, 0);
+    const after = filledPose(0.5);
+    layer.update(after, clock.ctx, clock.now);
+    for (const c of MOUTH) expect(after[c]).toBe(0);
+    for (const c of ADDED) expect(after[c]).toBe(0.5);
+    expect(layer.envIndex).toBe(-1);
+    expect(layer.clipTime).toBeNaN();
+  });
+});
+
+describe('MouthLayer head bob', () => {
+  /** Jaw 0 → 1 over 100 ms (10 per second), held for 100 ms, then 1 → 0 over 100 ms. */
+  const TRAP = makeEnv({
+    jaw: [
+      ...Array.from({ length: 11 }, (_, i) => i / 10),
+      ...Array(10).fill(1),
+      ...Array.from({ length: 11 }, (_, i) => 1 - i / 10),
+    ],
+  });
+
+  it('HeadY += −6 · clamp(d(jaw)/dt / 20, −1, 1), with the derivative over the last 30 ms', () => {
+    const { sample } = layerAt(TRAP);
+    expect(sample(0.05)[Ch.HeadY]).toBeCloseTo(-3, 5); // rising 10 per second: −6 · 10/20
+    expect(sample(0.15)[Ch.HeadY]).toBeCloseTo(0, 6); // flat
+    expect(sample(0.25)[Ch.HeadY]).toBeCloseTo(3, 5); // falling 10 per second
+    // Between frame centres: jaw(0.125) = 1, jaw(0.095) = 0.95: 5/3 per second.
+    expect(sample(0.125)[Ch.HeadY]).toBeCloseTo(-0.5, 5);
+    // Window straddling the top of the ramp: jaw(0.12) = 1, jaw(0.09) = 0.9, so 0.1 / 0.030 per second.
+    expect(sample(0.12)[Ch.HeadY]).toBeCloseTo((-6 * (0.1 / 0.03)) / 20, 5);
+  });
+
+  it('clamps at ±6 and adds to the HeadY already in the pose', () => {
+    const { sample } = layerAt(makeEnv({ jaw: [0, 0.5, 1, 1, 1, 1, 0.5, 0, 0, 0] }));
+    expect(sample(0.02, filledPose(2))[Ch.HeadY]).toBe(2 - 6); // 50 per second: clamped
+    expect(sample(0.07, filledPose(2))[Ch.HeadY]).toBe(2 + 6);
+    expect(sample(0.05, filledPose(2))[Ch.HeadY]).toBe(2); // jaw(0.05) = jaw(0.02) = 1
+  });
+
+  it('reads the jaw as 0 outside the clip: a bob as the clip starts and ends, none beyond', () => {
+    // Jaw 0.3 for 100 ms: 0.3 over the 30 ms window is 10 per second, half the full rate.
+    const { sample } = layerAt(makeEnv({ jaw: Array(10).fill(0.3) }));
+    const half = 6 * Math.min(1, 0.3 / 0.03 / 20); // 3
+    expect(sample(-0.01)[Ch.HeadY]).toBe(0);
+    expect(sample(0.01)[Ch.HeadY]).toBeCloseTo(-half, 5); // jaw(−0.02) = 0
+    expect(sample(0.05)[Ch.HeadY]).toBe(0);
+    expect(sample(0.11)[Ch.HeadY]).toBeCloseTo(half, 5); // jaw(0.11) = 0, jaw(0.08) = 0.3
+    expect(sample(0.13)[Ch.HeadY]).toBe(0);
+    expect(sample(0.5)[Ch.HeadY]).toBe(0);
+  });
+});
+
+describe('MouthLayer brow impulse (Validation 4)', () => {
+  const ENV = makeEnv({ jaw: BROW_JAW });
+  /** Exact crossing times on the interpolated (float32) jaw track. */
+  const UP: number[] = [];
+  const DOWN: number[] = [];
+  for (let s = 0; s + 1 < ENV.jaw.length; s++) {
+    const j0 = ENV.jaw[s]!;
+    const j1 = ENV.jaw[s + 1]!;
+    const xc = s + (0.8 - j0) / (j1 - j0);
+    if (j0 < 0.8 && j1 >= 0.8) UP.push(xc * 0.01);
+    if (j0 >= 0.8 && j1 < 0.8) DOWN.push(xc * 0.01);
+  }
+  /** The brow lift the spec asks for at clip time t: one +5 impulse per upward crossing at or before t. */
+  const expected = (t: number): number =>
+    UP.reduce((sum, tc) => (tc <= t ? sum + 5 * Math.exp(-(t - tc) / 0.15) : sum), 0);
+
+  it('the fixture has three upward and three downward crossings', () => {
+    expect(UP).toHaveLength(3);
+    expect(DOWN).toHaveLength(3);
+  });
+
+  it('fires once per upward crossing, at the crossing, and never on a downward one (1 ms frames)', () => {
+    const { sample } = layerAt(ENV);
+    const fires: number[] = [];
+    let prev = 0;
+    for (let j = -50; j <= 800; j++) {
+      const t = j * 0.001;
+      const pose = sample(t);
+      const brow = pose[Ch.BrowL]!;
+      expect(pose[Ch.BrowR]).toBe(brow);
+      if (brow > prev + 1) fires.push(t);
+      prev = brow;
+    }
+    expect(fires).toHaveLength(UP.length);
+    fires.forEach((t, i) => {
+      expect(t).toBeGreaterThanOrEqual(UP[i]! - 1e-12);
+      expect(t).toBeLessThan(UP[i]! + 0.001);
+    });
+  });
+
+  it('matches one +5 impulse (τ 150 ms) per upward crossing for any frame times', () => {
+    fc.assert(
+      fc.property(
+        fc.array(fc.double({ min: 0.001, max: 0.05, noNaN: true }), { minLength: 40, maxLength: 60 }),
+        (steps) => {
+          const { sample } = layerAt(ENV);
+          let t = -0.02;
+          for (const dt of steps) {
+            t += dt;
+            const pose = sample(t);
+            expect(pose[Ch.BrowL]).toBeCloseTo(expected(t), 5);
+            expect(pose[Ch.BrowR]).toBeCloseTo(expected(t), 5);
+          }
+        },
+      ),
+      { numRuns: 200 },
+    );
+  });
+
+  it('decays with τ = 150 ms and adds to the brows already in the pose', () => {
+    // One crossing, at frame 1 + (0.8 − 0.5) / 0.5 = 1.6.
+    const env = makeEnv({ jaw: [0, 0.5, ...Array(30).fill(1)] });
+    const tc = (1 + (0.8 - 0.5) / 0.5) * 0.01;
+    const { sample } = layerAt(env);
+    const pose = createPose();
+    pose[Ch.BrowL] = 6;
+    pose[Ch.BrowR] = -1;
+    sample(tc + 0.15, pose);
+    expect(pose[Ch.BrowL]).toBeCloseTo(6 + 5 / Math.E, 5);
+    expect(pose[Ch.BrowR]).toBeCloseTo(-1 + 5 / Math.E, 5);
+  });
+
+  it('does not fire again when the clock steps back across a crossing', () => {
+    const { sample } = layerAt(ENV);
+    const tc = UP[0]!;
+    let fires = 0;
+    let prev = 0;
+    for (const t of [tc - 0.004, tc + 0.002, tc - 0.003, tc + 0.001, tc + 0.004, tc + 0.02]) {
+      const brow = sample(t)[Ch.BrowL]!;
+      if (brow > prev + 1) fires++;
+      prev = brow;
+    }
+    expect(fires).toBe(1);
+  });
+
+  it('a first frame at or above 0.8 crosses at t = 0; setClip resets the lift', () => {
+    const { layer, sample } = layerAt(makeEnv({ jaw: [0.9, 0.9, 0.9, 0.9] }));
+    expect(sample(-0.01)[Ch.BrowL]).toBe(0);
+    expect(sample(0.02)[Ch.BrowL]).toBeCloseTo(5 * Math.exp(-0.02 / 0.15), 5);
+    layer.setClip(makeEnv({ jaw: [0.5, 0.5, 0.5, 0.5] }), 100);
+    expect(sample(0.02)[Ch.BrowL]).toBe(0);
+  });
+
+  it('setClip restarts the crossing scan: replaying the clip fires every crossing again', () => {
+    const { layer, sample } = layerAt(ENV);
+    const firesPerPass: number[] = [];
+    for (let pass = 0; pass < 2; pass++) {
+      if (pass === 1) layer.setClip(ENV, 100);
+      let fires = 0;
+      let prev = 0;
+      for (let j = -50; j <= 800; j++) {
+        const brow = sample(j * 0.001)[Ch.BrowL]!;
+        if (brow > prev + 1) fires++;
+        prev = brow;
+      }
+      firesPerPass.push(fires);
+    }
+    expect(firesPerPass).toEqual([3, 3]);
+  });
+
+  it('a clock that steps back before a crossing holds the lift at +5 rather than growing it', () => {
+    const { sample } = layerAt(ENV);
+    const tc = UP[0]!;
+    sample(tc + 0.002);
+    expect(sample(tc - 0.003)[Ch.BrowL]).toBeCloseTo(5, 5);
+  });
+
+  it('a non-finite clip time closes the mouth and adds nothing, even while a brow lift is active', () => {
+    const { layer, sample } = layerAt(ENV);
+    expect(sample(UP[0]! + 0.01)[Ch.BrowL]).toBeGreaterThan(4);
+    const pose = sample(Number.NaN, filledPose(0.5));
+    for (const c of MOUTH) expect(pose[c]).toBe(0);
+    for (const c of ADDED) expect(pose[c]).toBe(0.5);
+    expect(layer.envIndex).toBe(-1);
+    expect(layer.clipTime).toBeNaN();
+  });
+});
+
+type Constructor = new (...args: never[]) => object;
+
+/** Wraps `original` so that every `new` of it, including those inside its static `from` and `of`, calls `onNew`. */
+function countingConstructor<C extends Constructor>(original: C, onNew: () => void): C {
+  return new Proxy(original, {
+    construct(target, args: never[], newTarget: Constructor): object {
+      onNew();
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+}
+
+/** `%TypedArray%.prototype`, which every typed array class inherits its methods from. */
+const TYPED_ARRAY_PROTOTYPE = Reflect.getPrototypeOf(Float32Array.prototype) ?? Float32Array.prototype;
+/** Its methods that return a new typed array. */
+const TYPED_ARRAY_METHODS = ['slice', 'map', 'filter', 'subarray', 'toReversed', 'toSorted', 'with'] as const;
+
+/**
+ * Runs `fn` and counts the allocations it makes through the array globals (the meter of src/anim/clip.test.ts):
+ * every `new` of `Array`, `ArrayBuffer`, `Float32Array` or `Float64Array` (static `from` and `of` included, and
+ * `new` through a typed array's `constructor`), and every call of an allocating `%TypedArray%.prototype` method.
+ * Everything is restored afterwards.
+ */
+function countAllocations(fn: () => void): number {
+  let count = 0;
+  const onNew = (): void => {
+    count++;
+  };
+  const saved: { obj: object; key: string; desc: PropertyDescriptor }[] = [];
+  const patch = (obj: object, key: string, value: unknown): void => {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined) throw new Error(`nothing to patch at ${key}`);
+    saved.push({ obj, key, desc });
+    Object.defineProperty(obj, key, { ...desc, value });
+  };
+  const float32 = countingConstructor(Float32Array, onNew);
+  const float64 = countingConstructor(Float64Array, onNew);
+  patch(Float32Array.prototype, 'constructor', float32);
+  patch(Float64Array.prototype, 'constructor', float64);
+  patch(globalThis, 'Array', countingConstructor(Array, onNew));
+  patch(globalThis, 'ArrayBuffer', countingConstructor(ArrayBuffer, onNew));
+  patch(globalThis, 'Float32Array', float32);
+  patch(globalThis, 'Float64Array', float64);
+  for (const name of TYPED_ARRAY_METHODS) {
+    const original: unknown = Reflect.get(TYPED_ARRAY_PROTOTYPE, name);
+    if (typeof original !== 'function') throw new Error(`no %TypedArray%.prototype.${name}`);
+    patch(TYPED_ARRAY_PROTOTYPE, name, function (this: unknown, ...args: unknown[]): unknown {
+      count++;
+      return Reflect.apply(original, this, args);
+    });
+  }
+  try {
+    fn();
+  } finally {
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const { obj, key, desc } = saved[i]!;
+      Object.defineProperty(obj, key, desc);
+    }
+  }
+  return count;
+}
+
+/** The `gc` function, exposed once at runtime with Node built-ins only (no `--expose-gc` flag needed). */
+let exposedGc: (() => void) | undefined;
+
+/** Runs a full garbage collection. */
+function forceGc(): void {
+  if (exposedGc === undefined) {
+    setFlagsFromString('--expose-gc');
+    const gc: unknown = runInNewContext('gc');
+    if (typeof gc !== 'function') throw new Error('gc() is not available');
+    exposedGc = (): void => {
+      gc();
+    };
+  }
+  exposedGc();
+}
+
+/**
+ * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ */
+function heapGrowth(fn: () => void): number {
+  forceGc();
+  const profiler = new GCProfiler();
+  profiler.start();
+  const before = process.memoryUsage().heapUsed;
+  fn();
+  const growth = process.memoryUsage().heapUsed - before;
+  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+}
+
+describe('MouthLayer allocation (Validation 5)', () => {
+  const UPDATES = 10_000;
+  const LIMIT = 1_048_576;
+  /** 3 s of talking: the jaw swings 0.05…0.95 at 4 Hz, so the head bobs and the brows fire 12 times per pass. */
+  const ENV = makeEnv({
+    jaw: Array.from({ length: 300 }, (_, i) => 0.5 - 0.45 * Math.cos((2 * Math.PI * i) / 25)),
+    width: Array.from({ length: 300 }, (_, i) => (i % 13) / 13),
+    round: Array.from({ length: 300 }, (_, i) => (i % 7) / 7),
+    teeth: Array.from({ length: 300 }, (_, i) => (i % 5) / 5),
+  });
+  const START = 100;
+
+  /**
+   * 10 000 rAF-like updates at 60 fps: a pass restarts the clip every 200 frames (sample times from 60 ms
+   * before the clip to about 260 ms after its end, L included), re-seeding the pose each frame as the director
+   * does. With `withNow` false the layer extrapolates with its own performance.now.
+   */
+  function makeRun(withNow: boolean): () => void {
+    const layer = new MouthLayer();
+    const pose = createPose();
+    const ts = { contextTime: 0, performanceTime: 1000 };
+    const ctx: OutputClockCtx = { currentTime: 0, outputLatency: 0.02, getOutputTimestamp: () => ts };
+    return () => {
+      for (let i = 0; i < UPDATES; i++) {
+        const frame = i % 200;
+        if (frame === 0) layer.setClip(ENV, START);
+        ts.contextTime = START - 0.1 + frame / 60;
+        if (!withNow) ts.performanceTime = performance.now();
+        pose.fill(0);
+        if (withNow) layer.update(pose, ctx, now1000);
+        else layer.update(pose, ctx);
+      }
+    };
+  }
+
+  it('makes no array or typed-array allocation over 10 000 updates', () => {
+    for (const withNow of [true, false]) {
+      const run = makeRun(withNow);
+      expect(countAllocations(run)).toBe(0);
+    }
+  });
+
+  it('grows the heap by < 1 MB over 10 000 updates, once V8 has optimised it', () => {
+    for (const withNow of [true, false]) {
+      const run = makeRun(withNow);
+      // As in src/anim/clip.test.ts: warm up so V8's optimising tiers take over (until then every double is
+      // boxed), then take the best of up to 20 runs, each from a freshly collected heap; a run during which any
+      // GC ran counts as +Infinity. An update that really allocates does so in every run.
+      forceGc();
+      for (let w = 0; w < 10; w++) run();
+      let best = heapGrowth(run);
+      for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(run));
+      expect(best).toBeLessThan(LIMIT);
+    }
+  });
+
+  it('both meters have teeth (positive controls)', () => {
+    expect(countAllocations(() => void new Float32Array(CH_COUNT))).toBe(1);
+    expect(countAllocations(() => void Array.from({ length: 3 }))).toBeGreaterThan(0);
+    const kept: number[][] = [];
+    const growth = heapGrowth(() => {
+      for (let i = 0; i < UPDATES; i++) kept.push(Array.from({ length: 64 }, (_, j) => j + 0.5));
+    });
+    expect(kept).toHaveLength(UPDATES);
+    expect(growth).toBeGreaterThanOrEqual(LIMIT);
+  });
+});
