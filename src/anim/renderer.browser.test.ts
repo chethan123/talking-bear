@@ -163,6 +163,14 @@ function countAllocations(fn: () => void): number {
 
 function doNothing(): void {}
 
+/** A neutral pose with the mouth channels `Jaw` and `Teeth` set. */
+function mouth(jaw: number, teeth: number): Pose {
+  const p = createPose();
+  p[Ch.Jaw] = jaw;
+  p[Ch.Teeth] = teeth;
+  return p;
+}
+
 /** `performance.memory.usedJSHeapSize` (Chromium; precise with --enable-precise-memory-info). */
 function usedJSHeapSize(): number {
   const memory: unknown = Reflect.get(performance, 'memory');
@@ -234,24 +242,40 @@ describe('render allocates nothing per frame', () => {
     });
     expect(frames).toBe(0);
 
-    // Each frame leaves the context as it found it: every save() restored, globalAlpha back to 1.
-    // Every drawMouth branch runs: the gallery (shut, tongue only, tongue and teeth), plus an open mouth with
-    // neither tongue nor teeth, and teeth without a tongue.
-    const openOnly = createPose();
-    openOnly[Ch.Jaw] = 0.1;
-    const teethOnly = openOnly.slice();
-    teethOnly[Ch.Teeth] = 0.6;
-    const cases: (readonly [string, Pose])[] = NAMES.map((name) => [name, POSES[name]] as const);
-    cases.push(['open mouth, no tongue or teeth', openOnly], ['teeth, no tongue', teethOnly]);
+    // Each frame leaves the context as it found it: every save() restored, globalAlpha back to 1. The exact
+    // save count also tells which drawMouth branch ran: 2 is the sclera clips alone, 3 adds the mouth clip
+    // (drawn when the tongue or the teeth show). So the cases include each threshold, just off it on both
+    // sides and exactly on it (pose channels are float32: see TONGUE_MIN / TEETH_MIN in renderer.ts).
+    const gallery: Record<PoseName, number> = {
+      neutral: 2,
+      blink: 2,
+      listening: 2,
+      talkOpen: 3,
+      talkRound: 3,
+      asleep: 2,
+      squish: 2,
+      dizzy: 3,
+    };
+    const cases: (readonly [string, Pose, number])[] = NAMES.map(
+      (name) => [name, POSES[name], gallery[name]] as const,
+    );
+    cases.push(
+      ['open mouth, no tongue or teeth (Jaw 0.1)', mouth(0.1, 0), 2],
+      ['teeth, no tongue (Jaw 0.1, Teeth 0.6)', mouth(0.1, 0.6), 3],
+      ['just under both thresholds (Jaw 0.149, Teeth 0.299)', mouth(0.149, 0.299), 2],
+      ['exactly on both thresholds (Jaw 0.15, Teeth 0.3)', mouth(0.15, 0.3), 2],
+      ['tongue just over (Jaw 0.151)', mouth(0.151, 0), 3],
+      ['teeth just over (Jaw 0.1, Teeth 0.301)', mouth(0.1, 0.301), 3],
+    );
     const counts = countSaves();
     try {
-      for (const [name, pose] of cases) {
+      for (const [name, pose, saves] of cases) {
         counts.saves = 0;
         counts.restores = 0;
         g.globalAlpha = 0.4;
         render(g, rig, pose, view);
-        expect(counts.saves, name).toBeGreaterThanOrEqual(2); // at least the two sclera clips
-        expect(counts.restores, name).toBe(counts.saves);
+        expect(counts.saves, name).toBe(saves);
+        expect(counts.restores, name).toBe(saves);
         expect(g.globalAlpha, name).toBe(1);
       }
     } finally {
@@ -289,9 +313,10 @@ describe('render allocates nothing per frame', () => {
         return usedJSHeapSize() - before;
       };
       /**
-       * Measures until 3 consecutive runs are clean or `max` runs are done. Clean is |growth| < BOUND: right
-       * after a forced GC the reading can also drop by a few bytes (CI's Chromium read −16 B on clean runs),
-       * while an allocation shows as growth (≥ 60 KB for one boxed number per frame).
+       * Measures until 3 consecutive runs are clean or `max` runs are done. Clean is −1 KB < growth < BOUND:
+       * right after a forced GC the reading can drop by a few bytes (CI's Chromium read −16 B on clean runs,
+       * this sandbox −156 B), while a larger drop means memory was freed during the run, which could hide an
+       * allocation, so it counts as inconclusive, not clean.
        */
       const settle = (poses: readonly Pose[], max: number): { ok: boolean; history: number[] } => {
         const history: number[] = [];
@@ -299,7 +324,7 @@ describe('render allocates nothing per frame', () => {
         while (streak < 3 && history.length < max) {
           const growth = measure(poses, doNothing);
           history.push(growth);
-          streak = Math.abs(growth) < BOUND ? streak + 1 : 0;
+          streak = growth > -1024 && growth < BOUND ? streak + 1 : 0;
         }
         return { ok: streak === 3, history };
       };
@@ -311,7 +336,9 @@ describe('render allocates nothing per frame', () => {
       );
       expect(warm.ok, `round-robin heap growth per run (bytes): ${warm.history.join(', ')}`).toBe(true);
       // Then each pose on its own, so a branch only one pose takes (teeth, tongue, stars, blush, lids) runs on
-      // every measured frame: one boxed number per frame is then 5 000 × ≥ 12 B = 60 KB, far over the bound.
+      // every measured frame. One boxed number per frame measured about 12 to 28 KB per 5 000-frame run (a
+      // single run can dip under the 16 KB bound), so what makes the kill reliable is the rule that 3
+      // consecutive runs must be clean: an allocating pose never gets there.
       const perPose = NAMES.map((name) => ({ name, ...settle([POSES[name]], 10) }));
       const report = perPose.map((p) => `${p.name}: ${p.history.join(', ')}`).join('; ');
       expect(
@@ -400,5 +427,105 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
       expect(Math.abs(expected[0]! - base[0]!), 'the blush visibly changes the pixel').toBeGreaterThan(10);
       expectRgbNear(pixel(g, x, y), expected, 2, `blush centre ${i === 0 ? 'L' : 'R'} at (${x}, ${y})`);
     });
+  });
+
+  test('the tongue shows only when Jaw > 0.15 and the teeth only when Teeth > 0.3', () => {
+    const { g, view } = mount(CSS_WIDTH, CSS_HEIGHT);
+    const rig = createRig();
+    /** The canvas pixel over design point (x, y) in jaw space, which is design space here (no bone moves). */
+    const at = (x: number, y: number): number[] =>
+      pixel(g, Math.floor(view.scale * x + view.ox), Math.floor(view.scale * y + view.oy));
+    // The tongue ellipse is centred at (500, 525 + 0.8·open), open = 110·Jaw: pink just over the threshold,
+    // the mouth interior just under it.
+    for (const [jaw, colour] of [
+      [0.151, '#E07A7A'],
+      [0.149, '#5A1E2E'],
+    ] as const) {
+      render(g, rig, mouth(jaw, 0), view);
+      expectRgbNear(at(500, 525 + 0.8 * 110 * Math.fround(jaw)), rgb(colour), 2, `Jaw ${jaw}: tongue centre`);
+    }
+    // At Jaw 0.7 the teeth's visible band runs from the top lip curve (y ≈ 534) to y ≈ 547, and the tongue
+    // starts below y ≈ 560: (500, 541) is white with teeth and the mouth interior without.
+    for (const [teeth, colour] of [
+      [0.301, '#FFFFFF'],
+      [0.299, '#5A1E2E'],
+    ] as const) {
+      render(g, rig, mouth(0.7, teeth), view);
+      expectRgbNear(at(500, 541), rgb(colour), 2, `Teeth ${teeth}: teeth centre`);
+    }
+  });
+
+  test('the iris, pupil and highlight are clipped to the sclera', () => {
+    const rig = createRig();
+    // The iris is a circle (centre and radius from its bbox), the sclera an ellipse (from its bbox).
+    const [ix0, iy0, ix1, iy1] = PARTS[partIndex('irisL')]!.bbox;
+    const [sx0, sy0, sx1, sy1] = PARTS[partIndex('scleraL')]!.bbox;
+    const r = (ix1 - ix0) / 2;
+    const shifted = createPose();
+    shifted[Ch.IrisX] = 10;
+    shifted[Ch.IrisY] = -10;
+    const m = new Float64Array(MAT);
+    partMatrix(
+      rig,
+      shifted,
+      boneMatrices(rig, shifted, new Float32Array(BONE_COUNT * MAT)),
+      partIndex('irisL'),
+      m,
+    );
+    const icx = (ix0 + ix1) / 2;
+    const icy = (iy0 + iy1) / 2;
+    const cx = m[0]! * icx + m[2]! * icy + m[4]!;
+    const cy = m[1]! * icx + m[3]! * icy + m[5]!;
+    // A point 0.95·r up and to the right of the shifted iris centre: inside the iris, just outside the sclera.
+    const qx = cx + 0.95 * r * Math.SQRT1_2;
+    const qy = cy - 0.95 * r * Math.SQRT1_2;
+    const inSclera = ((2 * qx - sx0 - sx1) / (sx1 - sx0)) ** 2 + ((2 * qy - sy0 - sy1) / (sy1 - sy0)) ** 2;
+    expect(inSclera, 'the probe point is outside the sclera').toBeGreaterThan(1.04);
+    // Zoom ×4 onto the point, so the sliver of iris outside the sclera is several pixels wide.
+    const { g } = mount(CSS_WIDTH, CSS_HEIGHT);
+    const view: View = { scale: 4, ox: CSS_WIDTH / 2 - 4 * qx, oy: CSS_HEIGHT / 2 - 4 * qy };
+    render(g, rig, createPose(), view);
+    const fur = pixel(g, CSS_WIDTH / 2, CSS_HEIGHT / 2);
+    expectRgbNear(fur, rgb('#2F7A6D'), 2, 'the probe point is head fur with the iris centred');
+    render(g, rig, shifted, view);
+    expectRgbNear(
+      pixel(g, CSS_WIDTH / 2, CSS_HEIGHT / 2),
+      fur,
+      2,
+      'the iris outside the sclera is clipped away',
+    );
+  });
+
+  test('render applies the view offset: centred fits on 700×700 (ox 100) and 500×900 (oy 100)', () => {
+    const rig = createRig();
+    const pose = POSES.talkOpen;
+    const bones = boneMatrices(rig, pose, new Float32Array(BONE_COUNT * MAT));
+    const m = new Float64Array(MAT);
+    for (const [width, height, ox, oy] of [
+      [700, 700, 100, 0],
+      [500, 900, 0, 100],
+    ] as const) {
+      const { g, view } = mount(width, height);
+      expect(view).toEqual({ scale: 0.5, ox, oy });
+      render(g, rig, pose, view);
+      /** The canvas pixel over the posed bbox centre of `id`. */
+      const centreOf = (id: string): number[] => {
+        const part = partIndex(id);
+        const [x0, y0, x1, y1] = PARTS[part]!.bbox;
+        const x = (x0 + x1) / 2;
+        const y = (y0 + y1) / 2;
+        partMatrix(rig, pose, bones, part, m);
+        const px = m[0]! * x + m[2]! * y + m[4]!;
+        const py = m[1]! * x + m[3]! * y + m[5]!;
+        return pixel(g, Math.floor(view.scale * px + view.ox), Math.floor(view.scale * py + view.oy));
+      };
+      const where = `${width}×${height}`;
+      // Parts go through the part loop's setTransform; the mouth goes through setBoneTransform.
+      expectRgbNear(centreOf('pupilL'), rgb('#1A1216'), 2, `${where}: pupilL centre`);
+      expectRgbNear(centreOf('noseTip'), rgb('#2B1D2A'), 2, `${where}: noseTip centre`);
+      const tongueY = 525 + 0.8 * 110 * Math.fround(pose[Ch.Jaw]!);
+      const tongue = pixel(g, Math.floor(0.5 * 500 + ox), Math.floor(0.5 * tongueY + oy));
+      expectRgbNear(tongue, rgb('#E07A7A'), 2, `${where}: tongue centre`);
+    }
   });
 });

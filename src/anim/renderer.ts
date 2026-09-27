@@ -63,6 +63,13 @@ export const STARS = {
   fill: '#E2B33C',
 } as const;
 
+/**
+ * The mouth thresholds at float32, the precision pose channels are stored at. `Teeth = 0.3` is stored as
+ * 0.30000001, which is `> 0.3`, so comparing against the double 0.3 would show teeth at exactly "0.3".
+ */
+const TONGUE_MIN = Math.fround(MOUTH.tongueJaw);
+const TEETH_MIN = Math.fround(MOUTH.teethMin);
+
 const JAW = boneIndex('jaw');
 const HEAD = boneIndex('head');
 
@@ -180,8 +187,8 @@ function drawMouth(g: CanvasRenderingContext2D, pose: Pose, view: View): void {
   g.closePath();
   g.fillStyle = MOUTH.interior;
   g.fill();
-  const tongue = jaw > MOUTH.tongueJaw;
-  const teeth = pose[Ch.Teeth]! > MOUTH.teethMin;
+  const tongue = jaw > TONGUE_MIN;
+  const teeth = pose[Ch.Teeth]! > TEETH_MIN;
   if (!tongue && !teeth) return;
   g.save();
   g.clip();

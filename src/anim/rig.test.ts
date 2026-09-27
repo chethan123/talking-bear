@@ -494,12 +494,20 @@ describe('boneMatrices and partMatrix: no allocation', () => {
     expect(best).toBeLessThan(LIMIT);
   });
 
-  it('the heap meter sees retained allocations (positive control)', () => {
-    const kept: number[][] = [];
-    const growth = heapGrowth(() => {
-      for (let k = 0; k < 10_000; k++) kept.push(Array.from({ length: 64 }, (_, j) => j + 0.5));
-    });
-    expect(kept).toHaveLength(10_000);
+  it('the heap meter sees retained allocations (positive control, with a GC-free reading)', () => {
+    // A run with a GC reads +Infinity, which would pass `≥ 1 MB` without proving anything, so retry until a
+    // reading is finite. 2 500 arrays of 64 doubles read about 5.6 MB here, on the second trial (the first
+    // one usually sees a GC).
+    let kept: number[][] = [];
+    let growth = Number.POSITIVE_INFINITY;
+    for (let trial = 0; trial < 20 && !Number.isFinite(growth); trial++) {
+      kept = [];
+      growth = heapGrowth(() => {
+        for (let k = 0; k < 2500; k++) kept.push(Array.from({ length: 64 }, (_, j) => j + 0.5));
+      });
+    }
+    expect(kept).toHaveLength(2500);
+    expect(Number.isFinite(growth)).toBe(true);
     expect(growth).toBeGreaterThanOrEqual(1_048_576);
   });
 });
