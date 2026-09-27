@@ -25,6 +25,13 @@ function whiteNoise(seed: number, n: number, amp: number): Float32Array {
   return x;
 }
 
+/** 1 s of a 224 Hz sine (amplitude 0.5, power 0.125) plus seeded uniform white noise at the given SNR. */
+function noisySine(snr: number, seed: number): Float32Array {
+  const a = Math.sqrt((3 * 0.125) / snr); // uniform noise on [−a, a] has power a²/3
+  const rng = mulberry32(seed);
+  return Float32Array.from(sine(224, 48000, 1), (v) => v + a * (2 * rng() - 1));
+}
+
 describe('yinF0', () => {
   it.each([100, 224, 480])('estimates a %d Hz sine at fs 48 000 within ±1 percent', (f) => {
     const est = yinF0(sine(f, 48000, 1), 48000);
@@ -86,6 +93,26 @@ describe('yinF0', () => {
     expect(relErr(yinF0(sine(900, 48000, 0.5), 48000, 70, 1000), 900)).toBeLessThanOrEqual(0.01);
   });
 
+  it('uses threshold 0.15 by default: a 224 Hz sine in white noise is voiced at SNR 7 (d′ ≈ 0.125), not at SNR 4.7 (d′ ≈ 0.175)', () => {
+    // YIN's d′ at the period of a sine in white noise is about 1 / (1 + SNR).
+    const snr7 = noisySine(7, 1);
+    const snr47 = noisySine(4.7, 2);
+    expect(yinF0(snr7, 48000)).not.toBeNaN();
+    expect(yinF0(snr7, 48000, 70, 800, 0.1)).toBeNaN();
+    expect(yinF0(snr47, 48000)).toBeNaN();
+    expect(yinF0(snr47, 48000, 70, 800, 0.2)).not.toBeNaN();
+  });
+
+  it('never reports an f0 outside [fmin, fmax]', () => {
+    for (const f of [850, 900, 1000, 65]) {
+      const est = yinF0(sine(f, 48000, 0.5), 48000);
+      if (!Number.isNaN(est)) {
+        expect(est, `${f} Hz → ${est} Hz`).toBeGreaterThanOrEqual(70);
+        expect(est, `${f} Hz → ${est} Hz`).toBeLessThanOrEqual(800);
+      }
+    }
+  });
+
   it('throws RangeError on invalid parameters', () => {
     const x = sine(224, 48000, 0.2);
     expect(() => yinF0(x, 0)).toThrow(RangeError);
@@ -93,6 +120,7 @@ describe('yinF0', () => {
     expect(() => yinF0(x, 48000, 800, 70)).toThrow(RangeError);
     expect(() => yinF0(x, 48000, 0, 800)).toThrow(RangeError);
     expect(() => yinF0(x, 48000, 70, 800, 0)).toThrow(RangeError);
+    expect(() => yinF0(x, 48000, 70, 800, 1.01)).toThrow(RangeError); // silence has d′ = 1
     expect(() => yinF0(x, 48000, 20, 800)).toThrow(RangeError); // a 50 ms lag doesn't fit a 40 ms window
   });
 });

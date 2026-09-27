@@ -16,7 +16,8 @@ const MIN_VOICED = 5;
  * 2. cumulative mean normalised difference d'(τ) = d(τ) · τ / Σ_{k=1}^{τ} d(k), with d'(τ) = 1 while that
  *    sum is 0;
  * 3. absolute threshold: the first τ in [tauMin, tauMax] with d'(τ) < threshold, then followed downhill to
- *    the local minimum (at most tauMax);
+ *    the local minimum (at most tauMax). A dip that still falls beyond tauMin or tauMax (its minimum lies outside
+ *    the searched lags, so its f0 is outside [fmin, fmax]) makes the window unvoiced: it is rejected, not clamped;
  * 4. parabolic interpolation of d' through τ − 1, τ, τ + 1.
  */
 function windowPeriod(
@@ -47,6 +48,10 @@ function windowPeriod(
   for (let tau = tauMin; tau <= tauMax; tau++) {
     if (d[tau]! >= threshold) continue;
     while (tau + 1 <= tauMax && d[tau + 1]! < d[tau]!) tau++;
+    // A dip whose minimum lies outside [tauMin, tauMax] is out of range: no f0 in [fmin, fmax] for this window.
+    if ((tau === tauMin && d[tau - 1]! < d[tau]!) || (tau === tauMax && d[tau + 1]! < d[tau]!)) {
+      return Number.NaN;
+    }
     // 4. Parabolic interpolation (tau − 1 ≥ tauMin − 1 ≥ 1 and tau + 1 ≤ tauMax + 1 are both computed).
     const a = d[tau - 1]!;
     const b = d[tau]!;
@@ -62,19 +67,20 @@ function windowPeriod(
  * round(0.01·fs) samples; windows that don't fit entirely in x are skipped), searching f0 in [fmin, fmax]:
  * lags τ from max(2, floor(fs/fmax)) to ceil(fs/fmin), each window's difference function integrating over
  * its first round(0.04·fs) − ceil(fs/fmin) − 1 samples. A window is voiced when its normalised difference dips
- * below `threshold`. Returns NaN if fewer than 5 windows are voiced (for even counts the median is the mean of
- * the middle two).
+ * below `threshold` at a local minimum inside the searched lags. Returns NaN if fewer than 5 windows are voiced
+ * (for even counts the median is the mean of the middle two).
  *
- * Throws RangeError unless fs, fmin, fmax and threshold are finite, fs > 0, 0 < fmin < fmax, threshold > 0,
- * and the window is longer than the longest lag plus one sample.
+ * Throws RangeError unless fs, fmin, fmax and threshold are finite, fs > 0, 0 < fmin < fmax, 0 < threshold ≤ 1
+ * (d' is 1 for silence, so a larger threshold would call silence voiced), and the window is longer than the
+ * longest lag plus one sample.
  */
 export function yinF0(x: Float32Array, fs: number, fmin = 70, fmax = 800, threshold = 0.15): number {
   if (!(Number.isFinite(fs) && fs > 0)) throw new RangeError(`fs must be finite and > 0 (fs = ${fs})`);
   if (!(Number.isFinite(fmin) && Number.isFinite(fmax) && fmin > 0 && fmin < fmax)) {
     throw new RangeError(`need finite 0 < fmin < fmax (fmin = ${fmin}, fmax = ${fmax})`);
   }
-  if (!(Number.isFinite(threshold) && threshold > 0)) {
-    throw new RangeError(`threshold must be finite and > 0 (threshold = ${threshold})`);
+  if (!(Number.isFinite(threshold) && threshold > 0 && threshold <= 1)) {
+    throw new RangeError(`threshold must satisfy 0 < threshold ≤ 1 (threshold = ${threshold})`);
   }
   const win = Math.round(WINDOW_SEC * fs);
   const hop = Math.round(HOP_SEC * fs);
