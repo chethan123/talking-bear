@@ -16,6 +16,13 @@ export const DEFAULT_ZERO_CROSSINGS = 8;
 export const DEFAULT_BETA = 6;
 /** Default anti-alias cutoff, as a fraction of the input Nyquist, is CUTOFF_FACTOR · min(1, ratio). */
 export const CUTOFF_FACTOR = 0.9;
+/**
+ * Largest accepted Kaiser β. The window evaluates I0 at arguments in [0, β], and the 30-term series stays
+ * within 1e-12 relative error of the exact I0 on [0, 20.5] (measured against a 60-digit reference: 3.6e-13 at
+ * 20, 2.6e-12 at 21, 1.9e-9 at 25, 1.8e-3 at 40). From β ≈ 5e6 it overflows, and Infinity / Infinity would
+ * make every coefficient NaN.
+ */
+export const MAX_BETA = 20;
 
 /** Terms of the I0 power series (k = 0 … 29). */
 const BESSEL_TERMS = 30;
@@ -24,6 +31,7 @@ const MAX_CACHED_TABLES = 16;
 
 export interface ResampleOpts {
   zeroCrossings?: number;
+  /** Kaiser β in [0, MAX_BETA]. Default DEFAULT_BETA. */
   beta?: number;
   /** Anti-alias cutoff as a fraction of the input Nyquist, in (0, 1]. Default CUTOFF_FACTOR · min(1, ratio). */
   cutoff?: number;
@@ -137,8 +145,8 @@ function resolveKernel(ratio: number, opts: ResampleOpts | undefined): KernelPar
   if (!Number.isInteger(zc) || zc < 1) {
     throw new RangeError(`zeroCrossings must be an integer >= 1 (got ${zc})`);
   }
-  if (!Number.isFinite(beta) || beta < 0) {
-    throw new RangeError(`beta must be finite and >= 0 (got ${beta})`);
+  if (!(beta >= 0 && beta <= MAX_BETA)) {
+    throw new RangeError(`beta must be in [0, ${MAX_BETA}] (got ${beta})`);
   }
   if (!Number.isFinite(c) || c <= 0 || c > 1) {
     throw new RangeError(`cutoff must be in (0, 1] (got ${c})`);
@@ -239,6 +247,7 @@ class StreamingResampler implements Resampler {
       if (this.filled - this.bufStart === cap) this.compact();
       const base = this.filled - this.bufStart;
       const n = Math.min(cap - base, len - off);
+      if (n === 0) throw new RangeError('resampler history buffer overflow'); // compaction invariant broken
       for (let i = 0; i < n; i++) buf[base + i] = input[off + i]!;
       off += n;
       this.filled += n;
@@ -265,6 +274,7 @@ class StreamingResampler implements Resampler {
       if (this.filled - this.bufStart === cap) this.compact();
       const base = this.filled - this.bufStart;
       const n = Math.min(cap - base, FLUSH_BLOCK);
+      if (n === 0) throw new RangeError('resampler history buffer overflow'); // compaction invariant broken
       buf.fill(0, base, base + n); // slots past `filled` may hold stale samples after compact()
       this.filled += n;
       written = this.emit(out, written, total);
@@ -293,7 +303,10 @@ class StreamingResampler implements Resampler {
       const pos = j / ratio; // computed directly, never accumulated
       const k = Math.floor(pos);
       if (k + half >= filled) break; // the last tap, input k + L, has not arrived yet
-      if (w >= out.length) throw new RangeError('out is too short for the computable outputs');
+      if (w >= out.length) {
+        this.nOut = j; // keep the state consistent with what was written
+        throw new RangeError('out is too short for the computable outputs');
+      }
       out[w++] = kernelDot(this.coeffs, this.taps, this.buf, k - half + 1 - this.bufStart, pos - k);
       j++;
     }

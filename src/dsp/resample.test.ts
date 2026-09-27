@@ -5,9 +5,11 @@ import {
   CUTOFF_FACTOR,
   DEFAULT_BETA,
   DEFAULT_ZERO_CROSSINGS,
+  MAX_BETA,
   PHASES,
   createResampler,
   resampleOffline,
+  type ResampleOpts,
   type Resampler,
 } from './resample.ts';
 
@@ -71,11 +73,14 @@ function streamAll(rs: Resampler, x: Float32Array, sizes: readonly number[]): Fl
   return concat(parts);
 }
 
-/** Test-local float64 reference of the issue's kernel formula (independent of the module's table). */
-function besselI0Ref(x: number): number {
+/**
+ * Test-local float64 reference of the issue's kernel formula (independent of the module's table). I0 uses
+ * the issue's 30-term series unless more terms are asked for.
+ */
+function besselI0Ref(x: number, terms = 30): number {
   let sum = 0;
   let fact = 1;
-  for (let k = 0; k < 30; k++) {
+  for (let k = 0; k < terms; k++) {
     if (k > 0) fact *= k;
     const t = Math.pow(x / 2, k) / fact;
     sum += t * t;
@@ -83,13 +88,13 @@ function besselI0Ref(x: number): number {
   return sum;
 }
 
-function hRef(t: number, c: number, zc: number, beta: number): number {
+function hRef(t: number, c: number, zc: number, beta: number, terms = 30): number {
   const halfWidth = zc / c;
   const u = t / halfWidth;
   if (Math.abs(u) >= 1) return 0;
   const x = c * t;
   const sinc = x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
-  return c * sinc * (besselI0Ref(beta * Math.sqrt(1 - u * u)) / besselI0Ref(beta));
+  return c * sinc * (besselI0Ref(beta * Math.sqrt(1 - u * u), terms) / besselI0Ref(beta, terms));
 }
 
 /** Frequency in cycles per sample from linearly interpolated zero crossings of y[from, to). */
@@ -210,6 +215,8 @@ describe('resampleOffline', () => {
       { beta: -1 },
       { beta: Number.NaN },
       { beta: Number.POSITIVE_INFINITY },
+      { beta: 1e7 },
+      { beta: MAX_BETA + 0.5 },
       { cutoff: 0 },
       { cutoff: -0.1 },
       { cutoff: 1.1 },
@@ -219,6 +226,27 @@ describe('resampleOffline', () => {
       expect(() => resampleOffline(x, 0.5, opts), JSON.stringify(opts)).toThrow(RangeError);
     }
     expect(resampleOffline(x, 0.5, { zeroCrossings: 4, beta: 0, cutoff: 1 }).length).toBe(8);
+  });
+
+  it('bounds β to [0, MAX_BETA = 20], where the 30-term I0 series is accurate and every coefficient finite', () => {
+    expect(MAX_BETA).toBe(20);
+    // Without the bound, β = 1e7 overflowed I0 to Infinity / Infinity and every output sample was NaN.
+    expect(() => resampleOffline(new Float32Array(16), 1 / 3, { beta: 1e7 })).toThrow(RangeError);
+    expect(() => createResampler(48_000, 16_000, { beta: 1e7 })).toThrow(RangeError);
+    // At β = MAX_BETA the kernel matches the exact I0 (80-term float64 series) to within 1e-5.
+    const ratio = 1 / 3;
+    const x = new Float32Array(300);
+    x[100] = 1;
+    const y = resampleOffline(x, ratio, { beta: MAX_BETA });
+    let worst = 0;
+    for (let j = 0; j < y.length; j++) {
+      const ref = hRef(100 - j / ratio, cutoffOf(ratio), DEFAULT_ZERO_CROSSINGS, MAX_BETA, 80);
+      expect(Number.isFinite(y[j]!), `y[${j}]`).toBe(true);
+      worst = Math.max(worst, Math.abs(y[j]! - ref));
+    }
+    expect(worst).toBeLessThanOrEqual(1e-5);
+    const streamed = streamAll(createResampler(48_000, 16_000, { beta: MAX_BETA }), noise(2000, 5), [128]);
+    expect(streamed.every(Number.isFinite)).toBe(true);
   });
 });
 
@@ -282,15 +310,23 @@ describe('createResampler', () => {
   });
 
   describe('lookahead: output j is emitted once input floor(j/r) + L arrives, never after ceil(j/r + H)', () => {
-    for (const { name, inRate, outRate } of [
+    const cases: Array<{ name: string; inRate: number; outRate: number; opts?: ResampleOpts }> = [
       ...STREAM_CASES,
       { name: '48k → 64k (upsampling)', inRate: 48_000, outRate: 64_000 },
-    ]) {
+      // L·ratio < 1, so the Math.round(nIn · ratio) cap (D2), not kernel arrival, decides some emissions.
+      {
+        name: '48k → 2.4k, zc 1, cutoff 1',
+        inRate: 48_000,
+        outRate: 2400,
+        opts: { zeroCrossings: 1, cutoff: 1 },
+      },
+    ];
+    for (const { name, inRate, outRate, opts } of cases) {
       it(name, () => {
-        const rs = createResampler(inRate, outRate);
+        const rs = createResampler(inRate, outRate, opts);
         const r = rs.ratio;
         const half = rs.groupDelayInputFrames;
-        const halfWidth = DEFAULT_ZERO_CROSSINGS / cutoffOf(r);
+        const halfWidth = (opts?.zeroCrossings ?? DEFAULT_ZERO_CROSSINGS) / (opts?.cutoff ?? cutoffOf(r));
         const one = new Float32Array(1);
         const out = new Float32Array(Math.ceil(r) + 2);
         const rand = mulberry32(7);
@@ -302,6 +338,7 @@ describe('createResampler', () => {
           // Outputs are emitted in order, so checking the last emitted and the next pending one suffices.
           const last = emitted - 1;
           if (last >= 0 && Math.floor(last / r) + half > n - 1) problems.push(`n=${n}: j=${last} too early`);
+          if (last >= Math.round(n * r)) problems.push(`n=${n}: j=${last} beyond Math.round(n * ratio)`);
           const next = emitted;
           if (next < Math.round(n * r) && Math.floor(next / r) + half <= n - 1) {
             problems.push(`n=${n}: j=${next} computable but not emitted`);
@@ -325,6 +362,10 @@ describe('createResampler', () => {
     expect(rs.flush().length).toBe(0);
     expect(() => rs.process(new Float32Array(4))).toThrow(Error);
     expect(() => rs.processInto(new Float32Array(4), new Float32Array(8))).toThrow(Error);
+    // A fractional part ≥ 0.5 tells Math.round from Math.floor: 1001 / 3 = 333.67 → 334 outputs.
+    rs.reset();
+    const head = rs.process(noise(1001, 2)).length;
+    expect(head + rs.flush().length).toBe(334);
   });
 
   it('reset() reproduces a fresh resampler bit-exactly (mid-stream and after flush)', () => {
