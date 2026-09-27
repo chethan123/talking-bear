@@ -119,6 +119,12 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
   expect(running).toBeGreaterThan(0);
   const frames = log.slice(running).map((x) => x.frame);
   expect(frames.every((f, i) => f >= 0 && (i === 0 || f >= frames[i - 1]!))).toBe(true);
+  // …in samples: between the Recording and Cooldown entries it advances with the wall clock (t, in ms).
+  const rec = log.find((x) => x.to === 'Recording');
+  const cool = log.find((x) => x.to === 'Cooldown');
+  if (rec === undefined || cool === undefined) throw new Error('the log has no Recording or Cooldown entry');
+  const skew = (cool.frame - rec.frame) / rate - (cool.t - rec.t) / 1000;
+  expect(Math.abs(skew), `log.frame vs t over Recording → Cooldown: skew ${skew} s`).toBeLessThan(0.05);
 
   // events: every reduced event with its payload, one per log entry.
   expect(events.map((x) => x.e.t)).toEqual(log.map((x) => x.event));
@@ -132,10 +138,11 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
   );
   expect(f0, `yinF0(outputSamples()) = ${f0} Hz`).toBeGreaterThanOrEqual(224 * 0.97);
   expect(f0, `yinF0(outputSamples()) = ${f0} Hz`).toBeLessThanOrEqual(224 * 1.03);
-  // …and all of it: the trimmed ring spans the vowel replayed at rate 1.6 (1.5 s / 1.6 = 0.9375 s) within 30 ms,
-  // so no block was lost or repeated, and it starts and ends on sound (the silence around it was trimmed).
+  // …and all of it: the trimmed ring spans the vowel replayed at rate 1.6 (1.5 s / 1.6 = 0.9375 s) within 15 ms,
+  // so no block (1024 frames, 21–23 ms) was lost or repeated, not even at either end of the sound, and it starts
+  // and ends on sound (the silence around it was trimmed at 1e-4).
   expect(SPEECH_SEC).toBe(1.5);
-  expect(Math.abs(seconds - SPEECH_SEC / 1.6), `output tap: ${seconds} s`).toBeLessThanOrEqual(0.03);
+  expect(Math.abs(seconds - SPEECH_SEC / 1.6), `output tap: ${seconds} s`).toBeLessThanOrEqual(0.015);
   expect(Math.abs(samples[0] ?? 0)).toBeGreaterThan(1e-4);
   expect(Math.abs(samples.at(-1) ?? 0)).toBeGreaterThan(1e-4);
 
@@ -143,6 +150,22 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
   // context a second time without a second output tap (the hooks insert it on the first ctxRunning only).
   await page.evaluate(() => (window as unknown as HookWindow).__bearTest?.setVisibility('hidden'));
   await expect.poll(() => state(page)).toBe('Paused');
+  // maxLevelDb covers exactly the last sinceMs: Paused posts no level events, so 1.5 s later the last second has
+  // none, the last 3 s still reach back into Listening, and the vowel is within the last minute.
+  await page.waitForTimeout(1500);
+  const levels = await page.evaluate(() => {
+    const h = (window as unknown as HookWindow).__bearTest;
+    if (h === undefined) throw new Error('window.__bearTest is missing');
+    return [h.maxLevelDb(1000), h.maxLevelDb(3000), h.maxLevelDb(60_000)];
+  });
+  console.log(
+    `hooks: log.frame skew ${skew.toFixed(4)} s over Recording → Cooldown; maxLevelDb(1000/3000/60000) 1.5 s into Paused = ${levels.join(' / ')} dB`,
+  );
+  expect(levels[0], `maxLevelDb(1000/3000/60000) = ${levels.join(', ')}`).toBe(Number.NEGATIVE_INFINITY);
+  expect(levels[1], `maxLevelDb(1000/3000/60000) = ${levels.join(', ')}`).toBeGreaterThan(
+    Number.NEGATIVE_INFINITY,
+  );
+  expect(levels[2], `maxLevelDb(1000/3000/60000) = ${levels.join(', ')}`).toBeGreaterThan(-50);
   await page.evaluate(() => (window as unknown as HookWindow).__bearTest?.setVisibility('visible'));
   await expect.poll(() => state(page), { timeout: 10_000 }).toBe('Listening');
   const ctxRunnings = await page.evaluate(
