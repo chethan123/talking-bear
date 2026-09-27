@@ -11,7 +11,7 @@ import { page } from 'vitest/browser';
 import { POSES } from './poses.ts';
 import type { PoseName } from './poses.ts';
 import { PARTS } from '../art/bear-parts.gen.ts';
-import { Ch } from './pose.ts';
+import { Ch, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
 import { BG_BOTTOM, BG_TOP, createContext, fitView, render, resizeCanvas } from './renderer.ts';
 import type { View } from './renderer.ts';
@@ -235,13 +235,21 @@ describe('render allocates nothing per frame', () => {
     expect(frames).toBe(0);
 
     // Each frame leaves the context as it found it: every save() restored, globalAlpha back to 1.
+    // Every drawMouth branch runs: the gallery (shut, tongue only, tongue and teeth), plus an open mouth with
+    // neither tongue nor teeth, and teeth without a tongue.
+    const openOnly = createPose();
+    openOnly[Ch.Jaw] = 0.1;
+    const teethOnly = openOnly.slice();
+    teethOnly[Ch.Teeth] = 0.6;
+    const cases: (readonly [string, Pose])[] = NAMES.map((name) => [name, POSES[name]] as const);
+    cases.push(['open mouth, no tongue or teeth', openOnly], ['teeth, no tongue', teethOnly]);
     const counts = countSaves();
     try {
-      for (const name of NAMES) {
+      for (const [name, pose] of cases) {
         counts.saves = 0;
         counts.restores = 0;
         g.globalAlpha = 0.4;
-        render(g, rig, POSES[name], view);
+        render(g, rig, pose, view);
         expect(counts.saves, name).toBeGreaterThanOrEqual(2); // at least the two sclera clips
         expect(counts.restores, name).toBe(counts.saves);
         expect(g.globalAlpha, name).toBe(1);
