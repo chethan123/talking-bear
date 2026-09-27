@@ -112,3 +112,78 @@ export function integratedLoudness(x: Float32Array, fs: number): number {
   }
   return blockLoudness(sumRel / countRel);
 }
+
+// True-peak interpolation filter: ITU-R BS.1770-4, Annex 2, the table of polyphase FIR interpolating filter
+// coefficients (4× oversampling, 48 taps as 4 phases × 12 taps), copied value for value (Prettier drops the
+// printed trailing zeros). Every value is an exact multiple of 2^-13, and the table matches the independent
+// transcription in vsariola/sointu tracker/detector.go. Phase-major: TRUE_PEAK_FIR[p·12 + k] is tap k of
+// phase p.
+const TP_TAPS = 12;
+const TRUE_PEAK_FIR = new Float64Array([
+  // Phase 0
+  0.001708984375, 0.010986328125, -0.0196533203125, 0.033203125, -0.0594482421875, 0.1373291015625,
+  0.97216796875, -0.102294921875, 0.047607421875, -0.026611328125, 0.014892578125, -0.00830078125,
+  // Phase 1
+  -0.0291748046875, 0.029296875, -0.0517578125, 0.089111328125, -0.16650390625, 0.465087890625, 0.77978515625,
+  -0.2003173828125, 0.1015625, -0.0582275390625, 0.0330810546875, -0.0189208984375,
+  // Phase 2
+  -0.0189208984375, 0.0330810546875, -0.0582275390625, 0.1015625, -0.2003173828125, 0.77978515625,
+  0.465087890625, -0.16650390625, 0.089111328125, -0.0517578125, 0.029296875, -0.0291748046875,
+  // Phase 3
+  -0.00830078125, 0.014892578125, -0.026611328125, 0.047607421875, -0.102294921875, 0.97216796875,
+  0.1373291015625, -0.0594482421875, 0.033203125, -0.0196533203125, 0.010986328125, 0.001708984375,
+]);
+
+/**
+ * True peak of x in dBTP (ITU-R BS.1770-4 Annex 2): 4× oversampling with the 48-tap interpolation FIR, run
+ * as 4 polyphase branches of 12 taps, y_p[m] = Σ_k h_p[k]·x[m−k]; returns 20·log10(max |y| over all phases).
+ * The whole zero-extended convolution is scanned (m = 0 … n + 10), including the filter's drain after the
+ * last sample, because the clip plays followed by silence. Returns -Infinity for silent or empty input.
+ * Does not allocate.
+ */
+export function truePeakDbtp(x: Float32Array): number {
+  const n = x.length;
+  const f = TRUE_PEAK_FIR;
+  let peak = 0;
+  for (let m = 0; m < n + TP_TAPS - 1; m++) {
+    const kLo = m >= n ? m - n + 1 : 0;
+    const kHi = m < TP_TAPS - 1 ? m : TP_TAPS - 1;
+    let y0 = 0;
+    let y1 = 0;
+    let y2 = 0;
+    let y3 = 0;
+    for (let k = kLo; k <= kHi; k++) {
+      const v = x[m - k]!;
+      y0 += f[k]! * v;
+      y1 += f[TP_TAPS + k]! * v;
+      y2 += f[2 * TP_TAPS + k]! * v;
+      y3 += f[3 * TP_TAPS + k]! * v;
+    }
+    const a = Math.max(Math.abs(y0), Math.abs(y1), Math.abs(y2), Math.abs(y3));
+    if (a > peak) peak = a;
+  }
+  return 20 * Math.log10(peak);
+}
+
+/**
+ * Gain in dB to apply to a processed voice clip (plan §4.3.4):
+ * - loudGain = voiced ? min(target − L, maxMakeupDb) : min(0, target − L), with L = integratedLoudness(x, fs),
+ *   and loudGain = 0 when L is -Infinity (silence);
+ * - ceilGain = ceilingDbtp − truePeakDbtp(x) (+Infinity for silence);
+ * - returns min(loudGain, ceilGain): loud input is only ever attenuated, unvoiced input is never amplified,
+ *   the make-up gain is capped, and the result is finite for finite input.
+ */
+export function voiceGainDb(
+  x: Float32Array,
+  fs: number,
+  voiced: boolean,
+  o: LoudnessOpts = LOUDNESS,
+): number {
+  const l = integratedLoudness(x, fs);
+  let loudGain = 0;
+  if (l !== -Infinity) {
+    loudGain = voiced ? Math.min(o.targetLufs - l, o.maxMakeupDb) : Math.min(0, o.targetLufs - l);
+  }
+  const ceilGain = o.ceilingDbtp - truePeakDbtp(x);
+  return Math.min(loudGain, ceilGain);
+}

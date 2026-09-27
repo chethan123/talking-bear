@@ -1,7 +1,19 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { mulberry32, sine } from '../../test/dsp-helpers.ts';
+import { mulberry32, rmsDb, sine } from '../../test/dsp-helpers.ts';
+import { readWav } from '../../test/wav.ts';
 import type { BiquadCoefficients } from './biquad.ts';
-import { integratedLoudness, kWeighting, kWeightingCoefficients } from './normalize.ts';
+import {
+  integratedLoudness,
+  kWeighting,
+  kWeightingCoefficients,
+  LOUDNESS,
+  truePeakDbtp,
+  voiceGainDb,
+} from './normalize.ts';
+import { resampleOffline } from './resample.ts';
 
 // BS.1770-4 Table 1 / Table 2 coefficients at 48 kHz, as pinned by the issue.
 const PINNED_SHELF: BiquadCoefficients = {
@@ -151,5 +163,250 @@ describe('integratedLoudness', () => {
     const x = new Float32Array(100);
     for (const fs of [0, Number.NaN, 3000]) expect(() => integratedLoudness(x, fs)).toThrow(RangeError);
     expect(() => integratedLoudness(new Float32Array(0), 0)).toThrow(RangeError);
+  });
+});
+
+// ITU-R BS.1770-4 Annex 2 coefficient table, as printed: 12 rows (taps) × 4 columns (phases 0–3). This is a second,
+// independent transcription; read row by row it is the interleaved 48-tap filter h[4k + p].
+const ANNEX2_TABLE: readonly (readonly [number, number, number, number])[] = [
+  [0.001708984375, -0.0291748046875, -0.0189208984375, -0.00830078125],
+  [0.010986328125, 0.029296875, 0.0330810546875, 0.014892578125],
+  [-0.0196533203125, -0.0517578125, -0.0582275390625, -0.026611328125],
+  [0.033203125, 0.089111328125, 0.1015625, 0.047607421875],
+  [-0.0594482421875, -0.16650390625, -0.2003173828125, -0.102294921875],
+  [0.1373291015625, 0.465087890625, 0.77978515625, 0.97216796875],
+  [0.97216796875, 0.77978515625, 0.465087890625, 0.1373291015625],
+  [-0.102294921875, -0.2003173828125, -0.16650390625, -0.0594482421875],
+  [0.047607421875, 0.1015625, 0.089111328125, 0.033203125],
+  [-0.026611328125, -0.0582275390625, -0.0517578125, -0.0196533203125],
+  [0.014892578125, 0.0330810546875, 0.029296875, 0.010986328125],
+  [-0.00830078125, -0.0189208984375, -0.0291748046875, 0.001708984375],
+];
+const H48 = ANNEX2_TABLE.flat();
+
+/** Reference true peak: the 4× zero-stuffed x fully convolved with the 48-tap h, max |y| in dB. */
+function directTruePeakDb(x: Float32Array): number {
+  const v = new Float64Array(4 * x.length);
+  for (let i = 0; i < x.length; i++) v[4 * i] = x[i]!;
+  let peak = 0;
+  for (let j = 0; j < v.length + H48.length - 1; j++) {
+    let acc = 0;
+    for (let i = 0; i < H48.length; i++) {
+      const idx = j - i;
+      if (idx >= 0 && idx < v.length) acc += H48[i]! * v[idx]!;
+    }
+    peak = Math.max(peak, Math.abs(acc));
+  }
+  return 20 * Math.log10(peak);
+}
+
+const FS = 48000;
+const FADE_SAMPLES = 960;
+
+/** One 2nd-order Klatt resonator (unity gain at DC), as in scripts/gen-fixtures.ts. */
+function resonate(x: Float64Array, freq: number, bandwidth: number): Float64Array {
+  const C = -Math.exp((-2 * Math.PI * bandwidth) / FS);
+  const B = 2 * Math.exp((-Math.PI * bandwidth) / FS) * Math.cos((2 * Math.PI * freq) / FS);
+  const A = 1 - B - C;
+  const y = new Float64Array(x.length);
+  let y1 = 0;
+  let y2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const v = A * x[i]! + B * y1 + C * y2;
+    y[i] = v;
+    y2 = y1;
+    y1 = v;
+  }
+  return y;
+}
+
+function fadeIn(i: number): number {
+  return 0.5 * (1 - Math.cos((Math.PI * i) / FADE_SAMPLES));
+}
+
+/**
+ * The vowel_short_100ms-style synthetic vowel of scripts/gen-fixtures.ts (whose vowel() is not exported):
+ * a jittered impulse train at f0 through resonators F1 700/80, F2 1220/90, F3 2600/120 Hz, a 4 Hz syllabic
+ * envelope, 20 ms raised-cosine fades, peak-normalised to −12 dBFS; 48 kHz.
+ */
+function synthVowel(rng: () => number, f0: number, durationS: number): Float32Array {
+  const n = Math.round(durationS * FS);
+  const excitation = new Float64Array(n);
+  let pos = 0;
+  while (Math.round(pos) < n) {
+    excitation[Math.round(pos)] = 1;
+    pos += (FS / f0) * (1 + 0.01 * (2 * rng() - 1));
+  }
+  let y = resonate(excitation, 700, 80);
+  y = resonate(y, 1220, 90);
+  y = resonate(y, 2600, 120);
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    let gain = 0.5 * (1 - Math.cos((2 * Math.PI * 4 * i) / FS));
+    if (i < FADE_SAMPLES) gain *= fadeIn(i);
+    if (i >= n - FADE_SAMPLES) gain *= fadeIn(n - 1 - i);
+    y[i] = y[i]! * gain;
+    peak = Math.max(peak, Math.abs(y[i]!));
+  }
+  const g = 10 ** (-12 / 20) / peak;
+  return Float32Array.from(y, (v) => v * g);
+}
+
+/** x scaled so that its RMS is `db` dBFS. */
+function atRmsDb(x: Float32Array, db: number): Float32Array {
+  const g = 10 ** (db / 20) / Math.sqrt(meanSquare(x));
+  return Float32Array.from(x, (v) => v * g);
+}
+
+/** x multiplied by 10^(gainDb/20) into a new array. */
+function applyGain(x: Float32Array, gainDb: number): Float32Array {
+  const g = 10 ** (gainDb / 20);
+  return Float32Array.from(x, (v) => v * g);
+}
+
+describe('truePeakDbtp', () => {
+  it('the Annex 2 table: 48 taps, every value a multiple of 2^-13, symmetric', () => {
+    expect(H48.length).toBe(48);
+    for (const v of H48) expect(Number.isInteger(v * 8192)).toBe(true);
+    for (let i = 0; i < 48; i++) expect(H48[i]).toBe(H48[47 - i]);
+  });
+
+  it('polyphase result equals the direct zero-stuffed 48-tap convolution within 1e-9 dB', () => {
+    for (let seed = 1; seed <= 40; seed++) {
+      const x = noise(64, seed);
+      expect(Math.abs(truePeakDbtp(x) - directTruePeakDb(x))).toBeLessThanOrEqual(1e-9);
+    }
+    const x = noise(1000, 99);
+    expect(Math.abs(truePeakDbtp(x) - directTruePeakDb(x))).toBeLessThanOrEqual(1e-9);
+  });
+
+  it('6: inter-sample peak — 12 kHz sine at 48 kHz, amplitude 0.5, phase π/4 reads −6.02 ± 0.2 dBTP', () => {
+    const x = sine(12000, FS, 1, 0.5, Math.PI / 4);
+    let samplePeak = 0;
+    for (const v of x) samplePeak = Math.max(samplePeak, Math.abs(v));
+    expect(Math.abs(20 * Math.log10(samplePeak) - -9.03)).toBeLessThanOrEqual(0.01);
+    expect(Math.abs(truePeakDbtp(x) - -6.02)).toBeLessThanOrEqual(0.2);
+  });
+
+  it('scans the filter drain after the last sample and the onset before the first', () => {
+    const expected = 20 * Math.log10(0.97216796875);
+    const last = new Float32Array(100);
+    last[99] = 1;
+    expect(Math.abs(truePeakDbtp(last) - expected)).toBeLessThanOrEqual(1e-9);
+    const first = new Float32Array(100);
+    first[0] = 1;
+    expect(Math.abs(truePeakDbtp(first) - expected)).toBeLessThanOrEqual(1e-9);
+  });
+
+  it('full-scale 997 Hz sine reads 0 ± 0.2 dBTP; scaling by 0.25 lowers it by 12.041 dB', () => {
+    const x = sine(997, FS, 0.5, 1);
+    const tp = truePeakDbtp(x);
+    expect(Math.abs(tp)).toBeLessThanOrEqual(0.2);
+    const quarter = Float32Array.from(x, (v) => v * 0.25);
+    expect(Math.abs(truePeakDbtp(quarter) - (tp - 12.041))).toBeLessThanOrEqual(1e-3);
+  });
+
+  it('silence and empty input are −Infinity', () => {
+    expect(truePeakDbtp(new Float32Array(1000))).toBe(-Infinity);
+    expect(truePeakDbtp(new Float32Array(0))).toBe(-Infinity);
+  });
+});
+
+describe('voiceGainDb', () => {
+  it('3: short clip — a 150 ms "hi" at ratio 0.5 gets a finite gain within the caps', () => {
+    const v = synthVowel(mulberry32(0xbea2), 140, 0.15);
+    expect(v.length).toBe(7200);
+    const y = resampleOffline(v, 0.5);
+    expect(y.length).toBe(3600);
+    expect(y.length).toBeLessThan(0.4 * FS);
+    expect(Number.isFinite(integratedLoudness(y, FS))).toBe(true);
+    const g = voiceGainDb(y, FS, true);
+    expect(Number.isFinite(g)).toBe(true);
+    expect(g).toBeLessThanOrEqual(LOUDNESS.maxMakeupDb);
+    expect(g).toBeLessThanOrEqual(LOUDNESS.ceilingDbtp - truePeakDbtp(y) + 1e-12);
+  });
+
+  it('4: whisper vs normal — the make-up cap keeps the whisper quieter', () => {
+    const v = synthVowel(mulberry32(0xbea2), 140, 1.5);
+    const whisper = atRmsDb(v, -45);
+    const normal = atRmsDb(v, -25);
+    expect(Math.abs(rmsDb(whisper) - -45)).toBeLessThan(0.01);
+    const gw = voiceGainDb(whisper, FS, true);
+    const gn = voiceGainDb(normal, FS, true);
+    expect(gw).toBe(12);
+    const lw = integratedLoudness(applyGain(whisper, gw), FS);
+    const ln = integratedLoudness(applyGain(normal, gn), FS);
+    expect(lw).toBeLessThan(ln);
+    expect(Math.abs(ln - LOUDNESS.targetLufs)).toBeLessThanOrEqual(0.1);
+  });
+
+  it('5: unvoiced white noise at −40 dBFS is never amplified', () => {
+    const x = atRmsDb(noise(2 * FS, 5), -40);
+    const g = voiceGainDb(x, FS, false);
+    expect(g).toBeLessThanOrEqual(0);
+    expect(g).toBe(0);
+  });
+
+  it('loud unvoiced input is attenuated to the target', () => {
+    const x = atRmsDb(noise(2 * FS, 6), -10);
+    const l = integratedLoudness(x, FS);
+    const g = voiceGainDb(x, FS, false);
+    expect(g).toBeLessThan(0);
+    expect(g).toBe(Math.min(Math.min(0, -20 - l), -3 - truePeakDbtp(x)));
+  });
+
+  it('loud voiced input is only attenuated', () => {
+    const x = sine(997, FS, 2, 0.5);
+    const l = integratedLoudness(x, FS);
+    const g = voiceGainDb(x, FS, true);
+    expect(g).toBeLessThan(0);
+    expect(g).toBe(Math.min(Math.min(-20 - l, 12), -3 - truePeakDbtp(x)));
+  });
+
+  it('the true-peak ceiling binds for a sparse click train', () => {
+    const x = new Float32Array(FS);
+    for (let i = 0; i < x.length; i += 4800) x[i] = 0.9;
+    const g = voiceGainDb(x, FS, true);
+    expect(g).toBe(-3 - truePeakDbtp(x));
+    expect(g).toBeLessThan(12);
+  });
+
+  it('silence and empty input get exactly 0 dB', () => {
+    for (const voiced of [true, false]) {
+      expect(voiceGainDb(new Float32Array(FS), FS, voiced)).toBe(0);
+      expect(voiceGainDb(new Float32Array(0), FS, voiced)).toBe(0);
+    }
+  });
+
+  it('respects custom options', () => {
+    const normal = atRmsDb(synthVowel(mulberry32(0xbea2), 140, 1.5), -25);
+    const o = { targetLufs: -30, maxMakeupDb: 6, ceilingDbtp: -1 };
+    const l = integratedLoudness(normal, FS);
+    const tp = truePeakDbtp(normal);
+    const g = voiceGainDb(normal, FS, true, o);
+    expect(g).toBe(Math.min(-30 - l, 6, -1 - tp));
+    expect(g).toBeLessThan(0);
+  });
+});
+
+describe('6: true-peak ceiling on every test/fixtures WAV', () => {
+  const dir = join(fileURLToPath(new URL('../../', import.meta.url)), 'test', 'fixtures');
+  const wavs = readdirSync(dir)
+    .filter((f) => f.endsWith('.wav'))
+    .toSorted();
+
+  it('finds the fixture WAVs', () => {
+    expect(wavs.length).toBeGreaterThanOrEqual(11);
+  });
+
+  it.each(wavs)('%s: true peak after voiceGainDb ≤ −3.0 dBTP + 0.05 (voiced and unvoiced)', (name) => {
+    const { sampleRate, channels } = readWav(readFileSync(join(dir, name)));
+    for (const ch of channels) {
+      for (const voiced of [true, false]) {
+        const g = voiceGainDb(ch, sampleRate, voiced);
+        expect(Number.isFinite(g)).toBe(true);
+        expect(truePeakDbtp(applyGain(ch, g))).toBeLessThanOrEqual(-3.0 + 0.05);
+      }
+    }
   });
 });
