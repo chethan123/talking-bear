@@ -61,7 +61,8 @@ export interface Engine {
   disarm(epoch: number): void;
   /**
    * Cuts `[fromFrame, toFrame)` from the capture ring; emits `clipReady{epoch, id}` or `takeFailed{epoch, id}`.
-   * Only the latest take is kept: a take superseded by a newer take() emits neither clipReady nor takeFailed.
+   * Only the latest take is kept: a take superseded by a newer take() never emits clipReady (a takeFailed from the
+   * worklet may still arrive for it).
    */
   take(epoch: number, id: number, fromFrame: number, toFrame: number): void;
   process(id: number, preset: VoicePreset): void;
@@ -70,7 +71,8 @@ export interface Engine {
   ): { pcm: Float32Array; sampleRate: number; envelope: Envelope; durationSec: number } | undefined;
   /**
    * The assembled clip of the latest completed take, if (epoch, id) matches it. Used by lab pages; process()
-   * transfers it away. A take superseded by a newer take() never completes (no clipReady, no takeFailed).
+   * transfers it away. A take superseded by a newer take() never completes: no clipReady (a takeFailed from the
+   * worklet may still arrive for it).
    */
   getClip(epoch: number, id: number): Float32Array | undefined;
   restartWorker(): void;
@@ -233,7 +235,10 @@ export function createEngine(opts: {
       }
       case 'error':
         if (m.where === 'fx') {
-          if (lastProcessId !== null) emit({ t: 'fxError', id: lastProcessId });
+          if (lastProcessId !== null) {
+            processRates.delete(lastProcessId);
+            emit({ t: 'fxError', id: lastProcessId });
+          }
         } else {
           emit({ t: 'vadError', message: m.message });
         }
@@ -244,6 +249,7 @@ export function createEngine(opts: {
   }
 
   function onWorkerFailure(): void {
+    if (workerDead) return; // one failure per worker: error and messageerror may both fire
     workerDead = true;
     emit({ t: 'workerFailed' });
   }
@@ -269,6 +275,7 @@ export function createEngine(opts: {
 
   /** Terminates the worker; its listeners go first, so nothing it still has queued is forwarded. */
   function stopWorker(): void {
+    workerDead = false; // the failure, if any, belonged to the worker being stopped
     const w = worker;
     if (w === null) return;
     w.removeEventListener('message', onWorkerMessage);
@@ -325,8 +332,9 @@ export function createEngine(opts: {
     try {
       connectSource();
     } catch {
+      const req = grantedReq; // closeMicStream() clears it
       closeMicStream();
-      if (grantedReq !== null) emit({ t: 'noDevice', req: grantedReq });
+      if (req !== null) emit({ t: 'noDevice', req });
     }
     return c;
   }
@@ -355,7 +363,12 @@ export function createEngine(opts: {
       emit({ t: 'ctxResumeFailed' });
       return;
     }
-    if (!wantRunning) return; // a suspend() raced this resume: no ctxRunning for a suspended context
+    if (!wantRunning) {
+      // A suspend() raced this resume: no ctxRunning, and the context ends suspended (Chrome can finish the
+      // pending resume after a suspend() issued while it was pending).
+      await c.suspend().catch(() => undefined);
+      return;
+    }
     emit({ t: 'ctxRunning', sampleRate: c.sampleRate });
   }
 
@@ -475,6 +488,8 @@ export function createEngine(opts: {
       closeMicStream();
       asm = null;
       clip = null;
+      processed = null; // no captured audio outlives the mic
+      processRates.clear(); // so a late processed reply can't bring it back
     },
     arm(epoch: number, restoreFloorDb?: number): void {
       // Epochs come from the reducer's integer counter. The worker's reset goes out before the worklet's arm.

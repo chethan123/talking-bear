@@ -1,23 +1,32 @@
 // The engine in a real Chromium (Vitest Browser Mode): real AudioContext, capture worklet (loaded from the Vite
 // dev server), DSP worker and the fake microphone (--use-fake-device-for-media-stream: a 400 Hz beep every
-// 500 ms). One engine is shared by the tests below, which run in order.
+// 500 ms). One engine is shared by tests 1–15, which run in order; tests 16–18 use fresh engines.
 //
-// Test-only patches on this page, installed before the engine exists and removed in afterAll: `Worker` records
-// every instance and terminate() call, `getUserMedia` records constraints and streams, and `enumerateDevices`
-// can return a scripted list. The engine itself has no test hooks.
+// Test-only patches on this page, installed before the engines exist and removed in afterAll: `Worker` records
+// every instance and terminate() call (and can be told to fail its next construction), `getUserMedia` records
+// constraints and streams, and `enumerateDevices` can return a scripted list. Some tests also wrap a prototype
+// method for the duration of one call (patchMethod). The engine itself has no test hooks.
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { PRESETS } from '../dsp/types.ts';
+import { CHUNK_MAX } from './constants.ts';
 import { createEngine, type Engine, type EngineEvent } from './engine.ts';
 import { CONSTRAINTS } from './mic.ts';
 
 const OriginalWorker = globalThis.Worker;
 const workers: RecordingWorker[] = [];
+/** When set, the next `new Worker` throws (the real worker it had to create first is terminated). */
+let failNextWorker = false;
 
 class RecordingWorker extends OriginalWorker {
   terminated = false;
   constructor(url: string | URL, options?: WorkerOptions) {
     super(url, options);
+    if (failNextWorker) {
+      failNextWorker = false;
+      super.terminate();
+      throw new DOMException('test: worker creation failed', 'SecurityError');
+    }
     workers.push(this);
   }
   override terminate(): void {
@@ -36,54 +45,114 @@ let scriptedDevices: MediaDeviceInfo[] | null = null;
 
 type EventOf<T extends EngineEvent['t']> = Extract<EngineEvent, { t: T }>;
 
-const log: EngineEvent[] = [];
-const waiters = new Set<() => void>();
-
-function onEvent(e: EngineEvent): void {
-  log.push(e);
-  for (const wake of waiters) wake(); // a waiter removes itself; deleting during Set iteration is safe
-}
-
 function isType<T extends EngineEvent['t']>(e: EngineEvent, t: T): e is EventOf<T> {
   return e.t === t;
 }
 
-/** Event types seen from `from` on, with counts (level events are frequent). */
-function seen(from: number): string {
-  const counts = new Map<string, number>();
-  for (const e of log.slice(from)) counts.set(e.t, (counts.get(e.t) ?? 0) + 1);
-  return [...counts].map(([t, n]) => `${t}×${n}`).join(', ') || 'nothing';
-}
+/** An engine's event log, with waiting helpers. */
+function createRecorder(): {
+  log: EngineEvent[];
+  onEvent: (e: EngineEvent) => void;
+  waitFor: <T extends EngineEvent['t']>(
+    t: T,
+    from: number,
+    ms: number,
+    pred?: (e: EventOf<T>) => boolean,
+  ) => Promise<{ event: EventOf<T>; index: number }>;
+  count: (t: EngineEvent['t'], from: number) => number;
+} {
+  const log: EngineEvent[] = [];
+  const waiters = new Set<() => void>();
 
-function count(t: EngineEvent['t'], from: number): number {
-  return log.slice(from).filter((e) => e.t === t).length;
-}
-
-/** The first event of type `t` at index ≥ `from` that satisfies `pred`, waiting up to `ms`. */
-async function waitFor<T extends EngineEvent['t']>(
-  t: T,
-  from: number,
-  ms: number,
-  pred: (e: EventOf<T>) => boolean = () => true,
-): Promise<{ event: EventOf<T>; index: number }> {
-  const deadline = performance.now() + ms;
-  for (;;) {
-    for (let i = from; i < log.length; i++) {
-      const e = log[i];
-      if (e !== undefined && isType(e, t) && pred(e)) return { event: e, index: i };
-    }
-    const left = deadline - performance.now();
-    if (left <= 0) throw new Error(`no matching ${t} within ${ms} ms; saw ${seen(from)}`);
-    await new Promise<void>((resolve) => {
-      const done = (): void => {
-        waiters.delete(done);
-        clearTimeout(timer);
-        resolve();
-      };
-      const timer = setTimeout(done, left);
-      waiters.add(done);
-    });
+  /** Event types seen from `from` on, with counts (level events are frequent). */
+  function seen(from: number): string {
+    const counts = new Map<string, number>();
+    for (const e of log.slice(from)) counts.set(e.t, (counts.get(e.t) ?? 0) + 1);
+    return [...counts].map(([t, n]) => `${t}×${n}`).join(', ') || 'nothing';
   }
+
+  /** The first event of type `t` at index ≥ `from` that satisfies `pred`, waiting up to `ms`. */
+  async function waitFor<T extends EngineEvent['t']>(
+    t: T,
+    from: number,
+    ms: number,
+    pred: (e: EventOf<T>) => boolean = () => true,
+  ): Promise<{ event: EventOf<T>; index: number }> {
+    const deadline = performance.now() + ms;
+    for (;;) {
+      for (let i = from; i < log.length; i++) {
+        const e = log[i];
+        if (e !== undefined && isType(e, t) && pred(e)) return { event: e, index: i };
+      }
+      const left = deadline - performance.now();
+      if (left <= 0) throw new Error(`no matching ${t} within ${ms} ms; saw ${seen(from)}`);
+      await new Promise<void>((resolve) => {
+        const done = (): void => {
+          waiters.delete(done);
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(done, left);
+        waiters.add(done);
+      });
+    }
+  }
+
+  return {
+    log,
+    onEvent: (e) => {
+      log.push(e);
+      for (const wake of waiters) wake(); // a waiter removes itself; deleting during Set iteration is safe
+    },
+    waitFor,
+    count: (t, from) => log.slice(from).filter((e) => e.t === t).length,
+  };
+}
+
+type Call = (self: unknown, args: unknown[]) => unknown;
+
+/** Replaces the own method `key` of `target` with `wrap(original)`; returns the function that restores it. */
+function patchMethod(target: object, key: string, wrap: (original: Call) => Call): () => void {
+  const desc = Object.getOwnPropertyDescriptor(target, key);
+  const original: unknown = desc?.value;
+  if (desc === undefined || typeof original !== 'function') throw new Error(`${key} is not an own method`);
+  const call: Call = (self, args) => Reflect.apply(original, self, args);
+  const replacement = wrap(call);
+  Object.defineProperty(target, key, {
+    ...desc,
+    value: function (this: unknown, ...args: unknown[]): unknown {
+      return replacement(this, args);
+    },
+  });
+  return () => {
+    Object.defineProperty(target, key, desc);
+  };
+}
+
+/** The `t` of a posted message. */
+function messageType(msg: unknown): string {
+  return typeof msg === 'object' && msg !== null && 't' in msg && typeof msg.t === 'string' ? msg.t : '?';
+}
+
+/** Records every Worker and MessagePort postMessage made while `run` executes, as `worker:<t>` / `port:<t>`. */
+function recordPosts(run: () => void): string[] {
+  const posts: string[] = [];
+  const record =
+    (where: string) =>
+    (original: Call): Call =>
+    (self, args) => {
+      posts.push(`${where}:${messageType(args[0])}`);
+      return original(self, args);
+    };
+  const restoreWorker = patchMethod(OriginalWorker.prototype, 'postMessage', record('worker'));
+  const restorePort = patchMethod(MessagePort.prototype, 'postMessage', record('port'));
+  try {
+    run();
+  } finally {
+    restorePort();
+    restoreWorker();
+  }
+  return posts;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -110,9 +179,33 @@ function lastWorker(): RecordingWorker {
   return w;
 }
 
+function withoutLevels(events: readonly EngineEvent[]): EngineEvent[] {
+  return events.filter((e) => e.t !== 'level');
+}
+
+const { log, onEvent, waitFor, count } = createRecorder();
 let engine: Engine;
+/** Engines of tests 16–18, closed in afterAll. */
+const freshEngines: Engine[] = [];
 let sr = 0;
 let armFrame = 0;
+
+function freshEngine(connectWorkletOutput = false): ReturnType<typeof createRecorder> & { engine: Engine } {
+  const rec = createRecorder();
+  const e = createEngine({ connectWorkletOutput, onEvent: rec.onEvent });
+  freshEngines.push(e);
+  return { ...rec, engine: e };
+}
+
+/** Fires devicechange with `devices` enumerated (null: the real list) and checks the inputsChanged count. */
+async function expectInputChanges(devices: MediaDeviceInfo[] | null, changes: 0 | 1): Promise<void> {
+  scriptedDevices = devices;
+  const from = log.length;
+  fireDeviceChange();
+  if (changes === 1) await waitFor('inputsChanged', from, 2000);
+  await sleep(changes === 1 ? 100 : 200);
+  expect(count('inputsChanged', from)).toBe(changes);
+}
 
 beforeAll(() => {
   globalThis.Worker = RecordingWorker;
@@ -128,10 +221,12 @@ beforeAll(() => {
 });
 
 afterAll(async () => {
-  engine.closeMic();
+  for (const e of [engine, ...freshEngines]) {
+    e.closeMic();
+    await e.context()?.close();
+  }
   for (const w of workers) w.terminate();
   globalThis.Worker = OriginalWorker;
-  await engine.context()?.close();
   Reflect.deleteProperty(md, 'getUserMedia');
   Reflect.deleteProperty(md, 'enumerateDevices');
 });
@@ -162,10 +257,13 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(log[index + 1]).toStrictEqual({ t: track.muted ? 'trackMuted' : 'trackUnmuted' });
   }, 10_000);
 
-  test('3: arm(1) emits armed{1, …}, and level events arrive within 1500 ms', async () => {
+  test('3: arm(1) posts reset to the worker before arm to the worklet, emits armed{1, …}, and level events arrive within 1500 ms', async () => {
     const from = log.length;
     const t0 = performance.now();
-    engine.arm(1);
+    const posts = recordPosts(() => {
+      engine.arm(1);
+    });
+    expect(posts).toStrictEqual(['worker:reset', 'port:arm']);
     const armed = await waitFor('armed', from, 1500, (e) => e.epoch === 1);
     expect(Number.isSafeInteger(armed.event.armFrame)).toBe(true);
     armFrame = armed.event.armFrame;
@@ -209,40 +307,76 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(log.slice(before)).toStrictEqual([{ t: 'fxError', id: 99 }]);
   }, 10_000);
 
-  test('7: devicechange emits inputsChanged only when the set of audio input ids changes', async () => {
-    const real = await realEnumerateDevices();
+  test('7: take() with a non-safe-integer argument fails synchronously and posts nothing', () => {
+    const cases: [number, number, number, number][] = [
+      [1, 1.5, 0, 10],
+      [Number.NaN, 3, 0, 10],
+      [1, 3, 0.5, 10],
+      [1, 3, 0, Number.POSITIVE_INFINITY],
+      [1, 3, 0, 2 ** 53],
+    ];
+    for (const [epoch, id, fromFrame, toFrame] of cases) {
+      const from = log.length;
+      const posts = recordPosts(() => {
+        engine.take(epoch, id, fromFrame, toFrame);
+      });
+      expect(posts, `take(${epoch}, ${id}, ${fromFrame}, ${toFrame})`).toStrictEqual([]);
+      expect(log.slice(from)).toStrictEqual([{ t: 'takeFailed', epoch, id }]);
+    }
+  });
 
-    // Another kind, and an audio input without an id: the set of input ids is unchanged.
-    scriptedDevices = [...real, deviceInfo('videoinput', 'extra-camera'), deviceInfo('audioinput', '')];
+  test('8: a take longer than CHUNK_MAX is assembled from its chunks in seq order', async () => {
+    const n = Math.round(1.5 * sr);
+    expect(n).toBeGreaterThan(CHUNK_MAX); // two chunks
     let from = log.length;
-    fireDeviceChange();
-    await sleep(200);
-    expect(count('inputsChanged', from)).toBe(0);
+    engine.take(1, 10, armFrame, armFrame + n);
+    await waitFor('clipReady', from, 5000, (e) => e.epoch === 1 && e.id === 10);
+    const big = engine.getClip(1, 10);
+    if (big === undefined) throw new Error('no clip for take 10');
+    expect(big.length).toBe(n);
+    // The same frames again, starting inside the first chunk: a one-chunk take that must match the tail.
+    const offset = 50_000;
+    from = log.length;
+    engine.take(1, 11, armFrame + offset, armFrame + n);
+    await waitFor('clipReady', from, 3000, (e) => e.epoch === 1 && e.id === 11);
+    const tail = engine.getClip(1, 11);
+    if (tail === undefined) throw new Error('no clip for take 11');
+    expect(tail.length).toBe(n - offset);
+    expect(Array.from(big.subarray(offset))).toStrictEqual(Array.from(tail));
+    expect(engine.getClip(1, 10)).toBeUndefined();
+  }, 15_000);
 
+  test("9: the worker's error{fx} becomes fxError{the last process id}, and error{vad} becomes vadError", () => {
+    engine.process(42, PRESETS.cub); // no clip with id 42: an early fxError{42}, and 42 is the last process id
+    expect(engine.getClip(1, 11)).toBeDefined(); // a mismatched process() leaves the clip alone
+    const w = lastWorker();
+    const from = log.length;
+    w.dispatchEvent(new MessageEvent('message', { data: { t: 'error', where: 'fx', message: 'x' } }));
+    w.dispatchEvent(new MessageEvent('message', { data: { t: 'error', where: 'vad', message: 'y' } }));
+    expect(withoutLevels(log.slice(from))).toStrictEqual([
+      { t: 'fxError', id: 42 },
+      { t: 'vadError', message: 'y' },
+    ]);
+  });
+
+  test('10: devicechange emits inputsChanged only when the set of audio input ids changes', async () => {
+    const real = await realEnumerateDevices();
+    // Another kind, and an audio input without an id: the set of input ids is unchanged.
+    await expectInputChanges(
+      [...real, deviceInfo('videoinput', 'extra-camera'), deviceInfo('audioinput', '')],
+      0,
+    );
     // A new input id.
-    scriptedDevices = [...real, deviceInfo('audioinput', 'extra-usb-mic')];
-    from = log.length;
-    fireDeviceChange();
-    await waitFor('inputsChanged', from, 2000);
-    await sleep(100);
-    expect(count('inputsChanged', from)).toBe(1);
-
+    await expectInputChanges([...real, deviceInfo('audioinput', 'usb-a')], 1);
     // The same list again: nothing.
-    from = log.length;
-    fireDeviceChange();
-    await sleep(200);
-    expect(count('inputsChanged', from)).toBe(0);
-
+    await expectInputChanges([...real, deviceInfo('audioinput', 'usb-a')], 0);
+    // A different id in its place: same size, different set (plan §4.5: never compare by count or position).
+    await expectInputChanges([...real, deviceInfo('audioinput', 'usb-b')], 1);
     // Back to the real list: one change.
-    scriptedDevices = null;
-    from = log.length;
-    fireDeviceChange();
-    await waitFor('inputsChanged', from, 2000);
-    await sleep(100);
-    expect(count('inputsChanged', from)).toBe(1);
+    await expectInputChanges(null, 1);
   }, 10_000);
 
-  test("8: the context's error event emits ctxError", () => {
+  test("11: the context's error event emits ctxError", () => {
     const ctx = engine.context();
     if (ctx === null) throw new Error('no context');
     const from = log.length;
@@ -250,20 +384,28 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(log.slice(from)).toStrictEqual([{ t: 'ctxError' }]);
   });
 
-  test('9: closeMic() leaves every track ended', () => {
+  test('12: closeMic() ends every track and drops the clip and the processed audio', () => {
+    expect(engine.getClip(1, 11)).toBeDefined();
+    expect(engine.getProcessed(2)).toBeDefined();
     engine.closeMic();
     expect(streams.length).toBeGreaterThan(0);
     for (const s of streams) for (const t of s.getTracks()) expect(t.readyState).toBe('ended');
-    for (const bad of ['ctxResumeFailed', 'workerFailed', 'vadError'] as const) {
-      expect(count(bad, 0), `${bad} during tests 1–9`).toBe(0);
+    expect(engine.getClip(1, 11)).toBeUndefined();
+    expect(engine.getProcessed(2)).toBeUndefined();
+    for (const bad of ['ctxResumeFailed', 'workerFailed'] as const) {
+      expect(count(bad, 0), `${bad} during tests 1–12`).toBe(0);
     }
+    expect(withoutLevels(log).filter((e) => e.t === 'vadError')).toStrictEqual([
+      { t: 'vadError', message: 'y' },
+    ]);
   });
 
-  test('10: after restartWorker() + arm(2), level events with epoch 2 arrive', async () => {
+  test('13: after restartWorker() + arm(2), level events with epoch 2 arrive', async () => {
     const old = lastWorker();
+    const workerCount = workers.length;
     const from = log.length;
     engine.restartWorker();
-    expect(workers).toHaveLength(2);
+    expect(workers).toHaveLength(workerCount + 1);
     expect(old.terminated).toBe(true);
     engine.arm(2);
     await waitFor('armed', from, 3000, (e) => e.epoch === 2);
@@ -272,43 +414,141 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(levels.every((e) => isType(e, 'level') && e.epoch === 2)).toBe(true);
   }, 10_000);
 
-  test('11: resume() recreates the worker after it failed (T17 D25), and only then', async () => {
+  test('14: a failed worker reports once, and resume() recreates it (T17 D25), and only then', async () => {
+    // error and messageerror from the same worker: one workerFailed.
     const failed = lastWorker();
-    const workerCount = workers.length;
+    let workerCount = workers.length;
     let from = log.length;
     failed.dispatchEvent(new Event('error'));
+    failed.dispatchEvent(new MessageEvent('messageerror'));
     expect(log.slice(from)).toStrictEqual([{ t: 'workerFailed' }]);
 
+    // The recreation itself fails: that is a new failure, reported, and resume() still runs the context.
+    failNextWorker = true;
+    from = log.length;
+    await engine.resume();
+    expect(failed.terminated).toBe(true);
+    expect(workers).toHaveLength(workerCount);
+    expect(withoutLevels(log.slice(from))).toStrictEqual([
+      { t: 'workerFailed' },
+      { t: 'ctxRunning', sampleRate: sr },
+    ]);
+
+    // The next resume() recreates it, and the new worker serves the next epoch.
     await engine.resume();
     expect(workers).toHaveLength(workerCount + 1);
-    expect(failed.terminated).toBe(true);
-    await waitFor('ctxRunning', from, 1000);
     from = log.length;
     engine.arm(3);
     await waitFor('level', from, 3000, (e) => e.epoch === 3);
 
     // No failure since: resume() keeps the worker.
+    workerCount = workers.length;
     await engine.resume();
-    expect(workers).toHaveLength(workerCount + 1);
+    expect(workers).toHaveLength(workerCount);
 
-    // messageerror counts as a failure too.
+    // messageerror alone counts as a failure too.
     const failedAgain = lastWorker();
     from = log.length;
     failedAgain.dispatchEvent(new MessageEvent('messageerror'));
     expect(log.slice(from)).toStrictEqual([{ t: 'workerFailed' }]);
     await engine.resume();
-    expect(workers).toHaveLength(workerCount + 2);
+    expect(workers).toHaveLength(workerCount + 1);
     expect(failedAgain.terminated).toBe(true);
-  }, 10_000);
 
-  test('12: suspend() suspends the context; resume() runs it again and emits ctxRunning', async () => {
+    // restartWorker() on a healthy worker whose replacement can't be created reports it.
+    failNextWorker = true;
+    workerCount = workers.length;
+    from = log.length;
+    engine.restartWorker();
+    expect(log.slice(from)).toStrictEqual([{ t: 'workerFailed' }]);
+    expect(workers).toHaveLength(workerCount);
+    await engine.resume();
+    expect(workers).toHaveLength(workerCount + 1);
+  }, 15_000);
+
+  test('15: suspend() and resume(); a suspend() while ctx.resume() is pending wins, with no ctxRunning', async () => {
     const ctx = engine.context();
     if (ctx === null) throw new Error('no context');
     await engine.suspend();
     expect(ctx.state).toBe('suspended');
-    const from = log.length;
+    let from = log.length;
     await engine.resume();
     expect(ctx.state).toBe('running');
     expect(log.slice(from)).toContainEqual({ t: 'ctxRunning', sampleRate: sr });
+
+    await engine.suspend();
+    const resumeContext = ctx.resume.bind(ctx);
+    ctx.resume = (): Promise<void> => {
+      const running = resumeContext();
+      void engine.suspend(); // lands while the engine awaits ctx.resume()
+      return running;
+    };
+    from = log.length;
+    try {
+      await engine.resume();
+    } finally {
+      Reflect.deleteProperty(ctx, 'resume');
+    }
+    await sleep(100);
+    expect(count('ctxRunning', from)).toBe(0);
+    expect(ctx.state).toBe('suspended');
+  }, 10_000);
+
+  test('16: the worklet output reaches destination only with connectWorkletOutput (plan §3.2)', async () => {
+    const edges: boolean[] = [];
+    const restore = patchMethod(AudioNode.prototype, 'connect', (original) => (self, args) => {
+      if (self instanceof AudioWorkletNode) edges.push(args[0] === self.context.destination);
+      return original(self, args);
+    });
+    try {
+      await freshEngine(false).engine.resume();
+      expect(edges).toStrictEqual([]);
+      await freshEngine(true).engine.resume();
+      expect(edges).toStrictEqual([true]);
+    } finally {
+      restore();
+    }
+  }, 10_000);
+
+  test('17: a mic granted before the graph that then fails to connect gives noDevice{req}, and the mic is closed', async () => {
+    const b = freshEngine();
+    b.engine.openMic(7);
+    await b.waitFor('micGranted', 0, 5000, (e) => e.req === 7);
+    const stream = streams.at(-1);
+    const track = stream?.getAudioTracks()[0];
+    if (stream === undefined || track === undefined) throw new Error('no stream was recorded');
+    const restore = patchMethod(AudioContext.prototype, 'createMediaStreamSource', () => () => {
+      throw new DOMException('test: cannot connect', 'InvalidStateError');
+    });
+    try {
+      await b.engine.resume();
+    } finally {
+      restore();
+    }
+    expect(withoutLevels(b.log)).toStrictEqual([
+      { t: 'micGranted', req: 7 },
+      { t: track.muted ? 'trackMuted' : 'trackUnmuted' },
+      { t: 'noDevice', req: 7 },
+      { t: 'ctxRunning', sampleRate: sr },
+    ]);
+    for (const t of stream.getTracks()) expect(t.readyState).toBe('ended');
+  }, 10_000);
+
+  test('18: a processed reply that arrives after closeMic() is dropped', async () => {
+    const d = freshEngine();
+    await d.engine.resume();
+    d.engine.openMic(1);
+    await d.waitFor('micGranted', 0, 5000);
+    d.engine.arm(1);
+    const { event } = await d.waitFor('armed', 0, 3000, (e) => e.epoch === 1);
+    const n = Math.round(0.1 * sr);
+    d.engine.take(1, 2, event.armFrame, event.armFrame + n);
+    await d.waitFor('clipReady', 0, 3000, (e) => e.id === 2);
+    const from = d.log.length;
+    d.engine.process(2, PRESETS.cub);
+    d.engine.closeMic(); // before the worker's reply
+    await sleep(300);
+    expect(d.count('processed', from)).toBe(0);
+    expect(d.engine.getProcessed(2)).toBeUndefined();
   }, 10_000);
 });
