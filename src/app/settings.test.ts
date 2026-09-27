@@ -3,11 +3,13 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import { PRESETS, type VoicePreset } from '../dsp/types.ts';
 import {
+  createSettingsStore,
   CUSTOM_PITCH_MAX,
   CUSTOM_PITCH_MIN,
   DEFAULT_SETTINGS,
   parseSettings,
   presetFor,
+  SETTINGS_KEY,
   SLEEP_TIMEOUT_MAX_SEC,
   SLEEP_TIMEOUT_MIN_SEC,
   type Settings,
@@ -30,6 +32,31 @@ function expectValid(s: Settings): void {
     expect(typeof s[k]).toBe('boolean');
   }
 }
+
+/** A Map-backed `getItem`/`setItem` fake that counts calls and can be told to throw. */
+function fakeStorage(init: Record<string, string> = {}) {
+  const data = new Map(Object.entries(init));
+  const calls = { getItem: 0, setItem: 0 };
+  const fail = { getItem: false, setItem: false };
+  return {
+    data,
+    calls,
+    fail,
+    getItem(k: string): string | null {
+      calls.getItem++;
+      if (fail.getItem) throw new DOMException('blocked', 'SecurityError');
+      return data.get(k) ?? null;
+    },
+    setItem(k: string, v: string): void {
+      calls.setItem++;
+      if (fail.setItem) throw new DOMException('full', 'QuotaExceededError');
+      data.set(k, v);
+    },
+  };
+}
+
+/** A deliberately invalid patch (a `Record<string, unknown>` is assignable to `Partial<Settings>`). */
+const invalid = (patch: Record<string, unknown>): Partial<Settings> => patch;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -56,6 +83,7 @@ describe('DEFAULT_SETTINGS', () => {
 
   it('types: voice is exactly the VoicePreset ids', () => {
     expectTypeOf<Settings['voice']>().toEqualTypeOf<VoicePreset['id']>();
+    expectTypeOf(createSettingsStore).parameter(1).toEqualTypeOf<string | undefined>();
   });
 });
 
@@ -264,5 +292,336 @@ describe('parseSettings', () => {
       }),
       { numRuns: 300 },
     );
+  });
+});
+
+describe('createSettingsStore: loading', () => {
+  it('starts with the defaults when nothing is stored, and loading never writes', () => {
+    const st = fakeStorage();
+    const store = createSettingsStore(st);
+    expect(store.get()).toStrictEqual(DEFAULT_SETTINGS);
+    expect(st.calls).toEqual({ getItem: 1, setItem: 0 });
+  });
+
+  it('works with storage = null', () => {
+    const store = createSettingsStore(null);
+    expect(store.get()).toStrictEqual(DEFAULT_SETTINGS);
+    const seen: Settings[] = [];
+    store.subscribe((s) => seen.push(s));
+    store.set({ voice: 'chipmunk' });
+    expect(store.get().voice).toBe('chipmunk');
+    expect(seen).toEqual([store.get()]);
+  });
+
+  it('reads and validates what is stored under the default key', () => {
+    expect(SETTINGS_KEY).toBe('bear.settings.v1');
+    const st = fakeStorage({
+      [SETTINGS_KEY]: JSON.stringify({ voice: 'bigbear', customPitch: 9, quietMode: false, extra: 1 }),
+    });
+    const store = createSettingsStore(st);
+    expect(store.get()).toStrictEqual({
+      ...DEFAULT_SETTINGS,
+      voice: 'bigbear',
+      customPitch: 2.2,
+      quietMode: false,
+    });
+    expect(st.calls.setItem).toBe(0);
+  });
+
+  it('uses the given key', () => {
+    const st = fakeStorage({ other: '{"voice":"chipmunk"}', [SETTINGS_KEY]: '{"voice":"bigbear"}' });
+    const store = createSettingsStore(st, 'other');
+    expect(store.get().voice).toBe('chipmunk');
+    store.set({ haptics: false });
+    expect(JSON.parse(st.data.get('other') ?? 'null')).toMatchObject({ voice: 'chipmunk', haptics: false });
+    expect(st.data.get(SETTINGS_KEY)).toBe('{"voice":"bigbear"}');
+  });
+
+  it.each(['not json', '', '{"voice":', 'null', '"cub"', '[1,2]', '42'])(
+    'gives the defaults for stored %j, and still persists the next set',
+    (text) => {
+      const st = fakeStorage({ [SETTINGS_KEY]: text });
+      const store = createSettingsStore(st);
+      expect(store.get()).toStrictEqual(DEFAULT_SETTINGS);
+      store.set({ voice: 'chipmunk' });
+      expect(st.calls.setItem).toBe(1);
+      expect(JSON.parse(st.data.get(SETTINGS_KEY) ?? 'null')).toStrictEqual({
+        ...DEFAULT_SETTINGS,
+        voice: 'chipmunk',
+      });
+    },
+  );
+
+  it('returns a frozen snapshot', () => {
+    const store = createSettingsStore(fakeStorage());
+    expect(Object.isFrozen(store.get())).toBe(true);
+    expect(store.get()).toBe(store.get());
+    store.set({ quietMode: false });
+    expect(Object.isFrozen(store.get())).toBe(true);
+  });
+});
+
+describe('createSettingsStore: storage errors', () => {
+  it('getItem throws → defaults, in memory only (setItem never called), set and subscribe still work', () => {
+    const st = fakeStorage({ [SETTINGS_KEY]: '{"voice":"bigbear"}' });
+    st.fail.getItem = true;
+    let store: ReturnType<typeof createSettingsStore> | undefined;
+    expect(() => {
+      store = createSettingsStore(st);
+    }).not.toThrow();
+    if (!store) throw new Error('no store');
+    expect(store.get()).toStrictEqual(DEFAULT_SETTINGS);
+    const cb = vi.fn();
+    store.subscribe(cb);
+    store.set({ voice: 'chipmunk', quietMode: false });
+    expect(store.get()).toStrictEqual({ ...DEFAULT_SETTINGS, voice: 'chipmunk', quietMode: false });
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith(store.get());
+    expect(st.calls.setItem).toBe(0);
+    expect(st.data.get(SETTINGS_KEY)).toBe('{"voice":"bigbear"}');
+  });
+
+  it('setItem throws → set does not throw, updates memory and notifies; later sets stay in memory', () => {
+    const st = fakeStorage();
+    st.fail.setItem = true;
+    const store = createSettingsStore(st);
+    const cb = vi.fn();
+    store.subscribe(cb);
+    expect(() => store.set({ voice: 'bigbear' })).not.toThrow();
+    expect(store.get().voice).toBe('bigbear');
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenLastCalledWith(store.get());
+    expect(st.calls.setItem).toBe(1);
+
+    st.fail.setItem = false; // storage recovers, but the store has latched to in-memory
+    store.set({ haptics: false });
+    expect(store.get()).toMatchObject({ voice: 'bigbear', haptics: false });
+    expect(cb).toHaveBeenCalledTimes(2);
+    expect(st.calls.setItem).toBe(1);
+    expect(st.data.size).toBe(0);
+  });
+});
+
+describe('createSettingsStore: set', () => {
+  it('merges the patch and keeps the rest', () => {
+    const store = createSettingsStore(fakeStorage());
+    store.set({ voice: 'custom', customPitch: 1.9 });
+    store.set({ sleepTimeoutSec: 300 });
+    expect(store.get()).toStrictEqual({
+      ...DEFAULT_SETTINGS,
+      voice: 'custom',
+      customPitch: 1.9,
+      sleepTimeoutSec: 300,
+    });
+  });
+
+  it('validates through parseSettings: invalid values become defaults, numbers are clamped', () => {
+    const store = createSettingsStore(fakeStorage());
+    store.set({ voice: 'chipmunk', customPitch: 1.2, sleepTimeoutSec: 300, haptics: false });
+    store.set(invalid({ voice: 'x', customPitch: 99, sleepTimeoutSec: -5, haptics: 'no', extra: 1 }));
+    expect(store.get()).toStrictEqual({
+      ...DEFAULT_SETTINGS,
+      customPitch: CUSTOM_PITCH_MAX,
+      sleepTimeoutSec: SLEEP_TIMEOUT_MIN_SEC,
+    });
+    store.set({ customPitch: Number.NaN });
+    expect(store.get().customPitch).toBe(DEFAULT_SETTINGS.customPitch);
+  });
+
+  it('treats undefined patch values as absent', () => {
+    const store = createSettingsStore(fakeStorage());
+    store.set({ voice: 'bigbear', quietMode: false });
+    store.set({ voice: undefined, quietMode: undefined, haptics: false });
+    expect(store.get()).toMatchObject({ voice: 'bigbear', quietMode: false, haptics: false });
+  });
+
+  it('never throws on a hostile patch, and never runs its getters', () => {
+    const store = createSettingsStore(fakeStorage());
+    store.set({ voice: 'bigbear' });
+    const patch = Object.defineProperty({ haptics: false }, 'voice', {
+      enumerable: true,
+      get(): never {
+        throw new Error('boom');
+      },
+    });
+    expect(() => store.set(patch)).not.toThrow();
+    expect(store.get()).toStrictEqual({ ...DEFAULT_SETTINGS, voice: 'bigbear', haptics: false });
+  });
+
+  it('property: set(patch) is parseSettings({ ...before, ...defined keys of patch })', () => {
+    const value = fc.oneof(
+      fc.constant(undefined),
+      fc.anything(),
+      fc.double(),
+      fc.boolean(),
+      fc.constantFrom(...VOICES),
+    );
+    const patch = fc.dictionary(fc.constantFrom(...KEYS, 'junk'), value, { noNullPrototype: true });
+    fc.assert(
+      fc.property(fc.array(patch, { maxLength: 6 }), (patches) => {
+        const store = createSettingsStore(fakeStorage());
+        for (const p of patches) {
+          const before = store.get();
+          const defined = Object.fromEntries(Object.entries(p).filter(([, v]) => v !== undefined));
+          store.set(invalid(p));
+          expect(store.get()).toStrictEqual(parseSettings({ ...before, ...defined }));
+        }
+      }),
+      { numRuns: 300 },
+    );
+  });
+
+  it('persists the validated JSON with exactly the known keys, before notifying', () => {
+    const st = fakeStorage();
+    const store = createSettingsStore(st);
+    let storedWhenNotified: string | undefined;
+    store.subscribe(() => {
+      storedWhenNotified = st.data.get(SETTINGS_KEY);
+    });
+    store.set(invalid({ voice: 'chipmunk', junk: true }));
+    const stored = st.data.get(SETTINGS_KEY);
+    expect(stored).toBe(JSON.stringify(store.get()));
+    expect(storedWhenNotified).toBe(stored);
+    expect(JSON.parse(stored ?? 'null')).toStrictEqual(store.get()); // exactly the known keys
+  });
+
+  it('persists and notifies on every set, even without a change', () => {
+    const st = fakeStorage();
+    const store = createSettingsStore(st);
+    const cb = vi.fn();
+    store.subscribe(cb);
+    store.set({});
+    store.set({ voice: 'cub' });
+    expect(cb).toHaveBeenCalledTimes(2);
+    expect(st.calls.setItem).toBe(2);
+  });
+});
+
+describe('createSettingsStore: round trip', () => {
+  it('a second store on the same storage reads back what the first one set', () => {
+    const st = fakeStorage();
+    const a = createSettingsStore(st);
+    const want: Settings = {
+      voice: 'custom',
+      customPitch: 0.85,
+      quietMode: false,
+      gentleMode: true,
+      haptics: false,
+      noisyRoomNs: true,
+      sleepTimeoutSec: 450,
+    };
+    a.set(want);
+    expect(a.get()).toStrictEqual(want);
+    const b = createSettingsStore(st);
+    expect(b.get()).toStrictEqual(want);
+    expect(presetFor(b.get())).toStrictEqual({ id: 'custom', pitchRatio: 0.85 });
+  });
+
+  it('property: any sequence of patches round-trips', () => {
+    const patch = fc.record(
+      {
+        voice: fc.constantFrom(...VOICES),
+        customPitch: fc.double({ min: 0, max: 3, noNaN: true }),
+        quietMode: fc.boolean(),
+        gentleMode: fc.boolean(),
+        haptics: fc.boolean(),
+        noisyRoomNs: fc.boolean(),
+        sleepTimeoutSec: fc.double({ min: 0, max: 1000, noNaN: true }),
+      },
+      { requiredKeys: [] },
+    );
+    fc.assert(
+      fc.property(fc.array(patch, { maxLength: 8 }), (patches) => {
+        const st = fakeStorage();
+        const a = createSettingsStore(st);
+        for (const p of patches) a.set(p);
+        expectValid(a.get());
+        expect(createSettingsStore(st).get()).toStrictEqual(a.get());
+      }),
+      { numRuns: 200 },
+    );
+  });
+});
+
+describe('createSettingsStore: subscribe', () => {
+  it('does not call back on subscribe; calls back with the new settings on set', () => {
+    const store = createSettingsStore(null);
+    const cb = vi.fn();
+    store.subscribe(cb);
+    expect(cb).not.toHaveBeenCalled();
+    store.set({ gentleMode: true });
+    expect(cb).toHaveBeenCalledExactlyOnceWith(store.get());
+  });
+
+  it('unsubscribe stops calls and is idempotent', () => {
+    const store = createSettingsStore(null);
+    const cb = vi.fn();
+    const other = vi.fn();
+    const off = store.subscribe(cb);
+    store.subscribe(other);
+    off();
+    off();
+    store.set({ haptics: false });
+    expect(cb).not.toHaveBeenCalled();
+    expect(other).toHaveBeenCalledTimes(1);
+  });
+
+  it('the same callback subscribed twice is called twice and unsubscribed independently', () => {
+    const store = createSettingsStore(null);
+    const cb = vi.fn();
+    const off1 = store.subscribe(cb);
+    store.subscribe(cb);
+    store.set({ haptics: false });
+    expect(cb).toHaveBeenCalledTimes(2);
+    off1();
+    store.set({ haptics: true });
+    expect(cb).toHaveBeenCalledTimes(3);
+  });
+
+  it('a throwing subscriber is logged; the others still run and set does not throw', () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const store = createSettingsStore(fakeStorage());
+    const before = vi.fn();
+    const after = vi.fn();
+    const err = new Error('subscriber bug');
+    store.subscribe(before);
+    store.subscribe(() => {
+      throw err;
+    });
+    store.subscribe(after);
+    expect(() => store.set({ quietMode: false })).not.toThrow();
+    expect(before).toHaveBeenCalledTimes(1);
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith('settings subscriber failed', err);
+  });
+
+  it('a subscriber added during a round waits for the next set; one removed during it is skipped', () => {
+    const store = createSettingsStore(null);
+    const late = vi.fn();
+    const removed = vi.fn();
+    let offRemoved: (() => void) | undefined;
+    store.subscribe(() => {
+      store.subscribe(late);
+      offRemoved?.();
+    });
+    offRemoved = store.subscribe(removed);
+    store.set({ haptics: false });
+    expect(late).not.toHaveBeenCalled();
+    expect(removed).not.toHaveBeenCalled();
+  });
+
+  it('a nested set from a subscriber leaves every subscriber with the latest value last', () => {
+    const store = createSettingsStore(fakeStorage());
+    const seenA: Settings[] = [];
+    const seenB: Settings[] = [];
+    store.subscribe((s) => {
+      seenA.push(s);
+      if (s.voice === 'chipmunk') store.set({ voice: 'bigbear' });
+    });
+    store.subscribe((s) => seenB.push(s));
+    store.set({ voice: 'chipmunk' });
+    expect(store.get().voice).toBe('bigbear');
+    expect(seenA.map((s) => s.voice)).toEqual(['chipmunk', 'bigbear']);
+    expect(seenB.map((s) => s.voice)).toEqual(['bigbear']);
   });
 });

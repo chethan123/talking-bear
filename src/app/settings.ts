@@ -115,3 +115,84 @@ function merge(base: Settings, patch: unknown): Settings {
 export function parseSettings(raw: unknown): Settings {
   return merge(DEFAULT_SETTINGS, raw);
 }
+
+/** Parses the stored text; no item, or text that isn't JSON, gives the defaults. */
+function parseStored(text: string | null): Settings {
+  if (typeof text !== 'string') return { ...DEFAULT_SETTINGS };
+  try {
+    return parseSettings(JSON.parse(text));
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+export interface SettingsStore {
+  /** The current settings: a frozen snapshot, replaced (never mutated) by `set`. */
+  get(): Settings;
+  /**
+   * Merges `patch` into the current settings (a key that is absent or `undefined` keeps its value),
+   * validates the result with `parseSettings` (an invalid value becomes its default, a number is
+   * clamped), persists it as JSON, then notifies every subscriber, even when nothing changed.
+   */
+  set(patch: Partial<Settings>): void;
+  /**
+   * Calls `cb` with the new settings after every `set` (not immediately: read `get()` for the current
+   * value). Returns an idempotent unsubscribe. Like DOM listeners, a round iterates a snapshot: a
+   * subscriber added during it waits for the next `set`, one removed during it is skipped. A throwing
+   * subscriber is logged, not rethrown, and the others still run. If a subscriber calls `set`, that
+   * nested `set` notifies everyone with the newer value and the outer round stops, so every
+   * subscriber's last value is the current one. A subscriber must not call `set` unconditionally:
+   * every `set` notifies, so that would recurse until the stack overflows.
+   */
+  subscribe(cb: (s: Settings) => void): () => void;
+}
+
+export function createSettingsStore(
+  storage: Pick<Storage, 'getItem' | 'setItem'> | null,
+  key = SETTINGS_KEY,
+): SettingsStore {
+  let backend = storage; // null once any access has thrown: in-memory only from then on
+  let text: string | null = null;
+  if (backend !== null) {
+    try {
+      text = backend.getItem(key);
+    } catch {
+      backend = null;
+    }
+  }
+  let current: Settings = Object.freeze(parseStored(text));
+  let version = 0; // bumped by every set; a round that sees a newer version stops
+  const subs = new Set<(s: Settings) => void>();
+
+  return {
+    get: () => current,
+    set(patch) {
+      const next = Object.freeze(merge(current, patch));
+      current = next;
+      const mine = ++version;
+      if (backend !== null) {
+        try {
+          backend.setItem(key, JSON.stringify(next));
+        } catch {
+          backend = null;
+        }
+      }
+      for (const cb of Array.from(subs)) {
+        if (version !== mine) break; // a subscriber's set already notified everyone with a newer value
+        if (!subs.has(cb)) continue; // unsubscribed during this round
+        try {
+          cb(next);
+        } catch (err) {
+          console.error('settings subscriber failed', err);
+        }
+      }
+    },
+    subscribe(cb) {
+      const entry = (s: Settings): void => cb(s); // its own entry, so subscribing one cb twice works
+      subs.add(entry);
+      return () => {
+        subs.delete(entry);
+      };
+    },
+  };
+}
