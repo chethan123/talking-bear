@@ -134,6 +134,11 @@ export function createSession(initial: SessionState, deps: SessionDeps): Session
     const { state, effects } = out;
     current = state;
     for (const fx of effects) runner.run(fx);
+    // A processed result the reducer did not turn into a replay (a stale id, or a late reply after the
+    // processing watchdog) is never played, so nothing would release it: drop it now (plan §2).
+    if (e.t === 'processed' && !effects.some((fx) => fx.k === 'play' && fx.id === e.id)) {
+      safely('releaseProcessed', () => deps.engine.releaseProcessed(e.id));
+    }
     safely('onTransition', () => deps.onTransition?.(from, state.name, e, effects));
     transitionListeners.notify(from, state.name, e, effects);
     subscribers.notify(state);

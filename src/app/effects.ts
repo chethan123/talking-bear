@@ -105,8 +105,10 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
         if (r === 'ended') io.dispatch({ t: 'playbackAtSpeakerEnded', id });
       },
       (err: unknown) => {
+        // The player never rejects; if it did, the clip's end is unknown. End the replay rather than hang Playing.
         engine.releaseProcessed(id);
         console.error('effects: playback failed', err);
+        io.dispatch({ t: 'playbackAtSpeakerEnded', id });
       },
     );
   }

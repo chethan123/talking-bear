@@ -714,6 +714,7 @@ function runnerHarness(): {
   timeline: string[];
   player: ReturnType<typeof fakePlayer>;
   sfx: ReturnType<typeof fakeSfx>;
+  makePlayerCalls: () => number;
   makeSfxCalls: () => number;
   wake: boolean[];
   anims: AnimEvent[];
@@ -726,6 +727,7 @@ function runnerHarness(): {
   const dispatched: SessionEvent[] = [];
   const player = fakePlayer();
   const sfx = fakeSfx();
+  let makePlayerCalls = 0;
   let makeSfxCalls = 0;
   const wake: boolean[] = [];
   const anims: AnimEvent[] = [];
@@ -735,7 +737,10 @@ function runnerHarness(): {
   const runner = createEffectRunner(
     {
       engine: eng.engine,
-      makePlayer: () => player.player,
+      makePlayer: () => {
+        makePlayerCalls++;
+        return player.player;
+      },
       makeSfx: () => {
         makeSfxCalls++;
         return sfx.sfx;
@@ -762,6 +767,7 @@ function runnerHarness(): {
     timeline,
     player,
     sfx,
+    makePlayerCalls: () => makePlayerCalls,
     makeSfxCalls: () => makeSfxCalls,
     wake,
     anims,
@@ -771,7 +777,7 @@ function runnerHarness(): {
 }
 
 describe('Validation 4: named timers', () => {
-  it('replacing a named timer cancels the old one; a fired timer deletes itself', () => {
+  it('replacing a named timer cancels the old one, and a fired timer does not fire again', () => {
     const r = runnerHarness();
     r.run({ k: 'timer', name: 'sleep', ms: 1000 });
     r.run({ k: 'timer', name: 'sleep', ms: 3000 });
@@ -820,6 +826,83 @@ describe('Validation 4: named timers', () => {
     expect(stateOf(h)).toBe('Listening');
     h.clock.advance(1); // t = 220 s
     expect(stateOf(h)).toBe('Asleep');
+  });
+});
+
+describe('play effect (runner)', () => {
+  it('the AudioBuffer is mono at the processed sample rate, not the context rate', () => {
+    const r = runnerHarness();
+    r.eng.finishProcess(9, ramp(100), 24_000);
+    r.run({ k: 'play', id: 9 });
+    const b = at(r.eng.ctx.created, 0);
+    expect([b.numberOfChannels, b.length, b.sampleRate]).toEqual([1, 100, 24_000]);
+    expect(b.data).toEqual(ramp(100));
+  });
+
+  it('the player is created once across replays', () => {
+    const r = runnerHarness();
+    r.eng.finishProcess(1, ramp(10), 48_000);
+    r.run({ k: 'play', id: 1 });
+    r.eng.finishProcess(2, ramp(10), 48_000);
+    r.run({ k: 'play', id: 2 });
+    expect(r.player.plays).toHaveLength(2);
+    expect(r.makePlayerCalls()).toBe(1);
+  });
+
+  it('a rejected done is logged, releases the result and ends the replay', async () => {
+    const r = runnerHarness();
+    const errors = spyError();
+    r.eng.finishProcess(1, ramp(10), 48_000);
+    r.run({ k: 'play', id: 1 });
+    expect(r.timeline).not.toContain('release 1');
+    at(r.player.plays, 0).done.reject(new Error('player failed'));
+    await flush();
+    expect(errors).toHaveBeenCalledWith('effects: playback failed', expect.any(Error));
+    expect(r.timeline).toContain('release 1');
+    expect(r.eng.engine.getProcessed(1)).toBeUndefined();
+    expect(r.dispatched).toEqual([{ t: 'playbackAtSpeakerEnded', id: 1 }]);
+  });
+});
+
+describe('a processed result the reducer does not replay is released at once', () => {
+  /** From Listening: armed, seg start, seg end → Processing for take 1. */
+  function toProcessing(h: Harness): number {
+    h.eng.emit({ t: 'armed', epoch: 1, armFrame: 1000 });
+    h.eng.emit({ t: 'seg', epoch: 1, ev: { kind: 'start', frame: 48_000 } });
+    h.eng.emit({
+      t: 'seg',
+      epoch: 1,
+      ev: { kind: 'end', frame: 110_000, lastSpeechFrame: 96_000, reason: 'silence' },
+    });
+    expect(stateOf(h)).toBe('Processing');
+    return h.session.state().takeId;
+  }
+
+  it('a late reply after the processing watchdog (Cooldown): released, never played', async () => {
+    const h = setup();
+    await toListening(h);
+    const id = toProcessing(h);
+    h.eng.emit({ t: 'clipReady', epoch: 1, id });
+    h.clock.advance(DEFAULT_CONFIG.processingMs);
+    expect(stateOf(h)).toBe('Cooldown');
+    h.eng.finishProcess(id, ramp(4800), 48_000);
+    h.eng.emit({ t: 'processed', id, durationSec: 0.1 });
+    expect(stateOf(h)).toBe('Cooldown');
+    expect(h.player.plays).toEqual([]);
+    expect(h.timeline).toContain(`release ${id}`);
+    expect(h.eng.engine.getProcessed(id)).toBeUndefined();
+  });
+
+  it('a stale id while Processing another take: released, and the current take is left alone', async () => {
+    const h = setup();
+    await toListening(h);
+    const id = toProcessing(h);
+    h.eng.finishProcess(id + 100, ramp(10), 48_000);
+    h.eng.emit({ t: 'processed', id: id + 100, durationSec: 0.1 });
+    expect(stateOf(h)).toBe('Processing');
+    expect(h.timeline).toContain(`release ${id + 100}`);
+    expect(h.eng.engine.getProcessed(id + 100)).toBeUndefined();
+    expect(h.timeline).not.toContain(`release ${id}`);
   });
 });
 
