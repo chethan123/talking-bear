@@ -3,11 +3,12 @@
 // frames tagged with the ctx frame of their first sample (ctxRate 48000, so frame i starts at i·512·3).
 
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readWav } from '../../test/wav.ts';
 import type { WorkerToMain } from '../audio/messages.ts';
 import { resampleOffline } from '../dsp/resample.ts';
 import type { SegEvent } from '../dsp/segmenter.ts';
+import { PRESETS } from '../dsp/types.ts';
 import { SILERO_UNAVAILABLE_MESSAGE, VadCore } from './vad-core.ts';
 
 const CTX_RATE = 48000;
@@ -246,5 +247,112 @@ describe('VadCore framing', () => {
     expect(() => run.core.frame(1, 0, new Float32Array(511))).toThrow(RangeError);
     expect(() => new VadCore(0, () => {})).toThrow(RangeError);
     expect(() => new VadCore(Number.NaN, () => {})).toThrow(RangeError);
+  });
+});
+
+// ---- Worker glue (dsp.worker.ts) with a fake `self` and a fake MessagePort ----
+
+type Listener = (e: { data: unknown }) => void;
+
+class FakeTarget {
+  readonly listeners: Listener[] = [];
+  addEventListener(type: string, fn: Listener): void {
+    if (type === 'message') this.listeners.push(fn);
+  }
+  removeEventListener(type: string, fn: Listener): void {
+    const i = this.listeners.indexOf(fn);
+    if (type === 'message' && i >= 0) this.listeners.splice(i, 1);
+  }
+  dispatch(data: unknown): void {
+    for (const fn of this.listeners) fn({ data });
+  }
+}
+
+class FakeSelf extends FakeTarget {
+  readonly posted: { msg: WorkerToMain; transfer: Transferable[] }[] = [];
+  postMessage(msg: WorkerToMain, transfer: Transferable[]): void {
+    this.posted.push({ msg, transfer });
+  }
+}
+
+class FakePort extends FakeTarget {
+  started = false;
+  closed = false;
+  start(): void {
+    this.started = true;
+  }
+  close(): void {
+    this.closed = true;
+  }
+}
+
+describe('dsp.worker glue', () => {
+  let self: FakeSelf;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    self = new FakeSelf();
+    vi.stubGlobal('self', self);
+    await import('./dsp.worker.ts');
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('process echoes the pcm with durationSec = len / sr / 1.6 for the cub preset', () => {
+    const pcm = new Float32Array(24000).fill(0.25);
+    self.dispatch({ t: 'process', id: 7, pcm, sampleRate: 48000, preset: PRESETS.cub });
+    expect(self.posted).toHaveLength(1);
+    const { msg, transfer } = self.posted[0]!;
+    if (msg.t !== 'processed') throw new Error(`unexpected ${msg.t}`);
+    expect(msg.id).toBe(7);
+    expect(msg.pcm).toBe(pcm);
+    expect(msg.durationSec).toBeCloseTo(24000 / 48000 / 1.6, 12);
+    expect(msg.envelope.hopMs).toBe(10);
+    for (const track of [msg.envelope.jaw, msg.envelope.width, msg.envelope.round, msg.envelope.teeth]) {
+      expect(track).toHaveLength(0);
+    }
+    expect(transfer).toContain(pcm.buffer);
+  });
+
+  it('init wires the port to a VadCore; reset and frames produce seg messages via self.postMessage', () => {
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    expect(port.started).toBe(true);
+    self.dispatch({ t: 'reset', epoch: 9, vad: 'energy' });
+    frames16k(fixture('vowel_f0-140')).forEach((pcm16k, i) =>
+      port.dispatch({ t: 'frame', epoch: 9, firstFrame: Math.round(i * FRAME * 3), pcm16k }),
+    );
+    const posted = self.posted.map((p) => p.msg);
+    expect(kinds(posted)).toEqual(['start', 'end']);
+    expect(ofType(posted, 'floorSnapshot')).toHaveLength(1);
+    expect(levels(posted).length).toBeGreaterThan(0);
+  });
+
+  it('a later init closes the previous port and detaches it', () => {
+    const first = new FakePort();
+    const second = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: first });
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: second });
+    expect(first.closed).toBe(true);
+    expect(first.listeners).toHaveLength(0);
+    expect(second.listeners).toHaveLength(1);
+  });
+
+  it('turns handler exceptions into error messages', () => {
+    self.dispatch({ t: 'reset', epoch: 1, vad: 'energy' });
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: Number.NaN, port });
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    self.dispatch({ t: 'reset', epoch: 1, vad: 'energy' });
+    port.dispatch({ t: 'frame', epoch: 1, firstFrame: 0, pcm16k: new Float32Array(3) });
+    self.dispatch({ t: 'process', id: 1, pcm: new Float32Array(4), sampleRate: 48000 });
+    const errors = ofType(
+      self.posted.map((p) => p.msg),
+      'error',
+    );
+    expect(errors.map((m) => m.where)).toEqual(['vad', 'vad', 'vad', 'fx']);
+    expect(errors[0]!.message).toBe('reset before init');
   });
 });
