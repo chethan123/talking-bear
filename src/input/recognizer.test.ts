@@ -174,10 +174,10 @@ const strokeStart = (trace: readonly PointerSample[], hit: Hit) =>
 const scrubEvery = (stepMs: number) =>
   kinds(run([dn(0, 500, 500), ...path(1, 0, zigzag(500, 500, 8, 8, 3, 500), 4, stepMs)], on('belly')).all);
 
-/** A belly scrub with a 20 px first leg, then 3 legs of `leg` px (4 reversals). */
+/** A belly scrub with a `leg / 2` px first leg, then 3 legs of exactly `leg` px (4 reversals). */
 const scrubLegs = (leg: number) =>
   kinds(
-    run([dn(0, 500, 500), ...path(1, 0, zigzag(500, 500, 20, leg - 20, 3, 500), 4, 10)], on('belly')).all,
+    run([dn(0, 500, 500), ...path(1, 0, zigzag(500, 500, leg / 2, leg / 2, 3, 500), 4, 10)], on('belly')).all,
   );
 
 /** Three 50 ms belly taps with ups at 50 ms, 500 ms and `last`. */
@@ -502,10 +502,15 @@ describe('stroke', () => {
     expect(find(all, 'stroke', 'end')).toMatchObject({ pathPx: 186, dir: 0, against: false });
   });
 
-  it('updates come every 50 ms with 10 ms samples', () => {
-    const trace = [dn(0, 400, 300), ...line(1, 0, 400, 300, 700, 300, 100, 10)];
-    const t = timesOf(run(trace, on('belly')).steps, 'stroke:update');
-    expect(t.slice(0, 4)).toEqual([90, 140, 190, 240]); // start at 40 ms (12 px)
+  it('updates come on the first move ≥ 50 ms after the previous one', () => {
+    // 10 ms samples: start at 40 ms (12 px), then exactly 50 ms apart.
+    const every10 = [dn(0, 400, 300), ...line(1, 0, 400, 300, 700, 300, 100, 10)];
+    expect(timesOf(run(every10, on('belly')).steps, 'stroke:update').slice(0, 4)).toEqual([
+      90, 140, 190, 240,
+    ]);
+    // 7 ms samples: start at 28 ms (12 px), then 56 ms apart (49 would already be too soon).
+    const every7 = [dn(0, 400, 300), ...line(1, 0, 400, 300, 700, 300, 100, 7)];
+    expect(timesOf(run(every7, on('belly')).steps, 'stroke:update').slice(0, 4)).toEqual([84, 140, 196, 252]);
   });
 
   it('pathPx counts only the path inside the stroke’s region', () => {
@@ -553,17 +558,16 @@ describe('stroke', () => {
     expect(timesOf(steps, 'stroke:end')).toEqual([930]);
   });
 
-  it('two reversals 299 ms apart turn it into tickle handling: the stroke ends there, the up adds nothing', () => {
-    const pts = [
-      [300, 300],
-      [360, 300],
-      [300, 300],
-      [360, 300],
-    ] as const;
-    const { steps, all } = run(
-      [dn(0, 300, 300), ...path(1, 0, pts, 6, 29.9), up(930, 360, 300)],
-      on('headTop'),
-    );
+  it('two reversals 299.5 ms apart turn it into tickle handling: the stroke ends there, the up adds nothing', () => {
+    // 60 px legs of 299.5 ms: reversals at 299.5 and 599 ms.
+    const trace = [
+      dn(0, 300, 300),
+      ...line(1, 0, 300, 300, 360, 300, 10, 29.95),
+      ...line(1, 299.5, 360, 300, 300, 300, 10, 29.95),
+      ...line(1, 599, 300, 300, 360, 300, 10, 29.95),
+      up(930, 360, 300),
+    ];
+    const { steps, all } = run(trace, on('headTop'));
     expect(shape(all)).toEqual(['tap:down', 'stroke:start', 'stroke:update', 'stroke:end']);
     const [endT] = timesOf(steps, 'stroke:end');
     expect(endT).toBeLessThan(930);
@@ -740,11 +744,11 @@ describe('flick', () => {
     ]);
   });
 
-  it('exactly 800 px/s flicks (after a stroke: stroke end, then flick); 799 does not', () => {
+  it('exactly 800 px/s flicks (after a stroke: stroke end, then flick); 799.5 does not', () => {
     const { all } = run(flickAt(8), on('headTop'));
     expect(shape(all)).toEqual(['tap:down', 'stroke:start', 'stroke:update', 'stroke:end', 'flick']);
     expect(all.at(-1)).toEqual({ g: 'flick', region: 'headTop', vx: 800, vy: 0 });
-    expect(kinds(run(flickAt(7.99), on('headTop')).all)).not.toContain('flick');
+    expect(kinds(run(flickAt(7.995), on('headTop')).all)).not.toContain('flick');
   });
 
   it('a flick at 700 px/s is not a flick (it is a short stroke)', () => {
