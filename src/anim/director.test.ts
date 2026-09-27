@@ -1,13 +1,18 @@
 import { isDeepStrictEqual } from 'node:util';
+import { GCProfiler, setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import type { AnimEvent } from '../app/events.ts';
+import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
+import { sampleClip } from './clip.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
-import { directorReduce, evaluate, initialDirector } from './director.ts';
+import { directorReduce, evaluate, initialDirector, mouthCloseScale } from './director.ts';
 import type { DirectorState, DirInput, DirState } from './director.ts';
-import { Ch, CH_COUNT, createPose } from './pose.ts';
+import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
+import type { Pose } from './pose.ts';
 
 type AnimKind = AnimEvent['e'];
 /** A target state, `=` (the same state object back) or `clip` (the additive-clip rule). */
@@ -642,5 +647,333 @@ describe('property: random session input sequences', () => {
       }),
       { numRuns: 300 },
     );
+  });
+});
+
+// ---- evaluation helpers ------------------------------------------------------------------------------------------
+const DEG = Math.PI / 180;
+const BASE_NAMES: readonly BaseName[] = ['asleep', 'idle', 'attentive', 'thinking', 'talking', 'dozing'];
+
+/** The largest |a − b| over the non-mouth channels (NaN if either side is NaN there). */
+function bodyDiff(a: Pose, b: Pose): number {
+  let m = 0;
+  for (let i = 0; i < CH_COUNT; i++) {
+    if (MOUTH.includes(i)) continue;
+    const d = Math.abs(a[i]! - b[i]!);
+    m = d > m || Number.isNaN(d) ? d : m;
+  }
+  return m;
+}
+
+/** An independent crossfade + clip composite: `lerpPose(prev, base, clamp(dt/0.15)) + sampleClip(clip, …)`. */
+function composite(s: DirectorState, now: number): Pose {
+  const t = Math.min(1, Math.max(0, (now - s.fadeStart) / 0.15));
+  const p = lerpPose(BASE[s.prevBase], BASE[s.base], t, createPose());
+  if (s.clip === null) return p;
+  const c = s.clip;
+  const clip = CLIP_NAMES.find((n) => n === c.name);
+  if (clip === undefined) return p;
+  return addPose(p, sampleClip(SESSION_CLIPS[clip], now - c.start, createPose()), 1, p);
+}
+
+// ---- Validation 3: the 150 ms crossfade --------------------------------------------------------------------------
+describe('Validation 3: crossfade', () => {
+  it('at +75 ms evaluate is the midpoint of the two base poses (±1e-6) for all 30 ordered pairs', () => {
+    const out = createPose();
+    const mid = createPose();
+    let pairs = 0;
+    for (const a of BASE_NAMES) {
+      for (const b of BASE_NAMES) {
+        if (a === b) continue;
+        const s: DirectorState = { ...stateIn('Idle'), prevBase: a, base: b, fadeStart: 4, clip: null };
+        evaluate(s, 4.075, out);
+        lerpPose(BASE[a], BASE[b], 0.5, mid);
+        expect(bodyDiff(out, mid), `${a} → ${b}`).toBeLessThanOrEqual(1e-6);
+        pairs++;
+      }
+    }
+    expect(pairs).toBe(30);
+  });
+
+  it('starts exactly at prevBase, ends exactly at base from +150 ms, and never extrapolates before fadeStart', () => {
+    const out = createPose();
+    for (const a of BASE_NAMES) {
+      for (const b of BASE_NAMES) {
+        const s: DirectorState = { ...stateIn('Idle'), prevBase: a, base: b, fadeStart: 4, clip: null };
+        expect(bodyDiff(evaluate(s, 4, out), BASE[a]), `${a} → ${b} at 0`).toBe(0);
+        expect(bodyDiff(evaluate(s, 3.9, out), BASE[a]), `${a} → ${b} at −100 ms`).toBe(0);
+        expect(bodyDiff(evaluate(s, 4.15, out), BASE[b]), `${a} → ${b} at +150 ms`).toBe(0);
+        expect(bodyDiff(evaluate(s, 5, out), BASE[b]), `${a} → ${b} at +1 s`).toBe(0);
+      }
+    }
+  });
+
+  it('through the reducer: Idle → attentive at 4, evaluated at 4.075, is the idle/attentive midpoint', () => {
+    const s = run(stateIn('Idle', 3), anim({ e: 'attentive' }, 4));
+    const out = evaluate(s, 4.075, createPose());
+    expect(bodyDiff(out, lerpPose(BASE.idle, BASE.attentive, 0.5, createPose()))).toBeLessThanOrEqual(1e-6);
+  });
+
+  it('chained: start → wake@1 → tick at the clip end → attentive@4 fades from idle, not from asleep', () => {
+    const s = run(
+      initialDirector(0),
+      anim({ e: 'wake' }, 1),
+      tick(endOf('wake', 1)),
+      anim({ e: 'attentive' }, 4),
+    );
+    const out = evaluate(s, 4.075, createPose());
+    expect(bodyDiff(out, lerpPose(BASE.idle, BASE.attentive, 0.5, createPose()))).toBeLessThanOrEqual(1e-6);
+    expect(out[Ch.LidL]).toBe(0);
+  });
+});
+
+// ---- the active clip on top of the crossfade ---------------------------------------------------------------------
+describe('evaluate: the clip sample is added', () => {
+  it('Asleep → wake: the crossfade plus the wake clip sample (±1e-6) through the clip and after it', () => {
+    const s = run(stateIn('Asleep', 3), anim({ e: 'wake' }, 4));
+    const out = createPose();
+    for (const dt of [0, 0.05, 0.1, 0.15, 0.2, 0.7, 1.2, 2]) {
+      const exp = addPose(
+        lerpPose(BASE.asleep, BASE.idle, Math.min(1, dt / 0.15), createPose()),
+        sampleClip(SESSION_CLIPS.wake, dt, createPose()),
+        1,
+        createPose(),
+      );
+      expect(bodyDiff(evaluate(s, 4 + dt, out), exp), `dt ${dt}`).toBeLessThanOrEqual(1e-6);
+    }
+  });
+
+  it('confused on a settled Attentive: HeadTilt is attentive + 10° at +0.25 s, the rest the composite', () => {
+    const s = run(stateIn('Attentive', 3), anim({ e: 'confused' }, 4));
+    const out = evaluate(s, 4.25, createPose());
+    expect(Math.abs(out[Ch.HeadTilt]! - (BASE.attentive[Ch.HeadTilt]! + 10 * DEG))).toBeLessThanOrEqual(1e-6);
+    expect(bodyDiff(out, composite(s, 4.25))).toBeLessThanOrEqual(1e-6);
+  });
+
+  it('every reachable clip in every state matches the independent composite (±1e-6)', () => {
+    const out = createPose();
+    for (const name of STATES) {
+      for (const clip of CLIP_NAMES) {
+        const s: DirectorState = { ...stateIn(name, 4), fadeStart: 4, clip: { name: clip, start: 4 } };
+        for (const dt of [0, 0.03, 0.075, 0.15, 0.33, 0.6, 1, 3]) {
+          expect(
+            bodyDiff(evaluate(s, 4 + dt, out), composite(s, 4 + dt)),
+            `${name} ${clip} ${dt}`,
+          ).toBeLessThanOrEqual(1e-6);
+        }
+      }
+    }
+  });
+
+  it('an unknown clip adds nothing, and evaluate returns out', () => {
+    const s: DirectorState = { ...stateIn('Idle', 3), clip: { name: 'mystery', start: 3.5 } };
+    const out = createPose();
+    expect(evaluate(s, 4, out)).toBe(out);
+    expect(bodyDiff(out, BASE.idle)).toBe(0);
+  });
+});
+
+// ---- Validation 4: talkEnd and the mouth -------------------------------------------------------------------------
+describe('Validation 4: talkEnd, mouthCloseScale and the mouth channels', () => {
+  it('talkEnd sets mouthCloseStart = now', () => {
+    expect(run(stateIn('Talking', 5), anim({ e: 'talkEnd' }, 6)).mouthCloseStart).toBe(6);
+  });
+
+  it('mouthCloseScale returns 1, 0.5 and 0 at +0, +100 and ≥ +200 ms, and 1 for null', () => {
+    expect(mouthCloseScale(6, 6)).toBe(1);
+    expect(Math.abs(mouthCloseScale(6.1, 6) - 0.5)).toBeLessThanOrEqual(1e-9);
+    expect(mouthCloseScale(6.2, 6)).toBe(0);
+    expect(mouthCloseScale(6.25, 6)).toBe(0);
+    expect(mouthCloseScale(9, 6)).toBe(0);
+    expect(mouthCloseScale(1, null)).toBe(1);
+    expect(mouthCloseScale(Number.NaN, null)).toBe(1);
+  });
+
+  it('mouthCloseScale is clamped to 1 before the start and gives 0 for NaN', () => {
+    expect(mouthCloseScale(5.9, 6)).toBe(1);
+    expect(mouthCloseScale(Number.NaN, 6)).toBe(0);
+    expect(mouthCloseScale(6, Number.NaN)).toBe(0);
+  });
+
+  it('the scale over a talkEnd, then a new talk resets it to 1', () => {
+    let s = run(stateIn('Talking', 5), anim({ e: 'talkEnd' }, 6));
+    expect(mouthCloseScale(6.05, s.mouthCloseStart)).toBeCloseTo(0.75, 9);
+    s = run(s, anim({ e: 'attentive' }, 7), anim({ e: 'thinking' }, 8), anim({ e: 'talk', id: 2 }, 9));
+    expect(s.mouthCloseStart).toBeNull();
+    expect(mouthCloseScale(20, s.mouthCloseStart)).toBe(1);
+  });
+
+  it('evaluate never writes the mouth channels: every state × clip × time keeps the sentinels', () => {
+    const SENTINELS = [7.25, -3.5, 0.125, 42];
+    const clips: (string | null)[] = [null, ...CLIP_NAMES, 'mystery'];
+    let checks = 0;
+    for (const name of STATES) {
+      for (const clip of clips) {
+        const s: DirectorState = {
+          ...stateIn(name, 10),
+          fadeStart: 10,
+          clip: clip === null ? null : { name: clip, start: 10 },
+        };
+        for (const dt of [0, 0.075, 0.15, 0.4, 3]) {
+          const out = createPose().fill(Number.NaN);
+          for (const [j, m] of MOUTH.entries()) out[m] = SENTINELS[j]!;
+          evaluate(s, 10 + dt, out);
+          for (const [j, m] of MOUTH.entries())
+            expect(Object.is(out[m], SENTINELS[j]), `${name} ${clip}`).toBe(true);
+          for (let i = 0; i < CH_COUNT; i++) {
+            if (!MOUTH.includes(i)) expect(Number.isFinite(out[i]), `${name} ${clip} ch ${i}`).toBe(true);
+          }
+          checks++;
+        }
+      }
+    }
+    expect(checks).toBe(9 * 7 * 5);
+  });
+});
+
+// ---- evaluate does not allocate (the src/anim/clip.test.ts meters) -------------------------------------------------
+type Constructor = new (...args: never[]) => object;
+
+/** Wraps `original` so that every `new` of it, including those inside its static `from` and `of`, calls `onNew`. */
+function countingConstructor<C extends Constructor>(original: C, onNew: () => void): C {
+  return new Proxy(original, {
+    construct(target, args: never[], newTarget: Constructor): object {
+      onNew();
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+}
+
+/** `%TypedArray%.prototype`, which every typed array class inherits its methods from. */
+const TYPED_ARRAY_PROTOTYPE = Reflect.getPrototypeOf(Float32Array.prototype) ?? Float32Array.prototype;
+/** Its methods that return a new typed array. */
+const TYPED_ARRAY_METHODS = ['slice', 'map', 'filter', 'subarray', 'toReversed', 'toSorted', 'with'] as const;
+
+/**
+ * Runs `fn` and counts the allocations it makes through the array globals (the pattern of
+ * src/anim/pose.test.ts): every `new` of `Array`, `ArrayBuffer`, `Float32Array` or `Float64Array` (static
+ * `from` and `of` included, and `new` through a typed array's `constructor`), and every call of an allocating
+ * `%TypedArray%.prototype` method. Everything is restored afterwards.
+ */
+function countAllocations(fn: () => void): number {
+  let count = 0;
+  const onNew = (): void => {
+    count++;
+  };
+  const saved: { obj: object; key: string; desc: PropertyDescriptor }[] = [];
+  const patch = (obj: object, key: string, value: unknown): void => {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined) throw new Error(`nothing to patch at ${key}`);
+    saved.push({ obj, key, desc });
+    Object.defineProperty(obj, key, { ...desc, value });
+  };
+  const float32 = countingConstructor(Float32Array, onNew);
+  const float64 = countingConstructor(Float64Array, onNew);
+  patch(Float32Array.prototype, 'constructor', float32);
+  patch(Float64Array.prototype, 'constructor', float64);
+  patch(globalThis, 'Array', countingConstructor(Array, onNew));
+  patch(globalThis, 'ArrayBuffer', countingConstructor(ArrayBuffer, onNew));
+  patch(globalThis, 'Float32Array', float32);
+  patch(globalThis, 'Float64Array', float64);
+  for (const name of TYPED_ARRAY_METHODS) {
+    const original: unknown = Reflect.get(TYPED_ARRAY_PROTOTYPE, name);
+    if (typeof original !== 'function') throw new Error(`no %TypedArray%.prototype.${name}`);
+    patch(TYPED_ARRAY_PROTOTYPE, name, function (this: unknown, ...args: unknown[]): unknown {
+      count++;
+      return Reflect.apply(original, this, args);
+    });
+  }
+  try {
+    fn();
+  } finally {
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const { obj, key, desc } = saved[i]!;
+      Object.defineProperty(obj, key, desc);
+    }
+  }
+  return count;
+}
+
+/** The `gc` function, exposed once at runtime with Node built-ins only (no `--expose-gc` flag needed). */
+let exposedGc: (() => void) | undefined;
+
+/** Runs a full garbage collection. */
+function forceGc(): void {
+  if (exposedGc === undefined) {
+    setFlagsFromString('--expose-gc');
+    const gc: unknown = runInNewContext('gc');
+    if (typeof gc !== 'function') throw new Error('gc() is not available');
+    exposedGc = (): void => {
+      gc();
+    };
+  }
+  exposedGc();
+}
+
+/**
+ * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ */
+function heapGrowth(fn: () => void): number {
+  forceGc();
+  const profiler = new GCProfiler();
+  profiler.start();
+  const before = process.memoryUsage().heapUsed;
+  fn();
+  const growth = process.memoryUsage().heapUsed - before;
+  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+}
+
+describe('evaluate: no allocation (10 000 evaluations, heap growth < 1 MB)', () => {
+  /** Mid-fade with the wake clip, Idle + confused, Talking, Asleep + the sleep clip. */
+  const STATES_FOR_ALLOC: readonly DirectorState[] = [
+    run(initialDirector(0), anim({ e: 'wake' }, 1)),
+    run(stateIn('Idle', 0), anim({ e: 'confused' }, 1)),
+    stateIn('Talking', 0),
+    run(stateIn('Idle', 0), anim({ e: 'sleep' }, 1)),
+  ];
+  const N = 10_000;
+  /** Times sweeping [0.9, 2.3]: before the fades, through them and the clips, and past the clip ends. */
+  const tAt = (i: number): number => 0.9 + (1.4 * i) / (N - 1);
+
+  it('makes no array or typed-array allocation over 10 000 evaluations, and always returns out', () => {
+    const out = createPose();
+    const buffer = out.buffer;
+    let allOut = true;
+    const allocations = countAllocations(() => {
+      for (let i = 0; i < N; i++) {
+        if (evaluate(STATES_FOR_ALLOC[i & 3]!, tAt(i), out) !== out) allOut = false;
+      }
+    });
+    expect(allocations).toBe(0);
+    expect(allOut).toBe(true);
+    expect(out.buffer).toBe(buffer);
+  });
+
+  it('grows the heap by < 1 MB over 10 000 evaluations, once V8 has optimised it', () => {
+    const out = createPose();
+    const runAll = (): void => {
+      for (let i = 0; i < N; i++) evaluate(STATES_FOR_ALLOC[i & 3]!, tAt(i), out);
+    };
+    // As in clip.test.ts: warm up after a collection, then take the best of up to 20 runs, each from a freshly
+    // collected heap (a run during which any GC ran counts as +Infinity). An evaluate that allocates a pose per
+    // call grows the heap by megabytes in every run.
+    forceGc();
+    for (let w = 0; w < 10; w++) runAll();
+    const LIMIT = 1_048_576;
+    let best = heapGrowth(runAll);
+    for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(runAll));
+    expect(best).toBeLessThan(LIMIT);
+  });
+
+  it('both meters have teeth (positive controls)', () => {
+    expect(countAllocations(() => void new Float32Array(CH_COUNT))).toBe(1);
+    expect(countAllocations(() => void Array.from({ length: 3 }))).toBeGreaterThan(0);
+    const kept: number[][] = [];
+    const growth = heapGrowth(() => {
+      for (let i = 0; i < N; i++) kept.push(Array.from({ length: 64 }, (_, j) => j + 0.5));
+    });
+    expect(kept).toHaveLength(N);
+    expect(growth).toBeGreaterThanOrEqual(1_048_576);
   });
 });
