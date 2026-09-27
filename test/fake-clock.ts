@@ -25,10 +25,13 @@ export class FakeClock implements Clock {
     return this.#now;
   }
 
-  /** Like the browser, a negative or NaN delay counts as 0. Ids start at 1 and are never reused. */
+  /**
+   * Like the browser (WebIDL `long`), a negative, NaN or infinite delay counts as 0.
+   * Ids start at 1 and are never reused.
+   */
   setTimeout(cb: () => void, ms: number): number {
     const id = this.#nextId++;
-    this.#timers.set(id, { id, due: this.#now + (ms > 0 ? ms : 0), cb });
+    this.#timers.set(id, { id, due: this.#now + (Number.isFinite(ms) && ms > 0 ? ms : 0), cb });
     return id;
   }
 
@@ -60,6 +63,6 @@ export class FakeClock implements Clock {
       this.#now = next.due;
       next.cb();
     }
-    this.#now = end;
+    this.#now = Math.max(this.#now, end); // a re-entrant advance() in a callback may have gone further
   }
 }

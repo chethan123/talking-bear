@@ -25,6 +25,7 @@ export function createWakeLock(
   const api = nav.wakeLock;
   let wanted = false;
   let pending = false; // a request is in flight
+  let retryAfterPending = false; // a request was skipped because one was in flight
   let sentinel: WakeLockSentinelLike | null = null;
 
   const release = (s: WakeLockSentinelLike): void => {
@@ -37,22 +38,33 @@ export function createWakeLock(
 
   const request = (): void => {
     if (sentinel?.released === true) sentinel = null; // released by the UA; its event may still be queued
-    if (!api || !wanted || pending || sentinel !== null || vis.current() !== 'visible') return;
+    if (!api || !wanted || sentinel !== null || vis.current() !== 'visible') return;
+    if (pending) {
+      retryAfterPending = true; // e.g. hidden → visible while in flight: retry once when it settles
+      return;
+    }
     pending = true;
-    const onGranted = (s: WakeLockSentinelLike): void => {
+    /** The request settled. Retry once only if another request was skipped meanwhile (never a loop). */
+    const settled = (): void => {
       pending = false;
+      const retry = retryAfterPending;
+      retryAfterPending = false;
+      if (retry) request(); // no-op unless still wanted, visible and without a live sentinel
+    };
+    const onGranted = (s: WakeLockSentinelLike): void => {
       if (!wanted) {
         release(s); // set(false) arrived while the request was in flight
-        return;
+      } else {
+        sentinel = s; // may already be released (the page hid meanwhile): held() and request() check
+        s.addEventListener('release', () => {
+          if (sentinel === s) sentinel = null; // the UA released it (page hidden)
+        });
       }
-      sentinel = s;
-      s.addEventListener('release', () => {
-        if (sentinel === s) sentinel = null; // the UA released it (page hidden)
-      });
+      settled();
     };
     const onRejected = (err: unknown): void => {
-      pending = false;
       log('wake lock request failed', err);
+      settled();
     };
     try {
       api.request('screen').then(onGranted, onRejected);

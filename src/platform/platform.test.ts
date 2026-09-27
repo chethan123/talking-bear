@@ -178,6 +178,25 @@ describe('FakeClock', () => {
     clock.advance(1);
     expect(fired.at(-1)).toBe('nested+100@110');
   });
+
+  it('treats an infinite delay as 0, like the browser (WebIDL long)', () => {
+    const clock = new FakeClock();
+    const fired: string[] = [];
+    clock.setTimeout(() => fired.push('+inf'), Number.POSITIVE_INFINITY);
+    clock.setTimeout(() => fired.push('-inf'), Number.NEGATIVE_INFINITY);
+    clock.advance(0);
+    expect(fired).toEqual(['+inf', '-inf']);
+  });
+
+  it('never moves time backwards when a callback advances re-entrantly', () => {
+    const clock = new FakeClock();
+    const fired: string[] = [];
+    clock.setTimeout(() => clock.advance(20), 5); // from 5 to 25, inside the outer advance(10)
+    clock.setTimeout(() => fired.push(`inner@${clock.now()}`), 15);
+    clock.advance(10);
+    expect(fired).toEqual(['inner@15']);
+    expect(clock.now()).toBe(25);
+  });
 });
 
 describe('realClock', () => {
@@ -360,6 +379,84 @@ describe('createWakeLock', () => {
     expect(wl.held()).toBe(true);
   });
 
+  it('drops a sentinel that arrives already released, and re-requests on the next visible', async () => {
+    const { doc, vis } = makeVisibility();
+    const { nav, request, calls } = makeWakeLockNav();
+    const wl = createWakeLock(nav, vis, vi.fn());
+
+    wl.set(true);
+    const stale = new FakeSentinel();
+    stale.released = true; // released by the UA before we could listen: no release event will come
+    calls[0]?.resolve(stale);
+    await flush();
+    expect(wl.held()).toBe(false);
+
+    doc.setVisibility('hidden');
+    doc.setVisibility('visible');
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries once when a visible was skipped while the failed request was in flight', async () => {
+    const { doc, vis } = makeVisibility();
+    const { nav, request, calls, grant } = makeWakeLockNav();
+    const log = vi.fn();
+    const wl = createWakeLock(nav, vis, log);
+
+    wl.set(true);
+    doc.setVisibility('hidden');
+    doc.setVisibility('visible'); // skipped: a request is in flight
+    expect(request).toHaveBeenCalledTimes(1);
+    calls[0]?.reject(new Error('NotAllowedError: document hidden'));
+    await flush();
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(2); // exactly one retry
+    grant(1);
+    await flush();
+    expect(wl.held()).toBe(true);
+  });
+
+  it('retries once when a visible was skipped and the request is granted already released', async () => {
+    const { doc, vis } = makeVisibility();
+    const { nav, request, calls, grant } = makeWakeLockNav();
+    const wl = createWakeLock(nav, vis, vi.fn());
+
+    wl.set(true);
+    doc.setVisibility('hidden');
+    doc.setVisibility('visible'); // skipped: a request is in flight
+    const stale = new FakeSentinel();
+    stale.released = true;
+    calls[0]?.resolve(stale);
+    await flush();
+    expect(request).toHaveBeenCalledTimes(2);
+    grant(1);
+    await flush();
+    expect(wl.held()).toBe(true);
+  });
+
+  it('does not re-request after a plain rejection, and an owed retry never loops', async () => {
+    const { vis } = makeVisibility();
+    const { nav, request, calls } = makeWakeLockNav();
+    const log = vi.fn();
+    const wl = createWakeLock(nav, vis, log);
+    const err = new Error('NotAllowedError: battery saver');
+
+    wl.set(true);
+    calls[0]?.reject(err);
+    await flush();
+    expect(request).toHaveBeenCalledTimes(1); // nothing was skipped: no retry
+
+    wl.set(true); // request 2
+    wl.set(true); // skipped while in flight: one retry is owed
+    calls[1]?.reject(err);
+    await flush();
+    expect(request).toHaveBeenCalledTimes(3); // the one owed retry
+    calls[2]?.reject(err);
+    await flush();
+    expect(request).toHaveBeenCalledTimes(3); // no loop
+    expect(log).toHaveBeenCalledTimes(3);
+    expect(wl.held()).toBe(false);
+  });
+
   it('logs a request that throws synchronously', () => {
     const { vis } = makeVisibility();
     const err = new Error('sync');
@@ -485,6 +582,37 @@ describe('createMicPermission', () => {
     expect(seen).toEqual([]);
     status.change('granted');
     expect(seen).toEqual(['granted']);
+  });
+
+  it('follows the latest status object a query returns', async () => {
+    const { doc, vis } = makeVisibility();
+    const statuses: FakePermissionStatus[] = [];
+    let current: PermissionState = 'granted';
+    const nav: PermissionsNavigator = {
+      permissions: {
+        query: () => {
+          const s = new FakePermissionStatus(current); // a new object per query
+          statuses.push(s);
+          return Promise.resolve(s);
+        },
+      },
+    };
+    const perm = createMicPermission(nav, vis);
+    await perm.query();
+    const seen: string[] = [];
+    perm.subscribe((s) => seen.push(s));
+
+    doc.setVisibility('hidden');
+    current = 'prompt'; // a one-time grant expired in the background
+    doc.setVisibility('visible');
+    await flush();
+    expect(statuses).toHaveLength(2);
+    expect(seen).toEqual(['prompt']);
+
+    statuses[1]?.change('granted'); // granted again: the event arrives on the latest object
+    expect(seen).toEqual(['prompt', 'granted']);
+    statuses[0]?.change('denied'); // the first object is no longer observed
+    expect(seen).toEqual(['prompt', 'granted']);
   });
 
   it('ignores a query result that a newer change event overtook', async () => {

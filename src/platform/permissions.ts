@@ -13,8 +13,9 @@ export interface PermissionsNavigator {
 }
 
 /**
- * Microphone permission tracking (plan §4.5): `navigator.permissions.query({name:'microphone'})`, its
- * `change` event, and a re-query on every `visible` (a one-time grant can expire in the background).
+ * Microphone permission tracking (plan §4.5): `navigator.permissions.query({name:'microphone'})`, the
+ * `change` event of the latest status object it returned, and a re-query on every `visible` (a
+ * one-time grant can expire in the background).
  * Every observed value (a query result or a change event) is compared with the previous one, and
  * subscribers hear only changes; the first observation is the baseline, so callers get the current
  * value from `query()`.
@@ -34,7 +35,8 @@ export function createMicPermission(
   const api = nav.permissions;
   const subs = new Set<(s: MicPermissionState) => void>();
   let last: MicPermissionState | null = null;
-  let status: PermissionStatusLike | null = null;
+  let status: PermissionStatusLike | null = null; // the status object whose `change` events are observed
+  let unwatch: (() => void) | null = null;
   let generation = 0; // bumped by every query start and change event; older query results are stale
 
   const observe = (s: MicPermissionState): void => {
@@ -51,30 +53,37 @@ export function createMicPermission(
     }
   };
 
-  const onChange = (): void => {
-    generation++;
-    if (status !== null) observe(status.state);
+  /** Observes `change` on `s`, the latest status object, and stops observing the previous one. */
+  const watch = (s: PermissionStatusLike): void => {
+    unwatch?.();
+    const onChange = (): void => {
+      generation++;
+      observe(s.state);
+    };
+    s.addEventListener('change', onChange);
+    unwatch = () => s.removeEventListener('change', onChange);
+    status = s;
   };
 
-  const read = async (): Promise<MicPermissionState> => {
-    if (!api) return 'prompt';
+  const read = async (): Promise<{ state: MicPermissionState; status: PermissionStatusLike | null }> => {
+    if (!api) return { state: 'prompt', status: null };
     try {
       const s = await api.query({ name: 'microphone' });
-      if (status === null) {
-        status = s; // one live status object is enough to hear every change
-        s.addEventListener('change', onChange);
-      }
-      return s.state;
+      return { state: s.state, status: s };
     } catch {
-      return 'prompt';
+      return { state: 'prompt', status: null };
     }
   };
 
   const query = async (): Promise<MicPermissionState> => {
     const mine = ++generation;
-    const s = await read();
-    if (mine === generation) observe(s); // skip if a newer query or change event overtook this one
-    return s;
+    const r = await read();
+    if (mine === generation) {
+      // Not overtaken by a newer query or change event: follow its status object, then compare its value.
+      if (r.status !== null && r.status !== status) watch(r.status);
+      observe(r.state);
+    }
+    return r.state;
   };
 
   vis.subscribe((e) => {
