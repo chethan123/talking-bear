@@ -97,6 +97,7 @@ talking-bear/
 9. Run the task's **Validation** commands before opening the PR. Never skip, disable or weaken tests or thresholds.
 10. If blocked or anything is ambiguous, comment on the issue with the exact question or output and stop.
 11. Relative imports inside `src/dsp`, `src/workers` and `src/audio/constants.ts` always end in `.ts`, and only erasable TypeScript syntax is used (no enums, no parameter properties, no namespaces), so Node scripts can import them with type stripping.
+12. `src/platform/visibility.ts` is the app's only source of page visibility. No other app code (anything under `src/` except tests) reads `document.visibilityState` or `document.hidden`, or listens for `visibilitychange`, `pagehide`, `freeze` or `resume`: it subscribes to the `Visibility` from `createVisibility()` instead, so the e2e hook `visibility.simulate()` (plan §4.9.3) drives the whole app.
 
 ## Glossary
 
