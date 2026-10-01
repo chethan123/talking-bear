@@ -1160,7 +1160,7 @@ describe('errors', () => {
 });
 
 describe('wiring', () => {
-  it('engine level and vadError go only to subscribeLevel listeners; other engine events are dispatched', async () => {
+  it('engine level, vadError, vadReady and vadStats go only to subscribeLevel listeners; other engine events are dispatched', async () => {
     const h = setup();
     await toListening(h);
     const errors = spyError();
@@ -1169,9 +1169,13 @@ describe('wiring', () => {
     const count = h.transitions.length;
     const level: LevelEvent = { t: 'level', epoch: 1, frame: 480, db: -40, floorDb: -60 };
     const vadError: LevelEvent = { t: 'vadError', message: 'x' };
+    const ready: LevelEvent = { t: 'vadReady', backend: 'silero' };
+    const stats: LevelEvent = { t: 'vadStats', p95Ms: 4.5 };
     h.eng.emit(level);
     h.eng.emit(vadError);
-    expect(got).toEqual([level, vadError]);
+    h.eng.emit(ready);
+    h.eng.emit(stats);
+    expect(got).toEqual([level, vadError, ready, stats]);
     expect(h.transitions).toHaveLength(count);
     expect(errors).not.toHaveBeenCalled();
     h.eng.emit({ t: 'armed', epoch: 1, armFrame: 1234 });

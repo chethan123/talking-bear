@@ -3,13 +3,19 @@ import { readFileSync } from 'node:fs';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { mulberry32 } from '../../test/dsp-helpers.ts';
-import { ENERGY_HOP, HPF_CLIP_HZ, VAD_FRAME, VAD_RATE } from '../audio/constants.ts';
+import {
+  ENERGY_HOP,
+  HPF_CLIP_HZ,
+  PREGATE_WARMUP_FRAMES,
+  VAD_RATE,
+  VOICING_WINDOW,
+} from '../audio/constants.ts';
 import { CONSTRAINTS } from '../audio/mic.ts';
 import { butterworthHighpass, butterworthLowpass, cascade } from '../dsp/biquad.ts';
 import { GATE_HPF_HZ, GATE_LPF_HZ, createGateFilter } from '../dsp/energy-gate.ts';
 import { CUTOFF_FACTOR, DEFAULT_BETA, DEFAULT_ZERO_CROSSINGS, createResampler } from '../dsp/resample.ts';
 import { WEIGHTS_SHA256 } from '../dsp/silero/weights.ts';
-import { VOICING_FMAX_HZ, VOICING_FMIN_HZ } from '../dsp/voicing.ts';
+import { VOICED_THRESHOLD, VOICING_FMAX_HZ, VOICING_FMIN_HZ, createVoicing } from '../dsp/voicing.ts';
 import { FRONT_END_CONFIG } from './config.ts';
 import {
   canonicalJson,
@@ -68,6 +74,38 @@ function randomBits(rng: () => number, n: number): Uint32Array {
 function noise(seed: number, n: number): Float32Array {
   const rng = mulberry32(seed);
   return Float32Array.from({ length: n }, () => rng() * 2 - 1);
+}
+
+/** n samples at 16 kHz: the first three harmonics of f0 (amplitudes 1, 1/2, 1/3, seeded phases) plus a little
+ *  seeded noise. */
+function harmonicWindow(seed: number, f0: number, n: number): Float32Array {
+  const rng = mulberry32(seed);
+  const phases = [rng(), rng(), rng()].map((u) => 2 * Math.PI * u);
+  return Float32Array.from({ length: n }, (_, i) => {
+    let v = 0;
+    phases.forEach((phase, h) => {
+      v += Math.sin((2 * Math.PI * (h + 1) * f0 * i) / VAD_RATE + phase) / (h + 1);
+    });
+    return 0.3 * v + 0.02 * (2 * rng() - 1);
+  });
+}
+
+/** n samples at 16 kHz of seeded white noise through a two-pole resonator at f (pole radius r), after a
+ *  200-sample burn-in: narrow-band, so its autocorrelation decays with the lag. */
+function resonanceWindow(seed: number, f: number, r: number, n: number): Float32Array {
+  const rng = mulberry32(seed);
+  const a1 = 2 * r * Math.cos((2 * Math.PI * f) / VAD_RATE);
+  const a2 = -r * r;
+  const out = new Float32Array(n);
+  let y1 = 0;
+  let y2 = 0;
+  for (let i = 0; i < n + 200; i++) {
+    const y = 2 * rng() - 1 + a1 * y1 + a2 * y2;
+    y2 = y1;
+    y1 = y;
+    if (i >= 200) out[i - 200] = 0.01 * y;
+  }
+  return out;
 }
 
 function makeMeta(over: Partial<TraceMeta> = {}): TraceMeta {
@@ -481,12 +519,31 @@ describe('drift guard: FRONT_END_CONFIG equals the constants the pipeline uses',
     expect(FRONT_END_CONFIG.hopMs).toBe((ENERGY_HOP * 1000) / VAD_RATE);
     expect(FRONT_END_CONFIG.voicing.fminHz).toBe(VOICING_FMIN_HZ);
     expect(FRONT_END_CONFIG.voicing.fmaxHz).toBe(VOICING_FMAX_HZ);
-    // Placeholder pin: no voicing-window constant exists yet (the worker starts computing voicing with #46),
-    // and VAD_FRAME is the Silero frame length, not the voicing window. #46 (T35) exports VOICING_WINDOW
-    // (512) from src/audio/constants.ts and replaces this line with a pin to it.
-    expect(FRONT_END_CONFIG.voicing.window).toBe(VAD_FRAME);
-    // pregateWarmupFrames has no code constant yet either: #46 (T35) exports PREGATE_WARMUP_FRAMES (10) from
-    // src/audio/constants.ts and adds its pin here.
+    // The DSP worker's voicing window and the Silero pre-gate's warm-up length (#46, src/workers/vad-core.ts).
+    expect(FRONT_END_CONFIG.voicing.window).toBe(VOICING_WINDOW);
+    expect(FRONT_END_CONFIG.pregateWarmupFrames).toBe(PREGATE_WARMUP_FRAMES);
+  });
+
+  it("voicing: createVoicing's default F0 range is the configured one (functional)", () => {
+    // The pins above compare the config with the exported constants; this checks that createVoicing's
+    // defaults really are that range: with no arguments it must score like the configured range, on windows
+    // whose scores depend on each bound.
+    const v = FRONT_END_CONFIG.voicing;
+    const byDefaults = createVoicing(VAD_RATE);
+    const byConfig = createVoicing(VAD_RATE, v.fminHz, v.fmaxHz);
+    const harmonic = harmonicWindow(2, 75, v.window); // period 213 samples: needs lags up to fs / fmin
+    const resonance = resonanceWindow(4, 590, 0.98, v.window); // best lag ≈ 27: needs lags down to fs / fmax
+    const windows = [noise(5, v.window), harmonic, resonance];
+    for (const [i, w] of windows.entries())
+      expect(byConfig.score(w), `window ${i}`).toBe(byDefaults.score(w));
+    expect(Math.max(...windows.map((w) => byDefaults.score(w)))).toBeGreaterThan(VOICED_THRESHOLD);
+    // Teeth: each bound changes the score of the window that depends on it.
+    expect(createVoicing(VAD_RATE, v.fminHz + 10, v.fmaxHz).score(harmonic)).not.toBe(
+      byDefaults.score(harmonic),
+    );
+    expect(createVoicing(VAD_RATE, v.fminHz, v.fmaxHz - 100).score(resonance)).not.toBe(
+      byDefaults.score(resonance),
+    );
   });
 });
 
