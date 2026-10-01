@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: voices (X-F1)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./voices.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Which voice effect do you like best?</h1>
+    <p>
+      X-F1 (plan §5): a blind listening test of three ways to raise the pitch of your own voice: linear
+      <code>playbackRate</code>, the app's sinc resampler, and formant-preserving PSOLA, at a pitch ratio of
+      1.4, 1.7 or 2.0 picked at random for each trial. Enter the listener's label (for example "adult 1" or
+      "child 1"), choose the output route (phone speaker or headphones), and press Open mic (the app's own
+      constraints). Then, for each trial: hold Record, say a short phrase (at most 4 s), and release. The page
+      plays three versions as X1, X2 and X3, in a random order, 600 ms apart, all loudness-matched. Tap your
+      favourite, or All the same if you can't choose; Replay plays them again. Do several trials per listener
+      and route, then open the results below and press Copy results (JSON).
+    </p>
+    <p>
+      Privacy (plan Q2): only votes are kept. Your phrase and its three versions live in memory for one trial
+      and are zeroed after the vote, on a new recording, on Close and when you leave the page. Nothing
+      captured is stored or exported; Copy results and Copy log copy text only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
