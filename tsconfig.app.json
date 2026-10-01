@@ -15,6 +15,12 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src"],
-  "exclude": ["src/**/*.worklet.ts", "src/workers/**", "**/*.test.ts", "**/*.browser.test.ts"]
+  "include": ["src", "lab"],
+  "exclude": [
+    "src/**/*.worklet.ts",
+    "lab/**/*.worklet.ts",
+    "src/workers/**",
+    "**/*.test.ts",
+    "**/*.browser.test.ts"
+  ]
 }
