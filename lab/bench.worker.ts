@@ -398,7 +398,9 @@ async function workletDsp(req: BenchRequest): Promise<QuantumStats> {
   const every = Math.ceil(total / PROGRESS_STEPS);
   // #decimate / #postFrame state, as the worklet's fields (armed at the first quantum: armFrame = streamBase).
   const sink = new MessageChannel();
-  sink.port2.onmessage = (): void => {}; // drains and drops the posted frames
+  // Drains and drops the posted frames (addEventListener, unlike the onmessage setter, needs start()).
+  sink.port2.addEventListener('message', () => {});
+  sink.port2.start();
   const port = sink.port1;
   const ratio = dec.ratio;
   const streamBase = 0;
