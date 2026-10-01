@@ -1,5 +1,5 @@
 // Extracts the Silero VAD v6 16 kHz weights from the pinned upstream ONNX file (plan §4.2.3, §7 M2) into
-// src/dsp/silero/weights.bin (little-endian fp16, WEIGHTS_LAYOUT order, no header) and
+// src/dsp/silero/weights.bin (little-endian fp16, conv biases fp32, WEIGHTS_LAYOUT order, no header) and
 // src/dsp/silero/weights.provenance.json. Asserts every ONNX initializer name and dims, and that the
 // STFT basis is the periodic-Hann DFT that the TS port regenerates in code. Reruns are byte-identical.
 //
@@ -10,7 +10,12 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { WEIGHTS_BYTES, WEIGHTS_LAYOUT, WEIGHTS_SHA256 } from '../src/dsp/silero/weights.ts';
+import {
+  WEIGHTS_BYTES,
+  WEIGHTS_LAYOUT,
+  WEIGHTS_SHA256,
+  type WeightsFormat,
+} from '../src/dsp/silero/weights.ts';
 import { encodeFp16LE } from './fp16.ts';
 import { REPO_ROOT, SILERO_ONNX, ensureSileroOnnx, errorMessage, sha256Hex } from './fetch-silero-onnx.ts';
 import { readOnnxInitializers, type OnnxTensor } from './onnx-reader.ts';
@@ -25,6 +30,7 @@ export interface ProvenanceEntry {
   key: string;
   onnxName: string;
   dims: number[];
+  format: WeightsFormat;
   offsetBytes: number;
 }
 
@@ -37,7 +43,7 @@ export interface Provenance {
   onnxBytes: number;
   weightsSha256: string;
   weightsBytes: number;
-  format: 'fp16-le';
+  format: 'fp16-le, conv biases fp32-le';
   order: ProvenanceEntry[];
   stftBasis: string;
   extractedWith: string;
@@ -78,6 +84,22 @@ export function stftBasisMaxError(basis: Float32Array): number {
   return max;
 }
 
+/**
+ * Encodes every value as little-endian IEEE binary32, back to back (4 bytes per value). The values are float32
+ * already, so this is exact.
+ * @throws {RangeError} on NaN or ±Infinity: the Silero weights must stay finite.
+ */
+export function encodeFp32LE(values: ArrayLike<number>): Uint8Array {
+  const out = new Uint8Array(values.length * 4);
+  const view = new DataView(out.buffer);
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i]!;
+    if (!Number.isFinite(v)) throw new RangeError(`fp32: cannot encode non-finite value ${v}`);
+    view.setFloat32(i * 4, v, true);
+  }
+  return out;
+}
+
 /** Matches a JSON array of numbers as JSON.stringify(value, null, 2) prints it, one element per line. */
 const NUMBER_ARRAY = /\[\s*(-?\d[\d\s,.eE+-]*?)\s*\]/g;
 
@@ -107,18 +129,18 @@ export function extract(onnx: Uint8Array): Extracted {
   const weights = new Uint8Array(WEIGHTS_BYTES);
   const order: ProvenanceEntry[] = [];
   let offsetBytes = 0;
-  for (const { key, onnxName, dims } of WEIGHTS_LAYOUT) {
+  for (const { key, onnxName, dims, format } of WEIGHTS_LAYOUT) {
     const t = getTensor(inits, onnxName, dims);
     let encoded: Uint8Array;
     try {
-      encoded = encodeFp16LE(t.data);
+      encoded = format === 'fp32' ? encodeFp32LE(t.data) : encodeFp16LE(t.data);
     } catch (err) {
       throw new Error(`${onnxName}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
     }
     if (offsetBytes + encoded.byteLength > WEIGHTS_BYTES)
       throw new Error(`weights exceed ${WEIGHTS_BYTES} bytes`);
     weights.set(encoded, offsetBytes);
-    order.push({ key, onnxName, dims: [...dims], offsetBytes });
+    order.push({ key, onnxName, dims: [...dims], format, offsetBytes });
     offsetBytes += encoded.byteLength;
   }
   if (offsetBytes !== WEIGHTS_BYTES)
@@ -132,7 +154,7 @@ export function extract(onnx: Uint8Array): Extracted {
     onnxBytes: onnx.byteLength,
     weightsSha256: sha256Hex(weights),
     weightsBytes: WEIGHTS_BYTES,
-    format: 'fp16-le',
+    format: 'fp16-le, conv biases fp32-le',
     order,
     stftBasis: 'periodic-hann DFT, regenerated in code',
     extractedWith: 'scripts/extract-silero-weights.ts',
