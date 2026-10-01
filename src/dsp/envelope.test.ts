@@ -144,6 +144,15 @@ function tracks(env: Envelope): Float32Array[] {
   return [env.jaw, env.width, env.round, env.teeth];
 }
 
+/** 1 s at 48 kHz: loud broadband noise (100 Hz–20 kHz), then quiet noise, so every track and n vary. */
+function broadband(): Float32Array {
+  const fs = 48000;
+  const x = new Float32Array(fs);
+  addBandNoise(x, 0, fs / 2, fs, 100, 20000, 31, 0.3);
+  addBandNoise(x, fs / 2, fs, fs, 100, 20000, 32, 0.01);
+  return x;
+}
+
 describe('analyzeEnvelope', () => {
   describe('silence (validation 1)', () => {
     it.each(RATES)('1 s of zeros gives all four tracks exactly 0 at %i Hz', (fs) => {
@@ -433,15 +442,6 @@ describe('analyzeEnvelope', () => {
   });
 
   describe('scaleBandsWithP (X-A3, lab/envelope)', () => {
-    /** 1 s at 48 kHz: loud broadband noise (100 Hz–20 kHz), then quiet noise, so every track and n vary. */
-    function broadband(): Float32Array {
-      const fs = 48000;
-      const x = new Float32Array(fs);
-      addBandNoise(x, 0, fs / 2, fs, 100, 20000, 31, 0.3);
-      addBandNoise(x, fs / 2, fs, fs, 100, 20000, 32, 0.01);
-      return x;
-    }
-
     it('omitted opts, {} and { scaleBandsWithP: true } give identical tracks (the default scales with p)', () => {
       const x = broadband();
       const base = analyzeEnvelope(x, 48000, 1.6);
