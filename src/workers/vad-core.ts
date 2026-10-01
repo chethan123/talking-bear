@@ -12,6 +12,9 @@
 //   that throws switches the epoch to energy (an open segment ends as a `misfire`). The optional pre-gate
 //   (plan §4.2.3) skips inference while the gate has been closed for ≥ 700 ms and the segmenter is idle, and
 //   replays the last 10 skipped frames to warm the LSTM up when the gate opens again.
+//   Proximity gate (plan §4.2.2): a Silero `end` (silence or maxLength) becomes a `misfire` unless the power
+//   mean of the band-limited hop levels over the segment's speech frames is at least X dB (`proximityDb`,
+//   default PROXIMITY_DB) above the floor its `floorSnapshot` carried at the onset.
 //
 // Pure TypeScript: no worker globals (`post` is injected; the clock defaults to `performance.now`), so the
 // whole core runs in Node tests. The per-frame path doesn't allocate: every buffer is preallocated, and
@@ -21,6 +24,7 @@ import {
   ENERGY_HOP,
   ONSET_BLOCK_MS,
   PREGATE_WARMUP_FRAMES,
+  PROXIMITY_DB,
   VAD_FRAME,
   VAD_RATE,
   VOICING_WINDOW,
@@ -36,6 +40,7 @@ import {
   type EnergyGateState,
   type FrameFeatures,
 } from '../dsp/energy-gate.ts';
+import { activeLevelDb, passesProximity } from '../dsp/proximity.ts';
 import {
   ENERGY_SEG_PARAMS,
   initialSegState,
@@ -68,6 +73,9 @@ export const VAD_STATS_WINDOW = 312;
 /** Nearest-rank index of the 95th percentile in a sorted window. */
 const P95_INDEX = Math.ceil(0.95 * VAD_STATS_WINDOW) - 1;
 
+/** Proximity gate: band-limited hop levels (and their ctx frames) kept for the active level, 10 s of hops. */
+export const PROXIMITY_HISTORY_HOPS = 1000;
+
 /** One energy hop in ms (10). */
 const HOP_MS = (ENERGY_HOP * 1000) / VAD_RATE;
 
@@ -88,6 +96,8 @@ export class VadCore {
   private readonly now: () => number;
   /** Onset block length in ctx frames: Math.round(ONSET_BLOCK_MS / 1000 · ctxRate). */
   private readonly onsetBlockFrames: number;
+  /** Length of one 512-sample VAD frame in ctx frames (unrounded): VAD_FRAME · ctxRate / VAD_RATE. */
+  private readonly frameCtx: number;
   private readonly filter: Biquad;
   /** Gate-filtered copy of the current frame. */
   private readonly scratch = new Float32Array(VAD_FRAME);
@@ -104,6 +114,10 @@ export class VadCore {
   private readonly times = new Float64Array(VAD_STATS_WINDOW);
   /** Sort buffer for the p95. */
   private readonly sorted = new Float64Array(VAD_STATS_WINDOW);
+  /** Band-limited level (dBFS) of the epoch's hop j at j % PROXIMITY_HISTORY_HOPS, for the proximity gate. */
+  private readonly histDb = new Float32Array(PROXIMITY_HISTORY_HOPS);
+  /** Ctx frame of the epoch's hop j at j % PROXIMITY_HISTORY_HOPS (Float64: ctx frames outgrow 2^24). */
+  private readonly histFrame = new Float64Array(PROXIMITY_HISTORY_HOPS);
   /** Inferences over the core's lifetime. */
   private inferences = 0;
   /** The model handed over by `setModel`, used from the next `reset` (or at once by a late switch). */
@@ -118,12 +132,16 @@ export class VadCore {
   /** A `process` call threw this epoch: it stays on energy until the next reset. */
   private failed = false;
   private pregate = false;
+  /** The proximity gate's X (dB) for this epoch's Silero segments. */
+  private proximityDb = PROXIMITY_DB;
+  /** The floor the current segment's `floorSnapshot` carried (NaN: no floor yet at its onset). */
+  private onsetFloorDb = Number.NaN;
   private gate: EnergyGateState = initialEnergyGateState();
   private seg: SegState = initialSegState();
   private hopFill = 0;
   /** Ctx frame (unrounded) of the hop accumulator's first sample; valid while hopFill > 0. */
   private hopFirstFrame = 0;
-  /** Hops completed in this epoch. */
+  /** Hops completed in this epoch; hop j's level and frame are at j % PROXIMITY_HISTORY_HOPS in the history. */
   private hopCount = 0;
   /** firstFrame of the epoch's first accepted frame; null until then. */
   private epochStartFrame: number | null = null;
@@ -147,6 +165,7 @@ export class VadCore {
     this.post = post;
     this.now = opts?.now ?? defaultNow;
     this.onsetBlockFrames = Math.round((ONSET_BLOCK_MS / 1000) * ctxRate);
+    this.frameCtx = (VAD_FRAME * ctxRate) / VAD_RATE;
     this.filter = createGateFilter(VAD_RATE);
     const ring = new Float32Array(PREGATE_WARMUP_FRAMES * VAD_FRAME);
     for (let i = 0; i < PREGATE_WARMUP_FRAMES; i++) {
@@ -180,12 +199,19 @@ export class VadCore {
 
   /**
    * Starts a new listen: `epoch` becomes current, and the filter, hop remainder, segmenter, gate (restored to
-   * `restoreFloorDb` when it is finite), voicing history, pre-gate ring and epoch start are reset, and so is
-   * the model's LSTM state. The epoch runs on Silero iff `vad === 'silero'` and a model is set; a Silero
-   * request without a model posts SILERO_NOT_READY_MESSAGE and runs on energy. `pregate === true` enables
-   * the pre-gate.
+   * `restoreFloorDb` when it is finite), voicing history, hop history, pre-gate ring and epoch start are reset,
+   * and so is the model's LSTM state. The epoch runs on Silero iff `vad === 'silero'` and a model is set; a
+   * Silero request without a model posts SILERO_NOT_READY_MESSAGE and runs on energy. `pregate === true`
+   * enables the pre-gate. `proximityDb` is the proximity gate's X for the epoch's Silero segments
+   * (PROXIMITY_DB when undefined or NaN).
    */
-  reset(epoch: number, vad: 'silero' | 'energy', restoreFloorDb?: number, pregate?: boolean): void {
+  reset(
+    epoch: number,
+    vad: 'silero' | 'energy',
+    restoreFloorDb?: number,
+    pregate?: boolean,
+    proximityDb?: number,
+  ): void {
     this.epoch = epoch;
     this.filter.reset();
     this.hopFill = 0;
@@ -199,6 +225,8 @@ export class VadCore {
     this.voicedHops = 0;
     this.requested = vad;
     this.pregate = pregate === true;
+    this.proximityDb = proximityDb === undefined || Number.isNaN(proximityDb) ? PROXIMITY_DB : proximityDb;
+    this.onsetFloorDb = Number.NaN;
     this.failed = false;
     this.ringStart = 0;
     this.ringCount = 0;
@@ -253,6 +281,9 @@ export class VadCore {
     energyGateStep(gate, f, DEFAULT_ENERGY_PARAMS);
     const floorDb = gate.initialized ? gate.floorDb : Number.NaN;
     f.floorDb = floorDb;
+    const j = this.hopCount % PROXIMITY_HISTORY_HOPS;
+    this.histDb[j] = db;
+    this.histFrame[j] = ctxFrame;
     const win = this.voiceWin;
     win.copyWithin(0, ENERGY_HOP);
     win.set(this.hop, VOICING_WINDOW - ENERGY_HOP);
@@ -311,8 +342,31 @@ export class VadCore {
       return;
     }
     if (firstFrame < this.onsetBlockEnd) p = 0;
-    const ev = segmenterStep(this.seg, SILERO_SEG_PARAMS, firstFrame, p);
+    let ev: SegEvent | null = segmenterStep(this.seg, SILERO_SEG_PARAMS, firstFrame, p);
+    if (ev !== null && ev.kind === 'end' && !this.nearEnough(ev.lastSpeechFrame)) {
+      ev = { kind: 'misfire', frame: ev.frame }; // plan §4.2.2: too far from the floor, e.g. a TV across the room
+    }
     if (ev !== null) this.emit(epoch, ev, this.gate.initialized ? this.gate.floorDb : Number.NaN);
+  }
+
+  /**
+   * Proximity gate for the segment that just ended: the power mean of the hop levels whose ctx frame lies in
+   * [start frame, lastSpeechFrame + one VAD frame), i.e. the hops of its speech frames, against the onset floor.
+   * Hops older than the history (a segment longer than 10 s) are left out.
+   */
+  private nearEnough(lastSpeechFrame: number): boolean {
+    const n = PROXIMITY_HISTORY_HOPS;
+    const lo = this.seg.startFrame;
+    const hi = lastSpeechFrame + this.frameCtx;
+    const oldest = this.hopCount > n ? this.hopCount - n : 0;
+    // Hop frames increase with the hop index: walk back from the newest hop to the range's end, then its start.
+    let to = this.hopCount;
+    while (to > oldest && this.histFrame[(to - 1) % n]! >= hi) to--;
+    let from = to;
+    while (from > oldest && this.histFrame[(from - 1) % n]! >= lo) from--;
+    const start = from % n;
+    const active = activeLevelDb(this.histDb, start, start + (to - from));
+    return passesProximity(active, this.onsetFloorDb, this.proximityDb);
   }
 
   /** model.process(x), timed; every VAD_STATS_WINDOW inferences, posts the p95 of the last that many. */
@@ -332,7 +386,10 @@ export class VadCore {
   }
 
   private emit(epoch: number, ev: SegEvent, floorDb: number): void {
-    if (ev.kind === 'start') this.post({ t: 'floorSnapshot', epoch, floorDb });
+    if (ev.kind === 'start') {
+      this.onsetFloorDb = floorDb; // the proximity gate's reference
+      this.post({ t: 'floorSnapshot', epoch, floorDb });
+    }
     this.post({ t: 'seg', epoch, ev });
   }
 }
