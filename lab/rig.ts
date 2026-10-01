@@ -1,7 +1,7 @@
 // Lab page for the rig: the SVG DOM debug view (plan §4.6.1 "Keep SVG DOM as a debug view", §7 M4 "Debug")
 // and the X-A1 stress helper (plan §5). One slider per pose channel drives a pose that is drawn side by side as
 // SVG DOM, built from the generated parts with the rig's matrices as `transform` attributes, and by the app's
-// Canvas 2D renderer. Dev-only: `pnpm dev`, then /lab/rig.html (docs/lab.md). No audio is involved; the log is
+// Canvas 2D renderer, with their max pixel difference sampled once a second. Dev-only: `pnpm dev`, then /lab/rig.html (docs/lab.md). No audio is involved; the log is
 // text only. Lab pages set no CSS `style`: SVG geometry and every size are attributes.
 
 import { el, fmt, logPanel } from './common.ts';
@@ -29,6 +29,12 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 /** CSS size of each view in the comparison: the 1000 × 1400 design box at scale 0.36, one backing px per CSS px. */
 const VIEW_W = 360;
 const VIEW_H = 504;
+/** The pixel difference is sampled this often. */
+const SAMPLE_MS = 1000;
+/** A pixel whose largest channel |Δ| (of 255) exceeds this is counted as a real disagreement, not anti-aliasing. */
+const DIFF_COUNT_MIN = 64;
+/** The channels only the canvas draws (the mouth and the stars): zero in the parts-only reference. */
+const CANVAS_ONLY = [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth, Ch.Stars] as const;
 
 // ---- channels -----------------------------------------------------------------------------------------------
 
@@ -116,6 +122,8 @@ function valueText(v: number, unit: Unit): string {
 const rig = createRig();
 /** The sliders' pose: what both views show. */
 const base = createPose();
+/** Bumped by every change of `base`. */
+let version = 0;
 
 function svgEl<K extends keyof SVGElementTagNameMap>(
   tag: K,
@@ -191,6 +199,20 @@ const canvas = el('canvas', {
 const g = createContext(canvas);
 const compareView: View = fitView(VIEW_W, VIEW_H, { scale: 0, ox: 0, oy: 0 });
 
+/** A canvas the page reads back; never the visible one, which must stay as the renderer uses it. */
+function readbackContext(): CanvasRenderingContext2D {
+  const c = document.createElement('canvas');
+  c.width = VIEW_W;
+  c.height = VIEW_H;
+  const ctx = c.getContext('2d', { alpha: false, willReadFrequently: true });
+  if (ctx === null) throw new Error('lab/rig: no 2D canvas context');
+  return ctx;
+}
+/** The renderer's drawing of the SVG view's pose, of that pose without the mouth and stars, and the SVG image. */
+const refG = readbackContext();
+const partsG = readbackContext();
+const imgG = readbackContext();
+
 const root = document.getElementById('lab');
 if (!(root instanceof HTMLElement)) throw new Error('lab/rig: missing #lab');
 
@@ -262,6 +284,9 @@ const log = logPanel(root);
 
 const BONE_BUF = new Float32Array(BONE_COUNT * MAT);
 const PART_M = new Float64Array(MAT);
+/** The pose the SVG view shows, and its `version`: the pixel difference renders exactly this pose. */
+const svgPose = createPose();
+let svgVersion = -1;
 
 function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
@@ -287,6 +312,8 @@ function updateSvg(pose: Pose): void {
     svgParts[i]!.setAttribute('fill-opacity', String(partAlpha(i, pose)));
     svgClips.get(i)?.setAttribute('transform', m);
   }
+  svgPose.set(pose);
+  svgVersion = version;
 }
 
 let pendingStatic = 0;
@@ -300,6 +327,7 @@ function drawStatic(): void {
 
 /** Notes a change of `base` and schedules both views. */
 function changed(): void {
+  version++;
   if (pendingStatic === 0) pendingStatic = requestAnimationFrame(drawStatic);
 }
 
@@ -308,6 +336,73 @@ function syncSliders(): void {
     const v = base[s.ch]!;
     s.input.value = String(v / s.range.scale);
     s.value.textContent = valueText(v, s.range.unit);
+  }
+}
+
+// ---- pixel difference ---------------------------------------------------------------------------------------
+
+const serializer = new XMLSerializer();
+/** The SVG view's pose with the canvas-only channels at 0. */
+const partsPose = createPose();
+let sampling = false;
+let sampledVersion = -1;
+
+interface Diff {
+  /** The largest channel difference over all pixels, 0–255. */
+  readonly max: number;
+  /** Pixels whose largest channel difference exceeds `DIFF_COUNT_MIN`. */
+  readonly over: number;
+}
+
+/** Compares two RGBA buffers of the same size: per pixel, the largest |Δ| of R, G and B. */
+function diffStats(a: Uint8ClampedArray, b: Uint8ClampedArray): Diff {
+  let max = 0;
+  let over = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    const d = Math.max(
+      Math.abs(a[i]! - b[i]!),
+      Math.abs(a[i + 1]! - b[i + 1]!),
+      Math.abs(a[i + 2]! - b[i + 2]!),
+    );
+    if (d > max) max = d;
+    if (d > DIFF_COUNT_MIN) over++;
+  }
+  return { max, over };
+}
+
+function diffText(d: Diff): string {
+  return `${d.max} of 255; ${d.over} of ${VIEW_W * VIEW_H} pixels differ by more than ${DIFF_COUNT_MIN}`;
+}
+
+/**
+ * Rasterises the SVG view as an image and compares it, with `getImageData`, with the renderer's drawing of the
+ * same pose at the same size (the views), and with the renderer's drawing of that pose without the mouth and
+ * the stars (parts only: a real mismatch between the rig and the SVG view shows there whatever the mouth does).
+ * Skipped while a sample is in flight and when the SVG view hasn't changed since the last one.
+ */
+async function sampleDiff(): Promise<void> {
+  if (sampling || svgVersion === sampledVersion) return;
+  sampling = true;
+  try {
+    const v = svgVersion;
+    // Every side from the pose the SVG shows, taken before any await.
+    render(refG, rig, svgPose, compareView);
+    partsPose.set(svgPose);
+    for (const ch of CANVAS_ONLY) partsPose[ch] = 0;
+    render(partsG, rig, partsPose, compareView);
+    const img = new Image(VIEW_W, VIEW_H);
+    img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(serializer.serializeToString(svg))}`;
+    await img.decode();
+    imgG.drawImage(img, 0, 0, VIEW_W, VIEW_H);
+    const image = imgG.getImageData(0, 0, VIEW_W, VIEW_H).data;
+    const views = diffText(diffStats(refG.getImageData(0, 0, VIEW_W, VIEW_H).data, image));
+    const parts = diffText(diffStats(partsG.getImageData(0, 0, VIEW_W, VIEW_H).data, image));
+    sampledVersion = v;
+    show.diff.textContent = views;
+    show.diffParts.textContent = parts;
+    log(`max pixel difference: views ${views}; parts only ${parts}`);
+  } finally {
+    sampling = false;
   }
 }
 
@@ -341,6 +436,10 @@ resetButton.addEventListener('click', () => {
   changed();
   log('reset: neutral');
 });
+
+setInterval(() => {
+  sampleDiff().catch((err: unknown) => log(`pixel difference failed: ${String(err)}`));
+}, SAMPLE_MS);
 
 poseSelect.value = 'neutral';
 syncSliders();
