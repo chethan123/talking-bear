@@ -287,6 +287,11 @@ const onSfxEnded: Handler<'sfxAtSpeakerEnded'> = (s, e) =>
 const onTrackMuted: Handler<'trackMuted'> = (s) => stay(s, { micMuted: true }); // row 18 in Listening
 const onTrackUnmuted: Handler<'trackUnmuted'> = (s) => stay(s, { micMuted: false });
 const onUpdateReady: Handler<'updateReady'> = (s) => stay(s, { updateReady: true });
+/** M3 settings (issue #66): the preset of the next `process`, in every state; the same state if it is equal. */
+const onSettingsChanged: Handler<'settingsChanged'> = (s, e) =>
+  e.preset.id === s.preset.id && e.preset.pitchRatio === s.preset.pitchRatio
+    ? same(s)
+    : stay(s, { preset: e.preset });
 /** C11: already asleep or paused; `reduce` appends `applyUpdate` if an update is ready. */
 const onHideAsleepOrPaused = (s: SessionState): Out => same(s);
 
@@ -519,6 +524,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: onHideAsleepOrPaused,
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   NeedsParent: {
     tapBear: 'ignore',
@@ -552,6 +558,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Asleep'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Waking: {
     tapBear: 'ignore',
@@ -585,6 +592,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   MicDenied: {
     tapBear: 'ignore',
@@ -618,6 +626,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Listening: {
     tapBear: 'ignore',
@@ -651,6 +660,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Recording: {
     tapBear: 'ignore',
@@ -684,6 +694,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Processing: {
     tapBear: 'ignore',
@@ -717,6 +728,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Playing: {
     tapBear: 'ignore',
@@ -750,6 +762,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   SfxGated: {
     tapBear: 'ignore',
@@ -783,6 +796,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Cooldown: {
     tapBear: 'ignore',
@@ -816,6 +830,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Paused'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Paused: {
     tapBear: 'ignore',
@@ -849,6 +864,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: onHideAsleepOrPaused,
     visible: onWakeTap, // row 39: as rows 1 / 2 / 3
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
   Error: {
     tapBear: onErrorTap, // row 42
@@ -882,6 +898,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     freeze: goTo('Asleep'),
     visible: 'ignore',
     updateReady: onUpdateReady,
+    settingsChanged: onSettingsChanged,
   },
 };
 

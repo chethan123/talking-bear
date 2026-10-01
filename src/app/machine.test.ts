@@ -1252,6 +1252,10 @@ const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
   freeze: () => [{ t: 'freeze' }],
   visible: () => [{ t: 'visible' }],
   updateReady: () => [{ t: 'updateReady' }],
+  settingsChanged: () => [
+    { t: 'settingsChanged', preset: PRESETS.chipmunk },
+    { t: 'settingsChanged', preset: { id: 'custom', pitchRatio: 1.85 } },
+  ],
 };
 
 /** Stale variants of the events that carry an epoch, id or req (row 44); [] for the others. */
@@ -1293,6 +1297,7 @@ const STALE: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
   freeze: () => [],
   visible: () => [],
   updateReady: () => [],
+  settingsChanged: () => [],
 };
 
 const EVENT_TYPES: EventType[] = [
@@ -1327,6 +1332,7 @@ const EVENT_TYPES: EventType[] = [
   'freeze',
   'visible',
   'updateReady',
+  'settingsChanged',
 ];
 
 /** Two variants per state: plain, and one with every flag and counter set. */
@@ -1423,6 +1429,42 @@ describe('cross product (state × event)', () => {
       for (const t of EVENT_TYPES) for (const e of SAMPLES[t](s)) run(s, e);
       expect(s).toStrictEqual(copy);
     }
+  });
+});
+
+describe('settingsChanged (M3, issue #66)', () => {
+  const CUSTOM: SessionState['preset'] = { id: 'custom', pitchRatio: 0.85 };
+
+  it('in every state, updates only the preset, with no effects', () => {
+    for (const name of STATES) {
+      for (const s of variants(name)) {
+        for (const preset of [PRESETS.chipmunk, PRESETS.bigbear, CUSTOM]) {
+          const r = run(s, { t: 'settingsChanged', preset });
+          expect(r.effects).toStrictEqual([]);
+          expect(r.state).toStrictEqual({ ...s, preset });
+          expect(r.state.preset).toBe(preset);
+        }
+      }
+    }
+  });
+
+  it('a preset equal to the current one (even as another object) returns the same state object', () => {
+    for (const name of STATES) {
+      const s = stateIn(name, { preset: { id: 'custom', pitchRatio: 1.85 } });
+      expectIgnored(s, { t: 'settingsChanged', preset: { id: 'custom', pitchRatio: 1.85 } });
+      expectIgnored(stateIn(name), { t: 'settingsChanged', preset: PRESETS.cub });
+    }
+  });
+
+  it('a different custom pitch is a change', () => {
+    const s = stateIn('Listening', { preset: { id: 'custom', pitchRatio: 1.85 } });
+    expect(run(s, { t: 'settingsChanged', preset: CUSTOM }).state.preset).toBe(CUSTOM);
+  });
+
+  it('the next take is processed with the new preset', () => {
+    const s = run(stateIn('Processing'), { t: 'settingsChanged', preset: PRESETS.chipmunk }).state;
+    const r = run(s, { t: 'clipReady', epoch: EPOCH, id: TAKE });
+    expect(r.effects).toStrictEqual([{ k: 'process', id: TAKE, preset: PRESETS.chipmunk }]);
   });
 });
 

@@ -69,7 +69,9 @@ export type SessionEvent =
   | { t: 'pagehide' }
   | { t: 'freeze' }
   | { t: 'visible' }
-  | { t: 'updateReady' };
+  | { t: 'updateReady' }
+  // M3 settings (issue #66): the voice preset the next `process` uses. Every state updates `preset`, no effects.
+  | { t: 'settingsChanged'; preset: VoicePreset };
 export type EventType = SessionEvent['t'];
 
 // Plan §3.3, plus `seq` on sfx and `applyUpdate`.
