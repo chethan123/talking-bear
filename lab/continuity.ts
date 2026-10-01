@@ -166,11 +166,16 @@ export interface BlockResult {
 }
 
 /**
- * Analyses `x`, the frames right after those `carry` ended with, and updates `carry`. The tone (A, f) and the
- * threshold are the block's own.
+ * Analyses `x`, the frames right after those `carry` ended with, and updates `carry`. The tone (A, f), and with
+ * it the threshold, is `x`'s own unless given: the parts of one block split at a minute boundary share the
+ * block's tone (analyseByMinute).
  */
-export function analyseBlock(x: Float32Array, sampleRate: number, carry: Carry): BlockResult {
-  const tone = estimateTone(x, sampleRate);
+export function analyseBlock(
+  x: Float32Array,
+  sampleRate: number,
+  carry: Carry,
+  tone: Tone = estimateTone(x, sampleRate),
+): BlockResult {
   const threshold = discontinuityThreshold(tone, sampleRate);
   const minRun = minZeroRunFrames(sampleRate);
   const zeroRuns: number[] = [];
@@ -244,16 +249,69 @@ export function addZeroRun(t: Tally, frames: number, sampleRate: number): void {
   if (longerThanGate(frames, sampleRate)) t.longZeroRuns++;
 }
 
-export function addBlock(t: Tally, frames: number, r: BlockResult, sampleRate: number): void {
-  t.blocks++;
+/** Adds the frames and findings of a block, or of the part of one that falls in this tally's minute. */
+export function addPart(t: Tally, frames: number, r: BlockResult, sampleRate: number): void {
   t.frames += frames;
   t.discontinuities += r.discontinuities;
   for (const run of r.zeroRuns) addZeroRun(t, run, sampleRate);
 }
 
+/** addPart, and counts one more block. */
+export function addBlock(t: Tally, frames: number, r: BlockResult, sampleRate: number): void {
+  t.blocks++;
+  addPart(t, frames, r, sampleRate);
+}
+
 /** The 0-based minute of the run that ctx frame `frame` falls in. */
 export function minuteIndex(frame: number, startFrame: number, sampleRate: number): number {
   return Math.max(0, Math.floor((frame - startFrame) / (60 * sampleRate)));
+}
+
+/**
+ * The first frames of minutes (startFrame + ceil(k·60·sr), k ≥ 1, as minuteIndex counts them) strictly inside
+ * the block (from, to), ascending: where the block is cut so that each part counts in its own minute.
+ */
+export function minuteCuts(from: number, to: number, startFrame: number, sampleRate: number): number[] {
+  const cuts: number[] = [];
+  for (let k = minuteIndex(from, startFrame, sampleRate) + 1; ; k++) {
+    const at = startFrame + Math.ceil(k * 60 * sampleRate);
+    if (at >= to) return cuts;
+    cuts.push(at); // > from: k starts at the minute after from's
+  }
+}
+
+/** One part of a block: the frames of the block that fall in one minute. */
+export interface Part {
+  /** The ctx frame of the part's first sample. */
+  readonly from: number;
+  readonly minute: number;
+  readonly frames: number;
+  readonly result: BlockResult;
+}
+
+/**
+ * Analyses the block `x` = ctx frames [from, from + x.length) as consecutive parts split at minuteCuts, each
+ * with analyseBlock on the same carry and with the whole block's tone. So the counts summed over the parts are
+ * exactly those of one analyseBlock over the block (a discontinuity at a cut counts in the later part, a zero run
+ * in the part where it ends), and each part lands in its own minute.
+ */
+export function analyseByMinute(
+  x: Float32Array,
+  from: number,
+  startFrame: number,
+  sampleRate: number,
+  carry: Carry,
+): Part[] {
+  const to = from + x.length;
+  const tone = estimateTone(x, sampleRate);
+  const parts: Part[] = [];
+  let at = from;
+  for (const end of [...minuteCuts(from, to, startFrame, sampleRate), to]) {
+    const result = analyseBlock(x.subarray(at - from, end - from), sampleRate, carry, tone);
+    parts.push({ from: at, minute: minuteIndex(at, startFrame, sampleRate), frames: end - at, result });
+    at = end;
+  }
+  return parts;
 }
 
 export type Verdict = 'pending' | 'pass' | 'fail';
@@ -386,8 +444,9 @@ root.append(
     el(
       'p',
       {},
-      `Use it after the gap measurement and at least ${IDLE_SEC} s without output (Since last output, below): ` +
-        'the mic hears the clicks, so the gate freezes at the first click test.',
+      `Use it after the gap measurement. It unlocks after ${IDLE_SEC} s without output (Since last output, ` +
+        'below), so the sink can have suspended; the mic hears the clicks, so the gate freezes at the first ' +
+        'click test.',
     ),
   ),
   el(
@@ -636,7 +695,7 @@ function onClip(epoch: number, id: number): void {
     return;
   }
   let from = p.from;
-  let r: BlockResult | null = null;
+  let parts: Part[] | null = null;
   try {
     let x = pcm;
     if (s.startFrame === null) {
@@ -656,28 +715,45 @@ function onClip(epoch: number, id: number): void {
         log(`analysis starts at ctx frame ${at}`);
       }
     }
-    if (s.startFrame !== null) r = analyseBlock(x, s.sampleRate, s.carry);
+    if (s.startFrame !== null) parts = analyseByMinute(x, from, s.startFrame, s.sampleRate, s.carry);
   } finally {
     pcm.fill(0); // plan Q2: the audio is discarded as soon as it is analysed
   }
-  if (r === null || s.startFrame === null) {
+  if (parts === null || s.startFrame === null) {
     const why = s.audioFrame === null ? 'exact zeros only, waiting for the mic' : 'settling';
     log(`take ${p.id} [${p.from}, ${p.to}): ${why}`);
     render();
     return;
   }
-  const frames = p.to - from;
-  addBlock(minuteTally(s, from), frames, r, s.sampleRate);
-  addBlock(s.total, frames, r, s.sampleRate);
-  logMinutesBefore(s, minuteIndex(from, s.startFrame, s.sampleRate));
-  s.lastTone = r.tone;
-  if (r.discontinuities > 0 || r.zeroRuns.length > 0) {
-    const runs = r.zeroRuns.map((f) => `${ms(f, s.sampleRate)} ms`).join(', ');
-    const first = r.firstDiscontinuity < 0 ? '' : `, the first at ctx frame ${from + r.firstDiscontinuity}`;
+  // Each part counts in its own minute (a block split at a minute boundary counts as a block in both); the total
+  // counts the block once. The parts' counts sum to the whole block's.
+  let discontinuities = 0;
+  let firstAt = -1;
+  const runs: string[] = [];
+  parts.forEach((part, i) => {
+    const r = part.result;
+    addBlock(minuteTally(s, part.from), part.frames, r, s.sampleRate);
+    if (i === 0) addBlock(s.total, part.frames, r, s.sampleRate);
+    else addPart(s.total, part.frames, r, s.sampleRate);
+    if (firstAt < 0 && r.firstDiscontinuity >= 0) firstAt = part.from + r.firstDiscontinuity;
+    discontinuities += r.discontinuities;
+    for (const f of r.zeroRuns) runs.push(`${ms(f, s.sampleRate)} ms`);
+  });
+  const last = parts[parts.length - 1]!;
+  logMinutesBefore(s, last.minute);
+  s.lastTone = last.result.tone;
+  if (discontinuities > 0 || runs.length > 0) {
+    const threshold = last.result.threshold.toPrecision(3);
+    const first = firstAt < 0 ? '' : `, the first at ctx frame ${firstAt}`;
+    const cuts = parts
+      .slice(1)
+      .map((q) => q.from)
+      .join(', ');
+    const split = cuts === '' ? '' : ` (split at ${cuts})`;
     log(
-      `block [${from}, ${p.to}): ${r.discontinuities} discontinuities (threshold ${r.threshold.toPrecision(3)})` +
+      `block [${from}, ${p.to})${split}: ${discontinuities} discontinuities (threshold ${threshold})` +
         first +
-        (runs === '' ? '' : `, zero runs ${runs}`),
+        (runs.length === 0 ? '' : `, zero runs ${runs.join(', ')}`),
     );
   }
   render();
@@ -708,6 +784,7 @@ async function start(): Promise<void> {
   const gen = ++generation;
   startButton.disabled = true;
   stopButton.disabled = false;
+  show.resume.textContent = '–'; // a new session has no resume measurement yet
   say('Starting: context, then the mic.');
   const running = waitEvent((e) => e.t === 'ctxRunning' || e.t === 'ctxResumeFailed', SETUP_TIMEOUT_MS);
   engine.resume().catch((err: unknown) => log(`resume failed: ${String(err)}`));
@@ -870,8 +947,21 @@ function clickText(c: ClickLatency | null): string {
   return c === null ? 'timed out' : `${fmt(c.polledMs, 1)} ms (timestamp ${latencyText(c.timestampMs)})`;
 }
 
+/**
+ * Seconds until the click test may run: it needs IDLE_SEC without output (since Start or the last click test),
+ * so the sink can have suspended in graph B and the gate is never frozen on an early measurement.
+ */
+function clickWaitSec(s: Session, now: number): number {
+  return Math.max(0, IDLE_SEC - (now - s.lastOutputWall) / 1000);
+}
+
 async function clickTest(s: Session): Promise<void> {
   if (s.clicking) return;
+  const wait = clickWaitSec(s, performance.now());
+  if (wait > 0) {
+    log(`click test: ${fmt(wait, 1)} s of the ${IDLE_SEC} s without output still to go`);
+    return;
+  }
   s.clicking = true;
   clickButton.disabled = true;
   const idle = (performance.now() - s.lastOutputWall) / 1000;
@@ -897,7 +987,8 @@ async function clickTest(s: Session): Promise<void> {
   } finally {
     s.lastOutputWall = performance.now();
     s.clicking = false;
-    clickButton.disabled = session !== s;
+    clickButton.disabled = true; // locked again for IDLE_SEC; render() unlocks it
+    render();
   }
 }
 
@@ -1058,10 +1149,12 @@ function render(): void {
           ? 'waiting for the mic'
           : 'settling'
         : `${fmt((now - s.startWall) / 60000, 2)} min`;
+    const wait = clickWaitSec(s, now);
     show.idle.textContent = s.clicking
       ? 'click test running'
-      : `${fmt((now - s.lastOutputWall) / 1000, 0)} s`;
-    clickButton.disabled = s.clicking;
+      : `${fmt((now - s.lastOutputWall) / 1000, 0)} s` +
+        (wait > 0 ? `: Play click after idle unlocks in ${Math.ceil(wait)} s` : '');
+    clickButton.disabled = s.clicking || wait > 0;
     renderSession(s);
   }
   const l = load;
