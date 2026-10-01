@@ -25,6 +25,7 @@ const EDGES_HZ = [8000, 12000] as const;
 const MAX_SEC = MAX_UTTERANCE_MS / 1000;
 /** Shortest capture that is measured: every phrase takes well over a second to say, so a shorter hold is a slip. */
 const MIN_SEC = 1;
+const ALL_DONE = `All ${SIBILANT_PHRASES.length} phrases measured: Copy results (JSON), or Close and Open mic for a new set.`;
 
 /** One phrase's numbers: all the page keeps of a capture. */
 interface PhraseResult {
@@ -81,7 +82,10 @@ interface Session {
 /** What the results so far were measured with. */
 interface Setup {
   readonly sampleRate: number;
+  /** The track label, shown and copied as the device label. */
   readonly device: string;
+  /** `track.getSettings().deviceId` ('' if missing): tells apart inputs whose labels are equal or generic. */
+  readonly deviceId: string;
 }
 
 // ---- analysis -----------------------------------------------------------------------------------------------
@@ -267,10 +271,18 @@ function summaryText(s: Summary | null): string {
   return `median ${fmt(s.median, 1)} dB, p90 ${fmt(s.p90, 1)} dB, max ${fmt(s.max, 1)} dB (n = ${s.n})`;
 }
 
+/** Whether every phrase of the set has a measured result: capture stops until a new set (Close, Open mic). */
+function setComplete(): boolean {
+  return results.length >= SIBILANT_PHRASES.length;
+}
+
 function render(): void {
-  holdButton.disabled = session === null;
-  promptHead.textContent = `Phrase ${next + 1} of ${SIBILANT_PHRASES.length}`;
-  promptText.textContent = SIBILANT_PHRASES[next] ?? '';
+  const complete = setComplete();
+  holdButton.disabled = session === null || complete;
+  promptHead.textContent = complete
+    ? `All ${SIBILANT_PHRASES.length} phrases measured`
+    : `Phrase ${next + 1} of ${SIBILANT_PHRASES.length}`;
+  promptText.textContent = complete ? '' : (SIBILANT_PHRASES[next] ?? '');
   show.rate.textContent = setup === null ? '—' : `${setup.sampleRate} Hz`;
   show.device.textContent = setup === null ? '—' : setup.device;
   show.count.textContent = String(results.length);
@@ -370,17 +382,27 @@ async function openMic(): Promise<void> {
     capture: null,
   };
   c.addEventListener('statechange', () => log(`context state: ${c.state}`));
-  if (
-    setup !== null &&
-    results.length > 0 &&
-    (setup.sampleRate !== c.sampleRate || setup.device !== device)
-  ) {
-    log(`results cleared: measured at ${setup.sampleRate} Hz on ${setup.device}`);
-    results.length = 0;
-    rows.replaceChildren();
-    next = 0;
+  const deviceId = track?.getSettings().deviceId ?? '';
+  if (results.length > 0) {
+    // Results carry over only for the same input at the same rate, and only while the set is incomplete: a
+    // missing deviceId can't prove the input is the same, and a complete set makes this open start a new one.
+    const same =
+      setup !== null &&
+      deviceId !== '' &&
+      setup.deviceId === deviceId &&
+      setup.device === device &&
+      setup.sampleRate === c.sampleRate;
+    if (!same || setComplete()) {
+      const why = same ? 'all phrases were measured: new set' : 'another input, rate or no deviceId';
+      log(`results cleared (${why}); they were measured at ${setup?.sampleRate} Hz on ${setup?.device}`);
+      results.length = 0;
+      rows.replaceChildren();
+      next = 0;
+    } else {
+      log(`results kept: same input (deviceId ${deviceId}) at the same rate`);
+    }
   }
-  setup = { sampleRate: c.sampleRate, device };
+  setup = { sampleRate: c.sampleRate, device, deviceId };
   log(`sampleRate: ${c.sampleRate} Hz`);
   log(`device: ${device}`);
   log(`track.getSettings(): ${JSON.stringify(track?.getSettings() ?? null)}`);
@@ -429,6 +451,7 @@ function startPhrase(): void {
   const s = session;
   if (s === null) return say('Open the mic first.');
   if (s.capture !== null) return;
+  if (setComplete()) return say(ALL_DONE); // the button is disabled; a press that still arrives is ignored
   const total = s.buffer.length;
   const node = new AudioWorkletNode(s.ctx, RECORDER, {
     numberOfInputs: 1,
@@ -485,7 +508,7 @@ function finishPhrase(why: string): void {
   }
   const r: PhraseResult = { phrase: n, above8kDb: a.shareDb[0] ?? null, above12kDb: a.shareDb[1] ?? null };
   results.push(r);
-  next = (capture.phrase + 1) % SIBILANT_PHRASES.length;
+  next = capture.phrase + 1; // no wrap-around: after the last phrase the set is complete
   rows.append(
     el(
       'tr',
@@ -498,9 +521,7 @@ function finishPhrase(why: string): void {
   );
   render();
   const values = `above 8 kHz ${db(r.above8kDb)}, above 12 kHz ${db(r.above12kDb)}`;
-  say(
-    `Phrase ${n}: ${values}. Audio discarded.${results.length === SIBILANT_PHRASES.length ? ' All phrases done: copy the results.' : ''}`,
-  );
+  say(setComplete() ? ALL_DONE : `Phrase ${n}: ${values}. Audio discarded.`);
   const all = `above 8 kHz ${db(a.allFramesDb[0] ?? null)}, above 12 kHz ${db(a.allFramesDb[1] ?? null)}`;
   log(`${head}, ${a.active}/${a.frames} frames active, ${values} (all frames: ${all}); audio discarded`);
 }
@@ -529,13 +550,20 @@ function guard(what: string, run: () => void): void {
   }
 }
 
-/** The pointer that pressed the button, or null. A newer press replaces it, so a missed release can't stick. */
+/**
+ * The pointer that pressed the button, or null. A newer press replaces it and discards the capture whose release
+ * was missed, so nothing gets stuck and no stale capture is measured.
+ */
 let holdPointer: number | null = null;
 
 holdButton.addEventListener('pointerdown', (e) => {
   if (!e.isPrimary || e.button !== 0) return;
   holdPointer = e.pointerId;
-  guard('hold', startPhrase);
+  guard('hold', () => {
+    // A capture still running at a new press lost its release: discard it, then start the new phrase.
+    if (session !== null && session.capture !== null) discardPhrase('missed release');
+    startPhrase();
+  });
 });
 /**
  * The release is heard on the window, so lifting the finger or the mouse button off the button counts too. A
