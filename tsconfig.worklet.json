@@ -15,7 +15,7 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.worklet.ts", "src/dsp/**/*.ts"],
+  "include": ["src/**/*.worklet.ts", "src/dsp/**/*.ts", "lab/**/*.worklet.ts"],
   "exclude": ["**/*.test.ts", "**/*.browser.test.ts"],
   // Keeps `tsc -b` from failing with TS18003 (no inputs) before the first worklet or src/dsp file exists.
   "references": []

@@ -1,5 +1,5 @@
 // Lab page: plays every sound effect in SYNTHS for listening (plan §4.6.4). Dev-only (`pnpm dev`, then
-// /lab/sfx.html); no audio is captured, stored or downloaded.
+// /lab/sfx.html); no audio is captured, stored or exported.
 import { createMasterBus } from '../src/audio/bus.ts';
 import { createSfx } from '../src/audio/sfx.ts';
 import type { SfxId } from '../src/audio/sfx-ids.ts';
