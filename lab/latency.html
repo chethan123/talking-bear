@@ -24,10 +24,12 @@
       <code>predictedOutMs</code> is the output latency that <code>getOutputTimestamp()</code> predicts at
       schedule time; <code>residualMs</code> is their difference, the input latency plus the prediction error.
       A small, stable residual (p90 − p10 ≤ 5 ms) validates the audio side of <code>clipTimeNow</code> (plan
-      §3.3). <code>tailMs</code> is the echo tail: the time from the arrival until the level stays within 3 dB
-      of the pre-click noise floor for 50 ms. It sets the cooldown (plan §4.4 point 3): max(250, p90 of
-      <code>tailMs</code> + 50) ms. A tail that hasn't settled by the end of its take counts at the largest
-      tail that take could show, and the cooldown is then a lower bound. The log also gives each click's raw
+      §3.3); the verdict needs at least 10 detected clicks. The spread can't show a constant prediction error:
+      that is inside the median residual, together with the input and acoustic latency. <code>tailMs</code> is
+      the echo tail: the time from the arrival until the level stays within 3 dB of the pre-click noise floor
+      for 50 ms. It sets the cooldown (plan §4.4 point 3): max(250, p90 of <code>tailMs</code> + 50) ms. A
+      tail that hasn't settled by the end of its take counts at the largest tail that take could show, and the
+      cooldown is then a lower bound. The log also gives each click's raw
       <code>getOutputTimestamp()</code> and marks the clicks whose prediction fell back to
       <code>currentTime − outputLatency</code>.
     </p>

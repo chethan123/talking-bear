@@ -36,6 +36,8 @@ const COOLDOWN_MIN_MS = 250;
 const COOLDOWN_MARGIN_MS = 50;
 /** The residual is stable when its p90 − p10 spread is at most this. */
 const STABLE_SPREAD_MS = 5;
+/** The stability verdict needs at least this many clicks with a residual (half of CLICKS); else it is n/a. */
+const MIN_VERDICT_CLICKS = 10;
 /** How long to wait for the context and the mic (the permission prompt). */
 const SETUP_TIMEOUT_MS = 30000;
 /** How long to wait for `armed`, and for a take's `clipReady` or `takeFailed`. */
@@ -182,6 +184,28 @@ export function recommendedCooldownMs(tailsMs: readonly number[]): number | null
   return s === null ? null : Math.max(COOLDOWN_MIN_MS, Math.ceil(s.p90 + COOLDOWN_MARGIN_MS));
 }
 
+/**
+ * The residual-spread verdict for `residualsMs` out of `clicks` clicks run: n/a below MIN_VERDICT_CLICKS
+ * residuals, else the p90 − p10 spread and whether it is within STABLE_SPREAD_MS (issue #40 step 4, plan §5
+ * X-E5). The spread shows repeatability only, which the text says.
+ */
+export function spreadVerdict(residualsMs: readonly number[], clicks: number): string {
+  const s = stats(residualsMs);
+  const n = s === null ? 0 : s.n;
+  if (s === null || n < MIN_VERDICT_CLICKS) {
+    return `n/a (only ${n} of ${clicks} clicks detected; need ≥ ${MIN_VERDICT_CLICKS})`;
+  }
+  const spread = s.p90 - s.p10;
+  return (
+    `${fmt(spread, 1)} ms over ${n} clicks: ` +
+    (spread <= STABLE_SPREAD_MS
+      ? `stable (≤ ${STABLE_SPREAD_MS} ms)`
+      : `not stable (> ${STABLE_SPREAD_MS} ms)`) +
+    ". The spread can't show a constant prediction error: that is inside the median residual, together with " +
+    'the input and acoustic latency.'
+  );
+}
+
 /** The click: a symmetric Hann window of CLICK_SAMPLES samples, scaled so its peak is exactly 1.0. */
 export function clickSamples(): Float32Array<ArrayBuffer> {
   const w = (i: number): number => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (CLICK_SAMPLES - 1));
@@ -316,12 +340,31 @@ let current: Run | null = null;
  * arrived (plan Q2); clickOnce clears it once it holds the clip itself.
  */
 let pendingTake: { readonly epoch: number; readonly id: number } | null = null;
+/** The current click's source until it ends, so a cancelled run can stop a click that is still scheduled. */
+let currentSource: AudioBufferSourceNode | null = null;
 
-/** Zero-fills the pending take's clip if the engine holds it; closeMic() then drops it. */
+/**
+ * Plan Q2 on Stop and pagehide: if the pending take's clip already arrived (clipReady), it is zero-filled.
+ * getClip() only returns a completed clip: a take still being assembled is dropped by the closeMic() that
+ * follows (the engine's chunk assembly is not reachable from here).
+ */
 function discardPendingTake(): void {
   const p = pendingTake;
   pendingTake = null;
   if (p !== null) engine.getClip(p.epoch, p.id)?.fill(0);
+}
+
+/** Stops and disconnects the current click if it is still scheduled or playing (harmless once it has ended). */
+function cancelClick(): void {
+  const s = currentSource;
+  currentSource = null;
+  if (s === null) return;
+  try {
+    s.stop();
+  } catch {
+    // Already stopped.
+  }
+  s.disconnect();
 }
 
 function sleep(ms: number): Promise<void> {
@@ -396,7 +439,11 @@ async function clickOnce(
 ): Promise<ClickResult> {
   const src = new AudioBufferSourceNode(ctx, { buffer: click });
   src.connect(bus);
-  src.addEventListener('ended', () => src.disconnect());
+  src.addEventListener('ended', () => {
+    src.disconnect();
+    if (currentSource === src) currentSource = null;
+  });
+  currentSource = src;
   // One snapshot of the clock for T, the prediction and the log: outputContextTimeNow sees exactly the
   // currentTime, outputLatency and output timestamp that are logged.
   const now = ctx.currentTime;
@@ -536,14 +583,7 @@ function showSummary(results: readonly ClickResult[]): void {
     );
   }
 
-  const r = stats(residuals);
-  spreadValue.textContent =
-    r === null
-      ? 'n/a (no click detected)'
-      : `${fmt(r.p90 - r.p10, 1)} ms over ${r.n} clicks: ` +
-        (r.p90 - r.p10 <= STABLE_SPREAD_MS
-          ? `stable (≤ ${STABLE_SPREAD_MS} ms)`
-          : `not stable (> ${STABLE_SPREAD_MS} ms)`);
+  spreadValue.textContent = spreadVerdict(residuals, results.length);
   const cooldown = recommendedCooldownMs(tailsMs);
   cooldownValue.textContent =
     cooldown === null
@@ -601,6 +641,7 @@ async function start(): Promise<void> {
     status.textContent = `Run ${why} after ${results.length} clicks.`;
     log(`run ${why} after ${results.length} clicks`);
   } finally {
+    cancelClick(); // a click still scheduled must not play when the next run resumes the context
     discardPendingTake();
     engine.closeMic(); // stops the tracks and drops the engine's last clip
     showSummary(results);
@@ -617,6 +658,7 @@ function stop(why: string): void {
   if (r === null || r.stopped) return;
   r.stopped = true;
   log(`stop: ${why}`);
+  cancelClick();
   for (const w of waiters) w.resolve(null);
 }
 
@@ -626,6 +668,7 @@ startButton.addEventListener('click', () => {
 stopButton.addEventListener('click', () => stop('Stop pressed'));
 window.addEventListener('pagehide', () => {
   stop('pagehide');
+  cancelClick();
   discardPendingTake();
   engine.closeMic(); // at once: no captured audio outlives the visible page
 });
