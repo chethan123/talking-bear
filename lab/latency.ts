@@ -311,6 +311,18 @@ interface ClickResult {
 let nextReq = 1;
 let nextEpoch = 1;
 let current: Run | null = null;
+/**
+ * The take requested and not yet handed to the analysis, so Stop and pagehide can zero its clip if it already
+ * arrived (plan Q2); clickOnce clears it once it holds the clip itself.
+ */
+let pendingTake: { readonly epoch: number; readonly id: number } | null = null;
+
+/** Zero-fills the pending take's clip if the engine holds it; closeMic() then drops it. */
+function discardPendingTake(): void {
+  const p = pendingTake;
+  pendingTake = null;
+  if (p !== null) engine.getClip(p.epoch, p.id)?.fill(0);
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -413,9 +425,11 @@ async function clickOnce(
     (e) => (e.t === 'clipReady' || e.t === 'takeFailed') && e.epoch === epoch && e.id === index,
     EVENT_TIMEOUT_MS,
   );
+  pendingTake = { epoch, id: index };
   engine.take(epoch, index, fromFrame, toFrame);
   const e = await done;
-  checkStopped(r);
+  checkStopped(r); // stopped: start() zero-fills the pending take's clip
+  pendingTake = null; // from here on this function zero-fills any clip it gets
 
   const missing = {
     arrivalLagMs: null,
@@ -587,6 +601,7 @@ async function start(): Promise<void> {
     status.textContent = `Run ${why} after ${results.length} clicks.`;
     log(`run ${why} after ${results.length} clicks`);
   } finally {
+    discardPendingTake();
     engine.closeMic(); // stops the tracks and drops the engine's last clip
     showSummary(results);
     await engine.suspend();
@@ -611,5 +626,6 @@ startButton.addEventListener('click', () => {
 stopButton.addEventListener('click', () => stop('Stop pressed'));
 window.addEventListener('pagehide', () => {
   stop('pagehide');
+  discardPendingTake();
   engine.closeMic(); // at once: no captured audio outlives the visible page
 });
