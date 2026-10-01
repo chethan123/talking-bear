@@ -5,9 +5,9 @@
   "path": "src/silero_vad/data/silero_vad_16k_op15.onnx",
   "onnxSha256": "7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49",
   "onnxBytes": 1289603,
-  "weightsSha256": "a795abe08a96bb3c900d89085a3c5e6e4033675ec5f27c56790cbbec4152eb17",
-  "weightsBytes": 487938,
-  "format": "fp16-le, conv biases fp32-le",
+  "weightsSha256": "931c33e5c5e2aace3d831add44518d2a745a4154fd514e340bd81dc3fdff3497",
+  "weightsBytes": 741890,
+  "format": "fp16-le; fp32-le for the conv biases, conv2W, conv3W, conv4W and lstmWhh",
   "order": [
     {
       "key": "conv1W",
@@ -27,7 +27,7 @@
       "key": "conv2W",
       "onnxName": "model.encoder.1.reparam_conv.weight",
       "dims": [64, 128, 3],
-      "format": "fp16",
+      "format": "fp32",
       "offsetBytes": 99584
     },
     {
@@ -35,77 +35,77 @@
       "onnxName": "model.encoder.1.reparam_conv.bias",
       "dims": [64],
       "format": "fp32",
-      "offsetBytes": 148736
+      "offsetBytes": 197888
     },
     {
       "key": "conv3W",
       "onnxName": "model.encoder.2.reparam_conv.weight",
       "dims": [64, 64, 3],
-      "format": "fp16",
-      "offsetBytes": 148992
+      "format": "fp32",
+      "offsetBytes": 198144
     },
     {
       "key": "conv3B",
       "onnxName": "model.encoder.2.reparam_conv.bias",
       "dims": [64],
       "format": "fp32",
-      "offsetBytes": 173568
+      "offsetBytes": 247296
     },
     {
       "key": "conv4W",
       "onnxName": "model.encoder.3.reparam_conv.weight",
       "dims": [128, 64, 3],
-      "format": "fp16",
-      "offsetBytes": 173824
+      "format": "fp32",
+      "offsetBytes": 247552
     },
     {
       "key": "conv4B",
       "onnxName": "model.encoder.3.reparam_conv.bias",
       "dims": [128],
       "format": "fp32",
-      "offsetBytes": 222976
+      "offsetBytes": 345856
     },
     {
       "key": "lstmWih",
       "onnxName": "model.decoder.rnn.weight_ih",
       "dims": [512, 128],
       "format": "fp16",
-      "offsetBytes": 223488
+      "offsetBytes": 346368
     },
     {
       "key": "lstmWhh",
       "onnxName": "model.decoder.rnn.weight_hh",
       "dims": [512, 128],
-      "format": "fp16",
-      "offsetBytes": 354560
+      "format": "fp32",
+      "offsetBytes": 477440
     },
     {
       "key": "lstmBih",
       "onnxName": "model.decoder.rnn.bias_ih",
       "dims": [512],
       "format": "fp16",
-      "offsetBytes": 485632
+      "offsetBytes": 739584
     },
     {
       "key": "lstmBhh",
       "onnxName": "model.decoder.rnn.bias_hh",
       "dims": [512],
       "format": "fp16",
-      "offsetBytes": 486656
+      "offsetBytes": 740608
     },
     {
       "key": "finalW",
       "onnxName": "model.decoder.decoder.2.weight",
       "dims": [1, 128, 1],
       "format": "fp16",
-      "offsetBytes": 487680
+      "offsetBytes": 741632
     },
     {
       "key": "finalB",
       "onnxName": "model.decoder.decoder.2.bias",
       "dims": [1],
       "format": "fp16",
-      "offsetBytes": 487936
+      "offsetBytes": 741888
     }
   ],
   "stftBasis": "periodic-hann DFT, regenerated in code",

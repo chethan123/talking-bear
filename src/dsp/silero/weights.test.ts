@@ -67,20 +67,21 @@ const EXPECTED_LENGTHS: Record<keyof SileroWeights, number> = {
 
 /**
  * #43's layout table (T32) plus the per-tensor storage format decided on #44 (ORCH-ANSWER 5856983940: the
- * four conv biases are fp32), written out independently of WEIGHTS_LAYOUT.
+ * four conv biases are fp32) and on #182 (conv2W, conv3W, conv4W and lstmWhh are fp32 too), written out
+ * independently of WEIGHTS_LAYOUT.
  */
 const LAYOUT_TABLE: { key: keyof SileroWeights; onnxName: string; dims: number[]; format: WeightsFormat }[] =
   [
     { key: 'conv1W', onnxName: 'model.encoder.0.reparam_conv.weight', dims: [128, 129, 3], format: 'fp16' },
     { key: 'conv1B', onnxName: 'model.encoder.0.reparam_conv.bias', dims: [128], format: 'fp32' },
-    { key: 'conv2W', onnxName: 'model.encoder.1.reparam_conv.weight', dims: [64, 128, 3], format: 'fp16' },
+    { key: 'conv2W', onnxName: 'model.encoder.1.reparam_conv.weight', dims: [64, 128, 3], format: 'fp32' },
     { key: 'conv2B', onnxName: 'model.encoder.1.reparam_conv.bias', dims: [64], format: 'fp32' },
-    { key: 'conv3W', onnxName: 'model.encoder.2.reparam_conv.weight', dims: [64, 64, 3], format: 'fp16' },
+    { key: 'conv3W', onnxName: 'model.encoder.2.reparam_conv.weight', dims: [64, 64, 3], format: 'fp32' },
     { key: 'conv3B', onnxName: 'model.encoder.2.reparam_conv.bias', dims: [64], format: 'fp32' },
-    { key: 'conv4W', onnxName: 'model.encoder.3.reparam_conv.weight', dims: [128, 64, 3], format: 'fp16' },
+    { key: 'conv4W', onnxName: 'model.encoder.3.reparam_conv.weight', dims: [128, 64, 3], format: 'fp32' },
     { key: 'conv4B', onnxName: 'model.encoder.3.reparam_conv.bias', dims: [128], format: 'fp32' },
     { key: 'lstmWih', onnxName: 'model.decoder.rnn.weight_ih', dims: [512, 128], format: 'fp16' },
-    { key: 'lstmWhh', onnxName: 'model.decoder.rnn.weight_hh', dims: [512, 128], format: 'fp16' },
+    { key: 'lstmWhh', onnxName: 'model.decoder.rnn.weight_hh', dims: [512, 128], format: 'fp32' },
     { key: 'lstmBih', onnxName: 'model.decoder.rnn.bias_ih', dims: [512], format: 'fp16' },
     { key: 'lstmBhh', onnxName: 'model.decoder.rnn.bias_hh', dims: [512], format: 'fp16' },
     { key: 'finalW', onnxName: 'model.decoder.decoder.2.weight', dims: [1, 128, 1], format: 'fp16' },
@@ -110,15 +111,17 @@ describe('layout', () => {
 });
 
 describe('committed weights.bin', () => {
-  it('is 487,938 bytes and its SHA-256 is WEIGHTS_SHA256', () => {
-    expect(binBytes.byteLength).toBe(487_938);
+  it('is 741,890 bytes and its SHA-256 is WEIGHTS_SHA256', () => {
+    expect(binBytes.byteLength).toBe(741_890);
     expect(createHash('sha256').update(binBytes).digest('hex')).toBe(WEIGHTS_SHA256);
   });
 
   it('matches weights.provenance.json (hash, size, format, order and offsets)', () => {
     expect(provenance.weightsSha256).toBe(WEIGHTS_SHA256);
     expect(provenance.weightsBytes).toBe(WEIGHTS_BYTES);
-    expect(provenance.format).toBe('fp16-le, conv biases fp32-le');
+    expect(provenance.format).toBe(
+      'fp16-le; fp32-le for the conv biases, conv2W, conv3W, conv4W and lstmWhh',
+    );
     let offsetBytes = 0;
     const expected = LAYOUT_TABLE.map(({ key, onnxName, dims, format }) => {
       const entry = { key, onnxName, dims: [...dims], format, offsetBytes };
@@ -154,7 +157,7 @@ describe('committed weights.bin', () => {
     expect(provenance.path).toBe('src/silero_vad/data/silero_vad_16k_op15.onnx');
     expect(provenance.onnxSha256).toBe('7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49');
     expect(provenance.onnxBytes).toBe(1_289_603);
-    expect(provenance.weightsBytes).toBe(487_938);
+    expect(provenance.weightsBytes).toBe(741_890);
     expect(provenance.stftBasis).toBe('periodic-hann DFT, regenerated in code');
     expect(provenance.extractedWith).toBe('scripts/extract-silero-weights.ts');
     expect(provenance.licence).toBe('MIT');
@@ -174,9 +177,9 @@ describe('committed weights.bin', () => {
     }
   });
 
-  it('the conv biases carry fp32 precision, and every fp16 tensor is exactly fp16', () => {
-    // Each fp32 bias tensor must hold at least one value that isn't exactly representable in fp16 (otherwise
-    // it was rounded to fp16 before being stored).
+  it('every fp32 tensor carries fp32 precision, and every fp16 tensor is exactly fp16', () => {
+    // Each fp32 tensor must hold at least one value that isn't exactly representable in fp16 (otherwise it
+    // was rounded to fp16 before being stored).
     const w = decodeWeights(binBuffer());
     for (const { key, format } of LAYOUT_TABLE) {
       const values = [...w[key]];
@@ -205,20 +208,20 @@ describe('committed weights.bin', () => {
 });
 
 describe('decodeWeights', () => {
-  // 487,170 is the all-fp16 file of #43.
-  it.each([0, 487_170, WEIGHTS_BYTES - 2, WEIGHTS_BYTES - 1, WEIGHTS_BYTES + 1])(
+  // 487,170 is the all-fp16 file of #43; 487,938 is #44's file (only the conv biases fp32).
+  it.each([0, 487_170, 487_938, WEIGHTS_BYTES - 2, WEIGHTS_BYTES - 1, WEIGHTS_BYTES + 1])(
     'rejects a %i-byte buffer by its length',
     (n) => {
       expect(() => decodeWeights(new ArrayBuffer(n))).toThrow(RangeError);
-      expect(() => decodeWeights(new ArrayBuffer(n))).toThrow(`expected 487938 bytes, got ${n}`);
+      expect(() => decodeWeights(new ArrayBuffer(n))).toThrow(`expected 741890 bytes, got ${n}`);
     },
   );
 
   it('maps every key to its own slot (each tensor filled with a distinct value)', () => {
     // Byte offsets of the 14 tensors, from the dims and formats (independent of WEIGHTS_LAYOUT).
     const offsets = [
-      0, 99_072, 99_584, 148_736, 148_992, 173_568, 173_824, 222_976, 223_488, 354_560, 485_632, 486_656,
-      487_680, 487_936, 487_938,
+      0, 99_072, 99_584, 197_888, 198_144, 247_296, 247_552, 345_856, 346_368, 477_440, 739_584, 740_608,
+      741_632, 741_888, 741_890,
     ];
     const view = new DataView(new ArrayBuffer(WEIGHTS_BYTES));
     for (let t = 0; t < 14; t++) {
