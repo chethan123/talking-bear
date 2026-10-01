@@ -217,7 +217,8 @@ function refresh(): void {
   const locked = session !== null;
   participantInput.disabled = locked;
   ageSelect.disabled = locked;
-  exportButton.disabled = trials.length === 0;
+  // A trial in progress (its tail included) isn't in `trials` yet: Export waits for it to close.
+  exportButton.disabled = trials.length === 0 || current !== null;
   newButton.disabled = current !== null || exported < trials.length;
   const perClass = INTENDED.map((k) => `${k} ${trials.filter((t) => t.intended === k).length}`).join(', ');
   const who = session?.participant ?? `P${participantNumber()}`;
@@ -325,7 +326,7 @@ function isoBasic(d: Date): string {
 }
 
 exportButton.addEventListener('click', () => {
-  if (session === null || trials.length === 0) return;
+  if (session === null || trials.length === 0 || current !== null) return;
   const name = `gestures-${session.participant}-${isoBasic(new Date())}.json`;
   const json = JSON.stringify({
     format: FORMAT,
