@@ -31,7 +31,7 @@
   "devDependencies": {
     "@playwright/test": "1.63.0",
     "@types/audioworklet": "0.0.100",
-    "@types/node": "24.19.0",
+    "@types/node": "26.6.3",
     "@vitest/browser-playwright": "5.0.2",
     "@vitest/coverage-v8": "5.0.2",
     "fast-check": "4.10.2",
