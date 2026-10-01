@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: bench (X-V2, worklet DSP)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./bench.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Silero and worklet DSP timing</h1>
+    <p>
+      X-V2 (plan §5): the Silero TS port's time per 512-sample frame (32 ms of 16 kHz audio), in a Worker,
+      with onnxruntime-web (wasm, 1 thread) for comparison. Gate: <strong>silero-ts p95 ≤ 8 ms</strong>.
+      worklet-dsp times the capture worklet's high-pass, ring buffer and 16 kHz decimator per 128-frame
+      quantum (plan §4.10: p99 ≤ 50 µs), since the worklet itself has no <code>performance</code>.
+    </p>
+    <p>
+      silero-ort needs the pinned ONNX file: run <code>pnpm silero:fetch</code> once (it caches the file in
+      <code>.cache/silero/</code>, which <code>pnpm dev</code> serves). Without it the run reports “ORT
+      unavailable” and the others continue.
+    </p>
+    <p>
+      <strong>Thermals:</strong> on D1, capture <code>adb shell dumpsys thermalservice</code> before and after
+      the 10-min run with Real time checked, which lasts 10 min of wall time (plan §4.10: thermal status ≤
+      LIGHT after 10 min). A back-to-back 10-min run ends far sooner and is not a thermal soak.
+    </p>
+    <p>
+      The input is synthetic (alternating 2 s of pink noise at −40 dBFS and 2 s of a synthetic vowel). Nothing
+      is captured or stored; Copy log copies text only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
