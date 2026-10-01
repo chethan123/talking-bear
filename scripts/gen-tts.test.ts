@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -19,11 +20,13 @@ import {
   MANIFEST_PATH,
   MAX_SENTENCE_SAMPLES,
   MERGE_GAP_MS,
+  MIN_RUN_MS,
   PROVENANCE_PATH,
   SAMPLE_RATE,
   SIZE_BUDGET_BYTES,
   SPEECH_DIR,
   TEXTS_PATH,
+  THRESHOLD_DB,
   combo,
   labelSpans,
   parseDockerfile,
@@ -64,7 +67,23 @@ function block(x: Float32Array, from: number, to: number, amp: number): void {
 
 const ms = (n: number): number => n * (SAMPLE_RATE / 1000);
 
+/**
+ * sha256 of the 108 committed corpus WAVs, concatenated in manifest order (espeak-ng 1.51+dfsg-12build1, see
+ * test/corpus/PROVENANCE.md). It catches silent corruption that the peak, edge and label checks miss; regenerating
+ * the corpus with another espeak-ng build changes it on purpose.
+ */
+const CORPUS_WAV_SHA256 = '6b6dd427adfa5eee3180a904a424f8863132ea018c6ffa4bcc64af633fa0c48e';
+
 describe('labelSpans', () => {
+  test("the labelling constants are the issue's numbers", () => {
+    expect({ MERGE_GAP_MS, THRESHOLD_DB, MIN_RUN_MS, HOP }).toEqual({
+      MERGE_GAP_MS: { word: 150, sentence: 150, passage: 300 },
+      THRESHOLD_DB: 35,
+      MIN_RUN_MS: 50,
+      HOP: 160,
+    });
+  });
+
   test('speech is every hop strictly above max hop dB − 35 dB', () => {
     const x = new Float32Array(ms(300));
     block(x, 0, ms(100), 0.5);
@@ -97,6 +116,7 @@ describe('labelSpans', () => {
     block(x, 0, x.length, 0.5);
     expect(labelSpans(x, 150)).toEqual([[0, x.length]]);
     expect(labelSpans(x.subarray(0, ms(50) - 1), 150)).toEqual([]);
+    // Sanity check of the setup, not of labelSpans: the signal ends in a partial 37-sample hop.
     expect(x.length % HOP).toBe(37);
   });
 
@@ -183,9 +203,18 @@ describe('committed corpus: test/corpus/speech', () => {
 
   test("PROVENANCE.md names the Dockerfile's base image and package pins", () => {
     const provenance = readFileSync(PROVENANCE_PATH, 'utf8');
-    const { from, pins } = parseDockerfile(readFileSync(DOCKERFILE_PATH, 'utf8'));
+    const { from, pins, espeakVersion } = parseDockerfile(readFileSync(DOCKERFILE_PATH, 'utf8'));
     expect(provenance).toContain(`FROM ${from}`);
     for (const pin of pins) expect(provenance).toContain(pin);
+    expect(provenance).toContain(
+      `Verify on first \`docker build\` (\`docker run --rm --entrypoint dpkg <image> -s espeak-ng\` must report ${espeakVersion}).`,
+    );
+  });
+
+  test('the committed WAVs match the aggregate sha256 (manifest order)', () => {
+    const hash = createHash('sha256');
+    for (const entry of manifest) hash.update(readFileSync(join(SPEECH_DIR, entry.file)));
+    expect(hash.digest('hex')).toBe(CORPUS_WAV_SHA256);
   });
 
   test(`the directory is within the ${SIZE_BUDGET_BYTES}-byte budget`, () => {
@@ -265,6 +294,7 @@ describe('e2e TTS fixtures: e2e/fixtures/tts_sentence_{a,b}', () => {
     expect(sidecar.speech).toEqual(
       entry.spans.map(([s, e]) => ({ start: 3 * s + PAD_SAMPLES, end: 3 * e + PAD_SAMPLES })),
     );
+    // Sanity check of the pairing below (buildE2eFixtures follows E2E_SOURCES' order), not of the fixture.
     expect(rebuilt[i]!.name).toBe(name);
     expect(Buffer.from(rebuilt[i]!.wav).equals(bytes)).toBe(true);
     expect(rebuilt[i]!.json).toBe(json);
