@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, test } from 'vitest';
 
 import { butterworthHighpass, cascade } from '../src/dsp/biquad.ts';
@@ -60,7 +62,16 @@ import {
   sceneRng,
   tvNoise,
 } from './corpus-lib.ts';
-import { compareHashes, loadCorpus, mergeHashes, parseArgs, parseHashes } from './gen-corpus.ts';
+import {
+  HASHES_PATH,
+  compareHashes,
+  loadCorpus,
+  mergeHashes,
+  parseArgs,
+  parseHashes,
+  renderSubset,
+  sha256,
+} from './gen-corpus.ts';
 
 // The issue's literal numbers (#52), so a changed constant fails here instead of moving every expectation with it.
 const ISSUE_RT60S = [0.2, 0.4, 0.6];
@@ -628,4 +639,22 @@ describe('gen-corpus command line', () => {
     expect(() => parseHashes({ 'a.f32': 'xyz' })).toThrow();
     expect(parseHashes({ 'a.f32': h('a') })).toEqual({ 'a.f32': h('a') });
   });
+});
+
+describe('test/corpus/mix-hashes.json', () => {
+  const hashes = parseHashes(JSON.parse(readFileSync(HASHES_PATH, 'utf8')));
+
+  test('covers exactly the outputs of the full subset', () => {
+    expect(Object.keys(hashes).toSorted()).toEqual(
+      planCorpus('full', entries)
+        .flatMap((p) => [`${p.name}.f32`, `${p.name}.json`])
+        .toSorted(),
+    );
+  });
+
+  test('the fast subset renders to the recorded SHA-256 of every file', () => {
+    const files = renderSubset('fast', corpus);
+    expect(files.length).toBe(10);
+    for (const { name, bytes } of files) expect(`${name} ${sha256(bytes)}`).toBe(`${name} ${hashes[name]}`);
+  }, 60_000);
 });
