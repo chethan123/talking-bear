@@ -71,7 +71,7 @@ adb shell dumpsys audio | grep -i mode     # MODE_NORMAL vs MODE_IN_COMMUNICATIO
 adb shell dumpsys media.audio_flinger      # output device (speaker / earpiece) and usage of the active tracks
 ```
 
-Optional: SPL at 10 cm at maximum media volume with a sound-level meter (or a meter app on another phone), playing the tone.
+Optional: SPL at 10 cm at maximum media volume with a sound-level meter (or a meter app on another phone), playing the tone. The lab plays straight to `destination`, while the app's master bus (`src/audio/bus.ts`) applies a gain of 0.7 (−3.1 dB) after its own levels: when comparing SPL with the app's output, the −12 dBFS lab tone is 3.1 dB hotter than an app sound at the same pre-bus level.
 
 **X-E2 procedure** (plan §5): play white noise from a second device near D1's mic, with EC off and then on. Compare the spectra (a cutoff near 8 kHz means voice processing), the energy share above 8 kHz, and drift in the recording's level over repeated Record 3 s runs (OEM AGC). Plug in a wired headset and check which input `enumerateDevices()` and `track.getSettings()` report.
 

@@ -49,6 +49,14 @@ interface Plot {
   readonly nyquistLabel: string;
 }
 
+/** A recording in progress: its worklet node and the preallocated in-memory buffer it fills. */
+interface Capture {
+  readonly node: AudioWorkletNode;
+  /** 3 s at the context rate; zero-filled if the capture is cut short (Close, pagehide). */
+  readonly buffer: Float32Array<ArrayBuffer>;
+  filled: number;
+}
+
 interface Session {
   readonly ctx: AudioContext;
   readonly stream: MediaStream;
@@ -60,7 +68,7 @@ interface Session {
   /** The loudest bin (dB) per canvas column, reused every drawn frame. */
   readonly columns: Float32Array<ArrayBuffer>;
   readonly players: Set<AudioBufferSourceNode>;
-  recorder: AudioWorkletNode | null;
+  capture: Capture | null;
   /** The finished in-memory recording (3 s at the context rate), or null. */
   recording: Float32Array<ArrayBuffer> | null;
   raf: number;
@@ -161,7 +169,13 @@ function abandon(ctx: AudioContext | null, stream: MediaStream | null, why: stri
 async function startContext(): Promise<AudioContext> {
   // As in the app (src/audio/engine.ts): no forced sampleRate, 'interactive' latency.
   const ctx = new AudioContext({ latencyHint: 'interactive' });
-  await ctx.resume();
+  try {
+    await ctx.resume();
+  } catch (err) {
+    // A context that never started still holds audio resources: close it before reporting the failure.
+    ctx.close().catch((e: unknown) => log(`context close failed: ${String(e)}`));
+    throw err;
+  }
   log(`context created: state ${ctx.state}`);
   return ctx;
 }
@@ -272,7 +286,7 @@ async function openMic(): Promise<void> {
     bins: new Float32Array(analyser.frequencyBinCount),
     columns: new Float32Array(plot.width),
     players: new Set(),
-    recorder: null,
+    capture: null,
     recording: null,
     raf: 0,
     lastDraw: -Infinity,
@@ -303,7 +317,7 @@ function close(reason: string): void {
   }
   session = null;
   cancelAnimationFrame(s.raf);
-  stopRecorder(s);
+  stopRecorder(s)?.buffer.fill(0); // a capture cut short: its samples are zeroed too
   for (const player of s.players) {
     player.stop();
     player.disconnect();
@@ -323,13 +337,17 @@ function close(reason: string): void {
 
 // ---- recording ----------------------------------------------------------------------------------------------
 
-/** Ends a recording in progress: the worklet stops on 'stop', and blocks already in flight are ignored. */
-function stopRecorder(s: Session): void {
-  const node = s.recorder;
-  if (node === null) return;
-  s.recorder = null;
-  node.port.postMessage('stop', []); // MessagePort: the second argument is the (empty) transfer list
-  s.source.disconnect(node);
+/**
+ * Ends the recording in progress, if any, and returns it: the worklet stops on 'stop', and blocks already in
+ * flight are ignored. The caller keeps the buffer (a finished recording) or zero-fills it (cut short).
+ */
+function stopRecorder(s: Session): Capture | null {
+  const capture = s.capture;
+  if (capture === null) return null;
+  s.capture = null;
+  capture.node.port.postMessage('stop', []); // MessagePort: the second argument is the (empty) transfer list
+  s.source.disconnect(capture.node);
+  return capture;
 }
 
 function levels(x: Float32Array): { peakDb: number; rmsDb: number } {
@@ -345,12 +363,10 @@ function levels(x: Float32Array): { peakDb: number; rmsDb: number } {
 function record(): void {
   const s = session;
   if (s === null) return log('record: open the mic first');
-  if (s.recorder !== null) return log('record: already recording');
+  if (s.capture !== null) return log('record: already recording');
   s.recording?.fill(0);
   s.recording = null;
   const total = Math.round(RECORD_SEC * s.ctx.sampleRate);
-  const buffer = new Float32Array(total);
-  let filled = 0;
   const node = new AudioWorkletNode(s.ctx, RECORDER, {
     numberOfInputs: 1,
     numberOfOutputs: 1,
@@ -359,22 +375,23 @@ function record(): void {
     channelCountMode: 'explicit',
     channelInterpretation: 'speakers',
   });
+  const capture: Capture = { node, buffer: new Float32Array(total), filled: 0 };
   node.port.addEventListener('message', (e: MessageEvent<unknown>) => {
     const block = e.data;
-    if (!(block instanceof Float32Array) || s.recorder !== node) return;
-    const n = Math.min(block.length, total - filled);
-    buffer.set(block.subarray(0, n), filled);
-    filled += n;
-    if (filled < total) return;
+    if (!(block instanceof Float32Array) || s.capture !== capture) return;
+    const n = Math.min(block.length, total - capture.filled);
+    capture.buffer.set(block.subarray(0, n), capture.filled);
+    capture.filled += n;
+    if (capture.filled < total) return;
     stopRecorder(s);
-    s.recording = buffer;
-    const { peakDb, rmsDb } = levels(buffer);
+    s.recording = capture.buffer;
+    const { peakDb, rmsDb } = levels(capture.buffer);
     log(
       `record: done, ${total} frames (${fmt(total / s.ctx.sampleRate, 3)} s), peak ${fmt(peakDb, 1)} dBFS, rms ${fmt(rmsDb, 1)} dBFS`,
     );
   });
   node.port.start(); // addEventListener, unlike the onmessage setter, doesn't start the port
-  s.recorder = node;
+  s.capture = capture;
   s.source.connect(node); // the output stays unconnected: Chrome still pulls a worklet node with an input
   log(`record: started, ${total} frames`);
 }
