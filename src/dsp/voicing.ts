@@ -8,6 +8,11 @@
 /** A window is voiced when its score is above this. */
 export const VOICED_THRESHOLD = 0.5;
 
+/** Default F0 search range of `createVoicing` (Hz). Exported so that src/vad-trace/config.ts can be checked
+ *  against it. */
+export const VOICING_FMIN_HZ = 70;
+export const VOICING_FMAX_HZ = 600;
+
 /** A window whose energy Σ x[n]² is below this scores 0. */
 const MIN_WINDOW_ENERGY = 1e-10;
 /** Regulariser inside the square root of the normalisation. */
@@ -31,7 +36,7 @@ export interface Voicing {
  * A voicing scorer for windows at sample rate fs, searching F0 in [fminHz, fmaxHz]. Throws RangeError unless
  * fs is finite and positive and 0 < fminHz < fmaxHz <= fs / 2.
  */
-export function createVoicing(fs = 16000, fminHz = 70, fmaxHz = 600): Voicing {
+export function createVoicing(fs = 16000, fminHz = VOICING_FMIN_HZ, fmaxHz = VOICING_FMAX_HZ): Voicing {
   if (!(Number.isFinite(fs) && fs > 0 && fminHz > 0 && fmaxHz > fminHz && fmaxHz <= fs / 2)) {
     throw new RangeError(
       `invalid voicing parameters: fs ${fs}, fminHz ${fminHz}, fmaxHz ${fmaxHz} (need 0 < fminHz < fmaxHz <= fs / 2)`,
