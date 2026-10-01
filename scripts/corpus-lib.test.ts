@@ -35,6 +35,7 @@ import {
   TV_LPF_HZ,
   TV_STREAMS,
   type CorpusEntry,
+  type ScenePlan,
   activeRms,
   amfanNoise,
   babblePool,
@@ -43,15 +44,23 @@ import {
   convolve,
   createFft,
   deviceChain,
+  f32leBytes,
   fanNoise,
   makeRir,
+  metaBytes,
   midiHz,
   mixAtSnr,
   musicNoise,
   pinkNoise,
+  planBabble,
+  planCorpus,
+  renderScene,
   rms,
+  rotationStart,
+  sceneRng,
   tvNoise,
 } from './corpus-lib.ts';
+import { loadCorpus } from './gen-corpus.ts';
 
 // The issue's literal numbers (#52), so a changed constant fails here instead of moving every expectation with it.
 const ISSUE_RT60S = [0.2, 0.4, 0.6];
@@ -396,5 +405,177 @@ describe('SNR mixing', () => {
     expect(Math.abs(dB(activeRms(speech, spans) / activeRms(residual, spans)) - snrDb)).toBeLessThanOrEqual(
       0.1,
     );
+  });
+});
+
+const corpus = loadCorpus();
+const { entries, audio } = corpus;
+const byId = new Map(entries.map((e) => [e.id, e]));
+const textOf = (id: string): string => byId.get(id)!.text;
+
+/** A short SNR scene for `noise` built from the real corpus: 3 utterances, no 90 s fill. */
+function shortScene(noise: (typeof NOISES)[number], snrDb: number, seed: number): ScenePlan {
+  const full = planCorpus('full', entries).find((p) => p.name === `${noise}-snr${snrDb}`)!;
+  const placements = full.placements.slice(0, 3);
+  const last = placements.at(-1)!;
+  return { ...full, seed, placements, samples: last.offset + byId.get(last.id)!.samples + GAP_MIN };
+}
+
+describe('rendered scenes', () => {
+  test.each([...NOISES])('%s: measured SNR within ±0.1 dB and labels inside the scene', (noise) => {
+    for (const snrDb of ISSUE_SNRS_DB) {
+      const plan = shortScene(noise, snrDb, BASE_SEED + 1000);
+      const scene = renderScene(plan, entries, audio);
+      const { spans } = scene.meta;
+      const residual = scene.audio.map((v, i) => v - scene.speech[i]!);
+      expect(
+        Math.abs(dB(activeRms(scene.speech, spans) / activeRms(residual, spans)) - snrDb),
+      ).toBeLessThanOrEqual(0.1);
+      expect(scene.meta.samples).toBe(scene.audio.length);
+      for (const [s, e] of spans) {
+        expect(s).toBeGreaterThanOrEqual(16_000);
+        expect(e).toBeGreaterThan(s);
+        expect(e).toBeLessThanOrEqual(scene.audio.length);
+      }
+      expect(scene.meta.kinds.length).toBe(spans.length);
+      expect(scene.meta.ids.length).toBe(spans.length);
+    }
+  });
+
+  test.each([...NOISES])('%s: the same seed gives the same bytes, another seed different bytes', (noise) => {
+    const plan = shortScene(noise, 10, BASE_SEED + 2000);
+    const a = renderScene(plan, entries, audio);
+    const b = renderScene(plan, entries, audio);
+    expect(Buffer.from(f32leBytes(a.audio)).equals(Buffer.from(f32leBytes(b.audio)))).toBe(true);
+    expect(Buffer.from(metaBytes(a.meta)).equals(Buffer.from(metaBytes(b.meta)))).toBe(true);
+    const c = renderScene({ ...plan, seed: plan.seed + 1 }, entries, audio);
+    expect(Buffer.from(f32leBytes(a.audio)).equals(Buffer.from(f32leBytes(c.audio)))).toBe(false);
+  });
+
+  test('a noise-only stream is scaled to the given absolute level', () => {
+    const plan = {
+      ...planCorpus('fast', entries).find((p) => p.type === 'noise-only')!,
+      samples: 5 * SAMPLE_RATE,
+    };
+    const scene = renderScene(plan, entries, audio, 0.0123);
+    expect(rms(scene.audio)).toBeCloseTo(0.0123, 6);
+    expect(scene.meta.spans).toEqual([]);
+    expect(scene.meta.snrDb).toBeNull();
+    expect(() => renderScene(plan, entries, audio)).toThrow();
+  });
+});
+
+describe('tv babble', () => {
+  const tvPlans = planCorpus('full', entries).filter((p) => p.noise === 'tv');
+
+  test.each(tvPlans.map((p) => [p.name, p] as const))(
+    '%s: babble never contains the scene’s own ids or texts',
+    (_, plan) => {
+      const ownIds = plan.placements.map((p) => p.id);
+      const ownTexts = new Set(ownIds.map(textOf));
+      // The same draws as renderScene: the layout, the RIR tail, then the babble.
+      const rng = sceneRng(plan);
+      makeRir(rng, plan.rt60);
+      const streams = planBabble(rng, babblePool(entries, ownIds), plan.samples);
+      const ids = streams.flatMap((s) => s.items.map((item) => item.id));
+      expect(streams.length).toBe(3);
+      expect(ids.length).toBeGreaterThan(0);
+      expect(ids.filter((id) => ownIds.includes(id))).toEqual([]);
+      expect(ids.filter((id) => ownTexts.has(textOf(id)))).toEqual([]);
+      for (const s of streams) {
+        expect(s.levelDb).toBeGreaterThanOrEqual(-6);
+        expect(s.levelDb).toBeLessThanOrEqual(0);
+      }
+    },
+  );
+
+  test('renderScene uses those babble draws (fast-tv-snr10)', () => {
+    const plan = tvPlans.find((p) => p.name === 'fast-tv-snr10')!;
+    const rng = sceneRng(plan);
+    makeRir(rng, plan.rt60);
+    const own = plan.placements.map((p) => p.id);
+    const expected = planBabble(rng, babblePool(entries, own), plan.samples).flatMap((s) =>
+      s.items.map((i) => i.id),
+    );
+    const scene = renderScene(plan, entries, audio);
+    expect(scene.babbleIds).toEqual(expected);
+    const ownTexts = new Set(own.map(textOf));
+    expect(scene.babbleIds.filter((id) => ownTexts.has(textOf(id)))).toEqual([]);
+  });
+});
+
+describe('scene plans', () => {
+  const full = planCorpus('full', entries);
+  const fast = planCorpus('fast', entries);
+  const short = entries.filter((e) => e.kind !== 'passage');
+
+  test('the full subset has every scene once, with seeds 0xC0A5 + offset', () => {
+    expect(full.length).toBe(28);
+    expect(new Set(full.map((p) => p.name)).size).toBe(28);
+    expect(full.map((p) => p.offset)).toEqual([...Array(28).keys()]);
+    for (const p of full) expect(p.seed).toBe(0xc0a5 + p.offset);
+    expect(full.filter((p) => p.type === 'snr' && p.group === 'full').length).toBe(20);
+    expect(fast).toEqual(full.filter((p) => p.group === 'fast'));
+    expect(fast.map((p) => p.name)).toEqual([
+      'fast-fan-snr10',
+      'fast-fan-snr5',
+      'fast-tv-snr10',
+      'fast-tv-snr5',
+      'fast-fan-noise',
+    ]);
+    expect(planCorpus('full', entries)).toEqual(full);
+  });
+
+  test('every layout is drawn from mulberry32(seed): RT60, then one 2–3 s gap per utterance', () => {
+    for (const p of full) {
+      const rng = mulberry32(p.seed);
+      expect(p.rt60).toBe(ISSUE_RT60S[Math.floor(rng() * 3)]);
+      const ends = p.placements.map((pl) => pl.offset + byId.get(pl.id)!.samples);
+      const next = [...p.placements.slice(1).map((pl) => pl.offset), p.samples];
+      if (p.type !== 'noise-only') {
+        ends.forEach((end, i) => expect(next[i]! - end).toBe(32_000 + Math.floor(rng() * 16_001)));
+      }
+      expect(p.layoutDraws).toBe(p.placements.length + 1);
+    }
+  });
+
+  test('SNR scenes: rotated word/sentence renders, 1 s lead, ≈ 90 s (full) or 20 utterances (fast)', () => {
+    for (const p of full.filter((s) => s.type === 'snr')) {
+      expect(p.start).toBe(rotationStart(p.noise, p.snrDb!, short.length));
+      expect(p.placements[0]!.offset).toBe(16_000);
+      p.placements.forEach((pl, i) => expect(pl.id).toBe(short[(p.start! + i) % short.length]!.id));
+      if (p.group === 'full') {
+        expect(p.samples).toBeLessThanOrEqual(90 * 16_000);
+        expect(p.samples).toBeGreaterThan(84 * 16_000);
+      } else {
+        expect(p.placements.length).toBe(20);
+        expect(p.start).toBe(full.find((s) => s.name === p.name.slice('fast-'.length))!.start);
+      }
+    }
+  });
+
+  test('rotation starts a noise’s SNR scenes a quarter apart and an SNR’s noise scenes a fifth apart', () => {
+    expect(NOISES.map((noise) => SNRS_DB.map((snr) => rotationStart(noise, snr, 100)))).toEqual([
+      [0, 25, 50, 75],
+      [20, 45, 70, 95],
+      [40, 65, 90, 15],
+      [60, 85, 10, 35],
+      [80, 5, 30, 55],
+    ]);
+  });
+
+  test('passages and noise-only streams', () => {
+    const passages = full.find((p) => p.type === 'passages')!;
+    expect(passages.noise).toBe('fan');
+    expect(passages.snrDb).toBe(20);
+    expect(passages.placements.map((p) => p.id)).toEqual(
+      entries.filter((e) => e.kind === 'passage').map((e) => e.id),
+    );
+    const streams = full.filter((p) => p.type === 'noise-only');
+    expect(streams.map((p) => [p.name, p.noise, p.samples, p.levelFrom])).toEqual([
+      ['fan-noise', 'fan', 900 * 16_000, 'fan-snr10'],
+      ['music-noise', 'music', 900 * 16_000, 'music-snr10'],
+      ['fast-fan-noise', 'fan', 120 * 16_000, 'fast-fan-snr10'],
+    ]);
   });
 });

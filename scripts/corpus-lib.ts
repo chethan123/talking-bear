@@ -7,6 +7,7 @@
 // intermediate sums are float64, outputs Float32.
 
 import { butterworthHighpass, butterworthLowpass } from '../src/dsp/biquad.ts';
+import { mulberry32 } from '../test/dsp-helpers.ts';
 
 export const SAMPLE_RATE = 16_000;
 /** The corpus seed: scene k uses mulberry32((BASE_SEED + offset_k) >>> 0). */
@@ -497,4 +498,316 @@ export function mixAtSnr(
   const mix = new Float32Array(speech.length);
   for (let i = 0; i < mix.length; i++) mix[i] = speech[i]! + noiseGain * noise[i]!;
   return { mix, noiseGain };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Scene plans
+
+export type SceneType = 'snr' | 'passages' | 'noise-only';
+
+export interface Placement {
+  id: string;
+  kind: Kind;
+  /** Onset in the scene, in samples. */
+  offset: number;
+}
+
+export interface ScenePlan {
+  /** File stem: `<name>.f32` and `<name>.json` in .cache/corpus/. */
+  name: string;
+  /** The subset the scene belongs to; `--subset full` generates both. */
+  group: Subset;
+  type: SceneType;
+  noise: Noise;
+  snrDb: number | null;
+  /** The PRNG seed is (BASE_SEED + offset) >>> 0; offsets are unique across all scenes. */
+  offset: number;
+  seed: number;
+  rt60: number;
+  samples: number;
+  /** Index into the cyclic word+sentence list of the first utterance (SNR scenes). */
+  start: number | null;
+  placements: Placement[];
+  /** rng() calls consumed by the layout (the RT60 choice and the gaps); rendering skips this many. */
+  layoutDraws: number;
+  /** noise-only: the SNR-10 scene whose absolute noise level the stream copies. */
+  levelFrom: string | null;
+}
+
+interface SceneSpec {
+  name: string;
+  group: Subset;
+  type: SceneType;
+  noise: Noise;
+  snrDb: number | null;
+  offset: number;
+  levelFrom: string | null;
+}
+
+/**
+ * Every scene spec in seed-offset order: the 20 full SNR scenes (noise-major: fan, amfan, tv, music, clatter; SNR
+ * 20, 10, 5, 0) at offsets 0–19, the 15-min fan and music noise-only streams (20, 21), the passages scene (22), then
+ * the fast subset: fan and tv at SNR 10 and 5 (23–26) and 2 min of fan noise-only (27).
+ */
+export function sceneSpecs(): SceneSpec[] {
+  const specs: SceneSpec[] = [];
+  const add = (spec: Omit<SceneSpec, 'offset'>): void => {
+    specs.push({ ...spec, offset: specs.length });
+  };
+  for (const noise of NOISES) {
+    for (const snrDb of SNRS_DB) {
+      add({ name: `${noise}-snr${snrDb}`, group: 'full', type: 'snr', noise, snrDb, levelFrom: null });
+    }
+  }
+  for (const noise of ['fan', 'music'] as const) {
+    add({
+      name: `${noise}-noise`,
+      group: 'full',
+      type: 'noise-only',
+      noise,
+      snrDb: null,
+      levelFrom: `${noise}-snr10`,
+    });
+  }
+  add({ name: 'passages', group: 'full', type: 'passages', noise: 'fan', snrDb: 20, levelFrom: null });
+  for (const noise of ['fan', 'tv'] as const) {
+    for (const snrDb of [10, 5]) {
+      add({ name: `fast-${noise}-snr${snrDb}`, group: 'fast', type: 'snr', noise, snrDb, levelFrom: null });
+    }
+  }
+  add({
+    name: 'fast-fan-noise',
+    group: 'fast',
+    type: 'noise-only',
+    noise: 'fan',
+    snrDb: null,
+    levelFrom: 'fast-fan-snr10',
+  });
+  return specs;
+}
+
+/**
+ * The layout draws (rendering skips them with sceneRng): rt60 = RT60S[floor(3·u)], then one gap per utterance taken.
+ * `candidates` are tried in order; with `maxSamples` an utterance is taken only while the cursor + its length +
+ * GAP_MAX still fits (no draw for the first that doesn't), with `maxCount` at most that many are taken.
+ */
+function drawLayout(
+  rng: Rng,
+  candidates: Iterable<CorpusEntry>,
+  limit: { maxSamples?: number; maxCount?: number },
+): { rt60: number; placements: Placement[]; cursor: number; draws: number } {
+  let draws = 1;
+  const rt60 = RT60S[Math.floor(rng() * RT60S.length)]!;
+  const placements: Placement[] = [];
+  let cursor = LEAD_SAMPLES;
+  for (const entry of candidates) {
+    if (limit.maxCount !== undefined && placements.length >= limit.maxCount) break;
+    if (limit.maxSamples !== undefined && cursor + entry.samples + GAP_MAX > limit.maxSamples) break;
+    placements.push({ id: entry.id, kind: entry.kind, offset: cursor });
+    cursor += entry.samples + uniformInt(rng, GAP_MIN, GAP_MAX);
+    draws++;
+  }
+  return { rt60, placements, cursor, draws };
+}
+
+/** The word and sentence renders in manifest order, cycled from `start` (at most `count` items). */
+function* cyclic(list: readonly CorpusEntry[], start: number, count: number): Generator<CorpusEntry> {
+  for (let i = 0; i < count; i++) yield list[(start + i) % list.length]!;
+}
+
+/** The (BASE_SEED + offset) seed, as an unsigned 32-bit integer. */
+export function sceneSeed(offset: number): number {
+  return (BASE_SEED + offset) >>> 0;
+}
+
+/**
+ * The rotation of the cyclic word+sentence list for the SNR scene with noise index i (NOISES order) and SNR index j
+ * (SNRS_DB order): floor(len·(4i + 5j) / 20) mod len, i.e. (20i + 25j) mod 100 for the 100 short renders. A noise's
+ * four SNR scenes start a quarter of the list apart, and an SNR's five noise scenes a fifth apart, so neither the
+ * noise nor the SNR is confounded with words vs sentences (the list is 60 words, then 40 sentences).
+ */
+export function rotationStart(noise: Noise, snrDb: number, length: number): number {
+  const i = NOISES.indexOf(noise);
+  const j = SNRS_DB.findIndex((s) => s === snrDb);
+  if (i < 0 || j < 0) throw new RangeError(`no rotation for ${noise} at ${snrDb} dB`);
+  return Math.floor((length * (4 * i + 5 * j)) / 20) % length;
+}
+
+/**
+ * Plans every scene of `subset` from the manifest entries. An SNR scene takes word/sentence renders in cyclic
+ * manifest order (words, then sentences) from rotationStart: a full scene as many as fit in 90 s, a fast scene
+ * exactly 20 (so it starts like the full scene with the same noise and SNR). The passages scene holds every passage
+ * render in manifest order. `full` returns all 28 scenes (the fast ones included), `fast` only the 5 fast ones.
+ */
+export function planCorpus(subset: Subset, entries: readonly CorpusEntry[]): ScenePlan[] {
+  const short = entries.filter((e) => e.kind === 'word' || e.kind === 'sentence');
+  const passages = entries.filter((e) => e.kind === 'passage');
+  if (short.length === 0 || passages.length === 0)
+    throw new Error('the manifest needs short utterances and passages');
+  const plans: ScenePlan[] = [];
+  for (const spec of sceneSpecs()) {
+    if (subset !== 'full' && spec.group !== subset) continue;
+    const seed = sceneSeed(spec.offset);
+    const rng = mulberry32(seed);
+    let start: number | null = null;
+    let layout: ReturnType<typeof drawLayout>;
+    if (spec.type === 'snr') {
+      start = rotationStart(spec.noise, spec.snrDb!, short.length);
+      layout =
+        spec.group === 'full'
+          ? drawLayout(rng, cyclic(short, start, Infinity), { maxSamples: SCENE_MAX_SAMPLES })
+          : drawLayout(rng, cyclic(short, start, FAST_UTTERANCES), { maxCount: FAST_UTTERANCES });
+    } else if (spec.type === 'passages') {
+      layout = drawLayout(rng, passages, {});
+    } else {
+      layout = drawLayout(rng, [], {});
+    }
+    plans.push({
+      ...spec,
+      seed,
+      rt60: layout.rt60,
+      samples: spec.type === 'noise-only' ? NOISE_ONLY_SAMPLES[spec.group] : layout.cursor,
+      start,
+      placements: layout.placements,
+      layoutDraws: layout.draws,
+    });
+  }
+  return plans;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Rendering
+
+/** The scene's PRNG, positioned after its layout draws: the next draws are the RIR tail, then the noise. */
+export function sceneRng(plan: Pick<ScenePlan, 'seed' | 'layoutDraws'>): Rng {
+  const rng = mulberry32(plan.seed);
+  for (let i = 0; i < plan.layoutDraws; i++) rng();
+  return rng;
+}
+
+/** The `<scene>.json` sidecar. */
+export interface SceneMeta {
+  sampleRate: number;
+  samples: number;
+  noise: Noise;
+  snrDb: number | null;
+  rt60: number;
+  /** Speech spans (the clean labels of each placed utterance, shifted to its onset), in order. */
+  spans: Span[];
+  /** The kind of each span's utterance. */
+  kinds: Kind[];
+  /** The manifest id of each span's utterance. */
+  ids: string[];
+}
+
+export interface RenderedScene {
+  /** The scene: device-processed speech + scaled device-processed noise. */
+  audio: Float32Array;
+  meta: SceneMeta;
+  /** Device-processed speech (zeros for noise-only scenes). */
+  speech: Float32Array;
+  /** Device-processed noise, scaled as mixed. */
+  noise: Float32Array;
+  /** RMS of `noise` over the whole scene: the absolute noise level a noise-only stream copies. */
+  noiseRms: number;
+  /** tv scenes: every utterance id used by the babble. */
+  babbleIds: string[];
+}
+
+/**
+ * Renders a planned scene. Draw order after the layout draws: the RIR tail (round(rt60·fs) − 1 draws), then the
+ * noise. Speech and noise each go through the device chain (same RIR); SNR scenes are mixed at snrDb over the
+ * spans; a noise-only stream is scaled so its RMS equals `levelRms` (the noiseRms of its levelFrom scene).
+ */
+export function renderScene(
+  plan: ScenePlan,
+  entries: readonly CorpusEntry[],
+  audio: AudioLookup,
+  levelRms?: number,
+): RenderedScene {
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  const rng = sceneRng(plan);
+  const rir = makeRir(rng, plan.rt60);
+  const n = plan.samples;
+  const sceneIds = plan.placements.map((p) => p.id);
+  let raw: Float32Array;
+  let babbleIds: string[] = [];
+  switch (plan.noise) {
+    case 'fan':
+      raw = fanNoise(rng, n);
+      break;
+    case 'amfan':
+      raw = amfanNoise(rng, n).noise;
+      break;
+    case 'tv': {
+      const streams = planBabble(rng, babblePool(entries, sceneIds), n);
+      babbleIds = streams.flatMap((s) => s.items.map((item) => item.id));
+      raw = tvNoise(streams, audio, n);
+      break;
+    }
+    case 'music':
+      raw = musicNoise(rng, n);
+      break;
+    case 'clatter':
+      raw = clatterNoise(rng, n);
+      break;
+  }
+  const noise = deviceChain(raw, rir);
+  const spans: Span[] = [];
+  const kinds: Kind[] = [];
+  const ids: string[] = [];
+  const clean = new Float32Array(n);
+  for (const { id, kind, offset } of plan.placements) {
+    const entry = byId.get(id);
+    if (entry === undefined) throw new Error(`${plan.name}: unknown utterance ${id}`);
+    const a = audio(id);
+    if (a.length !== entry.samples)
+      throw new Error(`${id}: ${a.length} samples, manifest says ${entry.samples}`);
+    clean.set(a, offset);
+    for (const [s, e] of entry.spans) {
+      spans.push([offset + s, offset + e]);
+      kinds.push(kind);
+      ids.push(id);
+    }
+  }
+  let out: Float32Array;
+  let speech: Float32Array;
+  let scaled: Float32Array;
+  if (plan.type === 'noise-only') {
+    if (levelRms === undefined || !(levelRms > 0))
+      throw new Error(`${plan.name}: needs the level of ${plan.levelFrom}`);
+    speech = clean;
+    scaled = normaliseRms(noise, levelRms);
+    out = Float32Array.from(scaled);
+  } else {
+    speech = deviceChain(clean, rir);
+    const { mix, noiseGain } = mixAtSnr(speech, noise, spans, plan.snrDb!);
+    for (let i = 0; i < n; i++) noise[i] = noiseGain * noise[i]!;
+    scaled = noise;
+    out = mix;
+  }
+  const meta: SceneMeta = {
+    sampleRate: SAMPLE_RATE,
+    samples: n,
+    noise: plan.noise,
+    snrDb: plan.snrDb,
+    rt60: plan.rt60,
+    spans,
+    kinds,
+    ids,
+  };
+  return { audio: out, meta, speech, noise: scaled, noiseRms: rms(scaled), babbleIds };
+}
+
+/** Raw little-endian Float32 bytes of x. */
+export function f32leBytes(x: Float32Array): Uint8Array {
+  const bytes = new Uint8Array(x.length * 4);
+  const view = new DataView(bytes.buffer);
+  for (let i = 0; i < x.length; i++) view.setFloat32(i * 4, x[i]!, true);
+  return bytes;
+}
+
+/** The `<scene>.json` bytes: compact JSON plus a newline. */
+export function metaBytes(meta: SceneMeta): Uint8Array {
+  return new TextEncoder().encode(`${JSON.stringify(meta)}\n`);
 }
