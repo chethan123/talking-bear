@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: routing (X-E1, X-E2)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./routing.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Output routing and input processing</h1>
+    <p>
+      X-E1 (plan §5): with the mic open, does output go to the loudspeaker at media volume or to the earpiece
+      at call volume? Choose the EC setting and when the context is created, press Open mic, then play the
+      recording or the tone and watch the volume slider and <code>adb shell dumpsys audio</code>. X-E2: play
+      white noise from a second device and compare the spectrum and the energy above 8 kHz with EC on and off.
+    </p>
+    <p>
+      Privacy (plan Q2): the 3 s recording stays in memory only and is discarded on Close and when the page is
+      hidden. Nothing captured is stored or exported; Copy log copies text only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
