@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: continuity (X-R4)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./continuity.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Silent-sink suspension vs capture gaps</h1>
+    <p>
+      X-R4 (plan §5, §3.2): does connecting the capture worklet's zero output to <code>destination</code>
+      (graph B) let Chrome release the output device while the app only listens, without losing captured
+      audio, and what does resuming the output cost? Pick the graph (changing it reloads the page with the
+      choice in the URL), press Start, and play a steady tone of about 911 Hz (not a multiple of 100 Hz: at 48
+      kHz a 1 kHz tone repeats every 48 frames, so a dropped 4, 5 or 10 ms capture buffer leaves no step) from
+      a second device near the phone. Keep the tone at least 30 dB above the room noise, and keep the screen
+      on for the whole run: a hidden page's timers run about once a minute after 5 minutes, so a take would
+      outgrow the 12 s capture ring and fail.
+    </p>
+    <p>
+      Every second the page takes the newest audio from the capture worklet's ring and looks for
+      discontinuities (a step between neighbouring samples larger than 3× the steepest step of the block's
+      tone, A·2πf/sr, with A = RMS·√2 and f from zero crossings) and for runs of at least 1 ms of exact zeros.
+      Consecutive takes neither overlap nor leave a gap, so every captured frame is analysed exactly once,
+      from 1 s after the first captured sample that isn't an exact zero (the mic delivers a few tens of ms of
+      zeros as it starts, and its first buffers can jump). Run graph A first as the control, with the same
+      tone, level, load and room. Graph A has no suspension, so a discontinuity there comes from the setup
+      (tone too quiet, room noise, handling); graph B's result is then inconclusive, not a FAIL. Then run
+      graph B for the same time: keep the phone silent for at least 40 s first, so the silent-sink suspender
+      has released the output (<code>adb shell dumpsys media.audio_flinger</code>
+      shows no active output track then). Turn the load generator on for both runs.
+    </p>
+    <p>
+      Gate (plan §5): enable graph B only if there are 0 gaps longer than 20 ms in 10 minutes with the sink
+      suspended. A steady tone can't show how much audio a discontinuity lost, and the ring holds 80 Hz
+      high-passed audio, so a short input dropout leaves steps rather than exact zeros: every discontinuity
+      counts as a gap of unknown length, as do a zero run longer than 20 ms and a take that failed (frames
+      that couldn't be analysed). The verdict is FAIL as soon as one shows up, and PASS only after 10 min 40 s
+      of analysed audio without one (the first 40 s let the sink suspend).
+    </p>
+    <p>
+      Resume latency: after at least 40 s without output (Since last output), Play click after idle plays a 1
+      ms click through the app's master bus and measures the wall time until
+      <code>getOutputTimestamp().contextTime</code> passes the click's start time, then does the same for a
+      second click at once; the value in brackets is the same moment read from the timestamp itself, without
+      the polling delay. The mic hears the clicks, so the gate is frozen at the first click test: run it after
+      the gap measurement.
+    </p>
+    <p>
+      Privacy (plan Q2): the clip the page receives is zero-filled at once; a take still being assembled when
+      it is superseded (after a timeout) or when the mic closes is dropped, and the engine's chunk copies of a
+      take over 48 000 frames are dropped unzeroed (memory only; nothing is stored). Only counts are kept.
+      Nothing captured is stored or exported, the graph choice lives in the URL only, and Copy log copies text
+      only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
