@@ -22,6 +22,7 @@
     "test:browser": "vitest run --project browser",
     "e2e": "pnpm build:e2e && playwright test",
     "fixtures": "node scripts/gen-fixtures.ts",
+    "corpus": "node scripts/gen-corpus.ts",
     "gen:bear": "node scripts/gen-bear-parts.ts",
     "silero:fetch": "node scripts/fetch-silero-onnx.ts",
     "silero:extract": "node scripts/extract-silero-weights.ts",
