@@ -1279,12 +1279,19 @@ describe('dsp.worker glue', () => {
     expect(ofType(sent(), 'error')).toHaveLength(1); // only the not-ready one
   });
 
-  it('reset forwards restoreFloorDb and pregate to the VadCore', async () => {
+  it('reset forwards restoreFloorDb, pregate and proximityDb to the VadCore', async () => {
     const { VadCore: WorkerCore } = await import('./vad-core.ts'); // the worker's instance of the module
     const reset = vi.spyOn(WorkerCore.prototype, 'reset');
     self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
-    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', restoreFloorDb: -50, pregate: true });
-    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true);
+    self.dispatch({
+      t: 'reset',
+      epoch: 2,
+      vad: 'silero',
+      restoreFloorDb: -50,
+      pregate: true,
+      proximityDb: 9,
+    });
+    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true, 9);
   });
 
   it('turns handler exceptions into error messages', () => {
