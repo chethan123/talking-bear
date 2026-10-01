@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: spectrum (X-F2)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./spectrum.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Energy above 8 kHz in real captures</h1>
+    <p>
+      X-F2 (plan §5): how much energy a real capture carries above 8 kHz, which shows how audible aliasing
+      would have been without the sinc resampler. Press Open mic (the app's own constraints: all browser
+      processing off). Then, for each phrase: press, wait about half a second, say the phrase, wait about half
+      a second, release. The page shows the energy above 8 kHz and above 12 kHz relative to the total, over
+      the louder half of the 10 ms frames, and their median, p90 and max over the session. Do all 20 phrases
+      on each phone, then press Copy results (JSON). The device label can carry a name you gave a Bluetooth
+      headset: check it before you paste the results anywhere.
+    </p>
+    <p>
+      Privacy (plan Q2): each phrase is held in memory only while the button is down; it is analysed on
+      release and then zeroed at once. A hold that is interrupted, or a page that is hidden, discards the
+      phrase unanalysed. Only the numbers are kept. Nothing captured is stored or exported; Copy results and
+      Copy log copy text only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
