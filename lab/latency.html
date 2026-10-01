@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: latency (X-E5)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./latency.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Loopback click latency and echo tail</h1>
+    <p>
+      X-E5 (plan §5): Start plays 20 clicks, 1.5 s apart (about 30 s), through the app's master bus (gain 0.7)
+      and finds each one in this phone's own mic, through the app's audio engine: the mic opens with the app's
+      constraints (echo cancellation, noise suppression and auto gain all off) and each click is cut from the
+      capture worklet's ring with a take. Put the phone on a table in an ordinary room, set the media volume
+      the app will use, keep quiet, and press Start.
+    </p>
+    <p>
+      Per click: <code>arrivalLagMs</code> is the measured output plus input latency (the first sample after
+      the click's scheduled time <code>T</code> above 10× the RMS of the take's first 50 ms);
+      <code>predictedOutMs</code> is the output latency that <code>getOutputTimestamp()</code> predicts at
+      schedule time; <code>residualMs</code> is their difference, the input latency plus the prediction error.
+      A small, stable residual (p90 − p10 ≤ 5 ms) validates the audio side of <code>clipTimeNow</code> (plan
+      §3.3); the verdict needs at least 10 detected clicks. The spread can't show a constant prediction error:
+      that is inside the median residual, together with the input and acoustic latency. <code>tailMs</code> is
+      the echo tail: the time from the arrival until the level stays within 3 dB of the pre-click noise floor
+      for 50 ms. It sets the cooldown (plan §4.4 point 3): max(250, p90 of <code>tailMs</code> + 50) ms. A
+      tail that hasn't settled by the end of its take counts at the largest tail that take could show, and the
+      cooldown is then a lower bound. The log also gives each click's raw
+      <code>getOutputTimestamp()</code> and marks the clicks whose prediction fell back to
+      <code>currentTime − outputLatency</code>.
+    </p>
+    <p>
+      Privacy (plan Q2): each take is analysed as soon as it arrives, then zero-filled and dropped; only the
+      numbers are kept. Nothing captured is stored or exported; Copy log copies text only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
