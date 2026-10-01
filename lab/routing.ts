@@ -66,8 +66,8 @@ interface Session {
   raf: number;
   lastDraw: number;
   lastShareLog: number;
-  /** The displayed energy share, rounded to 0.1 dB (NaN: no signal), and its text. */
-  shareTenths: number;
+  /** The displayed energy share, rounded to 0.1 dB (NaN: no signal; null: nothing shown yet), and its text. */
+  shareTenths: number | null;
   shareText: string;
 }
 
@@ -277,7 +277,7 @@ async function openMic(): Promise<void> {
     raf: 0,
     lastDraw: -Infinity,
     lastShareLog: -Infinity,
-    shareTenths: Number.NEGATIVE_INFINITY,
+    shareTenths: null,
     shareText: '',
   };
   session = s;
@@ -437,7 +437,7 @@ function frame(now: number): void {
   if (now - s.lastDraw < DRAW_MS) return;
   s.lastDraw = now;
   const tenths = Math.round(10 * draw(s));
-  if (!Object.is(tenths, s.shareTenths)) {
+  if (s.shareTenths === null || !Object.is(tenths, s.shareTenths)) {
     // Only a changed value allocates its text.
     s.shareTenths = tenths;
     s.shareText = Number.isNaN(tenths) ? 'no signal' : `${fmt(tenths / 10, 1)} dB`;

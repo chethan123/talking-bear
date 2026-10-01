@@ -46,10 +46,13 @@ export function logPanel(root: HTMLElement): (line: string) => void {
 
   copy.addEventListener('click', () => {
     const text = pre.textContent;
-    navigator.clipboard.writeText(text).then(
-      () => log(`log copied (${text.length} characters)`),
-      (err: unknown) => log(`copy failed: ${String(err)}`),
-    );
+    // Through a promise, so a missing clipboard API (not a secure context) is logged too, never thrown.
+    Promise.resolve()
+      .then(() => navigator.clipboard.writeText(text))
+      .then(
+        () => log(`log copied (${text.length} characters)`),
+        (err: unknown) => log(`copy failed: ${String(err)}`),
+      );
   });
   root.append(el('h2', {}, 'Log'), copy, pre);
   return log;

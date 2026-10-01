@@ -1,6 +1,6 @@
 # Lab pages
 
-The `lab/` pages are dev-only experiment pages for the plan §5 experiments (X-E1, X-E2, …). They are extra Vite entry points that `pnpm dev` serves; `pnpm build` builds only `index.html`, so no lab page ever reaches `dist/` (M6's `check-dist` fails the build if `dist/lab` exists).
+The `lab/` pages are dev-only experiment pages for the plan §5 experiments (X-E1, X-E2, …). They are extra Vite entry points that `pnpm dev` serves; `pnpm build` builds only `index.html`, so no lab page ever reaches `dist/` (M6's `check-dist` will also fail the build if `dist/lab` exists).
 
 `lab/index.html` links every lab page. Today:
 
@@ -50,7 +50,7 @@ Then open `http://localhost:5173/lab/` (Vite's default port; if it is taken, Vit
 
 4. **On D1**, open Chrome at `http://localhost:5173/lab/` and pick a page. Allow the microphone when Chrome asks.
 5. **Remote DevTools (optional):** on the computer, open `chrome://inspect/#devices` in Chrome to see the phone's tab, its console and its errors.
-6. **Record the result:** press "Copy log", paste the log into `docs/device-notes.md` using its template (as `### <Txx> — <YYYY-MM-DD>`), and add the phone model, the Android version and the Chrome version from `chrome://version`. Every log also starts with the page's user agent.
+6. **Record the result:** press "Copy log", paste the log into `docs/device-notes.md` using its template (as `### <Txx> — <YYYY-MM-DD>`), and add the phone model, the Android version and the Chrome version from `chrome://version`. The `lab/routing` log also starts with the page's user agent, which includes the Chrome version.
 7. **Clean up:** `adb reverse --remove tcp:5173` (or `adb reverse --remove-all`).
 
 Wireless debugging (`adb pair` / `adb connect`) works the same way; use it for battery measurements, because USB charging distorts power numbers (plan §4.10, §10).
