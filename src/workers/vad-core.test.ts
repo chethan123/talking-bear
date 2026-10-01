@@ -18,6 +18,7 @@ import { createSilero, type SileroModel } from '../dsp/silero/model.ts';
 import { decodeWeights, type SileroWeights } from '../dsp/silero/weights.ts';
 import { PRESETS } from '../dsp/types.ts';
 import {
+  MIN_VOICED_MS,
   PREGATE_HOLD_FRAMES,
   SILERO_NOT_READY_MESSAGE,
   VAD_STATS_WINDOW,
@@ -396,6 +397,8 @@ describe('VadCore Silero backend (shipped weights)', () => {
     expect(ofType(run.msgs, 'error')).toHaveLength(1);
     expect(run.msgs.slice(1)).toEqual(energy);
     expect(kinds(energy)).toEqual(['start', 'end']);
+    run.core.reset(2, 'silero');
+    expect(ofType(run.msgs, 'error')).toHaveLength(2);
   });
 
   it('3b: a model set while the epoch is idle switches it to Silero at once', () => {
@@ -458,6 +461,39 @@ describe('VadCore Silero backend (shipped weights)', () => {
       { t: 'error', where: 'vad', message: 'silero failed: boom; using energy' },
     ]);
     expect(segs(msgs)).toEqual(segs(runFixture('vowel_f0-140').msgs));
+  });
+
+  it('4b: a model that throws inside a segment closes it with a misfire before energy takes over', () => {
+    // 20 frames of −70 dBFS noise, 10 at −20 dBFS (scripted p = 0.9: a Silero start), then 400 quiet frames
+    // (12.8 s, longer than the session's recording watchdog). The model throws on the first quiet frame, so
+    // the fresh energy segmenter never sees speech and cannot end the open segment itself.
+    const rng = mulberry32(61);
+    const noiseFrame = (rmsDb: number): Float32Array => {
+      const a = Math.sqrt(3) * 10 ** (rmsDb / 20);
+      return Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a);
+    };
+    const frames = [
+      ...Array.from({ length: 20 }, () => noiseFrame(-70)),
+      ...Array.from({ length: 10 }, () => noiseFrame(-20)),
+      ...Array.from({ length: 400 }, () => noiseFrame(-70)),
+    ];
+    const inner = scriptedModel(0.9, 0.1);
+    const model: SileroModel = {
+      reset: () => undefined,
+      process: (x) => {
+        if (inner.calls === 30) throw new Error('boom'); // the 31st call: frame 30, the first quiet one
+        return inner.process(x);
+      },
+    };
+    const { msgs } = runSilero(frames, model);
+    const error: WorkerToMain = { t: 'error', where: 'vad', message: 'silero failed: boom; using energy' };
+    expect(ofType(msgs, 'error')).toEqual([error]);
+    expect(segs(msgs)).toEqual([
+      { kind: 'start', frame: 20 * SILERO_GRID },
+      { kind: 'misfire', frame: 30 * SILERO_GRID },
+    ]);
+    const at = msgs.indexOf(ofType(msgs, 'error')[0]!);
+    expect(msgs[at + 1]).toEqual({ t: 'seg', epoch: 1, ev: { kind: 'misfire', frame: 30 * SILERO_GRID } });
   });
 
   it('5a: the pre-gate makes ≥ 70 % fewer process calls on noise_white_-60dbfs_3s', () => {
@@ -552,6 +588,43 @@ describe('VadCore Silero backend (shipped weights)', () => {
     expect(on.calls).toBeLessThan(off.calls);
   });
 
+  it('5f: reset empties the pre-gate ring: no frame of an earlier epoch is ever replayed', () => {
+    const spy = new SpyModel();
+    const seen: Float32Array[] = [];
+    spy.onProcess = (x) => seen.push(x);
+    const run = newCore();
+    run.core.setModel(spy);
+    run.core.reset(1, 'silero', undefined, true);
+    feed(
+      run,
+      1,
+      Array.from({ length: 40 }, () => new Float32Array(FRAME)),
+    ); // 18 skipped: the ring is full
+    expect(spy.calls).toBe(PREGATE_HOLD_FRAMES);
+    run.core.reset(2, 'silero', undefined, true);
+    const next = noiseLedVowelFrames()[0]!;
+    seen.length = 0;
+    run.core.frame(2, 0, next);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBe(next);
+  });
+
+  it('5g: the hold is exactly PREGATE_HOLD_FRAMES (22) closed frames', () => {
+    expect(PREGATE_HOLD_FRAMES).toBe(22);
+    const spy = new SpyModel();
+    const fed: number[] = [];
+    let cur = -1;
+    spy.onProcess = () => fed.push(cur);
+    const run = newCore();
+    run.core.setModel(spy);
+    run.core.reset(1, 'silero', undefined, true);
+    for (let k = 0; k < 40; k++) {
+      cur = k;
+      run.core.frame(1, k * SILERO_GRID, new Float32Array(FRAME));
+    }
+    expect(fed).toEqual(Array.from({ length: PREGATE_HOLD_FRAMES }, (_, k) => k));
+  });
+
   it('6: every reset() of a new epoch resets the LSTM state', () => {
     const spy = new SpyModel();
     const run = newCore();
@@ -572,7 +645,8 @@ describe('VadCore Silero backend (shipped weights)', () => {
       reset: () => undefined,
       process: () => {
         i++;
-        t += (((i - 1) % VAD_STATS_WINDOW) + 1) / 100; // 0.01 … 3.12 ms
+        // 0.01 … 3.12 ms in the first window, 10.01 … 13.12 ms after it.
+        t += (i > VAD_STATS_WINDOW ? 10 : 0) + (((i - 1) % VAD_STATS_WINDOW) + 1) / 100;
         return 0;
       },
     };
@@ -593,12 +667,15 @@ describe('VadCore Silero backend (shipped weights)', () => {
     expect(Number.isFinite(first[0]!.p95Ms)).toBe(true);
     expect(first[0]!.p95Ms).toBeCloseTo(2.97, 9); // nearest rank: the 297th of 0.01 … 3.12
     feedN(312);
-    expect(ofType(run.msgs, 'vadStats')).toHaveLength(2);
+    const both = ofType(run.msgs, 'vadStats');
+    expect(both).toHaveLength(2);
+    expect(both[1]!.p95Ms).toBeCloseTo(12.97, 9); // only the last 312 times count
   });
 });
 
 describe('VadCore energy voicing rule', () => {
   it('7: a 300 ms white-noise burst at −20 dBFS gives misfire, not end', () => {
+    expect(MIN_VOICED_MS).toBe(60);
     const x = concat48(whiteNoise48(21, 1.0, -70), whiteNoise48(22, 0.3, -20), whiteNoise48(23, 0.3, -70));
     const run = newCore();
     run.core.reset(1, 'energy');

@@ -9,9 +9,9 @@
 //   last 512 band-limited samples, plan §4.2.1 step 5).
 // - Silero (once `setModel` has handed over the model): each raw frame's speech probability steps the
 //   segmenter. The energy gate still runs on every hop, for `level`, the floor and `floorSnapshot`. A model
-//   that throws switches the epoch to energy. The optional pre-gate (plan §4.2.3) skips inference while the
-//   gate has been closed for ≥ 700 ms and the segmenter is idle, and replays the last 10 skipped frames to
-//   warm the LSTM up when the gate opens again.
+//   that throws switches the epoch to energy (an open segment ends as a `misfire`). The optional pre-gate
+//   (plan §4.2.3) skips inference while the gate has been closed for ≥ 700 ms and the segmenter is idle, and
+//   replays the last 10 skipped frames to warm the LSTM up when the gate opens again.
 //
 // Pure TypeScript: no worker globals (`post` is injected; the clock defaults to `performance.now`), so the
 // whole core runs in Node tests. The per-frame path doesn't allocate: every buffer is preallocated, and
@@ -155,9 +155,9 @@ export class VadCore {
   }
 
   /**
-   * Hands over the Silero model; epochs from the next `reset` on use it. If the current epoch asked for Silero,
-   * runs on energy only because no model was set, and its segmenter is idle, it switches to Silero at once
-   * (with an LSTM reset); otherwise it stays on its backend until the next `reset`.
+   * Hands over the Silero model; epochs from the next `reset` on use it. If the current epoch asked for
+   * Silero, runs on energy only because no model was set, and its segmenter is idle, it switches to Silero at
+   * once (with an LSTM reset); otherwise it stays on its backend until the next `reset`.
    */
   setModel(m: SileroModel): void {
     this.model = m;
@@ -180,9 +180,10 @@ export class VadCore {
 
   /**
    * Starts a new listen: `epoch` becomes current, and the filter, hop remainder, segmenter, gate (restored to
-   * `restoreFloorDb` when it is finite), voicing history, pre-gate ring and epoch start are reset, and so is the
-   * model's LSTM state. The epoch runs on Silero iff `vad === 'silero'` and a model is set; a Silero request
-   * without a model posts SILERO_NOT_READY_MESSAGE and runs on energy. `pregate === true` enables the pre-gate.
+   * `restoreFloorDb` when it is finite), voicing history, pre-gate ring and epoch start are reset, and so is
+   * the model's LSTM state. The epoch runs on Silero iff `vad === 'silero'` and a model is set; a Silero
+   * request without a model posts SILERO_NOT_READY_MESSAGE and runs on energy. `pregate === true` enables
+   * the pre-gate.
    */
   reset(epoch: number, vad: 'silero' | 'energy', restoreFloorDb?: number, pregate?: boolean): void {
     this.epoch = epoch;
@@ -240,11 +241,10 @@ export class VadCore {
   private stepHop(epoch: number, ctxFrame: number): void {
     const db = frameDb(this.hop, 0, ENERGY_HOP);
     const gate = this.gate;
-    // Pre-gate test, against the floor before this hop's update. The hop that initialises the floor (after
-    // digital silence) also counts as open: a steady onset would otherwise never rise 3 dB above itself.
-    if (
-      gate.initialized ? db > gate.floorDb + PREGATE_MARGIN_DB : db >= DEFAULT_ENERGY_PARAMS.ignoreBelowDb
-    ) {
+    // Pre-gate test, against the floor before this hop's update. A floor-initialising hop loud enough to be
+    // an energy onset (> −65 dBFS) also counts as open: a steady onset after digital silence would otherwise
+    // never rise 3 dB above the floor it initialises.
+    if (gate.initialized ? db > gate.floorDb + PREGATE_MARGIN_DB : db > DEFAULT_ENERGY_PARAMS.absMinDb) {
       this.gateOpen = true;
     }
     const f = this.features;
@@ -299,6 +299,9 @@ export class VadCore {
       p = this.infer(m, raw); // the raw frame: Silero is not band-limited
     } catch (err) {
       this.post({ t: 'error', where: 'vad', message: `silero failed: ${errorMessage(err)}; using energy` });
+      // The fresh energy segmenter can't end an open Silero segment: close it, or the session stays in
+      // Recording until its watchdog restarts the worker.
+      if (this.seg.inSpeech) this.emit(epoch, { kind: 'misfire', frame: firstFrame }, Number.NaN);
       this.silero = null;
       this.failed = true;
       this.seg = initialSegState();
