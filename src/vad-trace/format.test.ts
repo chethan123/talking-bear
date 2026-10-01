@@ -232,13 +232,22 @@ describe('length and schema validation', () => {
 
   it('decodeTrace throws when trace.bin does not hold exactly 4 · (3 · n10 + n32) bytes', () => {
     expect(bin.byteLength).toBe(68);
+    // The messages are asserted too: without the length check, a truncated bin would still throw a RangeError
+    // (an out-of-bounds DataView read), so the class alone does not prove the check fired.
     for (const len of [0, 1, 64, 67, 69, 72]) {
       const other = new Uint8Array(len);
       other.set(bin.subarray(0, Math.min(len, bin.byteLength)));
       expect(() => decodeTrace(json, other)).toThrow(RangeError);
+      expect(() => decodeTrace(json, other)).toThrow(
+        `trace.bin holds ${len} bytes; n10 = 5 and n32 = 2 need 68`,
+      );
     }
     for (const over of [{ n10: 6 }, { n10: 4 }, { n32: 3 }, { n32: 1 }, { n10: 6, n32: 0 }]) {
-      expect(() => decodeTrace(JSON.stringify({ ...meta, ...over }), bin)).toThrow(RangeError);
+      const m = { ...meta, ...over };
+      const need = 4 * (3 * m.n10 + m.n32);
+      const want = `trace.bin holds 68 bytes; n10 = ${m.n10} and n32 = ${m.n32} need ${need}`;
+      expect(() => decodeTrace(JSON.stringify(m), bin)).toThrow(RangeError);
+      expect(() => decodeTrace(JSON.stringify(m), bin)).toThrow(want);
     }
   });
 
@@ -256,10 +265,15 @@ describe('length and schema validation', () => {
       { version: 2 },
       { version: undefined },
       { device: 7 },
+      { chrome: 1 },
+      { sileroWeightsSha256: null },
+      { frontEndHash: undefined },
+      { scriptId: 0 },
       { startedAt: undefined },
       { ctxRate: 0 },
       { ctxRate: '48000' },
       { constraints: null },
+      { constraints: [] },
       { session: 'C' },
       { condition: 'rain' },
       { placement: 'pocket' },
@@ -270,6 +284,8 @@ describe('length and schema validation', () => {
       { labels: {} },
       { labels: [{ press: 1 }] },
       { labels: [{ press: -1, release: 4 }] },
+      { labels: [{ press: 1, release: -1 }] },
+      { labels: [{ press: 1, release: 2.5 }] },
       { notes: 3 },
     ];
     for (const over of bad) {
@@ -291,8 +307,10 @@ describe('hopStartFrame / sileroStartFrame', () => {
     const m44 = { firstFrame: 0, ctxRate: 44100 };
     expect([1, 2, 3].map((i) => hopStartFrame(m44, i))).toEqual([441, 882, 1323]);
     expect([1, 2, 3, 5].map((j) => sileroStartFrame(m44, j))).toEqual([1411, 2822, 4234, 7056]);
+    // 22050 Hz puts odd hops half-way between two frames (220.5), so the rounding itself is exercised.
+    expect(hopStartFrame({ firstFrame: 0, ctxRate: 22050 }, 1)).toBe(221);
     const mismatches: string[] = [];
-    for (const ctxRate of [44100, 48000]) {
+    for (const ctxRate of [22050, 44100, 48000]) {
       for (let i = 0; i < 20000; i++) {
         const want = 5 + Math.round(i * ctxRate * 0.01);
         if (hopStartFrame({ firstFrame: 5, ctxRate }, i) !== want) mismatches.push(`${ctxRate}:${i}`);
