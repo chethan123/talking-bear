@@ -724,23 +724,47 @@ function heapGrowth(fn: () => void): number {
 /** The one `post` of every core in the allocation tests, so the call site sees a single closure. */
 const NOOP_POST = (): void => {};
 
+/** A core on `vad` (with a real model for Silero) warmed up on 60 frames, and a stepper for more. */
+function stepper(frames: Float32Array[], vad: 'silero' | 'energy', pregate: boolean): () => void {
+  const core = new VadCore(CTX_RATE, NOOP_POST);
+  if (vad === 'silero') core.setModel(createSilero(W));
+  core.reset(1, vad, undefined, pregate);
+  let k = 0;
+  const step = (): void => {
+    core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
+    k++;
+  };
+  for (let i = 0; i < 60; i++) step();
+  return step;
+}
+
+/** Runs of 1000 frames of noise_white_-60dbfs_3s on Silero with `model`, after 400 warm-up frames. */
+function heapRunner(model: SileroModel, pregate: boolean): () => void {
+  const frames = frames16k(fixture('noise_white_-60dbfs_3s'), 0);
+  const core = new VadCore(CTX_RATE, NOOP_POST);
+  core.setModel(model);
+  core.reset(1, 'silero', -75, pregate);
+  let k = 0;
+  const run = (n: number): void => {
+    for (let i = 0; i < n; i++, k++) core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
+  };
+  run(400);
+  return () => run(1000);
+}
+
+/** The smallest finite growth over up to 20 runs, stopping early once `done(best)`. */
+function bestGrowth(run: () => void, done: (best: number) => boolean = () => false): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let trial = 0; trial < 20 && !(Number.isFinite(best) && done(best)); trial++) {
+    best = Math.min(best, heapGrowth(run));
+  }
+  expect(Number.isFinite(best)).toBe(true);
+  return best;
+}
+
 describe('no allocation on the per-frame path', () => {
   /** 64 B per frame over 1000 frames. */
   const LIMIT = 65_536;
-
-  /** A core on `vad` (with a real model for Silero) warmed up on 60 frames, and a stepper for more. */
-  function stepper(frames: Float32Array[], vad: 'silero' | 'energy', pregate: boolean): () => void {
-    const core = new VadCore(CTX_RATE, NOOP_POST);
-    if (vad === 'silero') core.setModel(createSilero(W));
-    core.reset(1, vad, undefined, pregate);
-    let k = 0;
-    const step = (): void => {
-      core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
-      k++;
-    };
-    for (let i = 0; i < 60; i++) step();
-    return step;
-  }
 
   it.each([
     ['silero', false],
@@ -757,30 +781,6 @@ describe('no allocation on the per-frame path', () => {
       ).toBe(0);
     },
   );
-
-  /** Runs of 1000 frames of noise_white_-60dbfs_3s on Silero with `model`, after 400 warm-up frames. */
-  function heapRunner(model: SileroModel, pregate: boolean): () => void {
-    const frames = frames16k(fixture('noise_white_-60dbfs_3s'), 0);
-    const core = new VadCore(CTX_RATE, NOOP_POST);
-    core.setModel(model);
-    core.reset(1, 'silero', -75, pregate);
-    let k = 0;
-    const run = (n: number): void => {
-      for (let i = 0; i < n; i++, k++) core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
-    };
-    run(400);
-    return () => run(1000);
-  }
-
-  /** The smallest finite growth over up to 20 runs, stopping early once `done(best)`. */
-  function bestGrowth(run: () => void, done: (best: number) => boolean = () => false): number {
-    let best = Number.POSITIVE_INFINITY;
-    for (let trial = 0; trial < 20 && !(Number.isFinite(best) && done(best)); trial++) {
-      best = Math.min(best, heapGrowth(run));
-    }
-    expect(Number.isFinite(best)).toBe(true);
-    return best;
-  }
 
   it.each([false, true])(
     'the Silero path (pregate %s) grows the heap < 64 KB per 1000 frames more than a zero model',
