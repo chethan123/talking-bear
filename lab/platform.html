@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: platform (X-E6, X-E10, X-E11)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./platform.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Backgrounding, sample rates and wake lock</h1>
+    <p>
+      Every line of the log carries the local wall-clock time and <code>performance.now()</code> in ms. The
+      page logs <code>visibilitychange</code> (with <code>visibilityState</code>), <code>pagehide</code>,
+      <code>pageshow</code>, <code>freeze</code> and <code>resume</code> from the moment it loads.
+    </p>
+    <p>
+      X-E6 (plan §5): press Start capture (echo cancellation off, the app's constraints). The input RMS is
+      logged once a second, with <code>ctx.state</code> and the track state, and so are the track's
+      <code>mute</code>, <code>unmute</code> and <code>ended</code> events and every context state change. Go
+      Home for 10 s and for 6 min, and lock and unlock the screen; note which mic notification Android shows.
+      The capture keeps running until Stop: nothing stops it when the page is hidden.
+    </p>
+    <p>
+      X-E10: press Probe rates. For each constraint set in turn (all three off; EC on; noiseSuppression only)
+      it opens a new context and the mic, waits 1 s, logs <code>ctx.sampleRate</code>,
+      <code>baseLatency</code>, <code>outputLatency</code> and <code>track.getSettings()</code> on one line,
+      and closes both. <code>ctx.sampleRate</code> is the context (output) rate, the same for every set
+      because the context is created before <code>getUserMedia</code>, as in the app; each set's capture rate
+      is the <code>sampleRate</code> inside <code>track.getSettings()</code>.
+    </p>
+    <p>
+      X-E11: press Acquire wake lock, lock and unlock the screen, and toggle battery saver. The lock follows
+      the app's policy (<code>src/platform/wake-lock.ts</code>): it is re-requested whenever the page becomes
+      visible while wanted. Every request, grant, <code>release</code> event and rejection is logged, with its
+      message.
+    </p>
+    <p>
+      Privacy (plan Q2): no audio is kept. The capture logs only RMS numbers, the log stays in memory, and
+      Copy log copies text only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
