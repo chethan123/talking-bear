@@ -7,7 +7,7 @@ Talking Bear itself is MIT licensed (see `LICENSE`). It ships the following thir
 - Upstream: https://github.com/snakers4/silero-vad
 - Commit: `5cd7945676eb32225748052e2e6a0580e4686a08` (tag `v6.2.3`)
 - Source file: `src/silero_vad/data/silero_vad_16k_op15.onnx` (SHA-256 `7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49`)
-- Shipped as: `src/dsp/silero/weights.bin`, the model weights converted to fp16 (conv biases fp32) by `scripts/extract-silero-weights.ts` (details in `src/dsp/silero/weights.provenance.json`)
+- Shipped as: `src/dsp/silero/weights.bin`, the model weights converted to fp16, except the conv biases, conv2W, conv3W, conv4W and lstmWhh, which stay fp32, by `scripts/extract-silero-weights.ts` (details in `src/dsp/silero/weights.provenance.json`)
 - Licence: MIT. The full licence text, copied verbatim from https://github.com/snakers4/silero-vad/blob/5cd7945676eb32225748052e2e6a0580e4686a08/LICENSE:
 
 ```text

@@ -3,8 +3,9 @@
 // ships. It runs every WAV under test/fixtures/ and test/corpus/speech/ (resampled to 16 kHz, cut into
 // 512-sample frames, every model reset between files) through ORT and through two TS models:
 //   Tier 1: fp32 weights read straight from the pinned ONNX: max|Δp| < 1e-4 and no flip at 0.5 or 0.35.
-//   Tier 2: the shipped weights.bin (fp16, conv biases fp32): max|Δp| < 5e-3 and no flip at 0.5 or 0.35,
-//           except on frames whose ORT p is within 5e-3 of that threshold (listed, not failed).
+//   Tier 2: the shipped weights.bin (fp16 or fp32 per tensor, per WEIGHTS_LAYOUT): max|Δp| < 5e-3 and no
+//           flip at 0.5 or 0.35, except on frames whose ORT p is within 5e-3 of that threshold (listed, not
+//           failed).
 // It also checks that src/dsp/silero/golden.json, the ORT p of vowel_f0-140.wav that model.test.ts compares
 // against without ORT, is up to date.
 //
@@ -383,13 +384,13 @@ async function run(swap: boolean, writeGoldenFile: boolean): Promise<number> {
     }
     const n = Math.max(total.frames, 1);
     console.log(
-      `ms/frame: TS fp32 ${(ms1 / n).toFixed(3)} · TS fp16 ${(ms2 / n).toFixed(3)} · ORT ${(msOrt / n).toFixed(3)}`,
+      `ms/frame: TS fp32 ${(ms1 / n).toFixed(3)} · TS shipped ${(ms2 / n).toFixed(3)} · ORT ${(msOrt / n).toFixed(3)}`,
     );
     console.log(`Tier 2 near-threshold frames (|ORT p − θ| ≤ ${NEAR}; listed, not failed):`);
     if (near.length === 0) console.log('  (none)');
     for (const f of near) {
       console.log(
-        `  ${f.file} frame ${f.frame}: θ ${f.threshold}, ORT ${p6(f.pOrt)}, TS fp16 ${p6(f.p)}, ` +
+        `  ${f.file} frame ${f.frame}: θ ${f.threshold}, ORT ${p6(f.pOrt)}, TS shipped ${p6(f.p)}, ` +
           (f.flipped ? 'flipped' : 'not flipped'),
       );
     }
