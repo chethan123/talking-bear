@@ -26,7 +26,8 @@
       chosen DPR. Lab pages have no CSS sizing, so on a high-DPR screen the stress canvas shows larger than
       the viewport; the cost is in its backing store, which matches the app's. The SVG view and the pixel
       difference pause meanwhile, and the page scrolls to the canvas while stress runs: read the statistics in
-      the log, or scroll up. Use remote DevTools for the full trace (<code>docs/lab.md</code>).
+      the log, or scroll up. A viewport change (rotation, the toolbar collapsing) resizes the stress canvas
+      and restarts the statistics. Use remote DevTools for the full trace (<code>docs/lab.md</code>).
     </p>
     <main id="lab"></main>
   </body>

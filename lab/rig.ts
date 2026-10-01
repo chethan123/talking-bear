@@ -5,7 +5,7 @@
 // every 200 ms, runs the idle layers on top of the sliders' pose and renders every frame at the app stage's
 // size (DPR cap 2 or native), with frame-time statistics. Dev-only: `pnpm dev`, then /lab/rig.html
 // (docs/lab.md). No audio is involved; the log is text only. Lab pages set no CSS `style`: SVG geometry and
-// every size are attributes.
+// sizes are attributes.
 
 import { el, fmt, logPanel } from './common.ts';
 import type { Attrs } from './common.ts';
@@ -60,8 +60,13 @@ const KICK_STEPS = Math.round(KICK_S / SUBSTEP);
 const SEED = 71;
 /** The statistics cover the frames of the last 60 s. */
 const WINDOW_MS = 60_000;
-/** A rAF interval longer than this counts as a dropped frame. */
+/** A rAF interval longer than this counts as a dropped frame (the issue's definition). */
 const DROP_MS = 20;
+/**
+ * A rAF interval longer than this many median intervals counts as a missed vsync: on a 90/120 Hz display one
+ * missed vsync stays under 20 ms, so `DROP_MS` alone can't see it.
+ */
+const MISSED_FACTOR = 1.5;
 /** Frames the statistics ring holds: 60 s at up to 240 Hz. */
 const RING = 60 * 240;
 /** While stress runs, a summary line goes to the log this often. */
@@ -213,6 +218,8 @@ interface Ring {
   readonly work: Float64Array;
   /** The work times inside the window, gathered for the percentiles. */
   readonly scratch: Float64Array;
+  /** The rAF intervals inside the window, gathered for their median. */
+  readonly dts: Float64Array;
   head: number;
   size: number;
 }
@@ -224,6 +231,9 @@ interface Summary {
   readonly p95: number;
   readonly max: number;
   readonly dropped: number;
+  /** Median rAF interval in the window (ms; NaN with fewer than 2 frames), and the intervals above 1.5 × it. */
+  readonly medianDtMs: number;
+  readonly missed: number;
   readonly fps: number;
 }
 
@@ -231,6 +241,7 @@ const ring: Ring = {
   t: new Float64Array(RING),
   work: new Float64Array(RING),
   scratch: new Float64Array(RING),
+  dts: new Float64Array(RING),
   head: 0,
   size: 0,
 };
@@ -250,12 +261,14 @@ function percentile(xs: Float64Array, p: number): number {
 
 /**
  * The frames whose rAF timestamp lies within 60 s of the latest one: work-time percentiles and max, the rAF
- * intervals over 20 ms between consecutive frames in that window, and the mean fps over it. Null before a frame.
+ * intervals over 20 ms between consecutive frames in that window, the median interval and the intervals over
+ * 1.5 × it (missed vsyncs at any refresh rate), and the mean fps over it. Null before a frame. Runs at 1 Hz only.
  */
 function summarize(): Summary | null {
   if (ring.size === 0) return null;
   const end = ring.t[(ring.head - 1 + RING) % RING]!;
   let n = 0;
+  let intervals = 0;
   let dropped = 0;
   let first = end;
   let prev = Number.NaN;
@@ -264,11 +277,19 @@ function summarize(): Summary | null {
     const t = ring.t[i]!;
     if (end - t > WINDOW_MS) continue;
     if (n === 0) first = t;
-    else if (t - prev > DROP_MS) dropped++;
+    else {
+      const dt = t - prev;
+      ring.dts[intervals++] = dt;
+      if (dt > DROP_MS) dropped++;
+    }
     prev = t;
     ring.scratch[n++] = ring.work[i]!;
   }
   const sorted = ring.scratch.subarray(0, n).toSorted();
+  const dts = ring.dts.subarray(0, intervals);
+  const medianDtMs = intervals > 0 ? percentile(dts.toSorted(), 50) : Number.NaN;
+  let missed = 0;
+  for (let k = 0; k < intervals; k++) if (dts[k]! > MISSED_FACTOR * medianDtMs) missed++;
   const spanMs = end - first;
   return {
     frames: n,
@@ -277,6 +298,8 @@ function summarize(): Summary | null {
     p95: percentile(sorted, 95),
     max: sorted[n - 1]!,
     dropped,
+    medianDtMs,
+    missed,
     fps: n > 1 ? (n - 1) / (spanMs / 1000) : Number.NaN,
   };
 }
@@ -401,6 +424,7 @@ const show = {
   backing: el('dd'),
   work: el('dd'),
   dropped: el('dd'),
+  missed: el('dd'),
   fps: el('dd'),
   window: el('dd'),
   springs: el('dd'),
@@ -448,6 +472,7 @@ const stressFieldset = el(
     ...row('Canvas backing store', show.backing),
     ...row('Main-thread ms per frame (rAF callback), p50 / p95 / max', show.work),
     ...row(`Dropped frames (Δt > ${DROP_MS} ms)`, show.dropped),
+    ...row(`Missed vsync (Δt > ${MISSED_FACTOR} × median rAF interval)`, show.missed),
     ...row('fps', show.fps),
     ...row('Window (last 60 s)', show.window),
     ...row('Spring peak |x − target| / amp (last 1 s)', show.springs),
@@ -618,6 +643,9 @@ interface Stress {
   readonly substep: (dt: number) => void;
   /** Largest |pos − target| of each spring since the last statistics refresh. */
   readonly peak: Float64Array;
+  /** The viewport (CSS px) the stage was last sized for. */
+  cssW: number;
+  cssH: number;
   raf: number;
   /** rAF timestamp of the previous frame; −1 before the first. */
   lastT: number;
@@ -682,6 +710,8 @@ function createStress(): Stress {
     view: { scale: 0, ox: 0, oy: 0 },
     substep,
     peak,
+    cssW: 0,
+    cssH: 0,
     raf: 0,
     lastT: -1,
     startedAt: performance.now(),
@@ -705,11 +735,14 @@ function frame(t: number): void {
 
 /**
  * Sizes the canvas as the app's stage: the viewport (CSS px) × min(devicePixelRatio, 2), or × devicePixelRatio
- * for "native". Without CSS the canvas shows at its backing-store size in CSS px. Restarts the statistics.
+ * for "native". Without CSS the canvas shows at its backing-store size in CSS px. Restarts the statistics and
+ * returns the backing-store description.
  */
-function sizeStage(s: Stress): void {
+function sizeStage(s: Stress): string {
   const cssW = window.innerWidth;
   const cssH = window.innerHeight;
+  s.cssW = cssW;
+  s.cssH = cssH;
   const dpr = window.devicePixelRatio;
   const native = dprSelect.value === 'native';
   if (native) {
@@ -722,17 +755,21 @@ function sizeStage(s: Stress): void {
   const factor = native ? dpr : Math.min(dpr, MAX_DPR);
   const text = `${canvas.width} × ${canvas.height} px: viewport ${cssW} × ${cssH} CSS px × ${fmt(factor, 3)} (devicePixelRatio ${dpr}, ${native ? 'native' : `cap ${MAX_DPR}`})`;
   show.backing.textContent = text;
-  log(`stress canvas: ${text}`);
   ring.head = 0;
   ring.size = 0;
   s.lastT = -1;
   s.startedAt = performance.now();
   s.lastLog = s.startedAt;
   refreshStats();
+  return text;
 }
 
 function summaryLine(sum: Summary): string {
-  return `ms/frame p50 ${fmt(sum.p50, 2)} p95 ${fmt(sum.p95, 2)} max ${fmt(sum.max, 2)}; dropped ${sum.dropped}; fps ${fmt(sum.fps, 1)}; ${sum.frames} frames over ${fmt(sum.spanMs / 1000, 1)} s`;
+  return `ms/frame p50 ${fmt(sum.p50, 2)} p95 ${fmt(sum.p95, 2)} max ${fmt(sum.max, 2)}; dropped ${sum.dropped}; ${missedText(sum)}; fps ${fmt(sum.fps, 1)}; ${sum.frames} frames over ${fmt(sum.spanMs / 1000, 1)} s`;
+}
+
+function missedText(sum: Summary): string {
+  return `missed vsync ${sum.missed} (median interval ${fmt(sum.medianDtMs, 2)} ms)`;
 }
 
 /** Each spring's peak excursion from its target since the last refresh, relative to its `amp`. */
@@ -753,12 +790,14 @@ function refreshStats(): void {
   if (sum === null) {
     show.work.textContent = '(no frames yet)';
     show.dropped.textContent = '';
+    show.missed.textContent = '';
     show.fps.textContent = '';
     show.window.textContent = '';
     return;
   }
   show.work.textContent = `${fmt(sum.p50, 2)} / ${fmt(sum.p95, 2)} / ${fmt(sum.max, 2)} ms`;
   show.dropped.textContent = String(sum.dropped);
+  show.missed.textContent = `${sum.missed} (median interval ${fmt(sum.medianDtMs, 2)} ms)`;
   show.fps.textContent = fmt(sum.fps, 1);
   show.window.textContent = `${fmt(sum.spanMs / 1000, 1)} s, ${sum.frames} frames`;
   const now = performance.now();
@@ -782,7 +821,7 @@ function startStress(): void {
   log(
     `stress: start, seed ${SEED}, ${SPRINGS.length} springs kicked every ${KICK_S * 1000} ms, layers blink, breathing, gaze, ear twitch, mood`,
   );
-  sizeStage(s);
+  log(`stress canvas: ${sizeStage(s)}`);
   showStage();
   s.raf = requestAnimationFrame(frame);
 }
@@ -843,7 +882,16 @@ stressBox.addEventListener('change', () => {
 dprSelect.addEventListener('change', () => {
   log(`DPR: ${dprSelect.value}`);
   if (stress === null) return;
-  sizeStage(stress);
+  log(`stress canvas: ${sizeStage(stress)}`);
+  showStage();
+});
+
+// As the app's stage: a new viewport (rotation, the mobile toolbar collapsing) resizes the stress canvas and
+// restarts the statistics.
+window.addEventListener('resize', () => {
+  const s = stress;
+  if (s === null || (window.innerWidth === s.cssW && window.innerHeight === s.cssH)) return;
+  log(`stress: resized to ${sizeStage(s)}`);
   showStage();
 });
 
