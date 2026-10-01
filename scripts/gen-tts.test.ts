@@ -1,11 +1,19 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { describe, expect, test } from 'vitest';
 
+import { readWav } from '../test/wav.ts';
 import {
   DOCKERFILE_PATH,
   HOP,
+  MANIFEST_PATH,
+  MAX_SENTENCE_SAMPLES,
+  MERGE_GAP_MS,
+  PROVENANCE_PATH,
   SAMPLE_RATE,
+  SIZE_BUDGET_BYTES,
+  SPEECH_DIR,
   TEXTS_PATH,
   combo,
   labelSpans,
@@ -14,6 +22,31 @@ import {
   parseTexts,
   planRenders,
 } from './gen-tts.ts';
+
+/**
+ * The format fields of a canonical 44-byte-header WAV, as writeWav emits it; throws if the header isn't canonical.
+ * (readWav decodes PCM16, PCM32 and float32 alike, so the sample format is checked here.)
+ */
+function canonicalHeader(bytes: Uint8Array): {
+  formatTag: number;
+  channels: number;
+  sampleRate: number;
+  bits: number;
+  dataBytes: number;
+} {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const id = (offset: number): string => String.fromCharCode(...bytes.subarray(offset, offset + 4));
+  expect([id(0), id(8), id(12), id(36)]).toEqual(['RIFF', 'WAVE', 'fmt ', 'data']);
+  expect(view.getUint32(16, true)).toBe(16);
+  expect(view.getUint32(40, true)).toBe(bytes.byteLength - 44);
+  return {
+    formatTag: view.getUint16(20, true),
+    channels: view.getUint16(22, true),
+    sampleRate: view.getUint32(24, true),
+    bits: view.getUint16(34, true),
+    dataBytes: view.getUint32(40, true),
+  };
+}
 
 /** `x` filled with `amp` (a square wave of amplitude amp, so every 10 ms hop has energy amp²) over [from, to). */
 function block(x: Float32Array, from: number, to: number, amp: number): void {
@@ -122,5 +155,71 @@ describe('render grid', () => {
       'libespeak-ng1',
       'espeak-ng-data',
     ]);
+  });
+});
+
+describe('committed corpus: test/corpus/speech', () => {
+  const manifest = parseManifest(JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')));
+  const renders = planRenders(parseTexts(JSON.parse(readFileSync(TEXTS_PATH, 'utf8'))));
+
+  test('the manifest lists every render of texts.json, in order, and the directory holds exactly its WAVs', () => {
+    expect(
+      manifest.map(({ id, kind, text, voice, pitch, speed }) => ({ id, kind, text, voice, pitch, speed })),
+    ).toEqual(renders);
+    expect(manifest.map((e) => e.file)).toEqual(renders.map((r) => `${r.id}.wav`));
+    const files = readdirSync(SPEECH_DIR).toSorted();
+    expect(files).toEqual([...manifest.map((e) => e.file), 'manifest.json'].toSorted());
+    expect(files.filter((f) => f.endsWith('.wav'))).toHaveLength(108);
+  });
+
+  test("PROVENANCE.md names the Dockerfile's base image and package pins", () => {
+    const provenance = readFileSync(PROVENANCE_PATH, 'utf8');
+    const { from, pins } = parseDockerfile(readFileSync(DOCKERFILE_PATH, 'utf8'));
+    expect(provenance).toContain(`FROM ${from}`);
+    for (const pin of pins) expect(provenance).toContain(pin);
+  });
+
+  test(`the directory is within the ${SIZE_BUDGET_BYTES}-byte budget`, () => {
+    const total = readdirSync(SPEECH_DIR).reduce((sum, f) => sum + statSync(join(SPEECH_DIR, f)).size, 0);
+    expect(total).toBeLessThanOrEqual(SIZE_BUDGET_BYTES);
+  });
+
+  test.each(manifest.map((e) => [e.id, e] as const))('%s', (_id, entry) => {
+    const bytes = readFileSync(join(SPEECH_DIR, entry.file));
+    // 16 kHz mono PCM16, `samples` long.
+    expect(canonicalHeader(bytes)).toEqual({
+      formatTag: 1,
+      channels: 1,
+      sampleRate: SAMPLE_RATE,
+      bits: 16,
+      dataBytes: entry.samples * 2,
+    });
+    const { sampleRate, channels } = readWav(bytes);
+    expect(sampleRate).toBe(SAMPLE_RATE);
+    expect(channels).toHaveLength(1);
+    const x = channels[0]!;
+    expect(x.length).toBe(entry.samples);
+    // No lead or tail padding; peak-normalised to −6 dBFS (0.501 × 32768 = 16423).
+    expect(x[0]).not.toBe(0);
+    expect(x[x.length - 1]).not.toBe(0);
+    let peak = 0;
+    for (const v of x) peak = Math.max(peak, Math.abs(v));
+    expect(Math.abs(peak * 32768 - 16423)).toBeLessThanOrEqual(1);
+    // Spans: integers, ordered, disjoint, inside the file; words and sentences have at least one.
+    if (entry.kind !== 'passage') expect(entry.spans.length).toBeGreaterThanOrEqual(1);
+    let previousEnd = -1;
+    for (const span of entry.spans) {
+      expect(span).toHaveLength(2);
+      const [start, end] = span;
+      expect(Number.isInteger(start) && Number.isInteger(end)).toBe(true);
+      expect(start).toBeGreaterThan(previousEnd);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(end).toBeGreaterThan(start);
+      expect(end).toBeLessThanOrEqual(entry.samples);
+      previousEnd = end;
+    }
+    // The labels are exactly what the labelling rules give on the committed signal.
+    expect(entry.spans).toEqual(labelSpans(x, MERGE_GAP_MS[entry.kind]));
+    if (entry.kind === 'sentence') expect(entry.samples).toBeLessThan(MAX_SENTENCE_SAMPLES);
   });
 });
