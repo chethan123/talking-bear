@@ -26,13 +26,12 @@
       discontinuities (a step between neighbouring samples larger than 3× the steepest step of the block's
       tone, A·2πf/sr, with A = RMS·√2 and f from zero crossings) and for runs of at least 1 ms of exact zeros.
       Consecutive takes neither overlap nor leave a gap, so every captured frame is analysed exactly once,
-      from the first captured sample that isn't an exact zero (the mic delivers a few tens of ms of zeros as
-      it starts). Run graph A first as the control, with the same tone, level, load and room. Graph A has no
-      suspension, so a discontinuity there comes from the setup (tone too quiet, room noise, handling); graph
-      B's result is then inconclusive, not a FAIL. Then run graph B for the same time: keep the phone silent
-      for at least 40 s first, so the silent-sink suspender has released the output (<code
-        >adb shell dumpsys media.audio_flinger</code
-      >
+      from 1 s after the first captured sample that isn't an exact zero (the mic delivers a few tens of ms of
+      zeros as it starts, and its first buffers can jump). Run graph A first as the control, with the same
+      tone, level, load and room. Graph A has no suspension, so a discontinuity there comes from the setup
+      (tone too quiet, room noise, handling); graph B's result is then inconclusive, not a FAIL. Then run
+      graph B for the same time: keep the phone silent for at least 40 s first, so the silent-sink suspender
+      has released the output (<code>adb shell dumpsys media.audio_flinger</code>
       shows no active output track then). Turn the load generator on for both runs.
     </p>
     <p>

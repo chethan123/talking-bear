@@ -33,6 +33,11 @@ export const DROP_SECONDS = [0.005, 0.01, 0.02] as const;
 export const BLIND_CYCLES = 0.075;
 /** Each block ends this many frames before the context's current frame, so the ring already holds all of it. */
 export const MARGIN_FRAMES = 1024;
+/**
+ * The analysis starts this long after the first captured sample that is not an exact zero: the mic source's
+ * first buffers can jump (one buffer after the audio starts, in 3 of 10 headless runs, in both graphs).
+ */
+export const SETTLE_SEC = 1;
 
 /** A: the worklet's output is unconnected (the default). B: `connectWorkletOutput: true`. */
 export type Graph = 'A' | 'B';
@@ -53,8 +58,8 @@ export function longerThanGate(frames: number, sampleRate: number): boolean {
 }
 
 /**
- * The index of the first sample of `x` that is not an exact zero, or −1 if there is none. The analysis starts
- * there: the mic source delivers exact zeros for its first few tens of ms (15–43 ms seen in headless Chrome).
+ * The index of the first sample of `x` that is not an exact zero, or −1 if there is none: where the captured
+ * audio starts (the mic source delivers exact zeros for its first few tens of ms: 15–43 ms in headless Chrome).
  */
 export function firstNonZero(x: Float32Array): number {
   for (let i = 0; i < x.length; i++) if (x[i] !== 0) return i;
@@ -70,6 +75,21 @@ export function blindDrops(freqHz: number): number[] {
     const cycles = freqHz * sec;
     return Math.abs(cycles - Math.round(cycles)) < BLIND_CYCLES;
   });
+}
+
+/**
+ * The ctx frame where the analysis starts within the take [from, to), given the frame where the captured audio
+ * started: SETTLE_SEC later, or `from` if that is already past (a take was lost meanwhile); null if it lies at or
+ * after `to` (the whole take is still settling).
+ */
+export function analysisStart(
+  audioFrame: number,
+  from: number,
+  to: number,
+  sampleRate: number,
+): number | null {
+  const at = Math.max(from, audioFrame + Math.round(SETTLE_SEC * sampleRate));
+  return at < to ? at : null;
 }
 
 /** A block's tone estimate. */
@@ -455,10 +475,9 @@ interface Pending {
 interface Session {
   readonly ctx: AudioContext;
   readonly sampleRate: number;
-  /**
-   * The ctx frame of the first captured sample that is not an exact zero: the analysis starts there, and the
-   * minutes count from it. Null until a take has shown one.
-   */
+  /** The ctx frame of the first captured sample that is not an exact zero; null until a take has shown one. */
+  audioFrame: number | null;
+  /** The ctx frame the analysis starts at (analysisStart), and the minutes count from; null until then. */
   startFrame: number | null;
   /** performance.now() when the analysis started (Elapsed), or null. */
   startWall: number | null;
@@ -621,13 +640,20 @@ function onClip(epoch: number, id: number): void {
   try {
     let x = pcm;
     if (s.startFrame === null) {
-      const k = firstNonZero(pcm);
-      if (k >= 0) {
-        from = p.from + k;
-        x = pcm.subarray(k);
-        s.startFrame = from;
+      if (s.audioFrame === null) {
+        const k = firstNonZero(pcm);
+        if (k >= 0) {
+          s.audioFrame = p.from + k;
+          log(`audio from ctx frame ${s.audioFrame}; the analysis starts ${SETTLE_SEC} s later`);
+        }
+      }
+      const at = s.audioFrame === null ? null : analysisStart(s.audioFrame, p.from, p.to, s.sampleRate);
+      if (at !== null) {
+        from = at;
+        x = pcm.subarray(at - p.from);
+        s.startFrame = at;
         s.startWall = performance.now();
-        log(`analysis starts at ctx frame ${from}: the first captured sample that is not an exact zero`);
+        log(`analysis starts at ctx frame ${at}`);
       }
     }
     if (s.startFrame !== null) r = analyseBlock(x, s.sampleRate, s.carry);
@@ -635,7 +661,8 @@ function onClip(epoch: number, id: number): void {
     pcm.fill(0); // plan Q2: the audio is discarded as soon as it is analysed
   }
   if (r === null || s.startFrame === null) {
-    log(`take ${p.id} [${p.from}, ${p.to}): exact zeros only, waiting for the mic`);
+    const why = s.audioFrame === null ? 'exact zeros only, waiting for the mic' : 'settling';
+    log(`take ${p.id} [${p.from}, ${p.to}): ${why}`);
     render();
     return;
   }
@@ -709,6 +736,7 @@ async function start(): Promise<void> {
   const s: Session = {
     ctx,
     sampleRate,
+    audioFrame: null,
     startFrame: null,
     startWall: null,
     timer: window.setInterval(() => tick(s), BLOCK_MS),
@@ -857,6 +885,11 @@ async function clickTest(s: Session): Promise<void> {
   try {
     const first = await measureClick(s, 'first click');
     const second = session === s ? await measureClick(s, 'second click') : null;
+    if (session !== s) {
+      show.resume.textContent = 'click test interrupted by Stop';
+      log('click test: interrupted by Stop');
+      return;
+    }
     show.resume.textContent =
       `first ${clickText(first)}, second ${clickText(second)} ` +
       `(after ${fmt(idle, 1)} s idle, graph ${graph})`;
@@ -1020,7 +1053,11 @@ function render(): void {
   if (s !== null) {
     const now = performance.now();
     show.elapsed.textContent =
-      s.startWall === null ? 'waiting for the mic' : `${fmt((now - s.startWall) / 60000, 2)} min`;
+      s.startWall === null
+        ? s.audioFrame === null
+          ? 'waiting for the mic'
+          : 'settling'
+        : `${fmt((now - s.startWall) / 60000, 2)} min`;
     show.idle.textContent = s.clicking
       ? 'click test running'
       : `${fmt((now - s.lastOutputWall) / 1000, 0)} s`;
