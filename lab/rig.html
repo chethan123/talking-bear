@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: rig (SVG DOM debug view, X-A1 stress)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./rig.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Rig: SVG DOM debug view and canvas stress</h1>
+    <p>
+      One slider per pose channel (plan §4.6.6). The same pose is drawn twice, side by side: as SVG DOM built
+      from the generated parts and bone matrices (plan §4.6.1, dev only), and by the app's Canvas 2D renderer.
+      The max pixel difference between the two is sampled once a second; it is informational. The SVG view
+      draws the parts only: the mouth and the dizzy stars are parametric canvas geometry, so
+      <code>Jaw</code>, <code>MouthW</code>, <code>MouthRound</code>, <code>Teeth</code> and
+      <code>Stars</code> show on the canvas alone. A second difference compares the parts only (the renderer
+      with those five channels at 0), so a real mismatch between the rig and the SVG view still shows.
+    </p>
+    <p>
+      Stress (X-A1, plan §5): every spring gets a random impulse every 200 ms, the idle layers run on top of
+      the sliders' pose, and the canvas renders every frame at the app stage's size (the viewport) with the
+      chosen DPR. Lab pages have no CSS sizing, so on a high-DPR screen the stress canvas shows larger than
+      the viewport; the cost is in its backing store, which matches the app's. The SVG view and the pixel
+      difference pause meanwhile, and the page scrolls to the canvas while stress runs: read the statistics in
+      the log, or scroll up. Use remote DevTools for the full trace (<code>docs/lab.md</code>).
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
