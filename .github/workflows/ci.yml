@@ -30,6 +30,7 @@ jobs:
       - run: pnpm parity
       - run: pnpm test:browser
       - run: pnpm build
+      - run: pnpm check:no-hooks
       - run: pnpm check:worklet
 
   e2e:

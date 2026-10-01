@@ -56,6 +56,13 @@ async function boot(): Promise<void> {
     onUi: (o) => showOverlay(o),
   });
 
+  // E2E hooks (plan §4.9.3): dead-code-eliminated from production builds, where the flag is unset. Installed
+  // before the UI is mounted, so no pointer input can reach the session before the hooks are listening.
+  if (import.meta.env.VITE_BEAR_TEST_HOOKS === '1') {
+    const { installTestHooks } = await import('./test-hooks.ts');
+    installTestHooks({ session, engine, visibility });
+  }
+
   const s = session;
   const circle = mountCircle(app, {
     visibility,
