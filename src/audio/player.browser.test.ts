@@ -83,13 +83,83 @@ describe('master bus', () => {
       sampleRate,
     });
     const bus = createMasterBus(off);
-    bus.setQuiet(false); // a no-op in M1; keeps this test true once M3 adds Quiet mode
+    bus.setQuiet(false); // Quiet mode is on by default (M3); off ramps to gain 1 with τ = 20 ms, settled after 15 τ
     const src = new ConstantSourceNode(off, { offset: 1 });
     src.connect(bus.input);
     src.start(0);
     const rendered = await off.startRendering();
     const data = rendered.getChannelData(0);
     for (const x of data.subarray(data.length - 128)) expect(x).toBeCloseTo(0.7, 6);
+  });
+
+  // Quiet mode (plan §4.3.4, issue #66): another −6 dB after the 0.7 master gain, as the bus's last node.
+  const QUIET = 10 ** (-6 / 20);
+  const OFFLINE_RATE = 48000;
+
+  /** A 0.3 s, 48 kHz offline context with a unit constant source into `bus.input`. */
+  function unitInto(off: OfflineAudioContext, bus: ReturnType<typeof createMasterBus>): void {
+    const src = new ConstantSourceNode(off, { offset: 1 });
+    src.connect(bus.input);
+    src.start(0);
+  }
+
+  function offline(): OfflineAudioContext {
+    return new OfflineAudioContext({
+      numberOfChannels: 1,
+      length: Math.round(0.3 * OFFLINE_RATE),
+      sampleRate: OFFLINE_RATE,
+    });
+  }
+
+  test('Quiet mode is on from creation: a unit signal reaches the destination at 0.7 · 10^(−6/20)', async () => {
+    const off = offline();
+    const bus = createMasterBus(off);
+    unitInto(off, bus);
+    const data = (await off.startRendering()).getChannelData(0);
+    for (const x of data.subarray(data.length - 128)) expect(x).toBeCloseTo(0.7 * QUIET, 6);
+  });
+
+  test("output is the bus's last node; a tap after it hears the post-Quiet level", async () => {
+    const off = offline();
+    const bus = createMasterBus(off);
+    expect(bus.output).not.toBe(bus.input);
+    // Wired as the engine's insertOutputTap does: output → tap → destination.
+    const tap = new GainNode(off, { gain: 1 });
+    bus.output.disconnect(off.destination);
+    bus.output.connect(tap);
+    tap.connect(off.destination);
+    unitInto(off, bus);
+    const data = (await off.startRendering()).getChannelData(0);
+    for (const x of data.subarray(data.length - 128)) expect(x).toBeCloseTo(0.7 * QUIET, 6); // ≈ 0.350831
+  });
+
+  test('setQuiet ramps with τ = 20 ms', async () => {
+    const off = offline();
+    const bus = createMasterBus(off);
+    unitInto(off, bus);
+    let t0 = Number.NaN;
+    const switched = off.suspend(0.1).then(() => {
+      t0 = off.currentTime;
+      bus.setQuiet(false);
+      return off.resume();
+    });
+    const data = (await off.startRendering()).getChannelData(0);
+    await switched;
+    const at = Math.round(t0 * OFFLINE_RATE);
+    expect(data[at - 1]).toBeCloseTo(0.7 * QUIET, 6);
+    // One time constant later the gain has covered 1 − 1/e of the way from 10^(−6/20) to 1.
+    expect(data[Math.round((t0 + 0.02) * OFFLINE_RATE)]).toBeCloseTo(
+      0.7 * (1 - (1 - QUIET) * Math.exp(-1)),
+      2,
+    );
+  });
+
+  test('createMasterBus(ctx, false) starts with Quiet off', async () => {
+    const off = offline();
+    const bus = createMasterBus(off, false);
+    unitInto(off, bus);
+    const data = (await off.startRendering()).getChannelData(0);
+    for (const x of data.subarray(0, 128)) expect(x).toBeCloseTo(0.7, 6);
   });
 });
 
