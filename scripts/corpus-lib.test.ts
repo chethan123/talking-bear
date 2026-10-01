@@ -60,7 +60,7 @@ import {
   sceneRng,
   tvNoise,
 } from './corpus-lib.ts';
-import { loadCorpus } from './gen-corpus.ts';
+import { compareHashes, loadCorpus, mergeHashes, parseArgs, parseHashes } from './gen-corpus.ts';
 
 // The issue's literal numbers (#52), so a changed constant fails here instead of moving every expectation with it.
 const ISSUE_RT60S = [0.2, 0.4, 0.6];
@@ -577,5 +577,55 @@ describe('scene plans', () => {
       ['music-noise', 'music', 900 * 16_000, 'music-snr10'],
       ['fast-fan-noise', 'fan', 120 * 16_000, 'fast-fan-snr10'],
     ]);
+  });
+});
+
+/** A fake 64-digit hash. */
+const h = (c: string): string => c.repeat(64);
+
+describe('gen-corpus command line', () => {
+  test('parseArgs', () => {
+    expect(parseArgs(['--subset', 'fast'])).toEqual({ subset: 'fast', mode: 'generate' });
+    expect(parseArgs(['--subset', 'full', '--check'])).toEqual({ subset: 'full', mode: 'check' });
+    expect(parseArgs(['--write-hashes', '--subset', 'full'])).toEqual({
+      subset: 'full',
+      mode: 'write-hashes',
+    });
+    for (const bad of [
+      [],
+      ['--subset'],
+      ['--subset', 'all'],
+      ['--subset', 'fast', '--check', '--write-hashes'],
+      ['--subset', 'fast', '--subset', 'full'],
+      ['--check'],
+      ['-x'],
+    ]) {
+      expect(() => parseArgs(bad)).toThrow(/usage/);
+    }
+  });
+
+  test('compareHashes reports missing, different and (full only) stale entries', () => {
+    const recorded = { 'a.f32': h('1'), 'b.f32': h('2'), 'stale.f32': h('3') };
+    const generated = { 'a.f32': h('1'), 'b.f32': h('9'), 'new.f32': h('4') };
+    expect(compareHashes('fast', generated, recorded)).toEqual([
+      `b.f32: expected ${h('2')}, got ${h('9')}`,
+      `new.f32: not in mix-hashes.json (got ${h('4')})`,
+    ]);
+    expect(compareHashes('full', generated, recorded)).toHaveLength(3);
+    expect(compareHashes('full', { 'a.f32': h('1') }, { 'a.f32': h('1') })).toEqual([]);
+  });
+
+  test('mergeHashes replaces everything for full and only the generated entries for fast', () => {
+    const recorded = { 'z.f32': h('1'), 'a.f32': h('2') };
+    expect(mergeHashes('full', { 'b.f32': h('3') }, recorded)).toEqual({ 'b.f32': h('3') });
+    const merged = mergeHashes('fast', { 'b.f32': h('3'), 'a.f32': h('4') }, recorded);
+    expect(merged).toEqual({ 'a.f32': h('4'), 'b.f32': h('3'), 'z.f32': h('1') });
+    expect(Object.keys(merged)).toEqual(['a.f32', 'b.f32', 'z.f32']);
+  });
+
+  test('parseHashes rejects malformed files', () => {
+    expect(() => parseHashes([])).toThrow();
+    expect(() => parseHashes({ 'a.f32': 'xyz' })).toThrow();
+    expect(parseHashes({ 'a.f32': h('a') })).toEqual({ 'a.f32': h('a') });
   });
 });
