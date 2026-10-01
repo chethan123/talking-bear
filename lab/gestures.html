@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: gestures (X-A7 pointer traces)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./gestures.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Gestures: labelled pointer traces</h1>
+    <p>
+      X-A7 (plan §5): at least 5 people, children included, each doing at least 20 prompted trials. For each
+      person, set an anonymous participant number (P1, P2, …, never a name) and the age group, then let them
+      do what each prompt asks, on the outlined region: a tap, a long-press (press and hold), a pet (stroke
+      the head) or a tickle (scrub the belly, or tap it quickly). The prompts come in a random order, each
+      gesture once in every four trials. The prompt and the recogniser's gestures show below the bear.
+    </p>
+    <p>
+      A trial records every pointer sample the app's pointer adapter feeds the recogniser (each coalesced move
+      and the frame ticks included), from the first touch until 600 ms after the last finger lifts; a touch
+      within those 600 ms continues the same trial. The bear is drawn once, in the neutral pose with no
+      animation, so the regions never move. Lab pages have no CSS sizing that fits the bear's aspect, so the
+      canvas's backing store has its CSS size, and the bear looks soft on a high-DPR screen.
+    </p>
+    <p>
+      Export saves this participant's trials as one JSON file,
+      <code>gestures-P&lt;n&gt;-&lt;UTC time&gt;.json</code>, with the canvas size and device pixel ratio; New
+      participant clears them once exported. Score the files with
+      <code>node scripts/gesture-eval.ts &lt;files…&gt; --min 0.9</code> (<code>docs/lab.md</code>).
+    </p>
+    <p>
+      Privacy (plan Q2): pointer coordinates and times only, with the participant number and age group. This
+      page never opens the microphone or plays any sound, stores nothing in the browser, and exports only when
+      Export is pressed.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
