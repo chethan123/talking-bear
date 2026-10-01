@@ -103,7 +103,7 @@ root.append(
     'voice-chain (X-F3, plan §5): processVoice (src/dsp/voice.ts) on synthetic 1, 5 and 10 s clips (400 ms ' +
       'vowel bursts, each followed by 100 ms of pink noise: 20 % noise) at the context rate below, for the ' +
       'cub, chipmunk and bigbear presets: after an untimed pre-warm, one warm-up call, then 30 timed calls ' +
-      'each, back to back (steady state; the logged warm-up call is the cold reference). Each voiceStages ' +
+      'each, back to back (steady state; the pre-warm log line gives the cold first call). Each voiceStages ' +
       'function is then timed on its own input, as batch means. Gate: p95 ≤ ' +
       `${VOICE_BUDGET_MS_PER_S} ms per second of audio (plan §4.10) for every clip and preset. Not part of ` +
       'the 10-min thermal soak.',

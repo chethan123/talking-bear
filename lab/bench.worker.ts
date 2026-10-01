@@ -746,11 +746,11 @@ function timeStage(
 
 /**
  * X-F3, back to back. First an untimed pre-warm (VOICE_PREWARM_ROUNDS rounds of processVoice on the 1 s clip,
- * each preset once), so the first row isn't timed while the JIT tiers up. Then, for each clip length (1, 5,
- * 10 s) and preset (cub, chipmunk, bigbear): one untimed warm-up call of processVoice(clip, rate, preset), then
- * VOICE_CALLS calls timed one by one with performance.now() around each; then each voiceStages function timed
- * on its own input (timeStage) in batches lasting at least max(2 ms, 20 timer steps), since a stage of a 1 s
- * clip can take less than one timer step; then checkStages.
+ * each preset once), so the first row isn't timed while the JIT tiers up; its total and its first, cold call
+ * are logged. Then, for each clip length (1, 5, 10 s) and preset (cub, chipmunk, bigbear): one untimed warm-up
+ * call of processVoice(clip, rate, preset), then VOICE_CALLS calls timed one by one with performance.now()
+ * around each; then each voiceStages function timed on its own input (timeStage) in batches lasting at least
+ * max(2 ms, 20 timer steps), since a stage of a 1 s clip can take less than one timer step; then checkStages.
  */
 function voiceChain(req: BenchRequest, timerStepMs: number): VoiceStats {
   const rate = req.rate;
@@ -766,14 +766,21 @@ function voiceChain(req: BenchRequest, timerStepMs: number): VoiceStats {
   });
   const warmClip = speechClip(rate, 1);
   const tw = performance.now();
-  for (let k = 0; k < VOICE_PREWARM_ROUNDS; k++)
-    for (const preset of VOICE_PRESETS) processVoice(warmClip, rate, preset);
+  // The pre-warm's first call is the fresh worker's first processVoice call: the cold reference.
+  let coldMs = 0;
+  for (let k = 0; k < VOICE_PREWARM_ROUNDS; k++) {
+    for (const preset of VOICE_PRESETS) {
+      processVoice(warmClip, rate, preset);
+      if (k === 0 && preset === VOICE_PRESETS[0]) coldMs = performance.now() - tw;
+    }
+  }
   post({
     t: 'info',
     bench: req.bench,
     line:
       `pre-warm: ${VOICE_PREWARM_ROUNDS} × ${VOICE_PRESETS.length} presets on the 1 s clip, ` +
-      `${(performance.now() - tw).toFixed(1)} ms`,
+      `${(performance.now() - tw).toFixed(1)} ms; its first call (cold: JIT, first allocations) ` +
+      `${coldMs.toFixed(1)} ms`,
   });
   const start = performance.now();
   for (const clipS of VOICE_CLIPS_S) {
