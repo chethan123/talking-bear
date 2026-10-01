@@ -33,8 +33,16 @@ export type WorkletToMain =
   | { t: 'takeFailed'; epoch: number; id: number; reason: 'evicted' };
 export type MainToWorker =
   // New listen: reset the segmenter, the LSTM and the history. `pregate`: skip Silero inference while the energy
-  // gate is closed and the segmenter idle (plan §4.2.3; off unless true).
-  | { t: 'reset'; epoch: number; vad: 'silero' | 'energy'; restoreFloorDb?: number; pregate?: boolean }
+  // gate is closed and the segmenter idle (plan §4.2.3; off unless true). `proximityDb`: the proximity gate's X
+  // for Silero segments (plan §4.2.2; PROXIMITY_DB when omitted).
+  | {
+      t: 'reset';
+      epoch: number;
+      vad: 'silero' | 'energy';
+      restoreFloorDb?: number;
+      pregate?: boolean;
+      proximityDb?: number;
+    }
   | { t: 'process'; id: number; pcm: Float32Array; sampleRate: number; preset: VoicePreset }
   // The context sample rate and the worker's end of the worklet↔worker channel (transferred).
   | { t: 'init'; ctxRate: number; port: MessagePort };
