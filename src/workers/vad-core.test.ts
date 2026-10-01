@@ -1,15 +1,30 @@
-// VadCore (energy backend) driven by the synthetic fixtures, plus a smoke test of the worker glue.
-// Fixtures are 48 kHz; like the capture worklet, the test decimates them to 16 kHz and feeds 512-sample
-// frames tagged with the ctx frame of their first sample (ctxRate 48000, so frame i starts at i·512·3).
+// VadCore driven by the synthetic fixtures: the energy backend (M1) and its voicing rule, the Silero backend on
+// the shipped weights (fallback, late model, failures, pre-gate, LSTM reset, vadStats), the allocation meters,
+// and a smoke test of the worker glue. Fixtures are 48 kHz; like the capture worklet, the test decimates them
+// to 16 kHz and feeds 512-sample frames tagged with the ctx frame of their first sample (ctxRate 48000, so
+// frame i starts at i·512·3).
 
 import { readFileSync } from 'node:fs';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { GCProfiler, setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { mulberry32 } from '../../test/dsp-helpers.ts';
 import { readWav } from '../../test/wav.ts';
+import { DEFAULT_VAD_BACKEND, PREGATE_ENABLED, PREGATE_WARMUP_FRAMES } from '../audio/constants.ts';
 import type { WorkerToMain } from '../audio/messages.ts';
 import { resampleOffline } from '../dsp/resample.ts';
 import type { SegEvent } from '../dsp/segmenter.ts';
+import { createSilero, type SileroModel } from '../dsp/silero/model.ts';
+import { decodeWeights, type SileroWeights } from '../dsp/silero/weights.ts';
 import { PRESETS } from '../dsp/types.ts';
-import { SILERO_UNAVAILABLE_MESSAGE, VadCore } from './vad-core.ts';
+import {
+  MIN_VOICED_MS,
+  PREGATE_HOLD_FRAMES,
+  SILERO_NOT_READY_MESSAGE,
+  VAD_STATS_WINDOW,
+  VadCore,
+  type VadCoreOptions,
+} from './vad-core.ts';
 
 const CTX_RATE = 48000;
 const FRAME = 512;
@@ -27,11 +42,11 @@ function fixture(name: string): Float32Array {
   return x;
 }
 
-/** The 16 kHz signal cut into 512-sample frames: the last partial frame is zero-filled, then PAD_FRAMES
+/** The 16 kHz signal cut into 512-sample frames: the last partial frame is zero-filled, then `padFrames`
  *  zero frames follow. Each frame is its own buffer, like a transferred worklet frame. */
-function frames16k(x48: Float32Array): Float32Array[] {
+function frames16k(x48: Float32Array, padFrames = PAD_FRAMES): Float32Array[] {
   const x16 = resampleOffline(x48, 1 / 3);
-  const n = Math.ceil(x16.length / FRAME) + PAD_FRAMES;
+  const n = Math.ceil(x16.length / FRAME) + padFrames;
   const out: Float32Array[] = [];
   for (let i = 0; i < n; i++) {
     const f = new Float32Array(FRAME);
@@ -46,9 +61,9 @@ interface Run {
   msgs: WorkerToMain[];
 }
 
-function newCore(ctxRate = CTX_RATE): Run {
+function newCore(ctxRate = CTX_RATE, opts?: VadCoreOptions): Run {
   const msgs: WorkerToMain[] = [];
-  return { core: new VadCore(ctxRate, (m) => msgs.push(m)), msgs };
+  return { core: new VadCore(ctxRate, (m) => msgs.push(m), opts), msgs };
 }
 
 /** Feeds frames with firstFrame = offset + round(i·512·3). */
@@ -214,15 +229,6 @@ describe('VadCore epochs and reset', () => {
     expect(a.msgs).toEqual(b.msgs);
     expect(segs(a.msgs)[0]).toEqual({ kind: 'start', frame: 777 + ONSET_BLOCK_FRAMES });
   });
-
-  it("reset(e, 'silero') posts the M1 error and continues with energy", () => {
-    const run = newCore();
-    run.core.reset(3, 'silero');
-    expect(run.msgs).toEqual([{ t: 'error', where: 'vad', message: SILERO_UNAVAILABLE_MESSAGE }]);
-    expect(SILERO_UNAVAILABLE_MESSAGE).toBe('silero backend not available in M1; using energy');
-    feed(run, 3, frames16k(fixture('vowel_f0-140')));
-    expect(kinds(run.msgs)).toEqual(['start', 'end']);
-  });
 });
 
 /** firstFrame of frame k at ctxRate 44100, starting at ctx frame 1000. */
@@ -251,6 +257,631 @@ describe('VadCore framing', () => {
     expect(() => run.core.frame(1, 0, new Float32Array(511))).toThrow(RangeError);
     expect(() => new VadCore(0, () => {})).toThrow(RangeError);
     expect(() => new VadCore(Number.NaN, () => {})).toThrow(RangeError);
+  });
+});
+
+// ---- Silero backend, pre-gate, stats and the energy voicing rule (T35) ----
+
+/** weights.bin as a fresh ArrayBuffer (a copy: never the Node Buffer, whose memory may be a shared pool). */
+function weightsBuffer(): ArrayBuffer {
+  const bytes = readFileSync(new URL('../dsp/silero/weights.bin', import.meta.url));
+  const buf = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buf).set(bytes);
+  return buf;
+}
+
+/** The shipped weights, as the worker decodes them. */
+const W: SileroWeights = decodeWeights(weightsBuffer());
+
+/** Counts reset() and process() calls of a model (by default a fresh real one) and can observe each frame. */
+class SpyModel implements SileroModel {
+  calls = 0;
+  resets = 0;
+  onProcess: ((x: Float32Array) => void) | null = null;
+  readonly inner: SileroModel;
+
+  constructor(inner: SileroModel = createSilero(W)) {
+    this.inner = inner;
+  }
+
+  reset(): void {
+    this.resets++;
+    this.inner.reset();
+  }
+
+  process(x: Float32Array): number {
+    this.calls++;
+    this.onProcess?.(x);
+    return this.inner.process(x);
+  }
+}
+
+/** A model that always answers 0: no inference cost. */
+function zeroModel(): SileroModel {
+  return { reset: () => undefined, process: () => 0 };
+}
+
+/** A counting model that answers `loud` for frames whose mean square is > 1e-4, else `quiet`. */
+function scriptedModel(loud: number, quiet: number): SileroModel & { calls: number } {
+  const m = {
+    calls: 0,
+    reset: (): void => undefined,
+    process(x: Float32Array): number {
+      m.calls++;
+      let sum = 0;
+      for (let i = 0; i < x.length; i++) sum += x[i]! * x[i]!;
+      return sum / x.length > 1e-4 ? loud : quiet;
+    },
+  };
+  return m;
+}
+
+/** A fresh core with `model` set, reset to epoch 1 on Silero (pre-gate as given), fed `frames`. */
+function runSilero(frames: Float32Array[], model: SileroModel, pregate = false): Run {
+  const run = newCore();
+  run.core.setModel(model);
+  run.core.reset(1, 'silero', undefined, pregate);
+  feed(run, 1, frames);
+  return run;
+}
+
+/** Seeded uniform white noise at 48 kHz with the given RMS level (dBFS). */
+function whiteNoise48(seed: number, seconds: number, rmsDb: number): Float32Array {
+  const rng = mulberry32(seed);
+  const a = Math.sqrt(3) * 10 ** (rmsDb / 20);
+  return Float32Array.from({ length: Math.round(seconds * CTX_RATE) }, () => (2 * rng() - 1) * a);
+}
+
+function concat48(...parts: Float32Array[]): Float32Array {
+  const out = new Float32Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+/** x + n, element-wise (same length). */
+function addNoise(x: Float32Array, n: Float32Array): Float32Array {
+  expect(n.length).toBe(x.length);
+  return Float32Array.from(x, (v, i) => v + n[i]!);
+}
+
+/** Silero frame labels: every 512-sample frame starts at a multiple of 512 · 3 ctx frames. */
+const SILERO_GRID = FRAME * 3;
+
+/** Checks that the message right before the first `start` seg is a floorSnapshot with a finite floor. */
+function expectSnapshotBeforeStart(msgs: WorkerToMain[]): void {
+  const i = msgs.findIndex((m) => m.t === 'seg' && m.ev.kind === 'start');
+  expect(i).toBeGreaterThan(0);
+  const before = msgs[i - 1];
+  if (before?.t !== 'floorSnapshot')
+    throw new Error(`expected a floorSnapshot before the start, got ${before?.t}`);
+  expect(Number.isFinite(before.floorDb)).toBe(true);
+}
+
+/** 2 s of −70 dBFS noise, vowel_f0-140 (plus noise), 1.5 s of noise: distinct frames, no zero padding. */
+function noiseLedVowelFrames(): Float32Array[] {
+  const x = concat48(
+    whiteNoise48(11, 1.0, -70),
+    addNoise(fixture('vowel_f0-140'), whiteNoise48(12, 2.8, -70)),
+    whiteNoise48(13, 1.5, -70),
+  );
+  return frames16k(x, 0);
+}
+
+describe('VadCore Silero backend (shipped weights)', () => {
+  it('1: silence_2s gives no seg events, with every frame through Silero', () => {
+    const frames = frames16k(fixture('silence_2s'));
+    const spy = new SpyModel();
+    const { msgs } = runSilero(frames, spy);
+    expect(ofType(msgs, 'seg')).toEqual([]);
+    expect(ofType(msgs, 'floorSnapshot')).toEqual([]);
+    expect(spy.calls).toBe(frames.length);
+    expect(levels(msgs).length).toBeGreaterThan(0);
+  });
+
+  it('2: knock gives no end events', () => {
+    const { msgs } = runSilero(frames16k(fixture('knock')), new SpyModel());
+    expect(kinds(msgs)).not.toContain('end');
+  });
+
+  it("3: without a model, reset(…, 'silero') posts the not-ready error once and runs exactly like energy", () => {
+    expect(SILERO_NOT_READY_MESSAGE).toBe('silero not ready; using energy');
+    const energy = runFixture('vowel_f0-140').msgs;
+    const run = newCore();
+    run.core.reset(1, 'silero');
+    feed(run, 1, frames16k(fixture('vowel_f0-140')));
+    expect(run.msgs[0]).toEqual({ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE });
+    expect(ofType(run.msgs, 'error')).toHaveLength(1);
+    expect(run.msgs.slice(1)).toEqual(energy);
+    expect(kinds(energy)).toEqual(['start', 'end']);
+    run.core.reset(2, 'silero');
+    expect(ofType(run.msgs, 'error')).toHaveLength(2);
+  });
+
+  it('3b: a model set while the epoch is idle switches it to Silero at once', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const run = newCore();
+    run.core.reset(1, 'silero');
+    feed(run, 1, frames.slice(0, 5)); // lead silence: the segmenter is idle
+    const spy = new SpyModel();
+    run.core.setModel(spy);
+    expect(spy.resets).toBe(1);
+    feed(run, 1, frames.slice(5), 5 * SILERO_GRID);
+    expect(spy.calls).toBe(frames.length - 5);
+    const evs = segs(run.msgs);
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'end']);
+    for (const e of evs) expect(e.frame % SILERO_GRID).toBe(0);
+    const end = evs[1];
+    if (end?.kind !== 'end') throw new Error('unreachable');
+    expect(end.frame - end.lastSpeechFrame).toBeLessThan(0.7 * CTX_RATE); // Silero hangover (energy: ≈ 0.8 s)
+    expectSnapshotBeforeStart(run.msgs);
+  });
+
+  it('3c: a model set during an active segment leaves the epoch on energy until the next reset', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const energy = runFixture('vowel_f0-140').msgs;
+    const run = newCore();
+    run.core.reset(1, 'silero');
+    let k = 0;
+    while (!kinds(run.msgs).includes('start')) {
+      expect(k).toBeLessThan(frames.length);
+      run.core.frame(1, k * SILERO_GRID, frames[k]!);
+      k++;
+    }
+    const spy = new SpyModel();
+    run.core.setModel(spy);
+    feed(run, 1, frames.slice(k), k * SILERO_GRID);
+    expect(spy.calls).toBe(0);
+    expect(spy.resets).toBe(0);
+    expect(run.msgs.slice(1)).toEqual(energy);
+    run.msgs.length = 0;
+    run.core.reset(2, 'silero');
+    expect(spy.resets).toBe(1);
+    feed(run, 2, frames, 10 * CTX_RATE);
+    expect(spy.calls).toBe(frames.length);
+    expect(ofType(run.msgs, 'error')).toEqual([]);
+  });
+
+  it('4: a model that throws on its 3rd call posts error{vad}, and energy processes the later frames', () => {
+    let n = 0;
+    const thrower: SileroModel = {
+      reset: () => undefined,
+      process: () => {
+        n++;
+        if (n === 3) throw new Error('boom');
+        return 0;
+      },
+    };
+    const { msgs } = runSilero(frames16k(fixture('vowel_f0-140')), thrower);
+    expect(n).toBe(3);
+    expect(ofType(msgs, 'error')).toEqual([
+      { t: 'error', where: 'vad', message: 'silero failed: boom; using energy' },
+    ]);
+    expect(segs(msgs)).toEqual(segs(runFixture('vowel_f0-140').msgs));
+  });
+
+  it('4b: a model that throws inside a segment closes it with a misfire before energy takes over', () => {
+    // 20 frames of −70 dBFS noise, 10 at −20 dBFS (scripted p = 0.9: a Silero start), then 400 quiet frames
+    // (12.8 s, longer than the session's recording watchdog). The model throws on the first quiet frame, so
+    // the fresh energy segmenter never sees speech and cannot end the open segment itself.
+    const rng = mulberry32(61);
+    const noiseFrame = (rmsDb: number): Float32Array => {
+      const a = Math.sqrt(3) * 10 ** (rmsDb / 20);
+      return Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a);
+    };
+    const frames = [
+      ...Array.from({ length: 20 }, () => noiseFrame(-70)),
+      ...Array.from({ length: 10 }, () => noiseFrame(-20)),
+      ...Array.from({ length: 400 }, () => noiseFrame(-70)),
+    ];
+    const inner = scriptedModel(0.9, 0.1);
+    const model: SileroModel = {
+      reset: () => undefined,
+      process: (x) => {
+        if (inner.calls === 30) throw new Error('boom'); // the 31st call: frame 30, the first quiet one
+        return inner.process(x);
+      },
+    };
+    const { msgs } = runSilero(frames, model);
+    const error: WorkerToMain = { t: 'error', where: 'vad', message: 'silero failed: boom; using energy' };
+    expect(ofType(msgs, 'error')).toEqual([error]);
+    expect(segs(msgs)).toEqual([
+      { kind: 'start', frame: 20 * SILERO_GRID },
+      { kind: 'misfire', frame: 30 * SILERO_GRID },
+    ]);
+    const at = msgs.indexOf(ofType(msgs, 'error')[0]!);
+    expect(msgs[at + 1]).toEqual({ t: 'seg', epoch: 1, ev: { kind: 'misfire', frame: 30 * SILERO_GRID } });
+  });
+
+  it('5a: the pre-gate makes ≥ 70 % fewer process calls on noise_white_-60dbfs_3s', () => {
+    const frames = frames16k(fixture('noise_white_-60dbfs_3s'));
+    const off = new SpyModel();
+    const on = new SpyModel();
+    const a = runSilero(frames, off, false);
+    const b = runSilero(frames, on, true);
+    expect(off.calls).toBe(frames.length);
+    expect(on.calls).toBeLessThanOrEqual(0.3 * off.calls);
+    expect(segs(b.msgs)).toEqual(segs(a.msgs));
+    expect(segs(a.msgs)).toEqual([]);
+  });
+
+  it('5b: vowel_f0-140 gives identical seg events with and without the pre-gate', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const off = new SpyModel();
+    const on = new SpyModel();
+    const a = runSilero(frames, off, false);
+    const b = runSilero(frames, on, true);
+    expect(segs(b.msgs)).toEqual(segs(a.msgs));
+    expect(kinds(a.msgs)).toEqual(['start', 'end']);
+    expect(on.calls).toBeLessThan(off.calls);
+    expectSnapshotBeforeStart(a.msgs);
+    expectSnapshotBeforeStart(b.msgs);
+  });
+
+  it('5c: on gate-open the pre-gate replays the last 10 skipped raw frames in order, then the current one', () => {
+    const frames = noiseLedVowelFrames();
+    const spy = new SpyModel();
+    let feeding = -1;
+    const calls: { feeding: number; idx: number }[] = [];
+    spy.onProcess = (x) => {
+      calls.push({ feeding, idx: frames.findIndex((f) => f.every((v, i) => v === x[i])) });
+    };
+    const run = newCore();
+    run.core.setModel(spy);
+    run.core.reset(1, 'silero', undefined, true);
+    frames.forEach((f, i) => {
+      feeding = i;
+      run.core.frame(1, i * SILERO_GRID, f);
+    });
+    // Every processed frame is a raw fed frame, each at most once, in order.
+    for (const [j, c] of calls.entries()) {
+      expect(c.idx, `call ${j}`).toBeGreaterThanOrEqual(0);
+      if (j > 0) expect(c.idx, `call ${j}`).toBeGreaterThan(calls[j - 1]!.idx);
+    }
+    const byFrame = new Map<number, number[]>();
+    for (const c of calls) byFrame.set(c.feeding, [...(byFrame.get(c.feeding) ?? []), c.idx]);
+    for (let i = 0; i < PREGATE_HOLD_FRAMES; i++) expect(byFrame.get(i), `frame ${i}`).toEqual([i]);
+    expect(frames.some((_, i) => !byFrame.has(i))).toBe(true); // something was skipped
+    for (const [j, idx] of byFrame) {
+      expect(idx.length).toBeLessThanOrEqual(PREGATE_WARMUP_FRAMES + 1);
+      expect(idx, `frame ${j}`).toEqual(Array.from({ length: idx.length }, (_, i) => j - idx.length + 1 + i));
+    }
+    expect([...byFrame.values()].some((idx) => idx.length === PREGATE_WARMUP_FRAMES + 1)).toBe(true);
+    const continuous = runSilero(frames, new SpyModel(), false);
+    expect(segs(run.msgs)).toEqual(segs(continuous.msgs));
+    expect(segs(run.msgs).length).toBeGreaterThan(0);
+  });
+
+  it('5d: the pre-gate never skips while the segmenter is in a segment', () => {
+    const x = concat48(whiteNoise48(41, 1.0, -70), whiteNoise48(42, 0.5, -20), whiteNoise48(43, 3.0, -70));
+    const frames = frames16k(x, 0);
+    // 0.4 is between the thresholds (0.35, 0.5): once started, the segment stays open through the quiet tail.
+    const off = scriptedModel(0.9, 0.4);
+    const on = scriptedModel(0.9, 0.4);
+    const a = runSilero(frames, off, false);
+    const b = runSilero(frames, on, true);
+    expect(on.calls).toBe(frames.length);
+    expect(segs(b.msgs)).toEqual(segs(a.msgs));
+    expect(kinds(a.msgs)).toEqual(['start']);
+  });
+
+  it("5e': the hop that initialises the floor after digital silence opens the pre-gate", () => {
+    // 16 kHz frames built directly: 70 zero frames, 32 frames of −20 dBFS noise starting on a hop boundary
+    // (70 · 512 = 224 · 160), 50 zero frames. Without the rule the floor would initialise at the noise level and
+    // the gate would never open, so Silero would never see the noise.
+    const rng = mulberry32(51);
+    const a = Math.sqrt(3) * 0.1;
+    const frames = Array.from({ length: 152 }, (_, k) =>
+      k >= 70 && k < 102
+        ? Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a)
+        : new Float32Array(FRAME),
+    );
+    const off = scriptedModel(0.9, 0.1);
+    const on = scriptedModel(0.9, 0.1);
+    const r0 = runSilero(frames, off, false);
+    const r1 = runSilero(frames, on, true);
+    expect(segs(r1.msgs)).toEqual(segs(r0.msgs));
+    expect(kinds(r0.msgs)).toEqual(['start', 'end']);
+    expect(on.calls).toBeLessThan(off.calls);
+  });
+
+  it('5f: reset empties the pre-gate ring: no frame of an earlier epoch is ever replayed', () => {
+    const spy = new SpyModel();
+    const seen: Float32Array[] = [];
+    spy.onProcess = (x) => seen.push(x);
+    const run = newCore();
+    run.core.setModel(spy);
+    run.core.reset(1, 'silero', undefined, true);
+    feed(
+      run,
+      1,
+      Array.from({ length: 40 }, () => new Float32Array(FRAME)),
+    ); // 18 skipped: the ring is full
+    expect(spy.calls).toBe(PREGATE_HOLD_FRAMES);
+    run.core.reset(2, 'silero', undefined, true);
+    const next = noiseLedVowelFrames()[0]!;
+    seen.length = 0;
+    run.core.frame(2, 0, next);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBe(next);
+  });
+
+  it('5g: the hold is exactly PREGATE_HOLD_FRAMES (22) closed frames', () => {
+    expect(PREGATE_HOLD_FRAMES).toBe(22);
+    const spy = new SpyModel();
+    const fed: number[] = [];
+    let cur = -1;
+    spy.onProcess = () => fed.push(cur);
+    const run = newCore();
+    run.core.setModel(spy);
+    run.core.reset(1, 'silero', undefined, true);
+    for (let k = 0; k < 40; k++) {
+      cur = k;
+      run.core.frame(1, k * SILERO_GRID, new Float32Array(FRAME));
+    }
+    expect(fed).toEqual(Array.from({ length: PREGATE_HOLD_FRAMES }, (_, k) => k));
+  });
+
+  it('6: every reset() of a new epoch resets the LSTM state', () => {
+    const spy = new SpyModel();
+    const run = newCore();
+    run.core.setModel(spy);
+    run.core.reset(1, 'silero');
+    expect(spy.resets).toBe(1);
+    feed(run, 1, frames16k(fixture('vowel_f0-140')).slice(0, 20));
+    run.core.reset(2, 'silero');
+    expect(spy.resets).toBe(2);
+    run.core.reset(3, 'energy');
+    expect(spy.resets).toBe(3);
+  });
+
+  it('8: vadStats is posted after every 312 inferences, with the p95 of the last 312 times', () => {
+    let t = 0;
+    let i = 0;
+    const clocked: SileroModel = {
+      reset: () => undefined,
+      process: () => {
+        i++;
+        // 0.01 … 3.12 ms in the first window, 10.01 … 13.12 ms after it.
+        t += (i > VAD_STATS_WINDOW ? 10 : 0) + (((i - 1) % VAD_STATS_WINDOW) + 1) / 100;
+        return 0;
+      },
+    };
+    const run = newCore(CTX_RATE, { now: () => t });
+    run.core.setModel(clocked);
+    run.core.reset(1, 'silero');
+    const zeros = new Float32Array(FRAME);
+    let k = 0;
+    const feedN = (n: number): void => {
+      for (let j = 0; j < n; j++, k++) run.core.frame(1, k * SILERO_GRID, zeros);
+    };
+    expect(VAD_STATS_WINDOW).toBe(312);
+    feedN(311);
+    expect(ofType(run.msgs, 'vadStats')).toEqual([]);
+    feedN(1);
+    const first = ofType(run.msgs, 'vadStats');
+    expect(first).toHaveLength(1);
+    expect(Number.isFinite(first[0]!.p95Ms)).toBe(true);
+    expect(first[0]!.p95Ms).toBeCloseTo(2.97, 9); // nearest rank: the 297th of 0.01 … 3.12
+    feedN(312);
+    const both = ofType(run.msgs, 'vadStats');
+    expect(both).toHaveLength(2);
+    expect(both[1]!.p95Ms).toBeCloseTo(12.97, 9); // only the last 312 times count
+  });
+});
+
+describe('VadCore energy voicing rule', () => {
+  it('7: a 300 ms white-noise burst at −20 dBFS gives misfire, not end', () => {
+    expect(MIN_VOICED_MS).toBe(60);
+    const x = concat48(whiteNoise48(21, 1.0, -70), whiteNoise48(22, 0.3, -20), whiteNoise48(23, 0.3, -70));
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    feed(run, 1, frames16k(x));
+    const evs = segs(run.msgs);
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'misfire']);
+    // ≥ 200 ms of speech before the 800 ms hangover: not the 150 ms minimum-speech rule, the voicing rule.
+    expect(evs[1]!.frame - evs[0]!.frame).toBeGreaterThanOrEqual(1.0 * CTX_RATE);
+  });
+
+  it('7b: a maxLength end without voicing is a misfire too', () => {
+    const x = concat48(whiteNoise48(31, 1.0, -70), whiteNoise48(32, 10.5, -20));
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    feed(run, 1, frames16k(x));
+    const evs = segs(run.msgs);
+    expect(evs.slice(0, 2).map((e) => e.kind)).toEqual(['start', 'misfire']);
+    expect(Math.abs(evs[1]!.frame - evs[0]!.frame - 10 * CTX_RATE)).toBeLessThanOrEqual(0.05 * CTX_RATE);
+  });
+});
+
+describe('defaults', () => {
+  it("9: the engine's VAD backend is still 'energy' and the pre-gate is off", () => {
+    expect(DEFAULT_VAD_BACKEND).toBe('energy');
+    expect(PREGATE_ENABLED).toBe(false);
+  });
+});
+
+// ---- Allocation meters (copied from src/dsp/silero/model.test.ts) ----
+
+type Constructor = new (...args: never[]) => object;
+
+/** Wraps `original` so that every `new` of it, including those inside its static `from` and `of`, calls `onNew`. */
+function countingConstructor<C extends Constructor>(original: C, onNew: () => void): C {
+  return new Proxy(original, {
+    construct(target, args: never[], newTarget: Constructor): object {
+      onNew();
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+}
+
+/** `%TypedArray%.prototype`, which every typed array class inherits its methods from. */
+const TYPED_ARRAY_PROTOTYPE = Reflect.getPrototypeOf(Float32Array.prototype) ?? Float32Array.prototype;
+/** Its methods that return a new typed array. */
+const TYPED_ARRAY_METHODS = ['slice', 'map', 'filter', 'subarray', 'toReversed', 'toSorted', 'with'] as const;
+
+/**
+ * Runs `fn` and counts the allocations it makes through the array globals (a copy of src/anim/clip.test.ts's
+ * meter): every `new` of `Array`, `ArrayBuffer`, `Float32Array` or `Float64Array` (static `from` and `of`
+ * included, and `new` through a typed array's `constructor`), and every call of an allocating
+ * `%TypedArray%.prototype` method. Everything is restored afterwards.
+ */
+function countAllocations(fn: () => void): number {
+  let count = 0;
+  const onNew = (): void => {
+    count++;
+  };
+  const saved: { obj: object; key: string; desc: PropertyDescriptor }[] = [];
+  const patch = (obj: object, key: string, value: unknown): void => {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined) throw new Error(`nothing to patch at ${key}`);
+    saved.push({ obj, key, desc });
+    Object.defineProperty(obj, key, { ...desc, value });
+  };
+  const float32 = countingConstructor(Float32Array, onNew);
+  const float64 = countingConstructor(Float64Array, onNew);
+  patch(Float32Array.prototype, 'constructor', float32);
+  patch(Float64Array.prototype, 'constructor', float64);
+  patch(globalThis, 'Array', countingConstructor(Array, onNew));
+  patch(globalThis, 'ArrayBuffer', countingConstructor(ArrayBuffer, onNew));
+  patch(globalThis, 'Float32Array', float32);
+  patch(globalThis, 'Float64Array', float64);
+  for (const name of TYPED_ARRAY_METHODS) {
+    const original: unknown = Reflect.get(TYPED_ARRAY_PROTOTYPE, name);
+    if (typeof original !== 'function') throw new Error(`no %TypedArray%.prototype.${name}`);
+    patch(TYPED_ARRAY_PROTOTYPE, name, function (this: unknown, ...args: unknown[]): unknown {
+      count++;
+      return Reflect.apply(original, this, args);
+    });
+  }
+  try {
+    fn();
+  } finally {
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const { obj, key, desc } = saved[i]!;
+      Object.defineProperty(obj, key, desc);
+    }
+  }
+  return count;
+}
+
+/** The `gc` function, exposed once at runtime with Node built-ins only (no `--expose-gc` flag needed). */
+let exposedGc: (() => void) | undefined;
+
+/** Runs a full garbage collection. */
+function forceGc(): void {
+  if (exposedGc === undefined) {
+    setFlagsFromString('--expose-gc');
+    const gc: unknown = runInNewContext('gc');
+    if (typeof gc !== 'function') throw new Error('gc() is not available');
+    exposedGc = (): void => {
+      gc();
+    };
+  }
+  exposedGc();
+}
+
+/**
+ * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ */
+function heapGrowth(fn: () => void): number {
+  forceGc();
+  const profiler = new GCProfiler();
+  profiler.start();
+  const before = process.memoryUsage().heapUsed;
+  fn();
+  const growth = process.memoryUsage().heapUsed - before;
+  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+}
+
+/** The one `post` of every core in the allocation tests, so the call site sees a single closure. */
+const NOOP_POST = (): void => {};
+
+/** A core on `vad` (with a real model for Silero) warmed up on 60 frames, and a stepper for more. */
+function stepper(frames: Float32Array[], vad: 'silero' | 'energy', pregate: boolean): () => void {
+  const core = new VadCore(CTX_RATE, NOOP_POST);
+  if (vad === 'silero') core.setModel(createSilero(W));
+  core.reset(1, vad, undefined, pregate);
+  let k = 0;
+  const step = (): void => {
+    core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
+    k++;
+  };
+  for (let i = 0; i < 60; i++) step();
+  return step;
+}
+
+/** Runs of 1000 frames of noise_white_-60dbfs_3s on Silero with `model`, after 400 warm-up frames. */
+function heapRunner(model: SileroModel, pregate: boolean): () => void {
+  const frames = frames16k(fixture('noise_white_-60dbfs_3s'), 0);
+  const core = new VadCore(CTX_RATE, NOOP_POST);
+  core.setModel(model);
+  core.reset(1, 'silero', -75, pregate);
+  let k = 0;
+  const run = (n: number): void => {
+    for (let i = 0; i < n; i++, k++) core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
+  };
+  run(400);
+  return () => run(1000);
+}
+
+/** The smallest finite growth over up to 20 runs, stopping early once `done(best)`. */
+function bestGrowth(run: () => void, done: (best: number) => boolean = () => false): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let trial = 0; trial < 20 && !(Number.isFinite(best) && done(best)); trial++) {
+    best = Math.min(best, heapGrowth(run));
+  }
+  expect(Number.isFinite(best)).toBe(true);
+  return best;
+}
+
+describe('no allocation on the per-frame path', () => {
+  /** 64 B per frame over 1000 frames. */
+  const LIMIT = 65_536;
+
+  it.each([
+    ['silero', false],
+    ['silero', true],
+    ['energy', false],
+  ] as const)(
+    '%s (pregate %s) makes no array allocation over 200 frames (skips and a warm-up included)',
+    (vad, pregate) => {
+      const step = stepper(noiseLedVowelFrames(), vad, pregate);
+      expect(
+        countAllocations(() => {
+          for (let i = 0; i < 200; i++) step();
+        }),
+      ).toBe(0);
+    },
+  );
+
+  it.each([false, true])(
+    'the Silero path (pregate %s) grows the heap < 64 KB per 1000 frames more than a zero model',
+    { timeout: 120_000 },
+    (pregate) => {
+      const zero = bestGrowth(heapRunner(zeroModel(), pregate));
+      const real = bestGrowth(heapRunner(createSilero(W), pregate), (b) => b - zero < LIMIT);
+      expect(real - zero).toBeLessThan(LIMIT);
+    },
+  );
+
+  it('both meters have teeth (positive controls)', { timeout: 120_000 }, () => {
+    const frame = noiseLedVowelFrames()[0]!;
+    expect(countAllocations(() => void frame.subarray(1))).toBeGreaterThan(0);
+    const kept = Array.from<Float32Array | undefined>({ length: 1000 });
+    const leaky = new SpyModel();
+    leaky.onProcess = (x) => {
+      kept[leaky.calls % 1000] = x.subarray(1);
+    };
+    const zero = bestGrowth(heapRunner(zeroModel(), false));
+    // Retry until a run is GC-free: +Infinity alone would pass the bound without proving anything.
+    const leak = bestGrowth(heapRunner(leaky, false), () => true);
+    expect(kept.every((v) => v !== undefined)).toBe(true);
+    expect(leak - zero).toBeGreaterThanOrEqual(LIMIT);
   });
 });
 
@@ -292,11 +923,16 @@ class FakePort extends FakeTarget {
 
 describe('dsp.worker glue', () => {
   let self: FakeSelf;
+  /** The worker's `fetch` (of weights.bin): by default it never settles, so no load result arrives. */
+  let fetchStub: Mock<(input: unknown) => Promise<Response>>;
+  const sent = (): WorkerToMain[] => self.posted.map((p) => p.msg);
 
   beforeEach(async () => {
     vi.resetModules();
     self = new FakeSelf();
     vi.stubGlobal('self', self);
+    fetchStub = vi.fn((_input: unknown) => new Promise<Response>(() => {}));
+    vi.stubGlobal('fetch', fetchStub);
     await import('./dsp.worker.ts');
   });
 
@@ -358,6 +994,90 @@ describe('dsp.worker glue', () => {
       'error',
     );
     expect(errors.map((m) => m.where)).toEqual(['vad']);
+  });
+
+  it('init loads weights.bin once, sets the model and posts vadReady; Silero epochs then run on it', async () => {
+    fetchStub.mockImplementation(() => Promise.resolve(new Response(weightsBuffer())));
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    expect(ofType(sent(), 'vadReady')).toEqual([{ t: 'vadReady', backend: 'silero' }]);
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(String(fetchStub.mock.calls[0]?.[0])).toMatch(/\/src\/dsp\/silero\/weights\.bin$/);
+    self.dispatch({ t: 'reset', epoch: 9, vad: 'silero', pregate: false });
+    const frames = frames16k(fixture('vowel_f0-140'));
+    frames.forEach((pcm16k, i) =>
+      port.dispatch({ t: 'frame', epoch: 9, firstFrame: i * SILERO_GRID, pcm16k }),
+    );
+    expect(ofType(sent(), 'error')).toEqual([]);
+    expect(segs(sent())).toEqual(segs(runSilero(frames, createSilero(W)).msgs));
+    // A later init reuses the loaded model: vadReady again, no second fetch.
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    expect(ofType(sent(), 'vadReady')).toHaveLength(2);
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a rejected fetch', (): Promise<Response> => Promise.reject(new TypeError('network down'))],
+    ['an HTTP 404', (): Promise<Response> => Promise.resolve(new Response(null, { status: 404 }))],
+  ])(
+    '%s posts error{vad} and no vadReady; Silero epochs run on energy; the next init retries',
+    async (_name, impl) => {
+      fetchStub.mockImplementation(impl);
+      self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+      await vi.waitFor(() => expect(ofType(sent(), 'error')).toHaveLength(1));
+      const err = ofType(sent(), 'error')[0]!;
+      expect(err.where).toBe('vad');
+      expect(err.message.startsWith('silero weights failed to load: ')).toBe(true);
+      expect(ofType(sent(), 'vadReady')).toEqual([]);
+      self.posted.length = 0;
+      const port = new FakePort();
+      self.dispatch({ t: 'init', ctxRate: CTX_RATE, port }); // retries the load
+      expect(fetchStub).toHaveBeenCalledTimes(2);
+      await vi.waitFor(() => expect(ofType(sent(), 'error')).toHaveLength(1));
+      self.posted.length = 0;
+      self.dispatch({ t: 'reset', epoch: 3, vad: 'silero' });
+      expect(sent()).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
+      frames16k(fixture('vowel_f0-140')).forEach((pcm16k, i) =>
+        port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
+      );
+      expect(segs(sent())).toEqual(segs(runFixture('vowel_f0-140').msgs));
+    },
+  );
+
+  it('cold start: a Silero epoch armed before the weights arrive switches to Silero when they do', async () => {
+    let resolve: ((r: Response) => void) | undefined;
+    fetchStub.mockImplementation(
+      () =>
+        new Promise<Response>((r) => {
+          resolve = r;
+        }),
+    );
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    self.dispatch({ t: 'reset', epoch: 9, vad: 'silero', pregate: false });
+    expect(sent()).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const send = (i: number): void => {
+      port.dispatch({ t: 'frame', epoch: 9, firstFrame: i * SILERO_GRID, pcm16k: frames[i]! });
+    };
+    for (let i = 0; i < 5; i++) send(i); // lead silence, on energy
+    if (resolve === undefined) throw new Error('fetch was not called');
+    resolve(new Response(weightsBuffer()));
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    for (let i = 5; i < frames.length; i++) send(i);
+    const evs = segs(sent());
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'end']);
+    for (const e of evs) expect(e.frame % SILERO_GRID).toBe(0);
+    expect(ofType(sent(), 'error')).toHaveLength(1); // only the not-ready one
+  });
+
+  it('reset forwards restoreFloorDb and pregate to the VadCore', async () => {
+    const { VadCore: WorkerCore } = await import('./vad-core.ts'); // the worker's instance of the module
+    const reset = vi.spyOn(WorkerCore.prototype, 'reset');
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', restoreFloorDb: -50, pregate: true });
+    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true);
   });
 
   it('turns handler exceptions into error messages', () => {

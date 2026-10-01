@@ -32,7 +32,9 @@ export type WorkletToMain =
     }
   | { t: 'takeFailed'; epoch: number; id: number; reason: 'evicted' };
 export type MainToWorker =
-  | { t: 'reset'; epoch: number; vad: 'silero' | 'energy'; restoreFloorDb?: number } // new listen: reset segmenter, LSTM, history
+  // New listen: reset the segmenter, the LSTM and the history. `pregate`: skip Silero inference while the energy
+  // gate is closed and the segmenter idle (plan §4.2.3; off unless true).
+  | { t: 'reset'; epoch: number; vad: 'silero' | 'energy'; restoreFloorDb?: number; pregate?: boolean }
   | { t: 'process'; id: number; pcm: Float32Array; sampleRate: number; preset: VoicePreset }
   // The context sample rate and the worker's end of the worklet↔worker channel (transferred).
   | { t: 'init'; ctxRate: number; port: MessagePort };
@@ -41,6 +43,7 @@ export type WorkerToMain =
   | { t: 'level'; epoch: number; frame: number; db: number; floorDb: number } // ~30 Hz, UI/debug
   | { t: 'floorSnapshot'; epoch: number; floorDb: number } // taken at onset, restored at re-arm
   | { t: 'vadStats'; p95Ms: number }
+  | { t: 'vadReady'; backend: 'silero' } // the worker's Silero model is loaded and set
   | { t: 'processed'; id: number; pcm: Float32Array; envelope: Envelope; durationSec: number }
   | { t: 'error'; where: 'vad' | 'fx'; message: string };
 
@@ -87,6 +90,7 @@ export function transferList(msg: AudioMessage): Transfer {
     case 'level':
     case 'floorSnapshot':
     case 'vadStats':
+    case 'vadReady':
     case 'error':
       break;
     default:
