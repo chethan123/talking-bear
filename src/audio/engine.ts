@@ -7,6 +7,9 @@
 //                                          ▼                                        ▼ processed / error
 //                                        engine (main thread) ───── onEvent ─────→ session
 //
+// The worker also posts `vadReady` (its Silero model is loaded) and `vadStats`; both are forwarded as events,
+// which the session routes to its level listeners.
+//
 // The graph is built on the first successful resume(). The worklet's output is connected to `destination` only
 // when `connectWorkletOutput` is set (plan §3.2: a runtime flag, off until X-R4 shows no capture gaps).
 
@@ -14,6 +17,7 @@ import type { SessionEvent } from '../app/events.ts';
 import type { Envelope, VoicePreset } from '../dsp/types.ts';
 import workerUrl from '../workers/dsp.worker.ts?worker&url';
 import { createMasterBus, type MasterBus } from './bus.ts';
+import { DEFAULT_VAD_BACKEND, PREGATE_ENABLED } from './constants.ts';
 import workletUrl from './capture.worklet.ts?worker&url';
 import {
   transferList,
@@ -50,7 +54,9 @@ export type EngineEvent =
       }
     >
   | { t: 'level'; epoch: number; frame: number; db: number; floorDb: number }
-  | { t: 'vadError'; message: string };
+  | { t: 'vadError'; message: string }
+  | { t: 'vadReady'; backend: 'silero' } // the worker's Silero model is loaded (informational)
+  | { t: 'vadStats'; p95Ms: number }; // p95 Silero inference time over the last ≈ 10 s
 
 export interface Engine {
   resume(): Promise<void>;
@@ -263,8 +269,12 @@ export function createEngine(opts: {
           emit({ t: 'vadError', message: m.message });
         }
         break;
+      case 'vadReady':
+        emit({ t: 'vadReady', backend: m.backend });
+        break;
       case 'vadStats':
-        break; // M2 (T35) forwards it
+        emit({ t: 'vadStats', p95Ms: m.p95Ms });
+        break;
     }
   }
 
@@ -513,7 +523,15 @@ export function createEngine(opts: {
     },
     arm(epoch: number, restoreFloorDb?: number): void {
       // Epochs come from the reducer's integer counter. The worker's reset goes out before the worklet's arm.
-      if (worker !== null) postToWorker(worker, { t: 'reset', epoch, vad: 'energy', restoreFloorDb });
+      if (worker !== null) {
+        postToWorker(worker, {
+          t: 'reset',
+          epoch,
+          vad: DEFAULT_VAD_BACKEND,
+          restoreFloorDb,
+          pregate: PREGATE_ENABLED,
+        });
+      }
       if (node !== null) postToWorklet(node, { t: 'arm', epoch });
     },
     disarm(epoch: number): void {
