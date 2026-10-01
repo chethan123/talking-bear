@@ -9,7 +9,7 @@ import { resampleOffline } from '../resample.ts';
 import { SILERO_FRAME, createSilero, type SileroModel } from './model.ts';
 import { decodeWeights, type SileroWeights } from './weights.ts';
 
-// The shipped weights (weights.bin: fp16, conv biases fp32), as the app uses them. No ORT and no ONNX here:
+// The shipped weights (weights.bin: fp16 or fp32 per tensor), as the app uses them. No ORT and no ONNX here:
 // scripts/silero-parity.ts (pnpm parity) checks the port against onnxruntime-web and keeps golden.json, the
 // ORT p of vowel_f0-140.wav, up to date. This file's golden test is the coarse, ORT-free guard; parity's
 // Tier 1 (fp32 weights, max|Δp| < 1e-4) guards the fine details, such as the regenerated STFT basis.

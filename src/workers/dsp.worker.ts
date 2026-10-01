@@ -21,7 +21,7 @@ import { VadCore } from './vad-core.ts';
 
 declare const self: DedicatedWorkerGlobalScope;
 
-/** The shipped Silero weights (fp16, conv biases fp32; see src/dsp/silero/weights.ts). */
+/** The shipped Silero weights (fp16 or fp32 per tensor; see src/dsp/silero/weights.ts). */
 const WEIGHTS_URL = new URL('../dsp/silero/weights.bin', import.meta.url);
 
 let core: VadCore | null = null;
