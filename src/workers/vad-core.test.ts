@@ -10,8 +10,16 @@ import { runInNewContext } from 'node:vm';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { mulberry32 } from '../../test/dsp-helpers.ts';
 import { readWav } from '../../test/wav.ts';
-import { DEFAULT_VAD_BACKEND, PREGATE_ENABLED, PREGATE_WARMUP_FRAMES } from '../audio/constants.ts';
+import {
+  DEFAULT_VAD_BACKEND,
+  ENERGY_HOP,
+  PREGATE_ENABLED,
+  PREGATE_WARMUP_FRAMES,
+  PROXIMITY_DB,
+} from '../audio/constants.ts';
 import type { WorkerToMain } from '../audio/messages.ts';
+import { createGateFilter, frameDb } from '../dsp/energy-gate.ts';
+import { activeLevelDb } from '../dsp/proximity.ts';
 import { resampleOffline } from '../dsp/resample.ts';
 import type { SegEvent } from '../dsp/segmenter.ts';
 import { createSilero, type SileroModel } from '../dsp/silero/model.ts';
@@ -20,6 +28,7 @@ import { PRESETS } from '../dsp/types.ts';
 import {
   MIN_VOICED_MS,
   PREGATE_HOLD_FRAMES,
+  PROXIMITY_HISTORY_HOPS,
   SILERO_NOT_READY_MESSAGE,
   VAD_STATS_WINDOW,
   VadCore,
@@ -316,11 +325,11 @@ function scriptedModel(loud: number, quiet: number): SileroModel & { calls: numb
   return m;
 }
 
-/** A fresh core with `model` set, reset to epoch 1 on Silero (pre-gate as given), fed `frames`. */
-function runSilero(frames: Float32Array[], model: SileroModel, pregate = false): Run {
+/** A fresh core with `model` set, reset to epoch 1 on Silero (pre-gate and proximity X as given), fed `frames`. */
+function runSilero(frames: Float32Array[], model: SileroModel, pregate = false, proximityDb?: number): Run {
   const run = newCore();
   run.core.setModel(model);
-  run.core.reset(1, 'silero', undefined, pregate);
+  run.core.reset(1, 'silero', undefined, pregate, proximityDb);
   feed(run, 1, frames);
   return run;
 }
@@ -571,7 +580,8 @@ describe('VadCore Silero backend (shipped weights)', () => {
   it("5e': the hop that initialises the floor after digital silence opens the pre-gate", () => {
     // 16 kHz frames built directly: 70 zero frames, 32 frames of −20 dBFS noise starting on a hop boundary
     // (70 · 512 = 224 · 160), 50 zero frames. Without the rule the floor would initialise at the noise level and
-    // the gate would never open, so Silero would never see the noise.
+    // the gate would never open, so Silero would never see the noise. The proximity gate is off (X = −∞): the
+    // floor initialises at the burst's own level, so with the default X the segment would end as a misfire.
     const rng = mulberry32(51);
     const a = Math.sqrt(3) * 0.1;
     const frames = Array.from({ length: 152 }, (_, k) =>
@@ -581,11 +591,13 @@ describe('VadCore Silero backend (shipped weights)', () => {
     );
     const off = scriptedModel(0.9, 0.1);
     const on = scriptedModel(0.9, 0.1);
-    const r0 = runSilero(frames, off, false);
-    const r1 = runSilero(frames, on, true);
+    const r0 = runSilero(frames, off, false, Number.NEGATIVE_INFINITY);
+    const r1 = runSilero(frames, on, true, Number.NEGATIVE_INFINITY);
     expect(segs(r1.msgs)).toEqual(segs(r0.msgs));
     expect(kinds(r0.msgs)).toEqual(['start', 'end']);
     expect(on.calls).toBeLessThan(off.calls);
+    // Default X: the floor initialised on the burst's own first hop (D7 edge).
+    expect(kinds(runSilero(frames, scriptedModel(0.9, 0.1), false).msgs)).toEqual(['start', 'misfire']);
   });
 
   it('5f: reset empties the pre-gate ring: no frame of an earlier epoch is ever replayed', () => {
@@ -670,6 +682,201 @@ describe('VadCore Silero backend (shipped weights)', () => {
     const both = ofType(run.msgs, 'vadStats');
     expect(both).toHaveLength(2);
     expect(both[1]!.p95Ms).toBeCloseTo(12.97, 9); // only the last 312 times count
+  });
+});
+
+// ---- Proximity gate on Silero segments (T36) ----
+
+/** Frames of the proximity scenes: a lead of steady noise, the burst (the stub's speech), a tail for the hangover. */
+const LEAD = 40;
+const BURST = 30;
+const TAIL = 40;
+
+/**
+ * 16 kHz frames of seeded white noise, built directly (no resampling): `lead` frames at `floorDb` dBFS, `burst`
+ * frames `aboveDb` louder, then `tail` frames at `floorDb`.
+ */
+function burstFrames(
+  seed: number,
+  floorDb: number,
+  aboveDb: number,
+  lead: number,
+  burst: number,
+  tail: number,
+): Float32Array[] {
+  const rng = mulberry32(seed);
+  return Array.from({ length: lead + burst + tail }, (_, k) => {
+    const db = k >= lead && k < lead + burst ? floorDb + aboveDb : floorDb;
+    const a = Math.sqrt(3) * 10 ** (db / 20);
+    return Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a);
+  });
+}
+
+/** A stub model: p = 0.9 on its calls [from, to), else 0.1. With the pre-gate off, call k is frame k. */
+function burstModel(from: number, to: number): SileroModel {
+  let k = 0;
+  return {
+    reset: () => undefined,
+    process: () => {
+      const i = k++;
+      return i >= from && i < to ? 0.9 : 0.1;
+    },
+  };
+}
+
+/**
+ * The proximity margin of the one Silero segment in `msgs` (a run with the gate off), recomputed outside the
+ * core: the power mean of the band-limited hop levels whose ctx frame lies in [start.frame, lastSpeechFrame +
+ * one frame), minus the floorSnapshot. `frames` start at ctx frame 0, so hop h starts at ctx frame 480·h.
+ */
+function proximityMargin(frames: Float32Array[], msgs: WorkerToMain[]): number {
+  const filter = createGateFilter(16000);
+  const x = new Float32Array(frames.length * FRAME);
+  frames.forEach((f, k) => filter.process(f, x.subarray(k * FRAME, (k + 1) * FRAME)));
+  const hopCtx = ENERGY_HOP * 3;
+  const hopDb = Float32Array.from({ length: Math.floor(x.length / ENERGY_HOP) }, (_, h) =>
+    frameDb(x, h * ENERGY_HOP, (h + 1) * ENERGY_HOP),
+  );
+  const [start, end] = segs(msgs);
+  if (start?.kind !== 'start' || end?.kind !== 'end') throw new Error('expected one start and one end');
+  const from = Math.ceil(start.frame / hopCtx);
+  const to = Math.ceil((end.lastSpeechFrame + SILERO_GRID) / hopCtx);
+  const floor = ofType(msgs, 'floorSnapshot')[0]!.floorDb;
+  return activeLevelDb(hopDb, from, to) - floor;
+}
+
+describe('VadCore proximity gate (Silero segments)', () => {
+  it('a burst 12 dB above a steady noise floor passes with X = 6 and is a misfire with X = 15', () => {
+    const frames = burstFrames(71, -50, 12, LEAD, BURST, TAIL);
+    const pass = runSilero(frames, burstModel(LEAD, LEAD + BURST), false, 6);
+    const fail = runSilero(frames, burstModel(LEAD, LEAD + BURST), false, 15);
+    const evs = segs(pass.msgs);
+    expect(evs).toEqual([
+      { kind: 'start', frame: LEAD * SILERO_GRID },
+      {
+        kind: 'end',
+        frame: evs[1]?.frame,
+        lastSpeechFrame: (LEAD + BURST - 1) * SILERO_GRID,
+        reason: 'silence',
+      },
+    ]);
+    expectSnapshotBeforeStart(pass.msgs);
+    // X = 15: the very same messages, with the end replaced by a misfire at its frame.
+    const misfire: WorkerToMain = { t: 'seg', epoch: 1, ev: { kind: 'misfire', frame: evs[1]!.frame } };
+    expect(fail.msgs).toEqual(pass.msgs.map((m) => (m.t === 'seg' && m.ev.kind === 'end' ? misfire : m)));
+    expect(proximityMargin(frames, pass.msgs)).toBeGreaterThan(6);
+  });
+
+  it('X is compared with the power mean over the speech frames’ hops minus the onset floor, exactly', () => {
+    const frames = burstFrames(72, -50, 8, LEAD, BURST, TAIL);
+    const off = runSilero(frames, burstModel(LEAD, LEAD + BURST), false, Number.NEGATIVE_INFINITY);
+    const m = proximityMargin(frames, off.msgs);
+    expect(m).toBeGreaterThan(6);
+    expect(m).toBeLessThan(10);
+    const at = (x: number): string[] =>
+      kinds(runSilero(frames, burstModel(LEAD, LEAD + BURST), false, x).msgs);
+    expect(at(m - 1e-6)).toEqual(['start', 'end']);
+    expect(at(m + 1e-6)).toEqual(['start', 'misfire']);
+  });
+
+  it('maxLength ends are gated the same way (a 10 s segment: the history keeps its last 1000 hops)', () => {
+    expect(PROXIMITY_HISTORY_HOPS).toBe(1000);
+    const burst = 313; // 313 · 32 ms ≥ 10 s: the segment ends by maxLength on the burst's last frame
+    const frames = burstFrames(73, -50, 12, LEAD, burst, TAIL);
+    const pass = runSilero(frames, burstModel(LEAD, LEAD + burst), false, 6);
+    const fail = runSilero(frames, burstModel(LEAD, LEAD + burst), false, 15);
+    const end = { kind: 'end', frame: (LEAD + burst - 1) * SILERO_GRID, reason: 'maxLength' } as const;
+    expect(segs(pass.msgs)).toEqual([
+      { kind: 'start', frame: LEAD * SILERO_GRID },
+      { ...end, lastSpeechFrame: end.frame },
+    ]);
+    expect(segs(fail.msgs)).toEqual([
+      { kind: 'start', frame: LEAD * SILERO_GRID },
+      { kind: 'misfire', frame: end.frame },
+    ]);
+  });
+
+  it('reset without proximityDb (or with NaN) uses PROXIMITY_DB = 3 dB; a given X overrides it', () => {
+    expect(PROXIMITY_DB).toBe(3);
+    // Bursts with margins just below and just above 3 dB (≈ 2.76 and ≈ 3.26, measured with the gate off).
+    for (const [seed, aboveDb, want] of [
+      [74, 1.75, 'misfire'],
+      [75, 2.5, 'end'],
+    ] as const) {
+      const frames = burstFrames(seed, -50, aboveDb, LEAD, BURST, TAIL);
+      const run = (x?: number): Run => runSilero(frames, burstModel(LEAD, LEAD + BURST), false, x);
+      const m = proximityMargin(frames, run(Number.NEGATIVE_INFINITY).msgs);
+      expect(Math.abs(m - PROXIMITY_DB), `margin ${m}`).toBeLessThan(0.5);
+      expect(m >= PROXIMITY_DB ? 'end' : 'misfire').toBe(want);
+      expect(kinds(run().msgs)).toEqual(['start', want]);
+      expect(kinds(run(Number.NaN).msgs)).toEqual(['start', want]);
+      expect(run().msgs).toEqual(run(PROXIMITY_DB).msgs);
+      expect(kinds(run(m - 0.01).msgs)).toEqual(['start', 'end']);
+      expect(kinds(run(m + 0.01).msgs)).toEqual(['start', 'misfire']);
+    }
+  });
+
+  it('the override is per epoch: the next reset without it returns to the default', () => {
+    const frames = burstFrames(71, -50, 12, LEAD, BURST, TAIL);
+    const run = newCore();
+    const model = burstModel(LEAD, LEAD + BURST);
+    run.core.setModel(model);
+    run.core.reset(1, 'silero', undefined, false, 15);
+    feed(run, 1, frames);
+    expect(kinds(run.msgs)).toEqual(['start', 'misfire']);
+    run.msgs.length = 0;
+    run.core.setModel(burstModel(LEAD, LEAD + BURST));
+    run.core.reset(2, 'silero');
+    feed(run, 2, frames, 10 * CTX_RATE);
+    expect(kinds(run.msgs)).toEqual(['start', 'end']);
+  });
+
+  it('a segment with no floor at its onset (only digital silence before it) always passes', () => {
+    const frames = Array.from({ length: LEAD + BURST + TAIL }, () => new Float32Array(FRAME));
+    const { msgs } = runSilero(frames, burstModel(LEAD, LEAD + BURST), false, 1000);
+    expect(ofType(msgs, 'floorSnapshot')).toEqual([{ t: 'floorSnapshot', epoch: 1, floorDb: Number.NaN }]);
+    expect(kinds(msgs)).toEqual(['start', 'end']);
+  });
+
+  it('each segment of an epoch is gated against its own onset floor', () => {
+    // One epoch, two segments: a −28 dBFS burst over −40 dBFS noise, then a −50 dBFS burst after the noise has
+    // dropped to −60 dBFS. The second is ≈ 10 dB above its own onset floor but below the first segment's.
+    const rng = mulberry32(81);
+    const parts = [
+      [40, -40],
+      [30, -28],
+      [40, -40],
+      [40, -60],
+      [30, -50],
+      [40, -60],
+    ] as const;
+    const frames = parts.flatMap(([n, db]) => {
+      const a = Math.sqrt(3) * 10 ** (db / 20);
+      return Array.from({ length: n }, () => Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a));
+    });
+    let k = 0;
+    const model: SileroModel = {
+      reset: () => undefined,
+      process: () => {
+        const i = k++;
+        return (i >= 40 && i < 70) || (i >= 150 && i < 180) ? 0.9 : 0.1;
+      },
+    };
+    const { msgs } = runSilero(frames, model, false, 6);
+    expect(kinds(msgs)).toEqual(['start', 'end', 'start', 'end']);
+  });
+
+  it('the energy backend is not gated: proximityDb changes nothing there', () => {
+    const energy = runFixture('vowel_f0-140').msgs;
+    expect(kinds(energy)).toEqual(['start', 'end']);
+    const run = newCore();
+    run.core.reset(1, 'energy', undefined, false, 1000);
+    feed(run, 1, frames16k(fixture('vowel_f0-140')));
+    expect(run.msgs).toEqual(energy);
+    const fallback = newCore(); // Silero asked for, no model: the epoch runs on energy
+    fallback.core.reset(1, 'silero', undefined, false, 1000);
+    feed(fallback, 1, frames16k(fixture('vowel_f0-140')));
+    expect(fallback.msgs.slice(1)).toEqual(energy);
   });
 });
 
@@ -1072,12 +1279,19 @@ describe('dsp.worker glue', () => {
     expect(ofType(sent(), 'error')).toHaveLength(1); // only the not-ready one
   });
 
-  it('reset forwards restoreFloorDb and pregate to the VadCore', async () => {
+  it('reset forwards restoreFloorDb, pregate and proximityDb to the VadCore', async () => {
     const { VadCore: WorkerCore } = await import('./vad-core.ts'); // the worker's instance of the module
     const reset = vi.spyOn(WorkerCore.prototype, 'reset');
     self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
-    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', restoreFloorDb: -50, pregate: true });
-    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true);
+    self.dispatch({
+      t: 'reset',
+      epoch: 2,
+      vad: 'silero',
+      restoreFloorDb: -50,
+      pregate: true,
+      proximityDb: 9,
+    });
+    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true, 9);
   });
 
   it('turns handler exceptions into error messages', () => {

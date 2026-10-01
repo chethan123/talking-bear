@@ -114,7 +114,7 @@ function onMainMessage(e: MessageEvent<MainToWorker>): void {
     case 'reset':
       try {
         if (core === null) throw new Error('reset before init');
-        core.reset(msg.epoch, msg.vad, msg.restoreFloorDb, msg.pregate);
+        core.reset(msg.epoch, msg.vad, msg.restoreFloorDb, msg.pregate, msg.proximityDb);
       } catch (err) {
         postError('vad', err);
       }
