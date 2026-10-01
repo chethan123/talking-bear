@@ -60,7 +60,12 @@ const KICK_STEPS = Math.round(KICK_S / SUBSTEP);
 const SEED = 71;
 /** The statistics cover the frames of the last 60 s. */
 const WINDOW_MS = 60_000;
-/** A rAF interval longer than this counts as a dropped frame (the issue's definition). */
+/**
+ * A rAF interval longer than this counts as a dropped frame (the issue's definition). Intervals are measured
+ * between the callbacks' start times (`performance.now()`), not the rAF timestamps: a frame that starts late
+ * still gets its vsync's timestamp in headless Chromium (and wherever the scheduler hands the main thread a
+ * stale frame time), which would hide the overrun.
+ */
 const DROP_MS = 20;
 /**
  * A rAF interval longer than this many median intervals counts as a missed vsync: on a 90/120 Hz display one
@@ -212,7 +217,7 @@ const EXTRA_CH = Int32Array.from(EXTRA, (i) => SPRINGS[i]!.ch);
 
 // ---- frame statistics ---------------------------------------------------------------------------------------
 
-/** The rAF timestamp and the callback's own time of the latest `RING` frames, preallocated. */
+/** The start time (`performance.now()`) and the callback's own time of the latest `RING` frames, preallocated. */
 interface Ring {
   readonly t: Float64Array;
   readonly work: Float64Array;
@@ -260,7 +265,7 @@ function percentile(xs: Float64Array, p: number): number {
 }
 
 /**
- * The frames whose rAF timestamp lies within 60 s of the latest one: work-time percentiles and max, the rAF
+ * The frames that started within 60 s of the latest one: work-time percentiles and max, the rAF
  * intervals over 20 ms between consecutive frames in that window, the median interval and the intervals over
  * 1.5 × it (missed vsyncs at any refresh rate), and the mean fps over it. Null before a frame. Runs at 1 Hz only.
  */
@@ -730,7 +735,7 @@ function frame(t: number): void {
   const alpha = s.stepper.advance(dt, s.substep);
   lerpPose(s.prev, s.cur, alpha, s.out);
   render(g, rig, s.out, s.view);
-  pushFrame(t, performance.now() - t0);
+  pushFrame(t0, performance.now() - t0);
 }
 
 /**
