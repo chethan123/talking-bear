@@ -98,7 +98,7 @@ function invalid(what: string): never {
   throw new TypeError(`invalid trace meta: ${what}`);
 }
 
-/** Checks the shape of a TraceMeta (unknown extra fields are allowed); throws TypeError naming the bad field. */
+/** Checks the shape of a TraceMeta (unknown extra fields are allowed); throws TypeError naming the field. */
 function assertMeta(v: unknown): asserts v is TraceMeta {
   if (!isRecord(v)) invalid('not an object');
   if (v.version !== TRACE_VERSION) invalid(`unsupported version ${JSON.stringify(v.version)}`);

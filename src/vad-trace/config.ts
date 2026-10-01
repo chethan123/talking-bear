@@ -14,7 +14,7 @@
 import { CONSTRAINTS } from '../audio/mic.ts';
 
 export interface FrontEndConfig {
-  /** The capture worklet's 16 kHz decimator (`createResampler(sampleRate, VAD_RATE)` with default options). */
+  /** The capture worklet's 16 kHz decimator (`createResampler(sampleRate, VAD_RATE)`, default options). */
   readonly decimator: {
     readonly zeroCrossings: number;
     readonly beta: number;
@@ -28,8 +28,8 @@ export interface FrontEndConfig {
   /** Energy hop length (ms). */
   readonly hopMs: number;
   /**
-   * Voicing score: F0 search range (Hz) and window length (16 kHz samples). `window` has no code constant yet:
-   * #46 (T35) exports VOICING_WINDOW from src/audio/constants.ts and pins it in format.test.ts.
+   * Voicing score: F0 search range (Hz) and window length (16 kHz samples). `window` has no code constant
+   * yet: #46 (T35) exports VOICING_WINDOW from src/audio/constants.ts and pins it in format.test.ts.
    */
   readonly voicing: { readonly fminHz: number; readonly fmaxHz: number; readonly window: number };
   /**
