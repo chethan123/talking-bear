@@ -9,9 +9,9 @@
  *
  * **Coordinates.** `(x, y)` are CSS px relative to the canvas's top-left corner (`clientX − rect.left`,
  * `clientY − rect.top`), and `view` maps design units to those CSS px: `x_css = scale·x + ox`,
- * `y_css = scale·y + oy`. That is `fitView(cssWidth, cssHeight)` (`src/anim/renderer.ts`), not the renderer's
- * own view, which maps to backing-store px: divide its `scale`, `ox` and `oy` by the backing-store-to-CSS ratio
- * (`canvas.width / cssWidth`, ≈ `min(devicePixelRatio, 2)`) to get this one.
+ * `y_css = scale·y + oy`, i.e. `fitView(cssWidth, cssHeight, out)` (`src/anim/renderer.ts`) over the canvas's
+ * CSS size. The renderer's own view maps to backing-store px instead: divide its `scale`, `ox` and `oy` by the
+ * backing-store-to-CSS ratio (`canvas.width / cssWidth`, ≈ `min(devicePixelRatio, 2)`) to get this one.
  *
  * **Padding** (plan §7 M8: "bear hit regions padded by 12 px beyond the art"): `padCssPx / view.scale` design
  * units are added to both radii, in the bone's space.
