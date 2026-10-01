@@ -1,5 +1,5 @@
 // Extracts the Silero VAD v6 16 kHz weights from the pinned upstream ONNX file (plan §4.2.3, §7 M2) into
-// src/dsp/silero/weights.bin (little-endian fp16, conv biases fp32, WEIGHTS_LAYOUT order, no header) and
+// src/dsp/silero/weights.bin (little-endian fp16 or fp32 per tensor, WEIGHTS_LAYOUT order, no header) and
 // src/dsp/silero/weights.provenance.json. Asserts every ONNX initializer name and dims, and that the
 // STFT basis is the periodic-Hann DFT that the TS port regenerates in code. Reruns are byte-identical.
 //
@@ -43,7 +43,7 @@ export interface Provenance {
   onnxBytes: number;
   weightsSha256: string;
   weightsBytes: number;
-  format: 'fp16-le, conv biases fp32-le';
+  format: 'fp16-le; fp32-le for the conv biases, conv2W, conv3W, conv4W and lstmWhh';
   order: ProvenanceEntry[];
   stftBasis: string;
   extractedWith: string;
@@ -154,7 +154,7 @@ export function extract(onnx: Uint8Array): Extracted {
     onnxBytes: onnx.byteLength,
     weightsSha256: sha256Hex(weights),
     weightsBytes: WEIGHTS_BYTES,
-    format: 'fp16-le, conv biases fp32-le',
+    format: 'fp16-le; fp32-le for the conv biases, conv2W, conv3W, conv4W and lstmWhh',
     order,
     stftBasis: 'periodic-hann DFT, regenerated in code',
     extractedWith: 'scripts/extract-silero-weights.ts',

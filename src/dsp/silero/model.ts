@@ -7,7 +7,7 @@
 //   3. 4 × conv1d (k = 3, pad 1, ReLU): 129→128 s1, 128→64 s2, 64→64 s2, 64→128 s1 (time 4 → 4 → 2 → 1 → 1);
 //   4. LSTMCell(128), gate order i, f, g, o;
 //   5. p = σ(finalB + Σ finalW[k]·max(0, h[k])).
-// Weights: SileroWeights from weights.ts (the shipped weights.bin decoded: fp16, conv biases fp32; or all
+// Weights: SileroWeights from weights.ts (the shipped weights.bin decoded: fp16 or fp32 per tensor; or all
 // fp32 straight from the ONNX in scripts/silero-parity.ts, which checks parity against onnxruntime-web).
 // DOM-free (plan §3.3). process() allocates nothing: every buffer is created in createSilero.
 

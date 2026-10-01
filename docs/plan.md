@@ -225,7 +225,7 @@ export interface SegParams { posThreshold: number; negThreshold: number; hangove
 export function segmenterStep(s: SegState, p: SegParams, frame: number, prob: number): [SegState, SegEvent | null];
 
 export interface SileroModel { reset(): void; process(frame16k: Float32Array /* 512 */): number /* p(speech) */ }
-export function createSilero(weights: SileroWeights): SileroModel;   // TS port, fp16→fp32 weights at load
+export function createSilero(weights: SileroWeights): SileroModel;   // TS port, fp16/fp32→fp32 weights at load
 
 export interface VoicePreset { id: 'cub' | 'chipmunk' | 'bigbear' | 'custom'; pitchRatio: number }
 export interface Envelope { hopMs: 10; jaw: Float32Array; width: Float32Array; round: Float32Array; teeth: Float32Array }
@@ -651,14 +651,14 @@ Cost: 10 µs per frame at 16 kHz, plus 86 µs for voicing [E].
 
   Performance and size:
   - About 0.9–1.0 ms per frame in plain scalar JS (x86) [E].
-  - fp16 weights, excluding the STFT basis (which is generated in code), are **487 KB raw / 435 KB brotli**, still with 0 flips [E].
+  - fp16 weights, excluding the STFT basis (which is generated in code), are **487 KB raw / 435 KB brotli**, still with 0 flips [E]. The shipped file keeps the conv biases, conv2W, conv3W, conv4W and lstmWhh in fp32: **742 KB raw / 678 KB brotli**, because with only the conv biases in fp32, fp16 rounding moved p by up to 1.44e-2 on the M2 espeak-ng corpus (#182; see [§4.2.3](#423-decision)).
   - No WASM, so no `'wasm-unsafe-eval'` for this path.
 
 #### 4.2.2 Comparison
 
 | | Energy + floor + voicing | WebRTC VAD (WASM) | Silero v6 via ORT-web | **Silero v6 TS port** |
 |---|---|---|---|---|
-| Download (brotli) | ~4 KB | 7–18 KB | **~3.3 MB** (15.6 MB raw) | **~0.44 MB** |
+| Download (brotli) | ~4 KB | 7–18 KB | **~3.3 MB** (15.6 MB raw) | **~0.68 MB** |
 | x86 CPU per frame [E] | 10 µs / 10 ms (+86 µs voicing) | 2–6 µs / 10 ms | 0.41 ms / 32 ms | 0.9–1.0 ms / 32 ms |
 | Mid-range Android CPU (est. ×1.5–3 big core, ×4–8 little core) [M] | < 1 % | ~0 | 2–5 % big / ~10 % little | 5–10 % big / 12–25 % little **while running** |
 | False triggers/min, steady fan [E] | 0 | 19–24 at SNR 10; latches at ≤ 5 | 0 | = ORT |
@@ -678,10 +678,10 @@ Cost: 10 µs per frame at 16 kHz, plus 86 µs for voicing [E].
 #### 4.2.3 Decision
 
 - **Primary: Silero v6 16k, TS port, in the DSP worker**, fed 512-sample 16 kHz frames from the worklet over a transferred `MessagePort`.
-  - The weights are extracted at dev time by `scripts/extract-silero-weights.ts` from a **pinned** upstream file (commit plus SHA-256), stored as fp16 and committed with a provenance JSON. That keeps builds hermetic. The pin is `snakers4/silero-vad` commit `5cd7945676eb32225748052e2e6a0580e4686a08` (tag v6.2.3), file `src/silero_vad/data/silero_vad_16k_op15.onnx`, 1,289,603 bytes, SHA-256 `7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49`.
+  - The weights are extracted at dev time by `scripts/extract-silero-weights.ts` from a **pinned** upstream file (commit plus SHA-256), stored as fp16, except the conv biases, conv2W, conv3W, conv4W and lstmWhh, which stay fp32 (#182), and committed with a provenance JSON. That keeps builds hermetic. The pin is `snakers4/silero-vad` commit `5cd7945676eb32225748052e2e6a0580e4686a08` (tag v6.2.3), file `src/silero_vad/data/silero_vad_16k_op15.onnx`, 1,289,603 bytes, SHA-256 `7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49`.
   - `onnxruntime-web` is a **devDependency only**: it is the parity oracle in CI. Parity has two tiers:
     - the TS port with **fp32** weights: `max|Δp| < 1e-4`;
-    - the shipped **fp16** weights: `max|Δp| < 5e-3`. The spike measured 1.9e-3.
+    - the shipped **fp16/fp32** weights: `max|Δp| < 5e-3`. The spike measured 1.9e-3 (all fp16); the shipped layout measures 1.07e-3 over the fixtures and the espeak-ng corpus (#182).
 
     Both tiers require 0 decision flips at 0.5 and 0.35, excluding frames within ±5e-3 of the threshold.
 - **Level meter, fallback and optional pre-gate: the energy VAD, also in the DSP worker.**
@@ -1459,7 +1459,7 @@ The Caddy constraints have two causes:
 - Instead, stub `sampleRate`, `currentFrame`, `AudioWorkletProcessor` (with a `MessageChannel` port) and a capturing `registerProcessor` in a **`setupFiles`** entry, or inside `vi.hoisted()`.
 - Then load the module with `await import('../audio/capture.worklet')` inside the test, and drive `process()` quantum by quantum.
 
-**Silero parity.** The TS port is compared against `onnxruntime-web` in Node, with the two tiers from [§4.2.3](#423-decision): fp32 weights `max|Δp| < 1e-4`, and the shipped fp16 weights `max|Δp| < 5e-3`, with 0 decision flips across all fixtures. That's the same check I reproduced on one file (max error 2.4 × 10⁻⁶ over 1875 frames [E]), applied to a wider corpus.
+**Silero parity.** The TS port is compared against `onnxruntime-web` in Node, with the two tiers from [§4.2.3](#423-decision): fp32 weights `max|Δp| < 1e-4`, and the shipped fp16/fp32 weights `max|Δp| < 5e-3`, with 0 decision flips across all fixtures. That's the same check I reproduced on one file (max error 2.4 × 10⁻⁶ over 1875 frames [E]), applied to a wider corpus.
 
 **Coverage.** v8 provider, with ≥ 90 % line and branch thresholds **scoped by glob to the pure modules**: `src/dsp/**`, `src/app/machine.ts`, `src/app/settings.ts`, `src/input/recognizer.ts`, `src/anim/director.ts`. Vitest supports per-glob thresholds [V R61]. The adapters (`effects.ts`, `pointer-adapter.ts`) are covered by Browser Mode and e2e instead.
 
@@ -1570,7 +1570,7 @@ Nothing here has been measured on a phone yet, so every budget is an estimate [M
 | End-of-speech latency (definition in [§4.2.3](#423-decision); includes hangover) | ≤ hangover + 200 ms for a 5 s clip | take + processing + 50 ms margin + output latency | e2e frame log; traces |
 | Voice processing | ≤ 15 ms **per second of audio**, p95, in the worker on D1 (≤ 150 ms for a 10 s clip) | 2.4–3 ms/s on x86 [E] × 1.5–10 depending on core [M]. The Worker may land on a little core. | `lab/bench` |
 | Initial JS / CSS | ≤ 60 KB / 10 KB brotli | no framework | `size-limit` (brotli default [V R78]) |
-| Total precache | ≤ 1 MB brotli **over the precache manifest's URLs** (screenshots are not precached), including ~435 KB of Silero weights | | `size-limit` fed the manifest list |
+| Total precache | ≤ 1 MB brotli **over the precache manifest's URLs** (screenshots are not precached), including ~680 KB of Silero weights (#182) | | `size-limit` fed the manifest list |
 | LCP / TBT (Lighthouse mobile preset) | ≤ 2.0 s / ≤ 150 ms | Lighthouse emulates a moto g power (2022), 4× CPU, slow 4G [V R63] | LHCI on `main` (optional) |
 | First bear frame, warm start (SW cache) | ≤ 500 ms on device | | `performance.mark` + remote trace |
 | Tap → listening (permission already granted) | ≤ 300 ms | | `performance.mark` |
@@ -1773,7 +1773,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 **Build**
 
 - **Licence notice (with the weights, not at M8):** `THIRD_PARTY_NOTICES.md` in the repo, plus `public/licenses.txt`, which is served and precached, carrying Silero's MIT copyright and licence text. They land in the same PR that adds `weights.bin`, so no build or image, including M7's first public `v0.1.0`, ever ships the weights without the notice. `check-dist` asserts `licenses.txt` exists whenever `weights.bin` does.
-- **Silero:** `scripts/extract-silero-weights.ts` pins the upstream commit and SHA-256 of `silero_vad_16k_op15.onnx`. It records which Silero release that file is (v6.x) in the provenance JSON, and emits fp16 `weights.bin`. ONNX parsing uses a small hand-written protobuf reader for `TensorProto.raw_data` (≈ 60 lines; the research spike had one). `dsp/silero/model.ts` is the TS port.
+- **Silero:** `scripts/extract-silero-weights.ts` pins the upstream commit and SHA-256 of `silero_vad_16k_op15.onnx`. It records which Silero release that file is (v6.x) in the provenance JSON, and emits fp16/fp32 `weights.bin`. ONNX parsing uses a small hand-written protobuf reader for `TensorProto.raw_data` (≈ 60 lines; the research spike had one). `dsp/silero/model.ts` is the TS port.
 - **DSP worker:** Silero wired end to end; voicing on a 32 ms window; the optional pre-gate behind a flag (off).
 - **Harness:** `scripts/vad-eval.ts` runs the **same modules** on two input kinds: WAVs from the synthetic/TTS corpus, and real-voice **feature traces** (below). It reports hit, miss and split counts, truncation, end-of-speech latency (defined in [§4.2.3](#423-decision)), and false triggers per minute.
 - **Debug overlay:** probability trace, floor and per-frame timings.
@@ -2023,7 +2023,7 @@ pnpm's `minimumReleaseAge` delays brand-new releases by 24 h [V R66]. Several pi
 | Package | Version | Why | Licence |
 |---|---|---|---|
 | `workbox-window` | 7.4.1 | used by `virtual:pwa-register` (SW registration and update events) | MIT |
-| *(data)* Silero VAD v6 16k weights, fp16 | upstream pinned | VAD model, extracted from `silero_vad_16k_op15.onnx` | MIT (notice in `THIRD_PARTY_NOTICES.md`) |
+| *(data)* Silero VAD v6 16k weights, fp16/fp32 | upstream pinned | VAD model, extracted from `silero_vad_16k_op15.onnx` | MIT (notice in `THIRD_PARTY_NOTICES.md`) |
 
 Everything else that runs in the browser (DSP, VAD model code, renderer, gestures, state machines) is our own code: **no runtime framework**.
 
