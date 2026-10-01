@@ -232,7 +232,7 @@ function report(req: BenchRequest, outcome: Outcome): void {
     addRow([
       req.bench,
       input,
-      `${s.batches} batches × ${s.quantaPerBatch} quanta (batch means)`,
+      `${s.batches} batches × ${s.quantaPerBatch} quanta (batch means; armed path: frames posted with transfer)`,
       us(s.p50Us),
       '—',
       us(s.p99Us),
@@ -241,7 +241,8 @@ function report(req: BenchRequest, outcome: Outcome): void {
       wall,
     ]);
     log(
-      `${req.bench}: µs per quantum (mean of each ${s.quantaPerBatch}-quantum batch) over ${s.batches} batches ` +
+      `${req.bench} (armed path: frames posted with transfer): µs per quantum (mean of each ` +
+        `${s.quantaPerBatch}-quantum batch) over ${s.batches} batches ` +
         `(${input}): p50 ${us(s.p50Us)}, p99 ${us(s.p99Us)}, max ${us(s.maxUs)} (first batch ${us(s.firstUs)}), ` +
         `wall ${wall} (plan §4.10 budget: p99 ≤ ${WORKLET_BUDGET_US} µs)`,
     );
@@ -256,18 +257,24 @@ async function runBench(bench: BenchName): Promise<void> {
   report(req, await runInWorker(req));
 }
 
-/** Runs `benches` in order with the controls disabled, with the thermal reminders around a 10-min run. */
+/**
+ * Runs `benches` in order with the controls disabled. Around a real-time 10-min run (10 min of wall time: the
+ * thermal soak) it logs the thermal reminders; a back-to-back 10-min run ends far sooner, so it says it isn't one.
+ */
 async function runSeries(label: string, benches: readonly BenchName[]): Promise<void> {
   for (const c of controls) c.disabled = true;
   const long = Number(durationSelect.value) === LONG_SECONDS;
+  const soak = long && realtimeBox.checked;
   try {
-    if (long) log(`10-min run: capture \`${THERMAL_CMD}\` now, before it starts`);
+    if (soak) log(`10-min run: capture \`${THERMAL_CMD}\` now, before it starts`);
+    else if (long)
+      log('10-min back-to-back run: not a thermal soak (check "Real time" for the 10-min thermal test)');
     log(`${label}: start`);
     for (const bench of benches) await runBench(bench);
     // The verdict again, so a copied log ends with it.
     if (benches.includes('silero-ts')) log(gateLine.textContent);
     log(`${label}: done`);
-    if (long) log(`10-min run finished: capture \`${THERMAL_CMD}\` now`);
+    if (soak) log(`10-min run finished: capture \`${THERMAL_CMD}\` now`);
     status.textContent = `${label}: done.`;
   } finally {
     for (const c of controls) c.disabled = false;

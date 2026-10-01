@@ -3,8 +3,8 @@
 //   silero-ts    the Silero TS port (src/dsp/silero/model.ts, shipped weights.bin), timed per 512-sample frame;
 //   silero-ort   onnxruntime-web (wasm, 1 thread) on the pinned ONNX file, same input, for comparison;
 //   worklet-dsp  the capture worklet's per-quantum DSP (mono copy, 80 Hz high-pass, 12 s ring, 16 kHz
-//                decimator) at 48 or 44.1 kHz, timed in batches of 100 quanta: the worklet itself has no
-//                `performance` (plan §4.10).
+//                decimator, and its armed output path: 512-sample frames posted with transfer) at 48 or
+//                44.1 kHz, timed in batches of 100 quanta: the worklet itself has no `performance` (plan §4.10).
 // The input is synthetic, generated here: alternating 2 s of pink noise at −40 dBFS RMS and 2 s of a synthetic
 // vowel, made as scripts/gen-fixtures.ts makes them. Nothing is captured, stored or exported (plan Q2).
 //
@@ -13,7 +13,8 @@
 // ('message'), self.crossOriginIsolated, fetch, performance and setTimeout.
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web/wasm';
-import { HPF_CLIP_HZ, RING_SECONDS, VAD_RATE } from '../src/audio/constants.ts';
+import { HPF_CLIP_HZ, RING_SECONDS, VAD_FRAME, VAD_RATE } from '../src/audio/constants.ts';
+import type { WorkletToWorker } from '../src/audio/messages.ts';
 import { butterworthHighpass } from '../src/dsp/biquad.ts';
 import { createResampler } from '../src/dsp/resample.ts';
 import { RingBuffer } from '../src/dsp/ring-buffer.ts';
@@ -84,6 +85,9 @@ const QUANTUM = 128;
 const BATCH = 100;
 /** Progress messages per run. */
 const PROGRESS_STEPS = 10;
+/** worklet-dsp, back to back: yield to the event loop every this many batches (outside the timed region), so the
+ *  frame sink drains the posted frames. */
+const DRAIN_BATCHES = 10;
 /** Where `pnpm silero:fetch` (scripts/fetch-silero-onnx.ts) caches the pinned ONNX file; `pnpm dev` serves it. */
 const ONNX_URL = '/.cache/silero/silero_vad_16k_op15.onnx';
 /** The ONNX model's recurrent state: [2 (h, c), batch 1, 128], as in scripts/silero-parity.ts. */
@@ -370,7 +374,11 @@ async function sileroOrt(req: BenchRequest): Promise<FrameStats | null> {
 /**
  * The capture worklet's per-quantum DSP (src/audio/capture.worklet.ts: constructor and process() steps 2, 3
  * and 5) on `seconds` of the synthetic input at `rate`: mono copy, butterworthHighpass.process, RingBuffer.write
- * and resampler.processInto. Each batch of 100 quanta is timed as a whole (its input is copied in before t0).
+ * and resampler.processInto, then its #decimate output loop on the armed path, its worst case, armed from the
+ * first quantum: per decimated sample its position, the frame fill and the output counter; per full frame
+ * #postFrame (postMessage with the frame's buffer transferred, to a MessageChannel whose other end drains and
+ * drops it, then a new Float32Array(VAD_FRAME)). Each batch of 100 quanta is timed as a whole (its input is
+ * copied in before t0).
  */
 async function workletDsp(req: BenchRequest): Promise<QuantumStats> {
   const rate = req.rate;
@@ -388,8 +396,23 @@ async function workletDsp(req: BenchRequest): Promise<QuantumStats> {
   const usPerQuantum = new Float64Array(total);
   const periodMs = ((QUANTUM * BATCH) / rate) * 1000;
   const every = Math.ceil(total / PROGRESS_STEPS);
+  // #decimate / #postFrame state, as the worklet's fields (armed at the first quantum: armFrame = streamBase).
+  const sink = new MessageChannel();
+  sink.port2.onmessage = (): void => {}; // drains and drops the posted frames
+  const port = sink.port1;
+  const ratio = dec.ratio;
+  const streamBase = 0;
+  const armed = true;
+  const armFrame = streamBase;
+  const epoch = 1;
+  let outIndex = 0;
+  let fill = 0;
+  let framePos = 0;
+  let frame16k = new Float32Array(VAD_FRAME);
+  const frameMsg: WorkletToWorker = { t: 'frame', epoch, firstFrame: 0, pcm16k: frame16k };
+  const transfer: ArrayBuffer[] = [frame16k.buffer];
+  let posted = 0;
   let frame = 0;
-  let decimated = 0;
   const start = performance.now();
   for (let b = 0; b < total; b++) {
     if (req.realtime) await sleepUntil(start + b * periodMs);
@@ -400,18 +423,40 @@ async function workletDsp(req: BenchRequest): Promise<QuantumStats> {
       for (let i = 0; i < QUANTUM; i++) mono[i] = ch[i] ?? 0;
       hpf.process(mono, hp);
       ring.write(hp, frame);
-      decimated += dec.processInto(hp, decOut);
+      const n = dec.processInto(hp, decOut);
+      for (let j = 0; j < n; j++) {
+        const pos = streamBase + outIndex / ratio;
+        if (armed && pos >= armFrame) {
+          if (fill === 0) framePos = pos;
+          frame16k[fill++] = decOut[j]!;
+          if (fill === VAD_FRAME) {
+            fill = 0;
+            frameMsg.epoch = epoch;
+            frameMsg.firstFrame = Math.round(framePos);
+            frameMsg.pcm16k = frame16k;
+            transfer[0] = frame16k.buffer;
+            port.postMessage(frameMsg, transfer);
+            frame16k = new Float32Array(VAD_FRAME); // as #postFrame: replaces the transferred frame
+            posted++;
+          }
+        }
+        outIndex++;
+      }
       frame += QUANTUM;
     }
     usPerQuantum[b] = ((performance.now() - t0) * 1000) / BATCH;
     if ((b + 1) % every === 0 || b + 1 === total)
       post({ t: 'progress', bench: req.bench, done: b + 1, total });
+    if (!req.realtime && (b + 1) % DRAIN_BATCHES === 0) await sleepUntil(performance.now() + 1);
   }
+  sink.port1.close();
   const wallS = (performance.now() - start) / 1000;
   post({
     t: 'info',
     bench: req.bench,
-    line: `${frame} frames at ${rate} Hz → ${decimated} samples at ${VAD_RATE} Hz; ring ${ring.capacity} frames`,
+    line:
+      `${frame} frames at ${rate} Hz → ${outIndex} samples at ${VAD_RATE} Hz; armed path: ${posted} frames of ` +
+      `${VAD_FRAME} posted with transfer; ring ${ring.capacity} frames`,
   });
   const firstUs = usPerQuantum[0]!;
   usPerQuantum.sort();

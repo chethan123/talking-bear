@@ -24,7 +24,8 @@
     </p>
     <p>
       <strong>Thermals:</strong> on D1, capture <code>adb shell dumpsys thermalservice</code> before and after
-      the 10-min run (plan §4.10: thermal status ≤ LIGHT).
+      the 10-min run with Real time checked, which lasts 10 min of wall time (plan §4.10: thermal status ≤
+      LIGHT after 10 min). A back-to-back 10-min run ends far sooner and is not a thermal soak.
     </p>
     <p>
       The input is synthetic (alternating 2 s of pink noise at −40 dBFS and 2 s of a synthetic vowel). Nothing
