@@ -96,13 +96,14 @@ describe('master bus', () => {
   const QUIET = 10 ** (-6 / 20);
   const OFFLINE_RATE = 48000;
 
-  /** A 0.3 s, 48 kHz offline context with a unit constant source into `bus.input`. */
+  /** A unit constant source from time 0 into `bus.input`. */
   function unitInto(off: OfflineAudioContext, bus: ReturnType<typeof createMasterBus>): void {
     const src = new ConstantSourceNode(off, { offset: 1 });
     src.connect(bus.input);
     src.start(0);
   }
 
+  /** A 0.3 s, 48 kHz, mono offline context. */
   function offline(): OfflineAudioContext {
     return new OfflineAudioContext({
       numberOfChannels: 1,
