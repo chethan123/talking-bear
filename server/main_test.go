@@ -187,9 +187,9 @@ var serveCases = []serveCase{
 	{"416 br", "GET", "/assets/app-abc.js", []string{"Accept-Encoding", "br", "Range", "bytes=999999-"}, 416,
 		badRange(len(appJSBr)), badRangeBody},
 
-	// 412: no Content-Length of the variant on a bodiless status.
+	// 412: no-store, and no Content-Length of the variant on a bodiless status.
 	{"412 on a failed If-Match", "GET", "/assets/app-abc.js", []string{"Accept-Encoding", "br", "If-Match", `"nope"`}, 412,
-		with("Content-Type", jsType, "Cache-Control", immutable, "Etag", brETag, "Content-Encoding", "br", "Vary", "Accept-Encoding"), nil},
+		with("Content-Type", jsType, "Cache-Control", "no-store", "Etag", brETag, "Content-Encoding", "br", "Vary", "Accept-Encoding"), nil},
 
 	// 404: no-store, no SPA fallback, no path cleaning, variants not addressable.
 	{"404 unknown", "GET", "/nope", nil, 404, nf, nfBody},
@@ -424,6 +424,9 @@ func TestAcceptedEncodings(t *testing.T) {
 		{[]string{"br;q=0, gzip"}, false, true},
 		{[]string{"br;q=0.0, gzip;q=0.000"}, false, false},
 		{[]string{"BR ; Q=0.001"}, true, false},
+		{[]string{"gzip, BR ; Q=0"}, false, true}, // the parameter name is case-insensitive, with optional whitespace
+		{[]string{"identity; q=0.5, br; q=0, gzip"}, false, true},
+		{[]string{"br;q=0.5 , gzip;q=0"}, true, false},
 		{[]string{"gzip;q=1.0, br;q=0.1"}, true, true},
 		{[]string{"*"}, true, true},
 		{[]string{"*;q=0, br"}, true, false},
@@ -563,7 +566,7 @@ func TestNewServer(t *testing.T) {
 	if s.Addr != ":8080" || s.Handler != mux ||
 		s.ReadHeaderTimeout != 5*time.Second || s.ReadTimeout != 10*time.Second ||
 		s.WriteTimeout != 60*time.Second || s.IdleTimeout != 120*time.Second ||
-		s.MaxHeaderBytes != 16*1024 || !s.DisableGeneralOptionsHandler {
+		s.MaxHeaderBytes != 16*1024 || !s.DisableGeneralOptionsHandler || defaultAddr != ":8080" {
 		t.Errorf("newServer: %+v", s)
 	}
 }

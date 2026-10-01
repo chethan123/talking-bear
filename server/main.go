@@ -15,9 +15,10 @@ import (
 // probeURL is what -probe checks; distroless has no shell or curl for a
 // container health check.
 const probeURL = "http://127.0.0.1:8080/healthz"
+const defaultAddr = ":8080" // -addr's default: the port -probe checks
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
+	addr := flag.String("addr", defaultAddr, "listen address")
 	probe := flag.Bool("probe", false, "GET "+probeURL+" and exit 0 on 204, 1 otherwise")
 	flag.Parse()
 	if *probe {

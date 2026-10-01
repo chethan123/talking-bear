@@ -147,26 +147,36 @@ func (s *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hdr.Set("Content-Type", e.contentType) // set, so ServeContent never sniffs
 	hdr.Set("Cache-Control", e.cacheControl)
 	hdr.Set("ETag", v.etag) // ServeContent evaluates If-None-Match, If-Match and If-Range against it
+	fw := &fullLengthWriter{ResponseWriter: w, errorCacheControl: s.h.ErrorCacheControl}
 	if v.encoding != "" {
 		hdr.Set("Content-Encoding", v.encoding)
 		// ServeContent omits Content-Length on a 200 when Content-Encoding is set.
-		w = &fullLengthWriter{ResponseWriter: w, length: strconv.Itoa(len(v.data))}
+		fw.length = strconv.Itoa(len(v.data))
 	}
-	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(v.data))
+	http.ServeContent(fw, r, "", time.Time{}, bytes.NewReader(v.data))
 }
 
-// fullLengthWriter sets Content-Length to the whole variant's length when
-// ServeContent sends a 200 (a full response, GET or HEAD). ServeContent sets
-// it itself on 206; 304, 412 and 416 must not carry the variant's length.
+// fullLengthWriter adjusts the headers of the status ServeContent picks.
+//
+// For an encoded variant, it sets Content-Length to the whole variant's length
+// when ServeContent sends a 200 (a full response, GET or HEAD). ServeContent
+// sets it itself on 206; 304, 412 and 416 must not carry the variant's length.
 // (A multi-range 206 of an encoded variant is multipart/byteranges and keeps
 // Content-Encoding; browsers do not send multi-range requests.)
+//
+// A 412 (failed If-Match) gets errorCacheControl instead of the file's policy,
+// so no cache stores it for a year; serveError already strips it from a 416.
 type fullLengthWriter struct {
 	http.ResponseWriter
-	length string
+	length            string // the encoded variant's length; "" for identity
+	errorCacheControl string
 }
 
 func (w *fullLengthWriter) WriteHeader(code int) {
-	if code == http.StatusOK {
+	if code == http.StatusPreconditionFailed {
+		w.Header().Set("Cache-Control", w.errorCacheControl)
+	}
+	if code == http.StatusOK && w.length != "" {
 		w.Header().Set("Content-Length", w.length)
 	}
 	w.ResponseWriter.WriteHeader(code)
