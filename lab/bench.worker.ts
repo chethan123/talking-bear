@@ -1,12 +1,16 @@
-// Lab worker for lab/bench (plan §5 X-V2, §4.10). lab/bench.ts starts one worker per benchmark run and
-// terminates it after the result, so no run inherits another's JIT, heap or wasm state:
+// Lab worker for lab/bench (plan §5 X-V2 and X-F3, §4.10). lab/bench.ts starts one worker per benchmark run
+// and terminates it after the result, so no run inherits another's JIT, heap or wasm state:
 //   silero-ts    the Silero TS port (src/dsp/silero/model.ts, shipped weights.bin), timed per 512-sample frame;
 //   silero-ort   onnxruntime-web (wasm, 1 thread) on the pinned ONNX file, same input, for comparison;
 //   worklet-dsp  the capture worklet's per-quantum DSP (mono copy, 80 Hz high-pass, 12 s ring, 16 kHz
 //                decimator, and its armed output path: 512-sample frames posted with transfer) at 48 or
-//                44.1 kHz, timed in batches of 100 quanta: the worklet itself has no `performance` (plan §4.10).
+//                44.1 kHz, timed in batches of 100 quanta: the worklet itself has no `performance` (plan §4.10);
+//   voice-chain  the voice effect (src/dsp/voice.ts processVoice) on 1, 5 and 10 s clips at 48 or 44.1 kHz for
+//                the cub, chipmunk and bigbear presets, 30 timed calls each, then each of its voiceStages
+//                functions timed on its own input in batches (plan §5 X-F3; budget §4.10: p95 ≤ 15 ms per s).
 // The input is synthetic, generated here: alternating 2 s of pink noise at −40 dBFS RMS and 2 s of a synthetic
-// vowel, made as scripts/gen-fixtures.ts makes them. Nothing is captured, stored or exported (plan Q2).
+// vowel, made as scripts/gen-fixtures.ts makes them; voice-chain clips are 400 ms vowel bursts, each followed
+// by 100 ms of that pink noise (20 % noise). Nothing is captured, stored or exported (plan Q2).
 //
 // Type-checked by tsconfig.app.json (its `lab` include: DOM lib, no WebWorker lib), so this file uses only
 // what a DedicatedWorkerGlobalScope shares with Window: self.postMessage(message, options), self.addEventListener
@@ -21,19 +25,24 @@ import { RingBuffer } from '../src/dsp/ring-buffer.ts';
 import { SILERO_CONTEXT, SILERO_FRAME, createSilero } from '../src/dsp/silero/model.ts';
 import { decodeWeights } from '../src/dsp/silero/weights.ts';
 import weightsUrl from '../src/dsp/silero/weights.bin?url';
+import { PRESETS, type Envelope, type VoicePreset } from '../src/dsp/types.ts';
+import { processVoice, voiceStages, type VoiceResult } from '../src/dsp/voice.ts';
 
 // ---- protocol (lab/bench.ts imports these types) ----------------------------------------------------------
 
-export type BenchName = 'silero-ts' | 'silero-ort' | 'worklet-dsp';
+export type BenchName = 'silero-ts' | 'silero-ort' | 'worklet-dsp' | 'voice-chain';
 
 /** One benchmark run; the worker answers with info and progress messages, then one result, unavailable or error. */
 export interface BenchRequest {
   readonly bench: BenchName;
-  /** Seconds of synthetic input: 60 or 600. */
+  /** Seconds of synthetic input: 60 or 600. voice-chain ignores it: its clips are always 1, 5 and 10 s. */
   readonly seconds: number;
-  /** worklet-dsp only: the context rate, 48000 or 44100 Hz. */
+  /** worklet-dsp and voice-chain: the context rate, 48000 or 44100 Hz. */
   readonly rate: number;
-  /** Feed the input in real time (one frame per 32 ms, one batch per 100 quanta) instead of back to back. */
+  /**
+   * Feed the input in real time (one frame per 32 ms, one batch per 100 quanta) instead of back to back.
+   * voice-chain ignores it and always runs back to back.
+   */
   readonly realtime: boolean;
   /** FrameStats.overPct counts frames slower than this (ms): the X-V2 gate's threshold, set by lab/bench.ts. */
   readonly overMs: number;
@@ -70,10 +79,63 @@ export interface QuantumStats {
   readonly wallS: number;
 }
 
+/** The voiceStages functions of src/dsp/voice.ts (processVoice is exactly their composition). */
+export type VoiceStageName = keyof typeof voiceStages;
+
+/** voice-chain, one stage on one clip and preset: ms per call as batch means, one value per timed batch. */
+export interface StageStats {
+  readonly stage: VoiceStageName;
+  /** Calls per timed batch: doubled from 1 until a batch lasts at least max(2 ms, 20 timer steps), ≤ 1024. */
+  readonly batch: number;
+  /** Timed batches (each a mean over `batch` calls). */
+  readonly batches: number;
+  readonly p50Ms: number;
+  readonly p95Ms: number;
+  readonly maxMs: number;
+  /** Checked once after timing: one more call of the timed batch gives processVoice's own result for the stage. */
+  readonly matches: boolean;
+}
+
+/** voice-chain, one clip length and preset: processVoice timed per call, then each stage. */
+export interface VoiceRow {
+  /** The clip's length in seconds of audio (1, 5 or 10): ms per second of audio is ms / clipS. */
+  readonly clipS: number;
+  readonly preset: VoicePreset['id'];
+  readonly pitchRatio: number;
+  /** Samples in and out of processVoice (the output plays at rate 1). */
+  readonly inSamples: number;
+  readonly outSamples: number;
+  /** Timed processVoice calls (after one untimed warm-up call). */
+  readonly calls: number;
+  readonly p50Ms: number;
+  readonly p95Ms: number;
+  readonly maxMs: number;
+  /** The timed calls' times in ms, ascending (p50, p95 and max are read from it). */
+  readonly sortedMs: readonly number[];
+  /** The warm-up call before the timed ones, not in the percentiles: the first per clip and preset. */
+  readonly warmupMs: number;
+  /** The stage inputs (voiceStages composed as processVoice composes them) reproduce processVoice's output. */
+  readonly composed: boolean;
+  /** One entry per voiceStages function, in chain order. */
+  readonly stages: readonly StageStats[];
+}
+
+/** voice-chain: one row per clip length (1, 5, 10 s) and preset (cub, chipmunk, bigbear), in that order. */
+export interface VoiceStats {
+  readonly kind: 'voice';
+  readonly rate: number;
+  readonly rows: readonly VoiceRow[];
+  readonly wallS: number;
+}
+
 export type BenchReply =
   | { readonly t: 'info'; readonly bench: BenchName; readonly line: string }
   | { readonly t: 'progress'; readonly bench: BenchName; readonly done: number; readonly total: number }
-  | { readonly t: 'result'; readonly bench: BenchName; readonly stats: FrameStats | QuantumStats }
+  | {
+      readonly t: 'result';
+      readonly bench: BenchName;
+      readonly stats: FrameStats | QuantumStats | VoiceStats;
+    }
   | { readonly t: 'unavailable'; readonly bench: BenchName; readonly message: string }
   | { readonly t: 'error'; readonly bench: BenchName; readonly message: string };
 
@@ -106,6 +168,26 @@ const FORMANTS: readonly (readonly [number, number])[] = [
   [1220, 90],
   [2600, 120],
 ];
+
+// voice-chain (plan §5 X-F3).
+/** Clip lengths in seconds of audio, timed processVoice calls per clip and preset, and the presets, in order. */
+const VOICE_CLIPS_S: readonly number[] = [1, 5, 10];
+const VOICE_CALLS = 30;
+/** Untimed processVoice rounds (each preset once) on the 1 s clip before the first row, so it isn't JIT-cold. */
+const VOICE_PREWARM_ROUNDS = 10;
+const VOICE_PRESETS: readonly VoicePreset[] = [PRESETS.cub, PRESETS.chipmunk, PRESETS.bigbear];
+/** A clip is 500 ms units of a 400 ms vowel burst then 100 ms of pink noise: 20 % of it is noise. */
+const BURST_S = 0.4;
+const NOISE_GAP_S = 0.1;
+/** A timed stage batch lasts at least this long, and at least STAGE_BATCH_STEPS timer steps (≤ 5 % each). */
+const STAGE_BATCH_MIN_MS = 2;
+const STAGE_BATCH_STEPS = 20;
+/** The largest stage batch, in calls. */
+const STAGE_BATCH_MAX = 1024;
+/** The voiceStages functions in processVoice's order (voiceStages lists them in that order). */
+const STAGE_ORDER: readonly VoiceStageName[] = Object.keys(voiceStages).filter((k): k is VoiceStageName =>
+  Object.hasOwn(voiceStages, k),
+);
 
 // ---- synthetic input ----------------------------------------------------------------------------------------
 
@@ -198,6 +280,28 @@ function synthCycle(rate: number): Float32Array {
   cycle.set(pinkNoise(rng, n, NOISE_DBFS), 0);
   cycle.set(vowel(rng, rate, n), n);
   return cycle;
+}
+
+/**
+ * A voice-chain clip of `seconds` (a multiple of 0.5) at `rate`: 500 ms units, each a 400 ms vowel burst (the
+ * vowel above: 4 Hz syllabic envelope, 20 ms fades, peak −12 dBFS) then 100 ms of pink noise at −40 dBFS RMS,
+ * so 20 % of the clip is noise. Seeded: the same arguments always give the same clip.
+ */
+function speechClip(rate: number, seconds: number): Float32Array {
+  const rng = mulberry32(SEED);
+  const n = Math.round(seconds * rate);
+  const burst = Math.round(BURST_S * rate);
+  const gap = Math.round(NOISE_GAP_S * rate);
+  const clip = new Float32Array(n);
+  for (let pos = 0; pos < n;) {
+    const b = Math.min(burst, n - pos);
+    clip.set(vowel(rng, rate, b), pos);
+    pos += b;
+    const g = Math.min(gap, n - pos);
+    if (g > 0) clip.set(pinkNoise(rng, g, NOISE_DBFS), pos);
+    pos += g;
+  }
+  return clip;
 }
 
 /** A source that fills each buffer it is given with the next samples of `cycle`, wrapping; never allocates. */
@@ -475,13 +579,260 @@ async function workletDsp(req: BenchRequest): Promise<QuantumStats> {
   };
 }
 
-async function run(req: BenchRequest): Promise<void> {
+/** Calls `call` `b` times back to back and returns the elapsed ms: one performance.now() pair for the batch. */
+function timeCalls(b: number, call: () => unknown): number {
+  const t0 = performance.now();
+  for (let k = 0; k < b; k++) call();
+  return performance.now() - t0;
+}
+
+/** Whether a and b hold the same samples. */
+function sameSamples(a: Float32Array, b: Float32Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * The inputs of each voiceStages function for one clip `pcm` at `rate` and pitch ratio `p`: processVoice's
+ * intermediate buffers, made by composing voiceStages exactly as processVoice does (x = hpfTrim(pcm, rate);
+ * y = resample(x, p); voiced = isVoiced(y, rate); applyGain(y, rate, voiced); fades(y, rate)), with a copy of
+ * y kept before each in-place stage. `faded` is the buffer processVoice returns (and envelope's input).
+ */
+interface StageInputs {
+  readonly x: Float32Array;
+  readonly y: Float32Array;
+  readonly voiced: boolean;
+  readonly gained: Float32Array;
+  readonly faded: Float32Array;
+}
+
+function stageInputs(pcm: Float32Array, rate: number, p: number): StageInputs {
+  const x = voiceStages.hpfTrim(pcm, rate);
+  const y = voiceStages.resample(x, p);
+  const voiced = voiceStages.isVoiced(y, rate);
+  const gained = y.slice();
+  voiceStages.applyGain(gained, rate, voiced);
+  const faded = gained.slice();
+  voiceStages.fades(faded, rate);
+  return { x, y, voiced, gained, faded };
+}
+
+/** The result of the latest timed call of each pure stage, kept so checkStages can compare it. */
+interface StageResults {
+  clipped: boolean;
+  x: Float32Array;
+  y: Float32Array;
+  voiced: boolean;
+  envelope: Envelope | null;
+}
+
+/**
+ * Per voiceStages function, a batch: `(b) => ms` runs the stage b times on its input from `inp` and returns
+ * the elapsed ms; each pure stage's latest result goes to `last`. The in-place stages (applyGain, fades) first
+ * restore `work` from their input, outside the timed region; the calls of one batch then repeat on that copy,
+ * which costs the same each time, since their loops don't depend on the sample values.
+ */
+function stageBatches(
+  pcm: Float32Array,
+  rate: number,
+  p: number,
+  inp: StageInputs,
+  work: Float32Array,
+  last: StageResults,
+): Readonly<Record<VoiceStageName, (b: number) => number>> {
+  return {
+    clipDetect: (b) =>
+      timeCalls(b, () => {
+        last.clipped = voiceStages.clipDetect(pcm);
+      }),
+    hpfTrim: (b) =>
+      timeCalls(b, () => {
+        last.x = voiceStages.hpfTrim(pcm, rate);
+      }),
+    resample: (b) =>
+      timeCalls(b, () => {
+        last.y = voiceStages.resample(inp.x, p);
+      }),
+    isVoiced: (b) =>
+      timeCalls(b, () => {
+        last.voiced = voiceStages.isVoiced(inp.y, rate);
+      }),
+    applyGain: (b) => {
+      work.set(inp.y);
+      return timeCalls(b, () => voiceStages.applyGain(work, rate, inp.voiced));
+    },
+    fades: (b) => {
+      work.set(inp.gained);
+      return timeCalls(b, () => voiceStages.fades(work, rate));
+    },
+    envelope: (b) =>
+      timeCalls(b, () => {
+        last.envelope = voiceStages.envelope(inp.faded, rate, p);
+      }),
+  };
+}
+
+/** Whether two envelopes have the same hop and the same four tracks. */
+function sameEnvelope(a: Envelope | null, b: Envelope): boolean {
+  return (
+    a !== null &&
+    a.hopMs === b.hopMs &&
+    sameSamples(a.jaw, b.jaw) &&
+    sameSamples(a.width, b.width) &&
+    sameSamples(a.round, b.round) &&
+    sameSamples(a.teeth, b.teeth)
+  );
+}
+
+/**
+ * Checks, once per row after the timing, what the timed batches compute: runs each batch once more with one
+ * call and compares that call's result with processVoice's own (`out`) or its intermediate buffers (`inp`):
+ * clipDetect with out.clipped, hpfTrim with x, resample with y, isVoiced with voiced, applyGain (on y) with
+ * gained, fades (on gained) with faded, envelope with out.envelope.
+ */
+function checkStages(
+  batches: Readonly<Record<VoiceStageName, (b: number) => number>>,
+  inp: StageInputs,
+  out: VoiceResult,
+  work: Float32Array,
+  last: StageResults,
+): Readonly<Record<VoiceStageName, boolean>> {
+  const ran = (stage: VoiceStageName): void => {
+    batches[stage](1);
+  };
+  ran('clipDetect');
+  const clipDetect = last.clipped === out.clipped;
+  ran('hpfTrim');
+  const hpfTrim = sameSamples(last.x, inp.x);
+  ran('resample');
+  const resample = sameSamples(last.y, inp.y);
+  ran('isVoiced');
+  const isVoiced = last.voiced === inp.voiced;
+  ran('applyGain');
+  const applyGain = sameSamples(work, inp.gained);
+  ran('fades');
+  const fades = sameSamples(work, inp.faded);
+  ran('envelope');
+  const envelope = sameEnvelope(last.envelope, out.envelope);
+  return { clipDetect, hpfTrim, resample, isVoiced, applyGain, fades, envelope };
+}
+
+/**
+ * Times one stage: doubles the batch size from 1 until the fastest of 3 batches lasts at least `minMs` or the
+ * size reaches STAGE_BATCH_MAX calls (these calibration batches also warm it up; the minimum keeps one slow
+ * batch, a GC, from stopping it early), then times VOICE_CALLS batches of that size. Returns ms per call as
+ * batch means (each batch's time / its size); `matches` is filled in by voiceChain.
+ */
+function timeStage(
+  stage: VoiceStageName,
+  batch: (b: number) => number,
+  minMs: number,
+): Omit<StageStats, 'matches'> {
+  let size = 1;
+  while (size < STAGE_BATCH_MAX && Math.min(batch(size), batch(size), batch(size)) < minMs) size *= 2;
+  const perCall = new Float64Array(VOICE_CALLS);
+  for (let i = 0; i < VOICE_CALLS; i++) perCall[i] = batch(size) / size;
+  perCall.sort();
+  return {
+    stage,
+    batch: size,
+    batches: VOICE_CALLS,
+    p50Ms: percentile(perCall, 50),
+    p95Ms: percentile(perCall, 95),
+    maxMs: perCall[VOICE_CALLS - 1]!,
+  };
+}
+
+/**
+ * X-F3, back to back. First an untimed pre-warm (VOICE_PREWARM_ROUNDS rounds of processVoice on the 1 s clip,
+ * each preset once), so the first row isn't timed while the JIT tiers up. Then, for each clip length (1, 5,
+ * 10 s) and preset (cub, chipmunk, bigbear): one untimed warm-up call of processVoice(clip, rate, preset), then
+ * VOICE_CALLS calls timed one by one with performance.now() around each; then each voiceStages function timed
+ * on its own input (timeStage) in batches lasting at least max(2 ms, 20 timer steps), since a stage of a 1 s
+ * clip can take less than one timer step; then checkStages.
+ */
+function voiceChain(req: BenchRequest, timerStepMs: number): VoiceStats {
+  const rate = req.rate;
+  const minMs = Math.max(STAGE_BATCH_MIN_MS, STAGE_BATCH_STEPS * timerStepMs);
+  const total = VOICE_CLIPS_S.length * VOICE_PRESETS.length;
+  const rows: VoiceRow[] = [];
   post({
     t: 'info',
     bench: req.bench,
-    line: `timer step ≈ ${timerStepUs().toFixed(1)} µs (crossOriginIsolated ${String(self.crossOriginIsolated)})`,
+    line:
+      `${VOICE_CALLS} timed processVoice calls per clip and preset after 1 warm-up call; stages in batches ` +
+      `of ≥ ${minMs.toFixed(1)} ms (≤ ${STAGE_BATCH_MAX} calls), ${VOICE_CALLS} batches each`,
   });
-  let stats: FrameStats | QuantumStats | null;
+  const warmClip = speechClip(rate, 1);
+  const tw = performance.now();
+  for (let k = 0; k < VOICE_PREWARM_ROUNDS; k++)
+    for (const preset of VOICE_PRESETS) processVoice(warmClip, rate, preset);
+  post({
+    t: 'info',
+    bench: req.bench,
+    line:
+      `pre-warm: ${VOICE_PREWARM_ROUNDS} × ${VOICE_PRESETS.length} presets on the 1 s clip, ` +
+      `${(performance.now() - tw).toFixed(1)} ms`,
+  });
+  const start = performance.now();
+  for (const clipS of VOICE_CLIPS_S) {
+    const pcm = speechClip(rate, clipS);
+    post({
+      t: 'info',
+      bench: req.bench,
+      line:
+        `${clipS} s clip: ${pcm.length} samples at ${rate} Hz, ${clipS / (BURST_S + NOISE_GAP_S)} × ` +
+        `(${BURST_S * 1000} ms vowel burst + ${NOISE_GAP_S * 1000} ms pink noise at ${NOISE_DBFS} dBFS)`,
+    });
+    for (const preset of VOICE_PRESETS) {
+      let t0 = performance.now();
+      const out = processVoice(pcm, rate, preset);
+      const warmupMs = performance.now() - t0;
+      const times = new Float64Array(VOICE_CALLS);
+      for (let i = 0; i < VOICE_CALLS; i++) {
+        t0 = performance.now();
+        processVoice(pcm, rate, preset);
+        times[i] = performance.now() - t0;
+      }
+      times.sort();
+      const p = preset.pitchRatio;
+      const inp = stageInputs(pcm, rate, p);
+      const work = new Float32Array(inp.y.length);
+      const none = new Float32Array(0);
+      const last: StageResults = { clipped: false, x: none, y: none, voiced: false, envelope: null };
+      const batches = stageBatches(pcm, rate, p, inp, work, last);
+      const timed = STAGE_ORDER.map((stage) => timeStage(stage, batches[stage], minMs));
+      const matches = checkStages(batches, inp, out, work, last);
+      rows.push({
+        clipS,
+        preset: preset.id,
+        pitchRatio: p,
+        inSamples: pcm.length,
+        outSamples: out.pcm.length,
+        calls: VOICE_CALLS,
+        p50Ms: percentile(times, 50),
+        p95Ms: percentile(times, 95),
+        maxMs: times[VOICE_CALLS - 1]!,
+        sortedMs: Array.from(times),
+        warmupMs,
+        composed: sameSamples(inp.faded, out.pcm),
+        stages: timed.map((t) => ({ ...t, matches: matches[t.stage] })),
+      });
+      post({ t: 'progress', bench: req.bench, done: rows.length, total });
+    }
+  }
+  return { kind: 'voice', rate, rows, wallS: (performance.now() - start) / 1000 };
+}
+
+async function run(req: BenchRequest): Promise<void> {
+  const stepUs = timerStepUs();
+  post({
+    t: 'info',
+    bench: req.bench,
+    line: `timer step ≈ ${stepUs.toFixed(1)} µs (crossOriginIsolated ${String(self.crossOriginIsolated)})`,
+  });
+  let stats: FrameStats | QuantumStats | VoiceStats | null;
   switch (req.bench) {
     case 'silero-ts':
       stats = await sileroTs(req);
@@ -491,6 +842,9 @@ async function run(req: BenchRequest): Promise<void> {
       break;
     case 'worklet-dsp':
       stats = await workletDsp(req);
+      break;
+    case 'voice-chain':
+      stats = voiceChain(req, stepUs / 1000);
       break;
   }
   if (stats !== null) post({ t: 'result', bench: req.bench, stats });
