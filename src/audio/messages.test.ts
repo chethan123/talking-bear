@@ -38,7 +38,7 @@ function ramp(n: number, offset = 0): Float32Array {
 // Exhaustive at compile time: the issue makes these two unions a tripwire (see the type-level test below),
 // so a task that adds a kind to them edits this file and adds its sample here.
 const mainToWorker: Samples<MainToWorker> = {
-  reset: () => ({ t: 'reset', epoch: 3, vad: 'energy', restoreFloorDb: -47 }),
+  reset: () => ({ t: 'reset', epoch: 3, vad: 'energy', restoreFloorDb: -47, pregate: true }),
   process: () => ({ t: 'process', id: 9, pcm: ramp(480), sampleRate: 48000, preset: PRESETS.cub }),
   init: () => ({ t: 'init', ctxRate: 48000, port: port() }),
 };
@@ -47,6 +47,7 @@ const workerToMain: Samples<WorkerToMain> = {
   level: () => ({ t: 'level', epoch: 3, frame: 52_800, db: -38.5, floorDb: Number.NaN }),
   floorSnapshot: () => ({ t: 'floorSnapshot', epoch: 3, floorDb: -52.25 }),
   vadStats: () => ({ t: 'vadStats', p95Ms: 4.5 }),
+  vadReady: () => ({ t: 'vadReady', backend: 'silero' }),
   processed: () => ({
     t: 'processed',
     id: 9,
@@ -147,6 +148,7 @@ describe('transferList + structuredClone', () => {
       'WorkerToMain level',
       'WorkerToMain floorSnapshot',
       'WorkerToMain vadStats',
+      'WorkerToMain vadReady',
       'WorkerToMain processed',
       'WorkerToMain error',
       'WorkerToMain processed (empty envelope)',
@@ -237,7 +239,7 @@ describe('dsp types', () => {
 describe('message kinds (type-level tripwire, checked by `pnpm typecheck`)', () => {
   test('WorkerToMain and MainToWorker have exactly the listed kinds', () => {
     expectTypeOf<WorkerToMain['t']>().toEqualTypeOf<
-      'seg' | 'level' | 'floorSnapshot' | 'vadStats' | 'processed' | 'error'
+      'seg' | 'level' | 'floorSnapshot' | 'vadStats' | 'vadReady' | 'processed' | 'error'
     >();
     expectTypeOf<MainToWorker['t']>().toEqualTypeOf<'reset' | 'process' | 'init'>();
   });
