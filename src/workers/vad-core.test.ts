@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { GCProfiler, setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { mulberry32 } from '../../test/dsp-helpers.ts';
 import { readWav } from '../../test/wav.ts';
 import { DEFAULT_VAD_BACKEND, PREGATE_ENABLED, PREGATE_WARMUP_FRAMES } from '../audio/constants.ts';
@@ -846,11 +846,16 @@ class FakePort extends FakeTarget {
 
 describe('dsp.worker glue', () => {
   let self: FakeSelf;
+  /** The worker's `fetch` (of weights.bin): by default it never settles, so no load result arrives. */
+  let fetchStub: Mock<(input: unknown) => Promise<Response>>;
+  const sent = (): WorkerToMain[] => self.posted.map((p) => p.msg);
 
   beforeEach(async () => {
     vi.resetModules();
     self = new FakeSelf();
     vi.stubGlobal('self', self);
+    fetchStub = vi.fn((_input: unknown) => new Promise<Response>(() => {}));
+    vi.stubGlobal('fetch', fetchStub);
     await import('./dsp.worker.ts');
   });
 
@@ -912,6 +917,90 @@ describe('dsp.worker glue', () => {
       'error',
     );
     expect(errors.map((m) => m.where)).toEqual(['vad']);
+  });
+
+  it('init loads weights.bin once, sets the model and posts vadReady; Silero epochs then run on it', async () => {
+    fetchStub.mockImplementation(() => Promise.resolve(new Response(weightsBuffer())));
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    expect(ofType(sent(), 'vadReady')).toEqual([{ t: 'vadReady', backend: 'silero' }]);
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(String(fetchStub.mock.calls[0]?.[0])).toMatch(/\/src\/dsp\/silero\/weights\.bin$/);
+    self.dispatch({ t: 'reset', epoch: 9, vad: 'silero', pregate: false });
+    const frames = frames16k(fixture('vowel_f0-140'));
+    frames.forEach((pcm16k, i) =>
+      port.dispatch({ t: 'frame', epoch: 9, firstFrame: i * SILERO_GRID, pcm16k }),
+    );
+    expect(ofType(sent(), 'error')).toEqual([]);
+    expect(segs(sent())).toEqual(segs(runSilero(frames, createSilero(W)).msgs));
+    // A later init reuses the loaded model: vadReady again, no second fetch.
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    expect(ofType(sent(), 'vadReady')).toHaveLength(2);
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a rejected fetch', (): Promise<Response> => Promise.reject(new TypeError('network down'))],
+    ['an HTTP 404', (): Promise<Response> => Promise.resolve(new Response(null, { status: 404 }))],
+  ])(
+    '%s posts error{vad} and no vadReady; Silero epochs run on energy; the next init retries',
+    async (_name, impl) => {
+      fetchStub.mockImplementation(impl);
+      self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+      await vi.waitFor(() => expect(ofType(sent(), 'error')).toHaveLength(1));
+      const err = ofType(sent(), 'error')[0]!;
+      expect(err.where).toBe('vad');
+      expect(err.message.startsWith('silero weights failed to load: ')).toBe(true);
+      expect(ofType(sent(), 'vadReady')).toEqual([]);
+      self.posted.length = 0;
+      const port = new FakePort();
+      self.dispatch({ t: 'init', ctxRate: CTX_RATE, port }); // retries the load
+      expect(fetchStub).toHaveBeenCalledTimes(2);
+      await vi.waitFor(() => expect(ofType(sent(), 'error')).toHaveLength(1));
+      self.posted.length = 0;
+      self.dispatch({ t: 'reset', epoch: 3, vad: 'silero' });
+      expect(sent()).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
+      frames16k(fixture('vowel_f0-140')).forEach((pcm16k, i) =>
+        port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
+      );
+      expect(segs(sent())).toEqual(segs(runFixture('vowel_f0-140').msgs));
+    },
+  );
+
+  it('cold start: a Silero epoch armed before the weights arrive switches to Silero when they do', async () => {
+    let resolve: ((r: Response) => void) | undefined;
+    fetchStub.mockImplementation(
+      () =>
+        new Promise<Response>((r) => {
+          resolve = r;
+        }),
+    );
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    self.dispatch({ t: 'reset', epoch: 9, vad: 'silero', pregate: false });
+    expect(sent()).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const send = (i: number): void => {
+      port.dispatch({ t: 'frame', epoch: 9, firstFrame: i * SILERO_GRID, pcm16k: frames[i]! });
+    };
+    for (let i = 0; i < 5; i++) send(i); // lead silence, on energy
+    if (resolve === undefined) throw new Error('fetch was not called');
+    resolve(new Response(weightsBuffer()));
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    for (let i = 5; i < frames.length; i++) send(i);
+    const evs = segs(sent());
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'end']);
+    for (const e of evs) expect(e.frame % SILERO_GRID).toBe(0);
+    expect(ofType(sent(), 'error')).toHaveLength(1); // only the not-ready one
+  });
+
+  it('reset forwards restoreFloorDb and pregate to the VadCore', async () => {
+    const { VadCore: WorkerCore } = await import('./vad-core.ts'); // the worker's instance of the module
+    const reset = vi.spyOn(WorkerCore.prototype, 'reset');
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', restoreFloorDb: -50, pregate: true });
+    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true);
   });
 
   it('turns handler exceptions into error messages', () => {
