@@ -17,6 +17,7 @@ import type { SegEvent } from '../dsp/segmenter.ts';
 import { createSilero, type SileroModel } from '../dsp/silero/model.ts';
 import { decodeWeights, type SileroWeights } from '../dsp/silero/weights.ts';
 import { PRESETS } from '../dsp/types.ts';
+import { processVoice } from '../dsp/voice.ts';
 import {
   MIN_VOICED_MS,
   PREGATE_HOLD_FRAMES,
@@ -940,20 +941,37 @@ describe('dsp.worker glue', () => {
     vi.unstubAllGlobals();
   });
 
-  it('process echoes the pcm with durationSec = len / sr / 1.6 for the cub preset', () => {
-    const pcm = new Float32Array(24000).fill(0.25);
-    self.dispatch({ t: 'process', id: 7, pcm, sampleRate: 48000, preset: PRESETS.cub });
+  // M3 (issue #66): `process` runs the voice chain and transfers every buffer of the reply.
+  it.each([
+    ['the cub preset on a vowel (not clipped)', PRESETS.cub, 1, false],
+    ['the chipmunk preset on a vowel driven into clipping', PRESETS.chipmunk, 8, true],
+  ] as const)('process replies with processVoice: %s', (_name, preset, drive, clipped) => {
+    const pcm = fixture('vowel_f0-140').map((x) => Math.max(-1, Math.min(1, x * drive)));
+    const expected = processVoice(pcm.slice(), CTX_RATE, preset);
+    self.dispatch({ t: 'process', id: 7, pcm, sampleRate: CTX_RATE, preset });
     expect(self.posted).toHaveLength(1);
     const { msg, transfer } = self.posted[0]!;
     if (msg.t !== 'processed') throw new Error(`unexpected ${msg.t}`);
     expect(msg.id).toBe(7);
-    expect(msg.pcm).toBe(pcm);
-    expect(msg.durationSec).toBeCloseTo(24000 / 48000 / 1.6, 12);
-    expect(msg.envelope.hopMs).toBe(10);
-    for (const track of [msg.envelope.jaw, msg.envelope.width, msg.envelope.round, msg.envelope.teeth]) {
-      expect(track).toHaveLength(0);
-    }
-    expect(transfer).toContain(pcm.buffer);
+    expect(msg.clipped).toBe(clipped);
+    expect(expected.clipped).toBe(clipped);
+    expect(msg.pcm).not.toBe(pcm);
+    expect(msg.pcm).toEqual(expected.pcm);
+    expect(msg.envelope).toEqual(expected.envelope);
+    expect(msg.envelope.jaw.length).toBeGreaterThan(0);
+    expect(msg.durationSec).toBe(expected.durationSec);
+    expect(msg.durationSec).toBe(msg.pcm.length / CTX_RATE);
+    // Trimmed to the 1.5 s vowel ± 50 ms (the fixture has 1 s of silence before it), then shortened by p.
+    expect(msg.durationSec).toBeLessThan(pcm.length / CTX_RATE / preset.pitchRatio);
+    const { jaw, width, round, teeth } = msg.envelope;
+    const buffers = [msg.pcm, jaw, width, round, teeth].map((v) => v.buffer);
+    expect(transfer).toHaveLength(new Set(buffers).size);
+    for (const b of buffers) expect(transfer).toContain(b);
+  });
+
+  it('process with an invalid sample rate replies error{where: fx}', () => {
+    self.dispatch({ t: 'process', id: 8, pcm: new Float32Array(480), sampleRate: 100, preset: PRESETS.cub });
+    expect(sent()).toStrictEqual([{ t: 'error', where: 'fx', message: expect.any(String) }]);
   });
 
   it('init wires the port to a VadCore; reset and frames produce seg messages via self.postMessage', () => {
