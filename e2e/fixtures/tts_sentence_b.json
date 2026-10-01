@@ -1,0 +1,11 @@
+{
+  "sampleRate": 48000,
+  "lengthSamples": 181395,
+  "speech": [
+    {
+      "start": 48000,
+      "end": 116640
+    }
+  ],
+  "f0": 314.3
+}

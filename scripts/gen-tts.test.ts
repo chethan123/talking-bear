@@ -5,6 +5,15 @@ import { describe, expect, test } from 'vitest';
 
 import { readWav } from '../test/wav.ts';
 import {
+  E2E_DIR,
+  E2E_RATE,
+  E2E_SOURCES,
+  PAD_SAMPLES,
+  buildE2eFixtures,
+  parseE2eSidecar,
+  selectSource,
+} from './gen-e2e-tts-fixtures.ts';
+import {
   DOCKERFILE_PATH,
   HOP,
   MANIFEST_PATH,
@@ -221,5 +230,43 @@ describe('committed corpus: test/corpus/speech', () => {
     // The labels are exactly what the labelling rules give on the committed signal.
     expect(entry.spans).toEqual(labelSpans(x, MERGE_GAP_MS[entry.kind]));
     if (entry.kind === 'sentence') expect(entry.samples).toBeLessThan(MAX_SENTENCE_SAMPLES);
+  });
+});
+
+describe('e2e TTS fixtures: e2e/fixtures/tts_sentence_{a,b}', () => {
+  const manifest = parseManifest(JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')));
+  const rebuilt = buildE2eFixtures();
+
+  test.each(E2E_SOURCES.map((s, i) => [s.name, s, i] as const))('%s', (name, source, i) => {
+    const bytes = readFileSync(join(E2E_DIR, `${name}.wav`));
+    const json = readFileSync(join(E2E_DIR, `${name}.json`), 'utf8');
+    const sidecar = parseE2eSidecar(JSON.parse(json));
+    // 48 kHz mono PCM16.
+    const header = canonicalHeader(bytes);
+    expect(header).toMatchObject({ formatTag: 1, channels: 1, sampleRate: E2E_RATE, bits: 16 });
+    const { channels } = readWav(bytes);
+    expect(channels).toHaveLength(1);
+    const x = channels[0]!;
+    // 1.0 s of leading zeros; at least 300 ms of trailing zeros (the fake mic repeats its last buffer).
+    expect(x.subarray(0, PAD_SAMPLES).every((v) => v === 0)).toBe(true);
+    expect(x.subarray(x.length - 0.3 * E2E_RATE).every((v) => v === 0)).toBe(true);
+    // The sidecar: the file's length, speech spans inside it, a finite f0.
+    expect(sidecar.sampleRate).toBe(E2E_RATE);
+    expect(sidecar.lengthSamples).toBe(x.length);
+    expect(sidecar.speech.length).toBeGreaterThanOrEqual(1);
+    for (const { start, end } of sidecar.speech) {
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(end).toBeGreaterThan(start);
+      expect(end).toBeLessThanOrEqual(x.length);
+    }
+    expect(Number.isFinite(sidecar.f0) && sidecar.f0 > 0).toBe(true);
+    // Its source: the manifest spans × 3 plus the 1.0 s lead; and the committed bytes are what the script builds.
+    const entry = selectSource(manifest, source);
+    expect(sidecar.speech).toEqual(
+      entry.spans.map(([s, e]) => ({ start: 3 * s + PAD_SAMPLES, end: 3 * e + PAD_SAMPLES })),
+    );
+    expect(rebuilt[i]!.name).toBe(name);
+    expect(Buffer.from(rebuilt[i]!.wav).equals(bytes)).toBe(true);
+    expect(rebuilt[i]!.json).toBe(json);
   });
 });
