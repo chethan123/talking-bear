@@ -255,6 +255,40 @@ describe('attachPointerAdapter', () => {
     expect(up.rawUps).toEqual([]);
   });
 
+  test('a detach from onSample stops that sample: no hit test, no gestures, and nothing afterwards', () => {
+    const r = rig({ onSample: () => r.adapter.detach() });
+    fire('pointerdown', 50, 60);
+    expect(r.rawDowns).toBe(1);
+    expect(r.hits).toEqual([]);
+    expect(r.gestures).toEqual([]);
+    fire('pointerup', 50, 60);
+    fire('pointerdown', 50, 150, { pointerId: 8 });
+    r.adapter.tick();
+    expect(r.rawDowns).toBe(1);
+    expect(r.hits).toEqual([]);
+    expect(r.gestures).toEqual([]);
+    expect(r.rawUps).toEqual([]);
+  });
+
+  test('a detach from the first onGesture of a sample drops the rest of its gestures', () => {
+    // A down for a pointer that is already down emits two gestures: the stale contact's cancel, then tap down.
+    const control = rig();
+    fire('pointerdown', 50, 60);
+    fire('pointerdown', 50, 60);
+    expect(control.gestures.map((g) => g.g)).toEqual(['tap', 'cancel', 'tap']);
+    control.adapter.detach();
+    const seen: Gesture[] = [];
+    const r = rig({
+      onGesture: (g) => {
+        seen.push(g);
+        if (g.g === 'cancel') r.adapter.detach();
+      },
+    });
+    fire('pointerdown', 50, 60);
+    fire('pointerdown', 50, 60);
+    expect(seen.map((g) => g.g)).toEqual(['tap', 'cancel']);
+  });
+
   test('coordinates use the canvas position read at the latest pointerdown', () => {
     const r = rig();
     canvas.style.left = `${LEFT + 25}px`; // moved after attach: not cached at attach

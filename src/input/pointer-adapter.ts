@@ -40,7 +40,10 @@ export interface PointerAdapterOptions {
 }
 
 export interface PointerAdapter {
-  /** Removes every listener, releases mouse capture, restores the canvas styles; later events and ticks do nothing. */
+  /**
+   * Removes every listener, releases mouse capture, restores the canvas styles; later events and ticks do nothing.
+   * It may be called from any callback: no further callback of the current event runs (not even `hit`).
+   */
   detach(): void;
   /** Feeds a tick sample while a pointer is down; call once per animation frame. */
   tick(): void;
@@ -76,13 +79,20 @@ export function attachPointerAdapter(canvas: HTMLCanvasElement, opts: PointerAda
   }));
   for (const name of HYGIENE_STYLES) style.setProperty(name, 'none');
 
+  /** Feeds one sample. Any callback may call `detach()`, so `attached` is re-read after each one. */
   function feed(s: PointerSample): void {
     if (!attached) return;
     opts.onSample?.(s);
+    // Detached by onSample: no hit test, no recogniser state, no gestures.
+    if (!attached) return;
     const r = recognize(state, s, opts.hit);
     state = r[0];
     const gestures = r[1];
-    for (let i = 0; i < gestures.length; i++) opts.onGesture(gestures[i]!);
+    for (let i = 0; i < gestures.length; i++) {
+      // Detached by an earlier onGesture: the rest of this sample's gestures are dropped.
+      if (!attached) return;
+      opts.onGesture(gestures[i]!);
+    }
   }
 
   /** A sample of pointer `e` at event `at` (`e` itself, or one of its coalesced events). */
