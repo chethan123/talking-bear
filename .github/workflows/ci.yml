@@ -32,8 +32,7 @@ jobs:
       - run: pnpm vad-eval --corpus fast --gate tts
       - run: pnpm test:browser
       - run: pnpm build
-      - run: pnpm check:no-hooks
-      - run: pnpm check:worklet
+      - run: pnpm check:dist
 
   coverage:
     runs-on: ubuntu-24.04
@@ -65,7 +64,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps --no-shell chromium
-      - run: pnpm e2e
+      - run: pnpm build:e2e
+      - run: node scripts/check-dist.mjs dist-e2e e2e
+      - run: pnpm exec playwright test
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
