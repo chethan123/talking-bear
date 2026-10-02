@@ -7,6 +7,9 @@ on:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
+  # TEMPORARY (issue #53 V4): runs this workflow on the PR once; removed by the next commit, before merge.
+  pull_request:
+    paths: ['.github/workflows/vad-nightly.yml']
 
 permissions:
   contents: read
