@@ -232,7 +232,7 @@ afterAll(async () => {
 });
 
 describe('engine (Browser Mode, fake media)', () => {
-  test('1: resume() emits ctxRunning and builds the graph', async () => {
+  test('1: resume() emits ctxRunning and builds the graph, and the worker loads Silero (vadReady)', async () => {
     const from = log.length;
     await engine.resume();
     const { event } = await waitFor('ctxRunning', from, 5000);
@@ -245,7 +245,11 @@ describe('engine (Browser Mode, fake media)', () => {
     if (!(bus instanceof GainNode)) throw new Error('masterBus() is not the 0.7 GainNode');
     expect(bus.gain.value).toBeCloseTo(0.7, 6);
     expect(workers).toHaveLength(1);
-  }, 10_000);
+    // The worker loads the Silero weights at startup (#46). Waiting for them puts epoch 1 (test 3) on Silero, the
+    // default backend (#51): no 'silero not ready' vadError (test 12), and vadStats (test 11b).
+    const ready = await waitFor('vadReady', 0, 5000);
+    expect(ready.event).toStrictEqual({ t: 'vadReady', backend: 'silero' });
+  }, 15_000);
 
   test('2: openMic(1) emits micGranted{1}, with the §4.1.1 constraints and the initial mute state', async () => {
     const from = log.length;
@@ -387,6 +391,14 @@ describe('engine (Browser Mode, fake media)', () => {
     ctx.dispatchEvent(new Event('error'));
     expect(log.slice(from)).toStrictEqual([{ t: 'ctxError' }]);
   });
+
+  test('11b: on Silero since arm(1), the worker posts vadStats with a finite p95Ms after 312 inferences', async () => {
+    // Epoch 1 (test 3) runs on Silero: one inference per 32 ms frame, so the first vadStats (every
+    // VAD_STATS_WINDOW = 312 inferences) comes ≈ 10 s after arm(1). The engine forwards it (#46).
+    const { event } = await waitFor('vadStats', 0, 15_000);
+    expect(Number.isFinite(event.p95Ms), `p95Ms ${event.p95Ms}`).toBe(true);
+    expect(event.p95Ms).toBeGreaterThanOrEqual(0);
+  }, 20_000);
 
   test('12: closeMic() ends every track and drops the clip and the processed audio', () => {
     expect(engine.getClip(1, 11)).toBeDefined();
