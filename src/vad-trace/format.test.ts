@@ -426,6 +426,7 @@ describe('frontEndHash', () => {
   it('changes when any config value changes', async () => {
     const paths = leafPaths(FRONT_END_CONFIG);
     expect(paths).toEqual([
+      'revision',
       'decimator.zeroCrossings',
       'decimator.beta',
       'decimator.cutoff',
