@@ -1,9 +1,10 @@
 import * as fs from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
 import type { Effect, SessionEvent, StateName } from '../../src/app/events.ts';
+import { ENERGY_HOP, VAD_RATE } from '../../src/audio/constants.ts';
 import { PRESETS } from '../../src/dsp/types.ts';
 import { yinF0 } from '../../src/dsp/yin.ts';
-import { SILERO_NOT_READY_MESSAGE } from '../../src/workers/vad-core.ts';
+import { LEVEL_EVERY_HOPS, SILERO_NOT_READY_MESSAGE } from '../../src/workers/vad-core.ts';
 import { expectNoEnforcedViolations, installCspRecorder } from './csp';
 
 // Shared helpers for the e2e specs (plan §4.9.3, §7 M1, §7 M3), on top of the e2e test hooks, window.__bearTest
@@ -47,6 +48,7 @@ export interface BearTestHooks {
   setVadBackend(b: VadBackend): void;
   vadBackend(): VadBackend;
   workerEvents: { t: number; e: WorkerEvent }[];
+  levels(sinceMs: number): { frame: number; db: number }[];
 }
 
 declare global {
@@ -328,6 +330,89 @@ export function expectProcessedDuration(processed: number, take: Take, speechSec
   expect(processed, what).toBeLessThanOrEqual(max);
 }
 
+/** A level at or below this is digital silence: frameDb reads −120 dB for an all-zero 10 ms hop. */
+const DIGITAL_SILENCE_DB = -100;
+
+/** The end margin of expectNoCaptureGap's window: step 4's VAD speech span margin (its default), in seconds. */
+const CAPTURE_GAP_END_MARGIN_SEC = 0.13;
+
+/**
+ * The interval between two level events, in seconds: the worker posts one every LEVEL_EVERY_HOPS-th hop (30 ms
+ * at every context rate: 1323 ctx frames at 44.1 kHz, 1440 at 48 kHz).
+ */
+const LEVEL_INTERVAL_SEC = (LEVEL_EVERY_HOPS * ENERGY_HOP) / VAD_RATE;
+
+/**
+ * The shortest run of digital silence inside the speech that expectNoCaptureGap calls a capture gap, in ms
+ * (issue #211, ORCH-ANSWER 5951841703). A run is consecutive level events at or below DIGITAL_SILENCE_DB; its
+ * span is the last one's frame minus the first one's, plus one level interval. The fixtures' own pauses stay
+ * well below it: tts_sentence_a.wav (espeak-ng) has 48 ms runs of exact zeros inside its speech, which give at
+ * most two silent levels in a row (60 ms). A gap that matters is far longer: a shorter one can't end the
+ * segment (the hangover is 600–800 ms) or move the take past steps 3–4's tolerances (0.13 s on the VAD span),
+ * and the CI gap of #189 lasted for the rest of the take. Defined in time, not in events, so it is the same
+ * at every context rate.
+ */
+const CAPTURE_GAP_MIN_MS = 100;
+
+/** A run of consecutive level events at or below DIGITAL_SILENCE_DB inside expectNoCaptureGap's window. */
+interface SilentRun {
+  /** The ctx frame of the run's first level event. */
+  frame: number;
+  /** The run's span (last frame − first frame + one level interval), in ms. */
+  ms: number;
+}
+
+/**
+ * Fails, naming the cause, when the input was digital silence for CAPTURE_GAP_MIN_MS or longer inside the
+ * fixture's speech: a run of consecutive level events (`__bearTest.levels`) at or below DIGITAL_SILENCE_DB,
+ * spanning at least CAPTURE_GAP_MIN_MS, among those with frames in [take.startFrame, take.startFrame +
+ * (speechSec − 0.13 s)). That is a capture gap of the test environment's fake mic (it stopped delivering audio,
+ * issue #211), not a VAD or voice-chain result, and the duration and VAD span checks after it would fail
+ * without saying why. Shorter runs are the fixture's own pauses and pass. Logs the window's minimum level and
+ * longest silent run.
+ */
+export async function expectNoCaptureGap(page: Page, take: Take, speechSec: number): Promise<void> {
+  const levels = await page.evaluate(() => {
+    const h = window.__bearTest;
+    if (h === undefined) throw new Error('window.__bearTest is missing');
+    return h.levels(120_000);
+  });
+  const { sr, startFrame } = take;
+  const until = startFrame + Math.round((speechSec - CAPTURE_GAP_END_MARGIN_SEC) * sr);
+  const inSpeech = levels.filter((l) => l.frame >= startFrame && l.frame < until);
+  const runs: SilentRun[] = [];
+  for (let i = 0; i < inSpeech.length; i++) {
+    if (inSpeech[i]!.db > DIGITAL_SILENCE_DB) continue;
+    let j = i; // the run is inSpeech[i..j]
+    while (j + 1 < inSpeech.length && inSpeech[j + 1]!.db <= DIGITAL_SILENCE_DB) j++;
+    const from = inSpeech[i]!.frame;
+    runs.push({ frame: from, ms: ((inSpeech[j]!.frame - from) / sr + LEVEL_INTERVAL_SEC) * 1000 });
+    i = j;
+  }
+  const at = (frame: number): string => `${((frame - startFrame) / sr).toFixed(3)} s`;
+  const lowest = inSpeech.reduce<{ frame: number; db: number } | null>(
+    (m, l) => (m === null || l.db < m.db ? l : m),
+    null,
+  );
+  const longest = runs.reduce((m, r) => Math.max(m, r.ms), 0);
+  console.log(
+    `capture-gap check: ${inSpeech.length} levels in [${startFrame}, ${until}); min level ` +
+      (lowest === null ? 'none' : `${lowest.db.toFixed(1)} dB at ${at(lowest.frame)}`) +
+      `; longest silent run ${longest.toFixed(0)} ms (${runs.length} silent run(s); ` +
+      `a capture gap is ≥ ${CAPTURE_GAP_MIN_MS} ms)`,
+  );
+  expect(inSpeech.length, 'level events in the speech window (the level probe works)').toBeGreaterThan(0);
+  const gap = runs.find((r) => r.ms >= CAPTURE_GAP_MIN_MS);
+  expect(
+    gap,
+    gap === undefined
+      ? 'no capture gap'
+      : `capture gap in the test environment: the input was digital silence (≤ ${DIGITAL_SILENCE_DB} dB) for ` +
+          `${gap.ms.toFixed(0)} ms from ${at(gap.frame)} into the fixture's speech (first frame ${gap.frame}). ` +
+          'The fake mic stopped delivering audio, so the take no longer measures the VAD or the voice chain',
+  ).toBeUndefined();
+}
+
 /** The largest |sample| of `samples` in dBFS (−Infinity when all are zero or there are none). */
 export function peakDbfs(samples: readonly number[]): number {
   let peak = 0;
@@ -397,8 +482,10 @@ export async function expectLoop(
   await expectMicSignal(page);
   const ended = await waitForLoop(page, woke, 15_000);
 
-  // 3. The replay's length: the take trimmed by processVoice, then divided by p (issue #66).
+  // 3. The replay's length: the take trimmed by processVoice, then divided by p (issue #66). First the input
+  //    itself: a capture gap inside the fixture's speech would fail steps 3–4 for a reason they can't name.
   const take = await lastTake(page);
+  await expectNoCaptureGap(page, take, speechSec);
   expect(take.reason, 'the speech ended in silence').toBe('silence');
   const processed = await processedDuration(page);
   expectProcessedDuration(processed, take, speechSec, PITCH_RATIO);
