@@ -1,6 +1,6 @@
 # Icons and installer screenshots
 
-The web app manifest (plan §4.7, written by #98) lists three icons and three installer screenshots. They are generated **once**, by hand, and committed. CI never generates them; it only serves and checks what is committed.
+The web app manifest (plan §4.7, written by #98) lists three icons and three installer screenshots. They are generated **once**, by hand, and committed. CI never generates them: the build copies the committed files from `public/` into `dist/`.
 
 | File | Size | Purpose |
 |---|---|---|
@@ -11,7 +11,7 @@ The web app manifest (plan §4.7, written by #98) lists three icons and three in
 | `public/screenshots/phone-2.webp` | 1080 × 1920 | `form_factor: narrow`: the bear talking back |
 | `public/screenshots/desktop-1.webp` | 1920 × 1080 | `form_factor: wide`: desktop |
 
-The screenshots are **not precached** (only the installer uses them). The icons are precached. They are also WebAPK update fields: changing an icon makes every installed WebAPK update (plan §4.7). So regenerate the icons only when the art really changes.
+The service worker (plan §4.7, #98) precaches the icons but **not the screenshots**, which only the installer uses. The icons are also WebAPK update fields: changing an icon makes every installed WebAPK update (plan §4.7). So regenerate the icons only when the art really changes.
 
 ## The icon source: `art/icon.svg`
 
@@ -32,7 +32,7 @@ The screenshots are **not precached** (only the installer uses them). The icons 
 
 **The rim.** The icon adds one thing the issue doesn't name: a 12-unit #225A51 outline drawn from the head's own silhouette paths, because Juni's fur is the same #2F7A6D as the circle, so without it the ears, notch and tuft vanish into the background; dropping the `rim` group restores the literal version. The rim is `earLFur`, `earRFur`, `tuftFur` and `headFur` again, filled and stroked `#225A51` (the palette's fur shade) with `stroke-width="24"` and round joins. It is drawn before the head, so only the outer 12 units show.
 
-**The maskable safe zone** is a circle of radius 40 % of the canvas, centred on it. Launchers may crop anything outside it. The transform moves the centre of the head's smallest enclosing circle, (500, 319) in `bear.svg` units, to the canvas centre. With the rim, the head reaches 36.9 % of the canvas (sampled outline), so there is a margin of about 3 % (16 px at 512).
+**The maskable safe zone** is a circle of radius 40 % of the canvas, centred on it. Launchers may crop anything outside it. The transform moves the centre of the head's smallest enclosing circle, (500, 319) in `bear.svg` units, to the canvas centre. With the rim, the head reaches 36.9 % of the canvas size on the sampled outline. Measured on the committed `maskable-512.png`, the farthest head pixel is 189.3 px from the centre (37.0 %), and no head pixel lies outside the 40 % circle (204.8 px). That leaves a margin of about 3 % (15 px at 512).
 
 **Authoring rules.** The rules in `art/README.md` apply to `bear.svg` only. `icon.svg` may use `<circle>`, `transform` and `stroke`. Nothing compiles it except the generator.
 
