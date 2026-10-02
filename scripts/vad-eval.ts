@@ -28,21 +28,26 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
+// The first Node script to import from src/app: events.ts must stay plain-Node runnable (`.ts` relative imports,
+// erasable syntax only), because CI's fast TTS gate runs this script with Node's type stripping.
 import { DEFAULT_CONFIG } from '../src/app/events.ts';
 import { PREGATE_ENABLED, PROXIMITY_DB, VAD_FRAME, VAD_RATE } from '../src/audio/constants.ts';
 import type { WorkerToMain } from '../src/audio/messages.ts';
 import { SILERO_SEG_PARAMS, ENERGY_SEG_PARAMS } from '../src/dsp/segmenter.ts';
 import { createSilero, type SileroModel } from '../src/dsp/silero/model.ts';
-import { decodeWeights } from '../src/dsp/silero/weights.ts';
+import { decodeWeights, WEIGHTS_SHA256 } from '../src/dsp/silero/weights.ts';
+import { frontEndHash } from '../src/vad-trace/format.ts';
 import { VadCore } from '../src/workers/vad-core.ts';
 import { planCorpus, type ScenePlan, type SceneMeta, type Subset, SUBSETS } from './corpus-lib.ts';
 import { CORPUS_DIR } from './gen-corpus.ts';
 import { MANIFEST_PATH, REPO_ROOT, parseManifest } from './gen-tts.ts';
-import { loadTrace, replayTrace, traceTruth } from './trace-replay.ts';
+import { loadTrace, partitionStale, replayTrace, traceTruth } from './trace-replay.ts';
 import {
   corpusTruth,
   evaluateScene,
+  FT_GATE_REQUIRED,
   poolMetrics,
+  TTS_GATE_SNRS,
   ttsGate,
   type CorpusLabels,
   type GateResult,
@@ -299,7 +304,10 @@ function table(rows: string[][]): string {
     .join('\n');
 }
 
-/** Pooled rows: per SNR level (20, 10, 5, 0), then the gate pool (SNR 20, 10, 5). */
+/** The gate pool's row name: snr20+10+5. */
+const GATE_POOL_ROW = `snr${TTS_GATE_SNRS.join('+')}`;
+
+/** Pooled rows: per SNR level (20, 10, 5, 0), then the gate pool (TTS_GATE_SNRS). */
 function pooledRows(scenes: readonly SceneRow[]): { name: string; metrics: Metrics }[] {
   const snr = scenes.filter((s) => s.type === 'snr');
   const out: { name: string; metrics: Metrics }[] = [];
@@ -307,8 +315,8 @@ function pooledRows(scenes: readonly SceneRow[]): { name: string; metrics: Metri
     const at = snr.filter((s) => s.snrDb === level);
     if (at.length > 0) out.push({ name: `snr${level}`, metrics: poolMetrics(at.map((s) => s.metrics)) });
   }
-  const gate = snr.filter((s) => s.snrDb !== null && s.snrDb >= 5);
-  if (gate.length > 0) out.push({ name: 'snr20+10+5', metrics: poolMetrics(gate.map((s) => s.metrics)) });
+  const gate = snr.filter((s) => s.snrDb !== null && TTS_GATE_SNRS.includes(s.snrDb));
+  if (gate.length > 0) out.push({ name: GATE_POOL_ROW, metrics: poolMetrics(gate.map((s) => s.metrics)) });
   return out;
 }
 
@@ -334,7 +342,8 @@ export function parseArgs(argv: readonly string[]): Args {
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]!;
     const value = argv[i + 1];
-    if (seen.has(flag) || value === undefined) throw new Error(USAGE);
+    // A missing value, or a flag where the value should be (`--json --gate tts`), is a usage error.
+    if (seen.has(flag) || value === undefined || value.startsWith('--')) throw new Error(USAGE);
     seen.add(flag);
     i++;
     if (flag === '--corpus') {
@@ -411,9 +420,19 @@ async function main(argv: readonly string[]): Promise<number> {
     }
   }
   const traces: SceneRow[] = [];
+  /** Stale traces (plan §7 M2 "Stale traces"): reported and skipped, never replayed. #61 adds the gate policy. */
+  const skippedTraces: { name: string; reason: 'frontEnd' | 'weights' }[] = [];
   if (args.traces !== null) {
-    for (const dir of traceDirs(args.traces)) {
-      const { meta, streams } = loadTrace(dir);
+    const loaded = traceDirs(args.traces).map((dir) => ({
+      name: relative(REPO_ROOT, dir) || dir,
+      ...loadTrace(dir),
+    }));
+    const { fresh, stale } = partitionStale(loaded, await frontEndHash(), WEIGHTS_SHA256);
+    for (const { trace, reason } of stale) {
+      console.log(`WARNING: ${trace.name} is stale (${reason}): skipped; re-record it (plan §7 M2)`);
+      skippedTraces.push({ name: trace.name, reason });
+    }
+    for (const { name, meta, streams } of fresh) {
       const { segments, durationFrames } = replayTrace(meta, streams, { backend: args.backend });
       const metrics = evaluateScene({
         ctxRate: meta.ctxRate,
@@ -422,7 +441,7 @@ async function main(argv: readonly string[]): Promise<number> {
         segments,
       });
       traces.push({
-        name: relative(REPO_ROOT, dir) || dir,
+        name,
         kind: 'trace',
         type: 'trace',
         noise: meta.condition,
@@ -435,19 +454,23 @@ async function main(argv: readonly string[]): Promise<number> {
   const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
 
   const pooled = pooledRows(scenes);
+  const gate: GateResult | null =
+    args.gate === 'tts' && args.corpus !== null ? ttsGate(scenes, FT_GATE_REQUIRED[args.corpus]) : null;
   if (scenes.length > 0) {
     console.log(`\nCorpus ${args.corpus}: per scene`);
     console.log(table(scenes.map((s) => row(s.name, s.metrics))));
     console.log(`\nCorpus ${args.corpus}: pooled`);
-    const gatePool = pooled.find((p) => p.name === 'snr20+10+5');
     const rows = pooled.map((p) => row(p.name, p.metrics));
-    if (gatePool !== undefined) {
-      rows.push(ungatedRow('whisper snr20+10+5 (not gated)', gatePool.metrics.ungated));
-    }
+    // The whisper row: the gate's own ungated counts, or (without --gate) the gate pool's.
+    const whisper = gate?.ungated ?? pooled.find((p) => p.name === GATE_POOL_ROW)?.metrics.ungated;
+    if (whisper !== undefined) rows.push(ungatedRow(`whisper ${GATE_POOL_ROW} (not gated)`, whisper));
     console.log(table(rows));
   }
   if (args.traces !== null) {
-    console.log(`\nTraces under ${args.traces}: ${traces.length}`);
+    console.log(
+      `\nTraces under ${args.traces}: ${traces.length} replayed, ${skippedTraces.length} stale (skipped)`,
+    );
+    for (const t of skippedTraces) console.log(`  skipped: ${t.name} (stale: ${t.reason})`);
     if (traces.length > 0) {
       console.log(
         table([
@@ -457,12 +480,15 @@ async function main(argv: readonly string[]): Promise<number> {
       );
     }
   }
-  let gate: GateResult | null = null;
-  if (args.gate === 'tts') {
-    gate = ttsGate(scenes);
+  if (gate !== null) {
     console.log('\nTTS gate');
     for (const c of gate.checks) {
-      console.log(`${c.pass ? 'PASS' : 'FAIL'} ${c.name}: ${c.value} ≤ ${c.limit} (${c.scenes.join(', ')})`);
+      const status = c.pass ? 'PASS' : 'FAIL';
+      console.log(
+        c.scenes.length === 0
+          ? `${status} ${c.name}`
+          : `${status} ${c.name}: ${c.value} ${c.pass ? '≤' : '>'} ${c.limit} (${c.scenes.join(', ')})`,
+      );
     }
     const u = gate.ungated;
     console.log(
@@ -485,6 +511,7 @@ async function main(argv: readonly string[]): Promise<number> {
       scenes,
       pooled,
       traces,
+      skippedTraces,
       gate,
     };
     writeFileSync(args.json, `${JSON.stringify(report, null, 2)}\n`);

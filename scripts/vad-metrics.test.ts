@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
+import { sceneSpecs } from './corpus-lib.ts';
 import {
   allowedErrors,
   corpusTruth,
   evaluateScene,
+  FT_GATE_MIN_SNR,
+  FT_GATE_NOISES,
+  FT_GATE_REQUIRED,
   MAX_FALSE_TRIGGERS_PER_MIN,
   overlaps,
   percentile,
@@ -13,6 +17,7 @@ import {
   type GateResult,
   type GateScene,
   type Metrics,
+  type RequiredFtPopulations,
   type Segment,
   type TruthSpan,
 } from './vad-metrics.ts';
@@ -119,6 +124,13 @@ describe('evaluateScene', () => {
     expect(m.eosMs).toEqual([640]);
     expect(m.eosP50Ms).toBe(640);
     expect(m.eosP90Ms).toBe(640);
+  });
+
+  it('measures EoS latency from the true offset, not the (widened) span end', () => {
+    // A trace span: [press − 150, release + 150) with the release (1850) as the offset.
+    const t: TruthSpan = { id: 'a', kind: 'short', gated: true, start: 850, end: 2000, offset: 1850 };
+    const m = evaluate([t], [seg(900, 2450, 1800)]);
+    expect(m.eosMs).toEqual([600]);
   });
 
   it('does not count segments that only touch a span, and counts them as false triggers', () => {
@@ -385,6 +397,10 @@ function scene(
   return { name, type, noise, snrDb, metrics: metrics(p) };
 }
 
+/** The full subset's required false-trigger populations (base() has all four), and none at all. */
+const FULL = FT_GATE_REQUIRED.full;
+const NONE: RequiredFtPopulations = { noiseOnly: [], snrAtLeast10: [] };
+
 /** 180 short phrases over SNR 20/10/5, plus the fan and music noise-only streams, all clean. */
 function base(): GateScene[] {
   return [
@@ -410,12 +426,19 @@ function passesWithFalseTriggers(name: string, falseTriggers: number): boolean {
     falseTriggers,
     falseTriggersPerMin: falseTriggers / target.metrics.minutes,
   });
-  return ttsGate(s).pass;
+  return ttsGate(s, FULL).pass;
+}
+
+/** Whether the gate passes once base()'s fan noise-only stream lasts `minutes` with `falseTriggers`. */
+function passesWithFanNoise(minutes: number, falseTriggers: number): boolean {
+  const s = base();
+  s[3] = scene('fan-noise', 'noise-only', 'fan', null, { minutes, falseTriggers });
+  return ttsGate(s, FULL).pass;
 }
 
 describe('ttsGate', () => {
   it('passes a clean corpus and lists every check', () => {
-    const r = ttsGate(base());
+    const r = ttsGate(base(), FULL);
     expect(r.pass).toBe(true);
     expect(r.checks.map((c) => c.name)).toEqual([
       'misses (SNR 20/10/5, gated N = 180)',
@@ -437,7 +460,7 @@ describe('ttsGate', () => {
     const at = (misses: number, splits: number): boolean => {
       const s = base();
       s[0]!.metrics = metrics({ shortPhrases: 60, hits: 60 - misses - splits, misses, splits, minutes: 1.5 });
-      return ttsGate(s).pass;
+      return ttsGate(s, FULL).pass;
     };
     expect(at(3, 3)).toBe(true);
     expect(at(4, 0)).toBe(false);
@@ -446,8 +469,8 @@ describe('ttsGate', () => {
     const s = base();
     s.push(scene('fan-snr0', 'snr', 'fan', 0, { shortPhrases: 30, misses: 30, minutes: 1.5 }));
     s.push(scene('passages', 'passages', 'fan', 20, { truncations: 8, minutes: 1.5 }));
-    expect(ttsGate(s).pass).toBe(true);
-    expect(check(ttsGate(s), 'misses')).toMatchObject({
+    expect(ttsGate(s, FULL).pass).toBe(true);
+    expect(check(ttsGate(s, FULL), 'misses')).toMatchObject({
       limit: 3,
       scenes: ['fan-snr20', 'tv-snr10', 'music-snr5', 'music-snr10'],
     });
@@ -456,14 +479,17 @@ describe('ttsGate', () => {
   it("gates false triggers on the passages scene with its noise's SNR ≥ 10 scenes", () => {
     const s = base();
     s.push(scene('passages', 'passages', 'fan', 20, { minutes: 1.5 }));
-    expect(check(ttsGate(s), 'false triggers/min, fan SNR')).toMatchObject({
+    expect(check(ttsGate(s, FULL), 'false triggers/min, fan SNR')).toMatchObject({
       scenes: ['fan-snr20', 'passages'],
       pass: true,
     });
     s[s.length - 1]!.metrics = metrics({ minutes: 1.5, falseTriggers: 1 });
     // 1 false trigger in 3.0 min of fan SNR ≥ 10 scenes: 0.333/min.
-    expect(check(ttsGate(s), 'false triggers/min, fan SNR')).toMatchObject({ value: 0.333, pass: false });
-    expect(ttsGate(s).pass).toBe(false);
+    expect(check(ttsGate(s, FULL), 'false triggers/min, fan SNR')).toMatchObject({
+      value: 0.333,
+      pass: false,
+    });
+    expect(ttsGate(s, FULL).pass).toBe(false);
   });
 
   it('never gates ungated short phrases, and reports them', () => {
@@ -474,7 +500,7 @@ describe('ttsGate', () => {
       minutes: 1.5,
       ungated: { shortPhrases: 12, hits: 2, misses: 10, splits: 0 },
     });
-    const r = ttsGate(s);
+    const r = ttsGate(s, FULL);
     expect(r.pass).toBe(true);
     expect(check(r, 'misses')).toMatchObject({
       name: 'misses (SNR 20/10/5, gated N = 180)',
@@ -488,13 +514,13 @@ describe('ttsGate', () => {
     const s = [
       scene('fast-fan-snr10', 'snr', 'fan', 10, { shortPhrases: 20, hits: 19, misses: 1, minutes: 1.2 }),
     ];
-    const r = ttsGate(s);
+    const r = ttsGate(s, NONE);
     expect(check(r, 'misses')).toMatchObject({ value: 1, limit: 0, pass: false });
     expect(r.pass).toBe(false);
   });
 
   it('fails when there is no gated SNR scene', () => {
-    const r = ttsGate([scene('fan-noise', 'noise-only', 'fan', null, { minutes: 15 })]);
+    const r = ttsGate([scene('fan-noise', 'noise-only', 'fan', null, { minutes: 15 })], NONE);
     expect(check(r, 'misses')!.pass).toBe(false);
     expect(r.pass).toBe(false);
   });
@@ -515,11 +541,59 @@ describe('ttsGate', () => {
     const s = base();
     s.push(scene('music-snr20', 'snr', 'music', 20, { shortPhrases: 0, minutes: 14, falseTriggers: 2 }));
     // 2 false triggers in 15.5 min of music SNR ≥ 10 scenes: 0.129/min.
-    const r = ttsGate(s);
+    const r = ttsGate(s, FULL);
     expect(check(r, 'false triggers/min, music SNR')).toMatchObject({
       value: 0.129,
       pass: true,
       scenes: ['music-snr10', 'music-snr20'],
     });
+  });
+
+  it('passes exactly 0.13/min and fails just above it', () => {
+    expect(passesWithFanNoise(100, 13)).toBe(true); // 13 in 100 min = 0.13/min
+    expect(passesWithFanNoise(100, 14)).toBe(false);
+  });
+
+  it('fails a required false-trigger population that has no scene, and skips one that is not required', () => {
+    const s = base().filter((x) => x.name !== 'music-noise');
+    const r = ttsGate(s, FULL);
+    expect(r.pass).toBe(false);
+    expect(check(r, 'false triggers/min, music noise-only')).toMatchObject({
+      name: 'false triggers/min, music noise-only: required, but no scene',
+      pass: false,
+      scenes: [],
+    });
+    // The fast subset requires fan only: without any music scene the gate passes, with no music check.
+    const fast = base().filter((x) => x.noise !== 'music');
+    const f = ttsGate(fast, FT_GATE_REQUIRED.fast);
+    expect(f.pass).toBe(true);
+    expect(f.checks.some((c) => c.name.includes('music'))).toBe(false);
+    // A missing SNR ≥ 10 population fails the same way.
+    const g = ttsGate(
+      base().filter((x) => x.name !== 'fan-snr20'),
+      FULL,
+    );
+    expect(check(g, 'false triggers/min, fan SNR')).toMatchObject({ pass: false, scenes: [] });
+  });
+});
+
+describe('FT_GATE_REQUIRED', () => {
+  it('matches the false-trigger populations of each corpus subset in corpus-lib', () => {
+    for (const subset of ['fast', 'full'] as const) {
+      const specs = sceneSpecs().filter((s) => s.group === subset);
+      const noiseOnly = FT_GATE_NOISES.filter((n) =>
+        specs.some((s) => s.type === 'noise-only' && s.noise === n),
+      );
+      const snrAtLeast10 = FT_GATE_NOISES.filter((n) =>
+        specs.some(
+          (s) =>
+            (s.type === 'snr' || s.type === 'passages') &&
+            s.noise === n &&
+            s.snrDb !== null &&
+            s.snrDb >= FT_GATE_MIN_SNR,
+        ),
+      );
+      expect(FT_GATE_REQUIRED[subset]).toEqual({ noiseOnly, snrAtLeast10 });
+    }
   });
 });

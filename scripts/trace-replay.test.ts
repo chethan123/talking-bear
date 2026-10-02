@@ -7,15 +7,21 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { mulberry32 } from '../test/dsp-helpers.ts';
 import { readWav } from '../test/wav.ts';
 import type { WorkerToMain } from '../src/audio/messages.ts';
-import { ENERGY_HOP, PROXIMITY_DB, VAD_FRAME, VOICING_WINDOW } from '../src/audio/constants.ts';
+import {
+  ENERGY_HOP,
+  PREGATE_ENABLED,
+  PROXIMITY_DB,
+  VAD_FRAME,
+  VOICING_WINDOW,
+} from '../src/audio/constants.ts';
 import { createGateFilter, frameDb } from '../src/dsp/energy-gate.ts';
 import { createSilero, type SileroModel } from '../src/dsp/silero/model.ts';
 import { decodeWeights } from '../src/dsp/silero/weights.ts';
 import { createVoicing } from '../src/dsp/voicing.ts';
 import { decodeTrace, encodeTrace, type TraceMeta, type TraceStreams } from '../src/vad-trace/format.ts';
 import { VadCore } from '../src/workers/vad-core.ts';
-import { loadTrace, replayTrace, traceTruth } from './trace-replay.ts';
-import { runVadCore } from './vad-eval.ts';
+import { loadTrace, partitionStale, replayTrace, traceTruth } from './trace-replay.ts';
+import { parseArgs, runVadCore } from './vad-eval.ts';
 import type { Segment } from './vad-metrics.ts';
 
 const CTX = 48_000;
@@ -167,6 +173,19 @@ describe('replayTrace: Silero', () => {
     expect(replayTrace(u.meta, u.streams, { backend: 'silero' }).segments[0]!.reason).toBe('misfire');
   });
 
+  it("steps a frame's own hops before its segmenter step, as VadCore does (onset floor)", () => {
+    // Only hops 32–34, the ones that end within start frame 10, initialise the floor (−58 dBFS); everything
+    // before is digital silence. Stepped first, they give the onset a floor, and the 0 dB segment misfires;
+    // stepped after the segmenter, the onset floor would be NaN and the segment would pass.
+    const s = streams(n10, n32, -120, 0, 0.1);
+    s.sileroP.fill(0.9, 10, 30);
+    s.bandDb.fill(-58, 32);
+    const t = viaFormat(meta({ n10, n32 }), s);
+    expect(replayTrace(t.meta, t.streams, { backend: 'silero' }).segments).toEqual([
+      { startFrame: 10 * FRAME_CTX, lastSpeechFrame: null, endFrame: 48 * FRAME_CTX, reason: 'misfire' },
+    ]);
+  });
+
   it('blocks onsets for 100 ms after the trace start', () => {
     const s = streams(n10, n32, -60, 0, 0.1);
     s.sileroP.fill(0.9, 0, 3); // frames 0–2 start before ctx frame 4800
@@ -247,6 +266,33 @@ describe('replayTrace: energy', () => {
     // Voiced hops before the start hop don't count.
     const early = build(40, 50);
     expect(replayTrace(early.meta, early.streams, { backend: 'energy' }).segments).toEqual([misfire]);
+  });
+});
+
+/** A named trace meta with the given hashes (no streams: partitionStale reads the meta only). */
+function namedTrace(name: string, frontEndHash: string, sileroWeightsSha256: string) {
+  return { name, meta: meta({ n10: 0, n32: 0, frontEndHash, sileroWeightsSha256 }) };
+}
+
+describe('partitionStale', () => {
+  it("splits traces by staleness() against the build's front-end hash and weights hash", () => {
+    const ok = 'a'.repeat(64);
+    const other = 'b'.repeat(64);
+    const traces = [
+      namedTrace('fresh', ok, ok),
+      namedTrace('front-end', other, ok),
+      namedTrace('weights', ok, other),
+      namedTrace('both', other, other),
+    ];
+    const { fresh, stale } = partitionStale(traces, ok, ok);
+    expect(fresh.map((x) => x.name)).toEqual(['fresh']);
+    // The front-end hash is checked first (staleness()).
+    expect(stale.map((x) => [x.trace.name, x.reason])).toEqual([
+      ['front-end', 'frontEnd'],
+      ['weights', 'weights'],
+      ['both', 'frontEnd'],
+    ]);
+    expect(partitionStale([], ok, ok)).toEqual({ fresh: [], stale: [] });
   });
 });
 
@@ -480,9 +526,26 @@ describe('runVadCore (the corpus runner: re-armed 250 ms after every end or misf
     expect(floors.every(([, db]) => Number.isFinite(db))).toBe(true);
     expect(spies).toHaveLength(1);
     expect(spies[0]!.resets).toEqual([
-      [1, 'silero', undefined, false],
-      [2, 'silero', floors[0]![1], false],
-      [3, 'silero', floors[1]![1], false],
+      [1, 'silero', undefined, PREGATE_ENABLED],
+      [2, 'silero', floors[0]![1], PREGATE_ENABLED],
+      [3, 'silero', floors[1]![1], PREGATE_ENABLED],
     ]);
+  });
+});
+
+describe('vad-eval parseArgs', () => {
+  it('parses the flags and rejects a missing value or a flag taken as a value', () => {
+    expect(parseArgs(['--corpus', 'fast', '--gate', 'tts', '--json', 'out.json'])).toEqual({
+      corpus: 'fast',
+      traces: null,
+      backend: 'silero',
+      gate: 'tts',
+      json: 'out.json',
+    });
+    expect(() => parseArgs(['--corpus', 'fast', '--json', '--gate', 'tts'])).toThrow(/usage/);
+    expect(() => parseArgs(['--corpus', 'fast', '--json'])).toThrow(/usage/);
+    expect(() => parseArgs(['--traces', '--corpus', 'fast'])).toThrow(/usage/);
+    expect(() => parseArgs(['--gate', 'tts'])).toThrow(/usage/); // the gate needs --corpus
+    expect(() => parseArgs([])).toThrow(/usage/);
   });
 });

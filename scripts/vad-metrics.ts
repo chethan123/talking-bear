@@ -281,8 +281,30 @@ export const TTS_GATE_SNRS: readonly number[] = [20, 10, 5];
 /** Noises whose false-trigger rate is gated, on their noise-only streams and on their scenes at SNR ≥ 10 dB. */
 export const FT_GATE_NOISES: readonly string[] = ['fan', 'music'];
 export const FT_GATE_MIN_SNR = 10;
-/** ≤ 2 false triggers per 15 min (plan §7 M2: ≈ 0.13/min). */
+/**
+ * TTS gate: ≤ 0.13/min false triggers on fan and music (plan §7 M2, "On the TTS corpus (CI-enforced regression
+ * floor)"; issue #53). The real-voice criterion "≤ 2 false triggers per 15 min" is #61's trace gate, not this one.
+ */
 export const MAX_FALSE_TRIGGERS_PER_MIN = 0.13;
+
+/** The noises (of FT_GATE_NOISES) whose false-trigger populations a corpus subset must contain. */
+export interface RequiredFtPopulations {
+  /** Noises that must have a noise-only stream. */
+  noiseOnly: readonly string[];
+  /** Noises that must have at least one scene at SNR ≥ FT_GATE_MIN_SNR (an SNR scene or the passages scene). */
+  snrAtLeast10: readonly string[];
+}
+
+/**
+ * The false-trigger populations each corpus subset holds (scripts/corpus-lib.ts sceneSpecs, pinned by a test): the
+ * full subset has 15-min fan and music noise-only streams and fan and music scenes at SNR 20 and 10; the fast subset
+ * has 2 min of fan noise-only and fan at SNR 10. The gate fails if a required population comes back empty, so a
+ * lost or renamed scene can't make the gate pass by omission.
+ */
+export const FT_GATE_REQUIRED: Readonly<Record<'fast' | 'full', RequiredFtPopulations>> = {
+  full: { noiseOnly: ['fan', 'music'], snrAtLeast10: ['fan', 'music'] },
+  fast: { noiseOnly: ['fan'], snrAtLeast10: ['fan'] },
+};
 
 /** A corpus scene with its metrics, as the gate sees it. */
 export interface GateScene {
@@ -313,10 +335,11 @@ export interface GateResult {
  * The TTS gate over a corpus group's scenes:
  * - misses ≤ floor(3·N/180) and splits ≤ floor(3·N/180), pooled over the SNR scenes at 20, 10 and 5 dB (N = their
  *   gated short phrases; the ungated ones are only reported, in `ungated`); it fails when there is no such scene;
- * - for fan and for music, each present population on its own: the noise-only stream(s), and the scenes at
- *   ≥ 10 dB SNR (the SNR scenes and the passages scene), pooled: false triggers ≤ 0.13/min.
+ * - for fan and for music, each population on its own: the noise-only stream(s), and the scenes at ≥ 10 dB SNR (the
+ *   SNR scenes and the passages scene), pooled: false triggers ≤ 0.13/min. A population listed in `required` that
+ *   has no scene fails; one that is neither present nor required is skipped.
  */
-export function ttsGate(scenes: readonly GateScene[]): GateResult {
+export function ttsGate(scenes: readonly GateScene[], required: RequiredFtPopulations): GateResult {
   const checks: GateCheck[] = [];
   const pool = scenes.filter((s) => s.type === 'snr' && s.snrDb !== null && TTS_GATE_SNRS.includes(s.snrDb));
   const pooled = poolMetrics(pool.map((s) => s.metrics));
@@ -335,8 +358,12 @@ export function ttsGate(scenes: readonly GateScene[]): GateResult {
     });
   }
   for (const noise of FT_GATE_NOISES) {
-    const populations: [string, GateScene[]][] = [
-      [`${noise} noise-only`, scenes.filter((s) => s.type === 'noise-only' && s.noise === noise)],
+    const populations: [string, GateScene[], boolean][] = [
+      [
+        `${noise} noise-only`,
+        scenes.filter((s) => s.type === 'noise-only' && s.noise === noise),
+        required.noiseOnly.includes(noise),
+      ],
       [
         `${noise} SNR ≥ ${FT_GATE_MIN_SNR}`,
         scenes.filter(
@@ -346,10 +373,22 @@ export function ttsGate(scenes: readonly GateScene[]): GateResult {
             s.snrDb !== null &&
             s.snrDb >= FT_GATE_MIN_SNR,
         ),
+        required.snrAtLeast10.includes(noise),
       ],
     ];
-    for (const [label, list] of populations) {
-      if (list.length === 0) continue;
+    for (const [label, list, isRequired] of populations) {
+      if (list.length === 0) {
+        if (isRequired) {
+          checks.push({
+            name: `false triggers/min, ${label}: required, but no scene`,
+            value: 0,
+            limit: MAX_FALSE_TRIGGERS_PER_MIN,
+            pass: false,
+            scenes: [],
+          });
+        }
+        continue;
+      }
       const m = poolMetrics(list.map((s) => s.metrics));
       const value = Math.round(m.falseTriggersPerMin * 1000) / 1000;
       checks.push({

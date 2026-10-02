@@ -41,6 +41,7 @@ import {
   decodeTrace,
   hopStartFrame,
   sileroStartFrame,
+  staleness,
   type TraceMeta,
   type TraceStreams,
 } from '../src/vad-trace/format.ts';
@@ -59,6 +60,26 @@ export interface ReplayOptions {
 
 /** One energy hop in ms (10). */
 const HOP_MS = (ENERGY_HOP * 1000) / VAD_RATE;
+
+/**
+ * Splits traces into the fresh ones and the stale ones, with `staleness(meta, currentFrontEndHash,
+ * currentWeightsSha)`'s reason (plan §7 M2 "Stale traces": changes upstream of the logged scalars invalidate a
+ * trace). Order is kept within each list.
+ */
+export function partitionStale<T extends { meta: TraceMeta }>(
+  traces: readonly T[],
+  currentFrontEndHash: string,
+  currentWeightsSha: string,
+): { fresh: T[]; stale: { trace: T; reason: 'frontEnd' | 'weights' }[] } {
+  const fresh: T[] = [];
+  const stale: { trace: T; reason: 'frontEnd' | 'weights' }[] = [];
+  for (const trace of traces) {
+    const s = staleness(trace.meta, currentFrontEndHash, currentWeightsSha);
+    if (s === null) fresh.push(trace);
+    else stale.push({ trace, reason: s.reason });
+  }
+  return { fresh, stale };
+}
 
 /** Reads <dir>/trace.json and <dir>/trace.bin. */
 export function loadTrace(dir: string): { meta: TraceMeta; streams: TraceStreams } {
