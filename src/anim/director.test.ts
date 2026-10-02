@@ -54,7 +54,7 @@ const KINDS: readonly AnimKind[] = Object.values(SAMPLES).map((ev) => ev.e);
 const CLIP_NAMES = ['wake', 'sleep', 'earTwitch', 'confused', 'shrug'] as const;
 type ClipName = (typeof CLIP_NAMES)[number];
 
-/** Issue #79 "Base mapping". Reacting and Sustained: a test-only representative (M4 never enters them). */
+/** Issue #79 "Base mapping"; Reacting and Sustained are Idle's (#91). */
 const BASE_OF_STATE: Record<DirState, BaseName> = {
   Asleep: 'asleep',
   Waking: 'idle',
@@ -70,7 +70,7 @@ const BASE_OF_STATE: Record<DirState, BaseName> = {
 /** The mouth channels, which only the mouth layer writes. */
 const MOUTH: readonly number[] = [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth];
 
-/** Plan decision D1: the outcome of every (state, event) pair. */
+/** Plan decision D1: the outcome of every (state, event) pair; #91 changed Reacting's and Sustained's idle and attentive. */
 const D1 = `
 state      wake    sleep   doze    idle  attentive  thinking  talk     talkEnd  confused earTwitch shrug reaction
 Asleep     Waking  =       =       Idle  =          =         =        =        clip     clip      clip  =
@@ -79,8 +79,8 @@ Idle       Waking  Asleep  Dozing  =     Attentive  =         =        =        
 Attentive  Waking  Asleep  =       Idle  =          Thinking  =        =        clip     clip      clip  =
 Thinking   Waking  Asleep  =       Idle  =          =         Talking  =        clip     clip      clip  =
 Talking    Waking  Asleep  =       Idle  =          =         =        Idle     clip     clip      clip  =
-Reacting   Waking  Asleep  =       Idle  =          =         =        =        clip     clip      clip  =
-Sustained  Waking  Asleep  =       Idle  =          =         =        =        clip     clip      clip  =
+Reacting   Waking  Asleep  =       =     Attentive  =         =        =        clip     clip      clip  =
+Sustained  Waking  Asleep  =       =     Attentive  =         =        =        clip     clip      clip  =
 Dozing     Waking  Asleep  =       Idle  Attentive  =         =        =        clip     clip      clip  =
 `;
 
@@ -125,6 +125,15 @@ function run(s: DirectorState, ...inputs: DirInput[]): DirectorState {
   return r;
 }
 
+/** The reaction fields of a director with no reaction history (`initialDirector`'s). */
+const NO_REACTION = {
+  reaction: null,
+  queued: null,
+  cooldowns: [],
+  repeats: [],
+  gentle: false,
+} as const satisfies Partial<DirectorState>;
+
 /**
  * A consistent state in `name` entered at `t0`: `prevBase` differs from `base` and its fade finished at
  * `t0 − 1`, so a transition that forgets to move `prevBase` or `fadeStart` shows. Waking plays its wake clip,
@@ -141,6 +150,7 @@ function stateIn(name: DirState, t0 = 10): DirectorState {
     clip: name === 'Waking' ? { name: 'wake', start: t0 } : null,
     talk: name === 'Talking' ? { id: 3, startCtxTime: null } : null,
     mouthCloseStart: name === 'Talking' ? null : t0 - 1,
+    ...NO_REACTION,
   };
 }
 
@@ -155,6 +165,12 @@ function variants(name: DirState): DirectorState[] {
 function deepFreeze(s: DirectorState): DirectorState {
   if (s.clip !== null) Object.freeze(s.clip);
   if (s.talk !== null) Object.freeze(s.talk);
+  if (s.reaction !== null) Object.freeze(s.reaction);
+  if (s.queued !== null) Object.freeze(s.queued);
+  for (const c of s.cooldowns) Object.freeze(c);
+  for (const e of s.repeats) Object.freeze(e);
+  Object.freeze(s.cooldowns);
+  Object.freeze(s.repeats);
   return Object.freeze(s);
 }
 
@@ -175,6 +191,11 @@ function expectedEnter(s: DirectorState, target: DirState, now: number): Directo
     clip,
     talk: target === 'Talking' ? { id: 7, startCtxTime: null } : null,
     mouthCloseStart: target === 'Talking' ? null : s.name === 'Talking' ? now : s.mouthCloseStart,
+    reaction: s.reaction,
+    queued: s.queued,
+    cooldowns: s.cooldowns,
+    repeats: s.repeats,
+    gentle: s.gentle,
   };
 }
 
@@ -184,8 +205,9 @@ function endOf(name: ClipName, start: number): number {
 }
 
 // ---- Validation 1: every edge of the plan §3.5 diagram that M4 covers ------------------------------------------
-// Not covered in M4 (reaction rules, M5 / #91): Idle → Reacting, Idle → Sustained, Reacting → Idle,
-// Sustained → Idle. Sources come from `stateIn`, where prevBase ≠ base, so each base change must move prevBase.
+// The reaction edges (Idle → Reacting, Idle → Sustained, Reacting → Idle, Sustained → Idle, Dozing → Idle on a
+// gesture) are tested under "#91" below. Sources come from `stateIn`, where prevBase ≠ base, so each base change
+// must move prevBase.
 describe('Validation 1: §3.5 diagram edges', () => {
   it('[*] → Asleep: initialDirector', () => {
     expect(initialDirector(2)).toStrictEqual({
@@ -197,6 +219,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
   });
 
@@ -210,6 +233,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'wake', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -226,6 +250,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -239,6 +264,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -252,6 +278,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -267,6 +294,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'earTwitch', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -280,6 +308,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: { id: 7, startCtxTime: null },
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
   });
 
@@ -293,6 +322,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 10.5,
+      ...NO_REACTION,
     });
   });
 
@@ -306,6 +336,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -319,6 +350,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -332,6 +364,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -345,6 +378,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'wake', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -358,6 +392,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'sleep', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -371,6 +406,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'sleep', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 });
@@ -434,6 +470,7 @@ describe('session sequences', () => {
       clip: { name: 'wake', start: 1 },
       talk: null,
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
     const wakeEnd = endOf('wake', 1);
     expect(directorReduce(s, tick(wakeEnd - 1e-9))).toBe(s);
@@ -469,6 +506,7 @@ describe('session sequences', () => {
       clip: null,
       talk: null,
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
   });
 
