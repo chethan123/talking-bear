@@ -710,10 +710,18 @@ function release(s: DirectorState, now: number, out: Out): DirectorState {
  * A tick: an active reaction that is over ends (and a fresh queued one starts); a stale queued reaction is
  * dropped; a clip at or past its end is cleared; in Waking, that (or having no clip) moves to Idle. Returns
  * `s` itself, allocating nothing, when nothing is due.
+ *
+ * It runs once per 120 Hz substep, so it takes the input itself rather than its time, and its quiet paths (no
+ * reaction, or a held or released one) pass no double to a call: V8's mid tier boxes a double passed across a
+ * call (#229, the frame-allocation smoke of #214). A non-finite time changes nothing: `t − t` is 0 for every
+ * finite `t` and NaN otherwise, a check that, unlike `Number.isFinite`, needs no call.
  */
-function tick(s: DirectorState, now: number, out: Out): DirectorState {
+function tick(s: DirectorState, i: { readonly now: number }, out: Out): DirectorState {
+  const now = i.now;
+  if (now - now !== 0) return s;
   const a = s.reaction;
-  if (a !== null && isOver(s, a, now)) return endReaction(s, a, now, out);
+  if (a !== null && (a.release !== null ? now >= a.release + RELEASE_S : !a.r.sustained && isOver(s, a, now)))
+    return endReaction(s, a, now, out);
   const q = s.queued;
   if (q !== null && now > q.at + QUEUE_S) return { ...s, queued: null };
   if (s.clip !== null && now < clipEnd(s, s.clip)) return s;
@@ -723,15 +731,14 @@ function tick(s: DirectorState, now: number, out: Out): DirectorState {
 
 /**
  * One step of the director. Pure: it never mutates `s`, and returns `s` itself when nothing changes. A tick,
- * gesture or release at a non-finite time changes nothing (a NaN release would otherwise never end): `t − t` is 0
- * for every finite `t` and NaN otherwise, a check that, unlike `Number.isFinite`, makes no call on the per-substep
- * tick path (call arguments box doubles in V8's mid tier, #229).
+ * gesture or release at a non-finite time changes nothing (a NaN release would otherwise never end; `tick`
+ * checks its own).
  */
 function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
-  if ((i.k === 'tick' || i.k === 'gesture' || i.k === 'release') && i.now - i.now !== 0) return s;
+  if ((i.k === 'gesture' || i.k === 'release') && i.now - i.now !== 0) return s;
   switch (i.k) {
     case 'tick':
-      return tick(s, i.now, out);
+      return tick(s, i, out);
     case 'anim': {
       if (!KINDS.has(i.ev.e)) return s;
       const handler = handlerFor(s.name, i.ev.e);
@@ -771,7 +778,7 @@ export function directorStep(s: DirectorState, i: DirInput): DirStep {
 
 /** The director reducer: `directorStep(s, i).state`, without collecting the outputs. */
 export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
-  return step(s, i, null);
+  return i.k === 'tick' ? tick(s, i, null) : step(s, i, null);
 }
 
 /**
