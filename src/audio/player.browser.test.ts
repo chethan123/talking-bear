@@ -66,6 +66,13 @@ afterAll(async () => {
   await ctx.close();
 });
 
+/** A unit constant source from time 0 into `bus.input`. */
+function unitInto(off: OfflineAudioContext, bus: ReturnType<typeof createMasterBus>): void {
+  const src = new ConstantSourceNode(off, { offset: 1 });
+  src.connect(bus.input);
+  src.start(0);
+}
+
 describe('master bus', () => {
   test('the master gain is 0.7', () => {
     const bus = createMasterBus(ctx);
@@ -95,13 +102,6 @@ describe('master bus', () => {
   // Quiet mode (plan §4.3.4, issue #66): another −6 dB after the 0.7 master gain, as the bus's last node.
   const QUIET = 10 ** (-6 / 20);
   const OFFLINE_RATE = 48000;
-
-  /** A unit constant source from time 0 into `bus.input`. */
-  function unitInto(off: OfflineAudioContext, bus: ReturnType<typeof createMasterBus>): void {
-    const src = new ConstantSourceNode(off, { offset: 1 });
-    src.connect(bus.input);
-    src.start(0);
-  }
 
   /** A 0.3 s, 48 kHz, mono offline context. */
   function offline(): OfflineAudioContext {

@@ -30,6 +30,7 @@ interface BearTestHooks {
   log: LogEntry[];
   events: { t: number; e: SessionEvent }[];
   state(): StateName;
+  setVisibility(v: 'visible' | 'hidden'): void;
   maxLevelDb(sinceMs: number): number;
   outputSamples(): number[];
   outputSampleRate(): number;
