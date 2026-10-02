@@ -54,6 +54,7 @@ const workerToMain: Samples<WorkerToMain> = {
     pcm: ramp(300),
     envelope: { hopMs: 10, jaw: ramp(7, 1), width: ramp(7, 2), round: ramp(7, 3), teeth: ramp(7, 4) },
     durationSec: 0.00625,
+    clipped: true,
   }),
   error: () => ({ t: 'error', where: 'fx', message: 'boom' }),
 };
@@ -97,10 +98,17 @@ const cases: [string, Factory][] = [
   ...named('WorkletToMain', workletToMain),
   ...named('MainToWorker', mainToWorker),
   ...named('WorkerToMain', workerToMain),
-  // The worker's M1 identity path (T16) replies with emptyEnvelope(): four zero-length tracks.
+  // An envelope with four zero-length tracks (emptyEnvelope()): zero-length buffers are transferred too.
   [
     'WorkerToMain processed (empty envelope)',
-    () => ({ t: 'processed', id: 10, pcm: ramp(64), envelope: emptyEnvelope(), durationSec: 0.001 }),
+    () => ({
+      t: 'processed',
+      id: 10,
+      pcm: ramp(64),
+      envelope: emptyEnvelope(),
+      durationSec: 0.001,
+      clipped: false,
+    }),
   ],
 ];
 
@@ -200,6 +208,7 @@ describe('transferList + structuredClone', () => {
       pcm: ramp(16),
       envelope: { hopMs: 10, jaw: track(0), width: track(1), round: track(2), teeth: track(3) },
       durationSec: 0.001,
+      clipped: false,
     };
     const transfer = transferList(msg);
     expect(transfer).toHaveLength(2);

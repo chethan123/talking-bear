@@ -1,13 +1,15 @@
 import * as fs from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
 import type { Effect, SessionEvent, StateName } from '../../src/app/events.ts';
+import { PRESETS } from '../../src/dsp/types.ts';
 import { yinF0 } from '../../src/dsp/yin.ts';
 import { expectNoEnforcedViolations, installCspRecorder } from './csp';
 
-// Shared helpers for the M1 e2e specs (plan §4.9.3, §7 M1), on top of the e2e test hooks, window.__bearTest
+// Shared helpers for the e2e specs (plan §4.9.3, §7 M1, §7 M3), on top of the e2e test hooks, window.__bearTest
 // (src/test-hooks.ts), which only the e2e build has. The hooks' module isn't part of this TypeScript project
 // (it imports a `?worker&url` module), so the part of its shape the specs use is restated here, typed with the
-// app's own event, effect and state types (type-only imports: no app code runs in Node, only the pure YIN).
+// app's own event, effect and state types (type-only imports: no app code runs in Node, only the pure YIN and
+// the preset table).
 
 /** One `__bearTest.log` entry: a step the session reduced (from === to when the state didn't change). */
 export interface LogEntry {
@@ -43,8 +45,17 @@ declare global {
 /** The element that carries `data-state` (main.ts). */
 const APP = 'main#app';
 
-/** M1's placeholder replay rate (plan §7 M1: `AudioBufferSourceNode` with `playbackRate = 1.6`). */
-export const PLAYBACK_RATE = 1.6;
+/**
+ * The pitch ratio p of the voice the specs hear: Bear cub, the default preset (plan §4.3.4). Each spec starts
+ * with empty storage, so the settings are the defaults.
+ */
+export const PITCH_RATIO = PRESETS.cub.pitchRatio;
+
+/**
+ * The output tap's sample peak bound, in dBFS: the voice chain's −3 dBTP ceiling, −3.1 dB of master gain (0.7)
+ * and −6 dB of Quiet mode (on by default). The tap sits after the Quiet gain (plan §4.3.4, issue #66).
+ */
+export const OUTPUT_PEAK_MAX_DBFS = -12;
 
 /** One loop's state changes, from the Listening it starts in. */
 export const LOOP: readonly StateName[] = ['Recording', 'Processing', 'Playing', 'Cooldown', 'Listening'];
@@ -198,7 +209,7 @@ export async function waitForLoop(page: Page, woke: Woke, budgetMs: number): Pro
   return i;
 }
 
-/** The `durationSec` of the last `processed` event: the length of the replay at PLAYBACK_RATE, in seconds. */
+/** The `durationSec` of the last `processed` event: the length of the replay (played at rate 1), in seconds. */
 export async function processedDuration(page: Page): Promise<number> {
   const all = await steps(page);
   for (let i = all.length - 1; i >= 0; i--) {
@@ -251,14 +262,45 @@ export async function lastTake(page: Page): Promise<Take> {
 }
 
 /**
- * The exact replay length of a take, in seconds: from 300 ms of pre-roll before the onset, clamped to the arm
- * frame, to 150 ms of tail after the last speech frame, played at PLAYBACK_RATE (plan §4.2.3, §4.4, §7 M1).
+ * The take's length in seconds: from 300 ms of pre-roll before the onset, clamped to the arm frame, to 150 ms
+ * of tail after the last speech frame (plan §4.2.3, §4.4, §7 M1).
  */
-export function expectedProcessedDuration(take: Take): number {
+export function takeSeconds(take: Take): number {
   const { sr } = take;
   const fromFrame = Math.max(take.startFrame - Math.round(0.3 * sr), take.armFrame);
   const toFrame = take.lastSpeechFrame + Math.round(0.15 * sr);
-  return (toFrame - fromFrame) / sr / PLAYBACK_RATE;
+  return (toFrame - fromFrame) / sr;
+}
+
+/**
+ * The range of the processed duration of `take` (issue #66) when the fixture's speech lasts `speechSec` and the
+ * voice's pitch ratio is `p`. processVoice trims the take, which can only shorten it but never below the speech
+ * plus its two 50 ms margins, then resamples by 1/p:
+ *   (speechSec + 0.1) / p − 0.064 ≤ processedDuration ≤ takeSeconds(take) / p + 0.002,
+ * with 0.064 s = 2 × 32 ms for the trim's 10 ms frame quantisation and the fixture's fade envelope, and 0.002 s
+ * for the resampler's length rounding.
+ */
+export function processedDurationBounds(
+  take: Take,
+  speechSec: number,
+  p: number,
+): { min: number; max: number } {
+  return { min: (speechSec + 0.1) / p - 0.064, max: takeSeconds(take) / p + 0.002 };
+}
+
+/** Asserts that `processed` is within processedDurationBounds(take, speechSec, p). */
+export function expectProcessedDuration(processed: number, take: Take, speechSec: number, p: number): void {
+  const { min, max } = processedDurationBounds(take, speechSec, p);
+  const what = `processedDuration ${processed} s, bounds [${min}, ${max}] s`;
+  expect(processed, what).toBeGreaterThanOrEqual(min);
+  expect(processed, what).toBeLessThanOrEqual(max);
+}
+
+/** The largest |sample| of `samples` in dBFS (−Infinity when all are zero or there are none). */
+export function peakDbfs(samples: readonly number[]): number {
+  let peak = 0;
+  for (const x of samples) peak = Math.max(peak, Math.abs(x));
+  return 20 * Math.log10(peak);
 }
 
 /** A fixture's sidecar (scripts/gen-fixtures.ts): `{ sampleRate, speech: [{ start, end }], f0? }`. */
@@ -292,8 +334,9 @@ function readSidecar(fixture: string): Sidecar {
 
 /**
  * One full loop on a vowel fixture (the `loop-*` specs): wake, a non-silent mic, the loop's state changes
- * within 15 s, the exact take and replay length, the VAD's speech span against the fixture's, the replay's
- * pitch, and no `arm` while gated. `f0` is the fixture's vowel f0 in Hz (its sidecar must agree).
+ * within 15 s, the replay length within processVoice's bounds, the VAD's speech span against the fixture's,
+ * the replay's pitch and peak, and no `arm` while gated. `f0` is the fixture's vowel f0 in Hz (its sidecar must
+ * agree).
  */
 export async function expectLoop(page: Page, fixture: string, f0: number): Promise<void> {
   const meta = readSidecar(fixture);
@@ -307,15 +350,11 @@ export async function expectLoop(page: Page, fixture: string, f0: number): Promi
   await expectMicSignal(page);
   const ended = await waitForLoop(page, woke, 15_000);
 
-  // 3. The take and its processing are exact.
+  // 3. The replay's length: the take trimmed by processVoice, then divided by p (issue #66).
   const take = await lastTake(page);
   expect(take.reason, 'the vowel ended in silence').toBe('silence');
-  const expected = expectedProcessedDuration(take);
   const processed = await processedDuration(page);
-  expect(
-    Math.abs(processed - expected),
-    `processedDuration ${processed} s, expected ${expected} s`,
-  ).toBeLessThanOrEqual(0.002);
+  expectProcessedDuration(processed, take, speechSec, PITCH_RATIO);
 
   // 4. VAD accuracy against the fixture (energy backend: 10 ms hops; the margin covers the fade envelope).
   const vadSec = (take.lastSpeechFrame - take.startFrame) / take.sr;
@@ -323,32 +362,38 @@ export async function expectLoop(page: Page, fixture: string, f0: number): Promi
     0.13,
   );
 
-  // 5. The replay's pitch: the vowel's f0 × 1.6, ±3 %.
+  // 5. The replay's pitch: the vowel's f0 × p, ±3 %.
   const { samples, rate } = await page.evaluate(() => {
     const h = window.__bearTest;
     if (h === undefined) throw new Error('window.__bearTest is missing');
     return { samples: h.outputSamples(), rate: h.outputSampleRate() };
   });
+  expect(samples.length, 'the output tap heard the replay').toBeGreaterThan(0);
   const outF0 = yinF0(Float32Array.from(samples), rate);
-  const wantF0 = f0 * PLAYBACK_RATE;
+  const wantF0 = f0 * PITCH_RATIO;
   expect(
     Math.abs(outF0 - wantF0) / wantF0,
     `yinF0(outputSamples()) = ${outF0} Hz, want ${wantF0} Hz`,
   ).toBeLessThanOrEqual(0.03);
 
-  // 6. No arm while gated.
+  // 6. The replay's sample peak at the output tap, after the master gain and Quiet mode.
+  const peak = peakDbfs(samples);
+  expect(peak, `outputSamples() peak ${peak} dBFS`).toBeLessThanOrEqual(OUTPUT_PEAK_MAX_DBFS);
+
+  // 7. No arm while gated.
   const all = await steps(page);
   const gatedArms = all.filter((s) => s.effects.includes('arm') && GATED.includes(s.to));
   expect(gatedArms, 'arm effects on steps into a gated state').toEqual([]);
 
   const preRollFrom = take.startFrame - Math.round(0.3 * take.sr);
+  const { min, max } = processedDurationBounds(take, speechSec, PITCH_RATIO);
   console.log(
     [
       `${fixture}: sr ${take.sr}, armFrame ${take.armFrame}, startFrame ${take.startFrame}, lastSpeechFrame ${take.lastSpeechFrame}`,
       `take from ${preRollFrom >= take.armFrame ? 'pre-roll' : 'armFrame'} (onset − 0.3 s − armFrame = ${((preRollFrom - take.armFrame) / take.sr).toFixed(4)} s)`,
-      `processedDuration ${processed.toFixed(6)} s, expected ${expected.toFixed(6)} s, diff ${((processed - expected) * 1000).toFixed(4)} ms`,
+      `processedDuration ${processed.toFixed(6)} s in [${min.toFixed(6)}, ${max.toFixed(6)}] s (take ${takeSeconds(take).toFixed(6)} s)`,
       `VAD ${vadSec.toFixed(4)} s vs ${speechSec} s (error ${((vadSec - speechSec) * 1000).toFixed(1)} ms)`,
-      `yinF0 ${outF0.toFixed(2)} Hz vs ${wantF0} Hz (error ${(((outF0 - wantF0) / wantF0) * 100).toFixed(2)} %), output ${(samples.length / rate).toFixed(4)} s`,
+      `yinF0 ${outF0.toFixed(2)} Hz vs ${wantF0} Hz (error ${(((outF0 - wantF0) / wantF0) * 100).toFixed(2)} %), output ${(samples.length / rate).toFixed(4)} s, peak ${peak.toFixed(2)} dBFS`,
       `loop ${((all[ended]!.t - woke.logT) / 1000).toFixed(2)} s`,
     ].join('; '),
   );

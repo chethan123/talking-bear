@@ -78,8 +78,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
     const buffer = out.ctx.createBuffer(1, p.pcm.length, p.sampleRate);
     // getChannelData().set() copies from any Float32Array; copyToChannel wants a Float32Array<ArrayBuffer>.
     buffer.getChannelData(0).set(p.pcm);
-    // M1: the placeholder pitch-up is the playback rate itself (×1.6 for `cub`); M3 (#66) plays at rate 1.
-    return pl.play(buffer, io.state().preset.pitchRatio).done;
+    // The voice chain already pitched the clip (plan §4.3.4): it plays at rate 1.
+    return pl.play(buffer, 1).done;
   }
 
   /**

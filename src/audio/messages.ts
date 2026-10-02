@@ -52,7 +52,16 @@ export type WorkerToMain =
   | { t: 'floorSnapshot'; epoch: number; floorDb: number } // taken at onset, restored at re-arm
   | { t: 'vadStats'; p95Ms: number }
   | { t: 'vadReady'; backend: 'silero' } // the worker's Silero model is loaded and set
-  | { t: 'processed'; id: number; pcm: Float32Array; envelope: Envelope; durationSec: number }
+  // The voice chain's result (src/dsp/voice.ts): `pcm` plays at rate 1, `envelope` is computed from exactly that
+  // buffer, and `clipped` flags a clipped take (plan §4.4; M8's "too loud" reaction).
+  | {
+      t: 'processed';
+      id: number;
+      pcm: Float32Array;
+      envelope: Envelope;
+      durationSec: number;
+      clipped: boolean;
+    }
   | { t: 'error'; where: 'vad' | 'fx'; message: string };
 
 /** Every message of the protocol, in any direction. */

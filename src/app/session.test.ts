@@ -614,14 +614,14 @@ describe('Validation 2: the full loop with fakes', () => {
     const buffer = at(h.eng.ctx.created, 0);
     expect([buffer.numberOfChannels, buffer.length, buffer.sampleRate]).toEqual([1, 4800, 48_000]);
     expect(buffer.data).toEqual(pcm);
-    // The player is created once, from the engine's context and master bus, and plays at the M1 rate.
+    // The player is created once, from the engine's context and master bus, and plays at rate 1: the voice
+    // chain already pitched the clip (M3, issue #66).
     expect(h.makePlayerCalls).toHaveLength(1);
     expect(at(h.makePlayerCalls, 0)[0]).toBe(h.eng.ctx);
     expect(at(h.makePlayerCalls, 0)[1]).toBe(h.eng.bus);
     const play = at(h.player.plays, 0);
     expect(play.buffer).toBe(buffer);
-    expect(play.rate).toBe(PRESETS.cub.pitchRatio);
-    expect(play.rate).toBe(1.6);
+    expect(play.rate).toBe(1);
     // While Playing (after the anim talk effect too), the processed result is still there.
     expect(h.anims).toContainEqual({ e: 'talk', id: 1 });
     expect(h.eng.engine.getProcessed(1)).toBeDefined();

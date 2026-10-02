@@ -294,13 +294,17 @@ describe('engine (Browser Mode, fake media)', () => {
     const from = log.length;
     engine.process(2, PRESETS.cub);
     const { event } = await waitFor('processed', from, 3000, (e) => e.id === 2);
-    const expected = sr / sr / PRESETS.cub.pitchRatio;
-    expect(Math.abs(event.durationSec - expected)).toBeLessThanOrEqual(1e-9);
     const result = engine.getProcessed(2);
-    expect(result?.pcm.length).toBe(sr);
-    expect(result?.sampleRate).toBe(sr);
-    expect(result?.durationSec).toBe(event.durationSec);
-    expect(result?.envelope.hopMs).toBe(10);
+    if (result === undefined) throw new Error('no processed result for id 2');
+    // The worker ran the voice chain (M3): the 1 s take, trimmed around the beeps, then resampled by 1/p, at
+    // the context rate.
+    expect(result.sampleRate).toBe(sr);
+    expect(result.durationSec).toBe(event.durationSec);
+    expect(result.durationSec).toBe(result.pcm.length / sr);
+    expect(result.pcm.length).toBeGreaterThan(0);
+    expect(result.pcm.length).toBeLessThanOrEqual(Math.round(sr / PRESETS.cub.pitchRatio));
+    expect(result.envelope.hopMs).toBe(10);
+    expect(result.envelope.jaw.length).toBeGreaterThan(0);
     expect(engine.getClip(1, 2)).toBeUndefined(); // transferred away
     const before = log.length;
     engine.process(99, PRESETS.cub);

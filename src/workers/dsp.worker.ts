@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 // DSP worker glue (plan §3.1, §3.3). Wires the main thread's messages and the worklet's MessagePort to a
-// VadCore, and answers `process` (M1: the clip is echoed unchanged; the voice chain replaces this in M3).
+// VadCore, and answers `process` with the voice chain, processVoice (plan §4.3.4): the reply's buffers (the
+// processed pcm and the four envelope tracks) are transferred, never copied.
 // Every handler is wrapped, so an exception becomes an `error` message instead of killing the worker.
 //
 // Silero (plan §4.2.3): the first successful `init` starts loading the shipped weights (weights.bin, which Vite
@@ -16,7 +17,7 @@ import {
 } from '../audio/messages.ts';
 import { createSilero, type SileroModel } from '../dsp/silero/model.ts';
 import { decodeWeights } from '../dsp/silero/weights.ts';
-import { emptyEnvelope } from '../dsp/types.ts';
+import { processVoice } from '../dsp/voice.ts';
 import { VadCore } from './vad-core.ts';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -121,12 +122,14 @@ function onMainMessage(e: MessageEvent<MainToWorker>): void {
       break;
     case 'process':
       try {
+        const r = processVoice(msg.pcm, msg.sampleRate, msg.preset);
         post({
           t: 'processed',
           id: msg.id,
-          pcm: msg.pcm,
-          envelope: emptyEnvelope(),
-          durationSec: msg.pcm.length / msg.sampleRate / msg.preset.pitchRatio,
+          pcm: r.pcm,
+          envelope: r.envelope,
+          durationSec: r.durationSec,
+          clipped: r.clipped,
         });
       } catch (err) {
         postError('fx', err);

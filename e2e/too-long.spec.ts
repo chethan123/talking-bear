@@ -1,11 +1,14 @@
 import { expect, test } from '@playwright/test';
 import {
-  expectedProcessedDuration,
   expectMicSignal,
+  expectProcessedDuration,
   lastTake,
   noCspViolationsAfterEach,
+  PITCH_RATIO,
+  processedDurationBounds,
   processedDuration,
   steps,
+  takeSeconds,
   waitForLoop,
   wake,
 } from './helpers/app';
@@ -16,7 +19,10 @@ test.use({ launchOptions: { args: micFlags('e2e/fixtures/long_12s.wav') } });
 test.setTimeout(45_000);
 noCspViolationsAfterEach();
 
-test('too-long: 12 s of speech is capped at 10 s, cut exactly and replayed', async ({ page }) => {
+/** The speech in the take: the 10 s cap (the fixture's vowel goes on past it). */
+const CAPPED_SPEECH_SEC = 10;
+
+test('too-long: 12 s of speech is capped at 10 s and replayed', async ({ page }) => {
   const woke = await wake(page);
   await expectMicSignal(page);
   // The loop completes back to Listening within 30 s of wake.
@@ -30,23 +36,16 @@ test('too-long: 12 s of speech is capped at 10 s, cut exactly and replayed', asy
 
   const take = await lastTake(page);
   expect(take.reason, 'the take ended at the 10 s cap').toBe('maxLength');
-  const expected = expectedProcessedDuration(take);
+  // The replay's length: the take trimmed by processVoice (only the pre-roll's silence can go), then divided by
+  // p (issue #66).
   const processed = await processedDuration(page);
-  expect(
-    Math.abs(processed - expected),
-    `processedDuration ${processed} s, expected ${expected} s`,
-  ).toBeLessThanOrEqual(0.002);
-  // 10 s of speech + 0.3 s pre-roll + 0.15 s tail, at ×1.6.
-  const capped = (10 + 0.3 + 0.15) / 1.6;
-  expect(Math.abs(processed - capped), `processedDuration ${processed} s, ≈ ${capped} s`).toBeLessThanOrEqual(
-    0.1,
-  );
+  expectProcessedDuration(processed, take, CAPPED_SPEECH_SEC, PITCH_RATIO);
+  const { min, max } = processedDurationBounds(take, CAPPED_SPEECH_SEC, PITCH_RATIO);
 
   console.log(
     [
       `long_12s: sr ${take.sr}, armFrame ${take.armFrame}, startFrame ${take.startFrame}, lastSpeechFrame ${take.lastSpeechFrame}`,
-      `processedDuration ${processed.toFixed(6)} s, expected ${expected.toFixed(6)} s, diff ${((processed - expected) * 1000).toFixed(4)} ms`,
-      `vs ${capped} s: ${((processed - capped) * 1000).toFixed(1)} ms`,
+      `processedDuration ${processed.toFixed(6)} s in [${min.toFixed(6)}, ${max.toFixed(6)}] s (take ${takeSeconds(take).toFixed(6)} s)`,
       `loop ${((all[ended]!.t - woke.logT) / 1000).toFixed(2)} s`,
     ].join('; '),
   );

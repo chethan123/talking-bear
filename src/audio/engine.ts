@@ -105,6 +105,12 @@ export interface OutputTapHost {
   insertOutputTap(node: AudioNode): void;
 }
 
+/** Quiet mode for the master bus (main.ts applies the setting). createEngine's result has it; `Engine` doesn't. */
+export interface QuietHost {
+  /** Quiet mode (plan §4.3.4): remembered, used when the graph is built, applied at once if the bus exists. */
+  setQuiet(on: boolean): void;
+}
+
 type Processed = NonNullable<ReturnType<Engine['getProcessed']>>;
 type ClipChunk = Extract<WorkletToMain, { t: 'clipChunk' }>;
 
@@ -159,7 +165,7 @@ function concat(chunks: readonly Float32Array[], length: number): Float32Array {
 export function createEngine(opts: {
   connectWorkletOutput: boolean;
   onEvent: (e: EngineEvent) => void;
-}): Engine & OutputTapHost {
+}): Engine & OutputTapHost & QuietHost {
   const { connectWorkletOutput, onEvent } = opts;
   const emit = (e: EngineEvent): void => {
     onEvent(e);
@@ -175,6 +181,7 @@ export function createEngine(opts: {
   let setup: Promise<AudioContext> | null = null;
   /** The node insertOutputTap() put between the bus and `destination`, if any. */
   let outputTap: AudioNode | null = null;
+  let quietMode = true; // plan §4.3.4: on by default
   /** Set by resume(), cleared by suspend(): the latest call wins when they race with the first build. */
   let wantRunning = false;
 
@@ -336,7 +343,7 @@ export function createEngine(opts: {
     c.addEventListener('error', onCtxError); // ctx.onerror (render errors, Chrome 128+)
     try {
       await c.audioWorklet.addModule(workletUrl);
-      const b = createMasterBus(c);
+      const b = createMasterBus(c, quietMode);
       const n = new AudioWorkletNode(c, 'capture', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
@@ -591,6 +598,10 @@ export function createEngine(opts: {
       bus.output.connect(tap);
       tap.connect(ctx.destination);
       outputTap = tap;
+    },
+    setQuiet(on: boolean): void {
+      quietMode = on;
+      bus?.setQuiet(on);
     },
   };
 }
