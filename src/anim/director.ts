@@ -27,8 +27,9 @@
  * **Cut crossfade** (#240). A step that puts another clip into the slot while the one playing hasn't ended (an
  * interrupting reaction, an additive one in Attentive or Thinking, a reaction starting over the flinch, `wake` or
  * `sleep`) keeps the outgoing clip as `prevClip`, and `evaluate` fades it out under the incoming one over 100 ms.
- * A second cut inside that fade keeps whichever outgoing clip moves the pose less at that instant, so it never
- * jumps more than a plain cut would. The first tick from `cutAt` + 100 ms clears `prevClip`. See `crossfade`.
+ * A second cut inside that fade keeps whichever outgoing clip moves the pose less at that instant, so, on a
+ * continuous base, it never jumps more than a plain cut would. A step that empties the slot, and the first tick
+ * from `cutAt` + 100 ms, clear `prevClip`. See `crossfade`.
  *
  * **Mouth.** Leaving Talking sets `mouthCloseStart = now` and clears `talk`; `talk` clears
  * `mouthCloseStart`, so every talk starts with the mouth fully open to the mouth layer.
@@ -834,7 +835,10 @@ function poseJump(a: Pose, b: Pose): number {
  * - **Cut:** the step put another clip (another name or start) into the slot while `s`'s clip hadn't ended:
  *   `next` gets that outgoing clip as `prevClip`, cut at the input's time, with its reaction's release when it
  *   was easing out. Whether it had ended is judged on `s`, so a held clip counts as playing even when the same
- *   step ends its reaction (`wake`, `sleep`). A clip dropped with no successor is no cut.
+ *   step ends its reaction (`wake`, `sleep`).
+ * - **An emptied slot:** a step that leaves no clip in the slot (the sleep clip dropped on leaving Asleep) is no
+ *   cut, and it clears `prevClip`: with no incoming clip there is nothing to fade under, and a `prevClip` left
+ *   behind would come back at its weight k when the next clip starts inside its 100 ms.
  * - **A second cut,** inside the fade of `s.prevClip` (weight k > 0): either the older `prevClip` stays (`next`
  *   carries it, as every handler spreads `s`) and the clip being cut drops out, or the clip being cut becomes
  *   `prevClip` and the older one drops out. It keeps the choice that moves the pose less at the cut (`evaluate`
@@ -847,14 +851,10 @@ function poseJump(a: Pose, b: Pose): number {
 function crossfade(s: DirectorState, next: DirectorState, i: DirInput): DirectorState {
   if (next === s && s.prevClip === null) return s;
   if (i.k === 'setGentle') return next;
+  if (next.clip === null) return next.prevClip === null ? next : { ...next, prevClip: null };
   const old = s.clip;
   const cur = next.clip;
-  if (
-    old !== null &&
-    cur !== null &&
-    (cur.name !== old.name || cur.start !== old.start) &&
-    i.now < clipEnd(s, old)
-  ) {
+  if (old !== null && (cur.name !== old.name || cur.start !== old.start) && i.now < clipEnd(s, old)) {
     const a = s.reaction;
     const releasedAt = a !== null && a.release !== null && a.clip === old.name ? a.release : null;
     const now = i.now;

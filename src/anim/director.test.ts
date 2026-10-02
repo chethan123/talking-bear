@@ -2466,9 +2466,24 @@ describe('#240: a clip cut while playing crossfades out over 100 ms', () => {
     expect(bodyDiff(poseAt(late, t), addPose(BASE.idle, hug, 1 - k, createPose()))).toBeLessThanOrEqual(1e-6);
   });
 
-  it('a clip dropped with no successor is no cut', () => {
+  it('a clip dropped with no successor is no cut, and it clears a prevClip still fading', () => {
     const dropped = run(stateIn('Idle'), anim({ e: 'sleep' }, 10.5), anim({ e: 'idle' }, 10.8));
     expect(dropped).toMatchObject({ name: 'Idle', clip: null, prevClip: null });
+    // sleep cuts the wake clip, then idle drops the sleep clip inside that cut's 100 ms: the wake clip must not
+    // come back at its weight when the next clip starts (code review finding 1: 0.113 and 0.360 against main's 0).
+    for (const [sleepAt, idleAt, tapAt] of [
+      [1.5, 1.55, 1.57],
+      [1.5, 1.5, 1.52],
+    ] as const) {
+      const cut = run(initialDirector(0), anim({ e: 'wake' }, 1), anim({ e: 'sleep' }, sleepAt));
+      expect(cut.prevClip).toMatchObject({ name: 'wake', cutAt: sleepAt });
+      const emptied = stepAll(cut, anim({ e: 'idle' }, idleAt)).s;
+      expect(emptied).toMatchObject({ name: 'Idle', clip: null, prevClip: null });
+      const tapped = stepAll(emptied, gest('cheekPuffL', 'cheekL', 'tap', tapAt)).s;
+      expect(tapped.clip).toStrictEqual({ name: 'cheekPuffL', start: tapAt });
+      expect(tapped.prevClip).toBeNull();
+      expect(bodyDiff(poseAt(tapped, tapAt), poseAt(emptied, tapAt))).toBeLessThanOrEqual(1e-6);
+    }
   });
 
   it('a second cut 30 ms into a fade keeps the older prevClip; one 80 ms into it replaces it', () => {
@@ -2477,6 +2492,8 @@ describe('#240: a clip cut while playing crossfades out over 100 ms', () => {
     const early = stepAll(before, gest('cheekPuffR', 'cheekR', 'tap', 11.53)).s;
     expect(early.clip).toStrictEqual({ name: 'cheekPuffR', start: 11.53 });
     expect(early.prevClip).toBe(before.prevClip);
+    // At +50 ms both choices move the pose by exactly the same amount (0.2777…): a tie keeps the older one.
+    expect(stepAll(before, gest('cheekPuffR', 'cheekR', 'tap', 11.55)).s.prevClip).toBe(before.prevClip);
     const late = stepAll(before, gest('cheekPuffR', 'cheekR', 'tap', 11.58)).s;
     expect(late.clip).toStrictEqual({ name: 'cheekPuffR', start: 11.58 });
     expect(late.prevClip).toStrictEqual({ name: 'cheekPuffL', start: 11.5, cutAt: 11.58, release: null });
@@ -2505,6 +2522,25 @@ describe('#240: a clip cut while playing crossfades out over 100 ms', () => {
       const plain = bodyDiff(poseAt(incoming(r), i.now), poseAt(incoming(s), i.now));
       expect(jump, `${s.clip?.name} → ${r.clip?.name} at ${i.now}`).toBeLessThanOrEqual(plain + 1e-6);
     }
+  });
+
+  it("a cut carries a reaction's release only when the cut clip is that reaction's own clip", () => {
+    // Talking with a held tickle whose giggle has ended: a P2 flinch takes the free slot, the tickle is released,
+    // and the announced long-press starts over the flinch at talkEnd. The flinch is cut, the tickle's release isn't.
+    const s = stepAll(
+      stateIn('Thinking'),
+      tickle(10.1),
+      anim({ e: 'talk', id: 3 }, 10.2),
+      gest('cheekPuffR', 'cheekR', 'tap', 11),
+      release(11.02),
+      gest('earDroopL', 'earL', 'longPress', 11.05),
+    ).s;
+    expect(s).toMatchObject({ name: 'Talking', clip: { name: 'flinch', start: 11 }, prevClip: null });
+    expect(s.reaction).toMatchObject({ clip: 'giggle', release: 11.02 });
+    expect(s.queued).toMatchObject({ r: R('earDroopL'), announced: true });
+    const r = stepAll(s, anim({ e: 'talkEnd' }, 11.1)).s;
+    expect(r.clip).toStrictEqual({ name: 'earDroopL', start: 11.1 });
+    expect(r.prevClip).toStrictEqual({ name: 'flinch', start: 11, cutAt: 11.1, release: null });
   });
 
   it('other inputs keep prevClip; evaluate ignores it once 100 ms are up, with no clip in the slot, or unknown', () => {
