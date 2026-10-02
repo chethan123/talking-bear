@@ -27,6 +27,7 @@ jobs:
       - run: node scripts/gen-bear-parts.ts --check
       - run: pnpm exec playwright install --with-deps --no-shell chromium
       - run: pnpm verify
+      - run: pnpm test:coverage
       - run: pnpm parity
       - run: pnpm test:browser
       - run: pnpm build
