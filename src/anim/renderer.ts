@@ -222,7 +222,7 @@ export function render(g: CanvasRenderingContext2D, rig: Rig, pose: Pose, view: 
       const jawRaw = pose[Ch.Jaw]!;
       const jaw = jawRaw < 0 ? 0 : jawRaw > 1 ? 1 : jawRaw;
       const open = MOUTH.openRange * jaw;
-      if (open >= 0.5) {
+      if (!(open < 0.5)) {
         const roundRaw = pose[Ch.MouthRound]!;
         const round = roundRaw < 0 ? 0 : roundRaw > 1 ? 1 : roundRaw;
         const wRaw = pose[Ch.MouthW]!;
