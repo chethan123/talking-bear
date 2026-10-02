@@ -843,6 +843,37 @@ describe('the device lines (#93)', () => {
     noMedia.dispose();
   });
 
+  test('inputs: an older enumeration that settles after a newer one never overwrites it', async () => {
+    const clock = new FakeClock();
+    const pending: ((list: MediaDeviceInfo[]) => void)[] = [];
+    const media = counted({
+      enumerateDevices: vi.fn(
+        (): Promise<MediaDeviceInfo[]> =>
+          new Promise((resolve) => {
+            pending.push(resolve);
+          }),
+      ),
+    });
+    const r = deviceRig(clock);
+    const overlay = mountDebugOverlay(root, {
+      frameStats: (out) => out,
+      clock,
+      device: { ...r.deps, mediaDevices: media },
+    });
+    // The mount's enumeration, then two devicechanges: three pending, settled newest first.
+    media.fire('devicechange');
+    media.fire('devicechange');
+    expect(pending).toHaveLength(3);
+    pending[2]!([device('audioinput', 'Newest')]);
+    await settle();
+    expect(line('inputs')).toBe('inputs Newest');
+    pending[1]!([device('audioinput', 'Older')]);
+    pending[0]!([device('audioinput', 'Oldest')]);
+    await settle();
+    expect(line('inputs')).toBe('inputs Newest');
+    overlay.dispose();
+  });
+
   test('sets no style attribute; dispose removes every listener and timer', async () => {
     const clock = new FakeClock();
     const r = deviceRig(clock, () => [device('audioinput', 'Speakerphone')]);

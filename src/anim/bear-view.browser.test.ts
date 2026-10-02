@@ -16,7 +16,7 @@ import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import type { Gesture } from '../input/recognizer.ts';
 import { REGION_IDS, type RegionId } from '../input/region-ids.ts';
-import { hitTest } from '../input/regions.ts';
+import { hitTest, REGIONS } from '../input/regions.ts';
 import type { VisEvent } from '../platform/visibility.ts';
 import { DEBUG_REFRESH_MS, formatFrameStats, mountDebugOverlay } from '../ui/debug-overlay.ts';
 import {
@@ -36,7 +36,7 @@ import { ASLEEP_FPS, IDLE_FPS, STATS_FRAMES, type FrameStats } from './loop.ts';
 import { Ch, createPose } from './pose.ts';
 import { POSES } from './poses.ts';
 import { createContext, fitView, MAX_DPR, render } from './renderer.ts';
-import { BONE_COUNT, boneMatrices, createRig, MAT } from './rig.ts';
+import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { SpringBank } from './springs.ts';
 import { configureSprings, SPRING, SPRING_COUNT, SPRING_PARAMS } from './springs-map.ts';
 
@@ -1038,9 +1038,11 @@ describe('pointer input and reactions (#93)', () => {
       expect(before.name, s).toBe('Idle');
       h.clock.t += 5;
       h.view.gesture(NOSE_TAP);
+      h.view.gesture({ g: 'tap', phase: 'down', region: 'background', x: 0, y: 100, count: 1 });
       expect(h.view.director(), s).toBe(before);
       expect(h.dispatch, s).not.toHaveBeenCalled();
       expect(haptics.play, s).not.toHaveBeenCalled();
+      expect(h.view.lookAt(), s).toBeNull();
     }
   });
 
@@ -1117,6 +1119,15 @@ describe('pointer input and reactions (#93)', () => {
     expect(all.view.director().reaction).toMatchObject({ r: { name: 'squish' }, release: null });
     pointer(all, 'pointerup', b.x, b.y, 2);
     expect(all.dispatch.mock.calls).toEqual([[reaction('squish', 3, 'pop')]]);
+
+    // The last pointer up may be a pointercancel: it releases everything too.
+    const cancelled = awake();
+    cancelled.view.gesture({ g: 'pinch', regions: ['cheekL', 'cheekR'], spanRatio: 0.8 });
+    cancelled.dispatch.mockClear();
+    const c = background(cancelled, 300);
+    pointer(cancelled, 'pointerdown', c.x, c.y, 1);
+    pointer(cancelled, 'pointercancel', c.x, c.y, 1);
+    expect(cancelled.dispatch.mock.calls).toEqual([[reaction('squish', 3, 'pop')]]);
   });
 
   test('director ticks route their outputs: a queued reaction that starts on a tick is dispatched then', () => {
@@ -1199,6 +1210,14 @@ describe('pointer input and reactions (#93)', () => {
     pointer(h, 'pointerup', belly.x + 4, belly.y, 3);
   });
 
+  test('the gaze maps a background point through the CSS view, also at DPR 2', () => {
+    const h = awake({ devicePixelRatio: () => 2 });
+    expect([h.view.canvas.width, h.view.canvas.height]).toEqual([2 * STAGE_W, 2 * STAGE_H]);
+    // The stage's CSS view is still scale 0.4: eye height at its left edge is the design point (0, 385).
+    h.view.gesture({ g: 'tap', phase: 'down', region: 'background', x: 0, y: 385 * 0.4, count: 1 });
+    expect(h.view.lookAt()).toEqual({ x: 0, y: 385 });
+  });
+
   test('reduced motion sets the director gentle', () => {
     const h = awake();
     expect(h.view.director().gentle).toBe(false);
@@ -1217,6 +1236,51 @@ describe('pointer input and reactions (#93)', () => {
     expect(() => h.view.regionCenter('background')).toThrow(RangeError);
   });
 
+  test('regionCenter and the hits follow the drawn pose: the bones are refreshed after a frame', () => {
+    const h = awake({}, 'Recording');
+    h.run(30);
+    const before = h.view.regionCenter('nose');
+    expect(hitAt(h, before)).toBe('nose');
+    // Attentive tilts the head 8°: after its 150 ms crossfade the nose has moved.
+    h.anim({ e: 'attentive' });
+    h.run(30);
+    const after = h.view.regionCenter('nose');
+    expect(Math.hypot(after.x - before.x, after.y - before.y)).toBeGreaterThan(2);
+    expect(hitAt(h, after)).toBe('nose');
+    // The adapter hits the moved nose too.
+    tapAt(h, after);
+    expect(h.dispatch).toHaveBeenCalledWith(reaction('sneeze', 2, 'sneeze'));
+  });
+
+  test("regionCenter is the forward map of the region's first entry, offset by the canvas's viewport position", () => {
+    const offset = new CSSStyleSheet();
+    offset.replaceSync('.t82-offset { margin-left: 200px; margin-top: 30px; }');
+    const sheets0 = [...document.adoptedStyleSheets];
+    document.adoptedStyleSheets = [...sheets0, offset];
+    root.classList.add('t82-offset');
+    try {
+      const h = awake();
+      h.run(30);
+      const rect = h.view.canvas.getBoundingClientRect();
+      expect(rect.left).toBeGreaterThanOrEqual(200);
+      const bones = boneMatrices(createRig(), h.view.pose(), new Float32Array(BONE_COUNT * MAT));
+      const view = fitView(STAGE_W, STAGE_H, { scale: 0, ox: 0, oy: 0 });
+      for (const id of ['nose', 'headTop'] as const) {
+        // headTop has a second entry on the tuft bone, after the head's: the first one is the centre.
+        const r = REGIONS.find((d) => d.id === id)!;
+        const o = boneIndex(r.bone) * MAT;
+        const x = bones[o]! * r.cx + bones[o + 2]! * r.cy + bones[o + 4]!;
+        const y = bones[o + 1]! * r.cx + bones[o + 3]! * r.cy + bones[o + 5]!;
+        const c = h.view.regionCenter(id);
+        expect(Math.abs(c.x - rect.left - (view.ox + view.scale * x)), id).toBeLessThan(1e-6);
+        expect(Math.abs(c.y - rect.top - (view.oy + view.scale * y)), id).toBeLessThan(1e-6);
+      }
+    } finally {
+      root.classList.remove('t82-offset');
+      document.adoptedStyleSheets = sheets0;
+    }
+  });
+
   test('activation: pointerdown notes down, pointerup notes up, pointercancel notes nothing', () => {
     const haptics = fakeHaptics();
     const h = awake({ haptics });
@@ -1228,6 +1292,38 @@ describe('pointer input and reactions (#93)', () => {
     pointer(h, 'pointerdown', p.x, p.y, 2);
     pointer(h, 'pointercancel', p.x, p.y, 2);
     expect(haptics.noteActivation.mock.calls).toEqual([['down'], ['up'], ['down']]);
+
+    // Two fingers: the first one's pointerup is noted while the second is still down.
+    const two = fakeHaptics();
+    const t = awake({ haptics: two });
+    const q = background(t, 300);
+    pointer(t, 'pointerdown', q.x, q.y, 1);
+    pointer(t, 'pointerdown', q.x, q.y + 40, 2);
+    pointer(t, 'pointerup', q.x, q.y, 1);
+    expect(two.noteActivation.mock.calls).toEqual([['down'], ['down'], ['up']]);
+    pointer(t, 'pointerup', q.x, q.y + 40, 2);
+    expect(two.noteActivation.mock.calls).toEqual([['down'], ['down'], ['up'], ['up']]);
+
+    // Asleep: the wake tap's pointerdown is noted as well as dispatching tapBear.
+    const asleep = fakeHaptics();
+    const z = harness({ haptics: asleep });
+    const w = background(z);
+    pointer(z, 'pointerdown', w.x, w.y, 1);
+    expect(asleep.noteActivation.mock.calls).toEqual([['down']]);
+    expect(z.dispatch.mock.calls).toEqual([[{ t: 'tapBear' }]]);
+  });
+
+  test('dispose detaches the pointer adapter: no listener, no inline style', () => {
+    const h = harness();
+    const c = h.view.canvas;
+    h.view.dispose();
+    mounted.splice(mounted.indexOf(h.view), 1);
+    root.append(c);
+    const p = { x: c.getBoundingClientRect().left + 10, y: c.getBoundingClientRect().top + 10 };
+    pointer(h, 'pointerdown', p.x, p.y, 1);
+    expect(h.dispatch).not.toHaveBeenCalled();
+    expect(c.style.length).toBe(0);
+    c.remove();
   });
 
   test('adapter.tick runs in the frame: a held finger becomes a long-press without moving', async () => {

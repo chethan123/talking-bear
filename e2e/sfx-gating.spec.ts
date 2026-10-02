@@ -31,6 +31,8 @@ interface Point {
 /** One `__bearTest.sfxLog` entry (src/test-hooks.ts `SfxLogEntry`): the fields this spec reads. */
 interface SfxLogEntry {
   t: number;
+  /** The ctx frame when the sfx was scheduled. */
+  frame: number;
   endCtxTime: number;
 }
 
@@ -68,6 +70,7 @@ function isSfxLog(v: unknown): v is SfxLogEntry[] {
         typeof x === 'object' &&
         x !== null &&
         typeof Reflect.get(x, 't') === 'number' &&
+        typeof Reflect.get(x, 'frame') === 'number' &&
         typeof Reflect.get(x, 'endCtxTime') === 'number',
     )
   );
@@ -126,8 +129,17 @@ test('sfx-gating: a tap storm enters SfxGated; every arm waits for the latest sf
   );
   expect(gated.length, 'transitions into SfxGated during the storm').toBeGreaterThanOrEqual(1);
 
-  // 2. Every scheduled sfx is logged with its end.
+  // 2. Every scheduled sfx is logged with its end: after the ctx time it was scheduled at, and within 5 s of it.
   expect(sfxLog.length, 'scheduled sfx (__bearTest.sfxLog)').toBeGreaterThanOrEqual(1);
+  for (const x of sfxLog) {
+    const scheduled = x.frame / rate;
+    expect(x.endCtxTime, `sfx scheduled at ctx ${scheduled.toFixed(3)} s: its end`).toBeGreaterThan(
+      scheduled,
+    );
+    expect(x.endCtxTime, `sfx scheduled at ctx ${scheduled.toFixed(3)} s: its end`).toBeLessThan(
+      scheduled + 5,
+    );
+  }
 
   // 3. Every arm after an sfx starts at a ctx time ≥ the latest end of the sfx scheduled before it + 0.25 s.
   const arms = all
