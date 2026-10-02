@@ -18,7 +18,7 @@ import {
   PROXIMITY_DB,
 } from '../audio/constants.ts';
 import type { WorkerToMain } from '../audio/messages.ts';
-import { createGateFilter, frameDb } from '../dsp/energy-gate.ts';
+import { DEFAULT_ENERGY_PARAMS, createGateFilter, frameDb } from '../dsp/energy-gate.ts';
 import { activeLevelDb } from '../dsp/proximity.ts';
 import { resampleOffline } from '../dsp/resample.ts';
 import type { SegEvent } from '../dsp/segmenter.ts';
@@ -582,26 +582,35 @@ describe('VadCore Silero backend (shipped weights)', () => {
   });
 
   it("5e': the hop that initialises the floor after digital silence opens the pre-gate", () => {
-    // 16 kHz frames built directly: 70 zero frames, 32 frames of −20 dBFS noise starting on a hop boundary
-    // (70 · 512 = 224 · 160), 50 zero frames. Without the rule the floor would initialise at the noise level and
-    // the gate would never open, so Silero would never see the noise. The proximity gate is off (X = −∞): the
-    // floor initialises at the burst's own level, so with the default X the segment would end as a misfire.
-    const rng = mulberry32(51);
-    const a = Math.sqrt(3) * 0.1;
-    const frames = Array.from({ length: 152 }, (_, k) =>
-      k >= 70 && k < 102
-        ? Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a)
-        : new Float32Array(FRAME),
-    );
+    // 16 kHz frames built directly: 70 zero frames, 32 frames of noise starting on a hop boundary
+    // (70 · 512 = 224 · 160), 50 zero frames. At −37 dBFS the burst is ≈ −41.7 dBFS on the gate path, under
+    // initFloorCapDb (#146), so the floor initialises at the burst's own level: without the rule the gate would
+    // never open, so Silero would never see the noise. The proximity gate is off (X = −∞): with the default X the
+    // segment would end as a misfire.
+    const seed = 51; // every burst draws the same noise
+    const burst = (rmsDb: number): Float32Array[] => {
+      const rng = mulberry32(seed);
+      const a = Math.sqrt(3) * 10 ** (rmsDb / 20);
+      return Array.from({ length: 152 }, (_, k) =>
+        k >= 70 && k < 102
+          ? Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a)
+          : new Float32Array(FRAME),
+      );
+    };
+    const frames = burst(-37);
     const off = scriptedModel(0.9, 0.1);
     const on = scriptedModel(0.9, 0.1);
     const r0 = runSilero(frames, off, false, Number.NEGATIVE_INFINITY);
     const r1 = runSilero(frames, on, true, Number.NEGATIVE_INFINITY);
+    // The floor was learned from the burst, not set by the cap.
+    expect(ofType(r0.msgs, 'floorSnapshot')[0]!.floorDb).toBeLessThan(DEFAULT_ENERGY_PARAMS.initFloorCapDb);
     expect(segs(r1.msgs)).toEqual(segs(r0.msgs));
     expect(kinds(r0.msgs)).toEqual(['start', 'end']);
     expect(on.calls).toBeLessThan(off.calls);
     // Default X: the floor initialised on the burst's own first hop (D7 edge).
     expect(kinds(runSilero(frames, scriptedModel(0.9, 0.1), false).msgs)).toEqual(['start', 'misfire']);
+    // #146: a −20 dBFS burst is above the cap, so its floor starts at initFloorCapDb and it passes the default X.
+    expect(kinds(runSilero(burst(-20), scriptedModel(0.9, 0.1), false).msgs)).toEqual(['start', 'end']);
   });
 
   it('5f: reset empties the pre-gate ring: no frame of an earlier epoch is ever replayed', () => {
