@@ -124,6 +124,19 @@ export interface TraceHost {
   setTrace(on: boolean): void;
 }
 
+/** A VAD backend the worker's `reset` can ask for (src/audio/messages.ts). */
+export type VadBackend = Extract<MainToWorker, { t: 'reset' }>['vad'];
+
+/**
+ * Pinning the VAD backend, for the e2e test hooks only (issue #51). createEngine's result has `setVadBackend`
+ * only in builds with `VITE_BEAR_TEST_HOOKS === '1'`; production builds dead-code-eliminate it, name included
+ * (`pnpm build && ! grep -rq setVadBackend dist`).
+ */
+export interface VadBackendHost {
+  /** The backend every later arm() asks the worker for; until the first call, DEFAULT_VAD_BACKEND. */
+  setVadBackend?: (b: VadBackend) => void;
+}
+
 type Processed = NonNullable<ReturnType<Engine['getProcessed']>>;
 type ClipChunk = Extract<WorkletToMain, { t: 'clipChunk' }>;
 
@@ -178,7 +191,7 @@ function concat(chunks: readonly Float32Array[], length: number): Float32Array {
 export function createEngine(opts: {
   connectWorkletOutput: boolean;
   onEvent: (e: EngineEvent) => void;
-}): Engine & OutputTapHost & QuietHost & TraceHost {
+}): Engine & OutputTapHost & QuietHost & TraceHost & VadBackendHost {
   const { connectWorkletOutput, onEvent } = opts;
   const emit = (e: EngineEvent): void => {
     onEvent(e);
@@ -197,6 +210,8 @@ export function createEngine(opts: {
   let quietMode = true; // plan §4.3.4: on by default
   /** The feature trace setting (setTrace); every new worker gets it after its init. */
   let traceOn = false;
+  /** The backend arm() asks the worker for (plan §4.2.3: Silero, energy while the model loads). */
+  let vadBackend: VadBackend = DEFAULT_VAD_BACKEND;
   /** Set by resume(), cleared by suspend(): the latest call wins when they race with the first build. */
   let wantRunning = false;
 
@@ -544,7 +559,7 @@ export function createEngine(opts: {
 
   // ---- the Engine --------------------------------------------------------------------------------------------
 
-  return {
+  const api: Engine & OutputTapHost & QuietHost & TraceHost & VadBackendHost = {
     resume,
     suspend,
     openMic(req: number): void {
@@ -563,7 +578,7 @@ export function createEngine(opts: {
         postToWorker(worker, {
           t: 'reset',
           epoch,
-          vad: DEFAULT_VAD_BACKEND,
+          vad: vadBackend,
           restoreFloorDb,
           pregate: PREGATE_ENABLED,
         });
@@ -637,4 +652,11 @@ export function createEngine(opts: {
       if (worker !== null) postToWorker(worker, { t: 'trace', on });
     },
   };
+  // Only the e2e build can pin the backend (issue #51): production builds drop this branch, as main.ts's hooks.
+  if (import.meta.env.VITE_BEAR_TEST_HOOKS === '1') {
+    api.setVadBackend = (b: VadBackend): void => {
+      vadBackend = b;
+    };
+  }
+  return api;
 }

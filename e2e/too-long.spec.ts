@@ -15,6 +15,7 @@ import {
 import { micFlags } from './helpers/flags';
 
 // Plan §4.9.3 `too-long`, §7 M1: 12 s of vowel is capped at the 10 s maximum utterance and still replayed.
+// Pinned to the energy backend (issue #51): Silero ends this synthetic vowel by silence before the 10 s cap.
 test.use({ launchOptions: { args: micFlags('e2e/fixtures/long_12s.wav') } });
 test.setTimeout(45_000);
 noCspViolationsAfterEach();
@@ -23,7 +24,7 @@ noCspViolationsAfterEach();
 const CAPPED_SPEECH_SEC = 10;
 
 test('too-long: 12 s of speech is capped at 10 s and replayed', async ({ page }) => {
-  const woke = await wake(page);
+  const woke = await wake(page, { vad: 'energy' });
   await expectMicSignal(page);
   // The loop completes back to Listening within 30 s of wake.
   const ended = await waitForLoop(page, woke, 30_000);
