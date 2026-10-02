@@ -29,6 +29,7 @@
     "silero:fetch": "node scripts/fetch-silero-onnx.ts",
     "silero:extract": "node scripts/extract-silero-weights.ts",
     "parity": "node scripts/fetch-silero-onnx.ts && node scripts/silero-parity.ts",
+    "vad-eval": "node scripts/vad-eval.ts",
     "verify": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test"
   },
   "devDependencies": {

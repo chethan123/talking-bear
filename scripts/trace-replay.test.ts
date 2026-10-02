@@ -7,7 +7,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { mulberry32 } from '../test/dsp-helpers.ts';
 import { readWav } from '../test/wav.ts';
 import type { WorkerToMain } from '../src/audio/messages.ts';
-import { ENERGY_HOP, VAD_FRAME, VOICING_WINDOW } from '../src/audio/constants.ts';
+import { ENERGY_HOP, PROXIMITY_DB, VAD_FRAME, VOICING_WINDOW } from '../src/audio/constants.ts';
 import { createGateFilter, frameDb } from '../src/dsp/energy-gate.ts';
 import { createSilero, type SileroModel } from '../src/dsp/silero/model.ts';
 import { decodeWeights } from '../src/dsp/silero/weights.ts';
@@ -15,6 +15,7 @@ import { createVoicing } from '../src/dsp/voicing.ts';
 import { decodeTrace, encodeTrace, type TraceMeta, type TraceStreams } from '../src/vad-trace/format.ts';
 import { VadCore } from '../src/workers/vad-core.ts';
 import { loadTrace, replayTrace, traceTruth } from './trace-replay.ts';
+import { runVadCore } from './vad-eval.ts';
 import type { Segment } from './vad-metrics.ts';
 
 const CTX = 48_000;
@@ -291,6 +292,11 @@ function equivalenceScene(): Float32Array {
     speech('word-00-r0.wav'),
     gap(2),
   ];
+  return withBed(parts, rng);
+}
+
+/** The parts end to end, plus a low uniform noise bed (≈ −60 dBFS band-limited) drawn from rng. */
+function withBed(parts: readonly Float32Array[], rng: () => number): Float32Array {
   const out = new Float32Array(parts.reduce((n, p) => n + p.length, 0));
   let at = 0;
   for (const p of parts) {
@@ -336,7 +342,12 @@ function toTrace(x: Float32Array, model: SileroModel): { meta: TraceMeta; stream
 }
 
 /** VadCore's segments for x in one listen (epoch 1, firstFrame i·1536). */
-function vadCoreSegments(x: Float32Array, backend: 'silero' | 'energy', model: SileroModel): Segment[] {
+function vadCoreSegments(
+  x: Float32Array,
+  backend: 'silero' | 'energy',
+  model: SileroModel,
+  proximityDb = EQUIV_X,
+): Segment[] {
   const out: Segment[] = [];
   let open = Number.NaN;
   const post = (m: WorkerToMain): void => {
@@ -354,7 +365,7 @@ function vadCoreSegments(x: Float32Array, backend: 'silero' | 'energy', model: S
   };
   const core = new VadCore(CTX, post, { now: () => 0 });
   core.setModel(model);
-  core.reset(1, backend, undefined, false, EQUIV_X);
+  core.reset(1, backend, undefined, false, proximityDb);
   for (let i = 0; i + VAD_FRAME <= x.length; i += VAD_FRAME) {
     core.frame(1, (i / VAD_FRAME) * FRAME_CTX, x.subarray(i, i + VAD_FRAME));
   }
@@ -379,5 +390,85 @@ describe('replayTrace matches VadCore on real speech', () => {
     expect(want.filter((s) => s.reason === 'silence').length).toBeGreaterThanOrEqual(2);
     expect(want.some((s) => s.reason === 'misfire')).toBe(true);
     expect(replayTrace(trace.meta, trace.streams, { backend: 'energy' }).segments).toEqual(want);
+  });
+});
+
+/** A VadCore that records the arguments of every `reset`. */
+class SpyCore extends VadCore {
+  readonly resets: unknown[][] = [];
+  override reset(...args: Parameters<VadCore['reset']>): void {
+    this.resets.push(args);
+    super.reset(...args);
+  }
+}
+
+/** Cooldown (250 ms) plus onset block (100 ms) at 48 kHz: the least gap between an end and the next start. */
+const REARM_SPACING = 12_000 + 4800;
+
+describe('runVadCore (the corpus runner: re-armed 250 ms after every end or misfire)', () => {
+  const model = shippedModel();
+  const x = equivalenceScene();
+
+  it.each([
+    ['silero', ['silence', 'silence', 'silence']],
+    ['energy', ['silence', 'silence', 'misfire', 'silence']],
+  ] as const)('%s: one listen up to the first end, then one listen per segment', (backend, reasons) => {
+    const one = vadCoreSegments(x, backend, model, PROXIMITY_DB);
+    const { segments, durationFrames } = runVadCore(x, backend, model);
+    expect(one.map((s) => s.reason)).toEqual(reasons);
+    expect(segments.map((s) => s.reason)).toEqual(reasons);
+    // Identical until the first re-arm; after it the LSTM (Silero) and the hop grid (energy) restart, so later
+    // frames may differ from one listen by a few frames.
+    expect(segments[0]).toEqual(one[0]);
+    for (let i = 1; i < segments.length; i++) {
+      expect(segments[i]!.startFrame).toBeGreaterThanOrEqual(segments[i - 1]!.endFrame + REARM_SPACING);
+    }
+    expect(durationFrames).toBe(Math.floor(x.length / VAD_FRAME) * FRAME_CTX);
+  });
+
+  it('skips the cooldown after an end and re-arms with the floor of the last floorSnapshot', () => {
+    // A sentence, then a second one starting 0.65 s after the first's speech ends: in one listen it starts at
+    // 164352, inside the 250 ms cooldown after the first end (159744).
+    const y = withBed(
+      [gap(1), speech('sentence-00-r0.wav'), gap(0.65), speech('sentence-01-r0.wav'), gap(2)],
+      mulberry32(7),
+    );
+    expect(vadCoreSegments(y, 'silero', model, PROXIMITY_DB).map((s) => [s.startFrame, s.endFrame])).toEqual([
+      [50688, 159744],
+      [164352, expect.any(Number)],
+    ]);
+    const spies: SpyCore[] = [];
+    const posts: WorkerToMain[] = [];
+    const { segments } = runVadCore(y, 'silero', model, {
+      createCore: (rate, post) => {
+        const spy = new SpyCore(
+          rate,
+          (m) => {
+            posts.push(m);
+            post(m);
+          },
+          { now: () => 0 },
+        );
+        spies.push(spy);
+        return spy;
+      },
+    });
+    // Frames before 172032 (the first at or after 159744 + 12000) are not fed; the listen re-armed there blocks
+    // onsets until 176832, so the second segment starts at the next frame, 178176.
+    expect(segments.map((s) => [s.startFrame, s.reason])).toEqual([
+      [50688, 'silence'],
+      [178176, 'silence'],
+    ]);
+    // One floorSnapshot per listen (at its start); each re-arm restores the previous listen's. The third listen
+    // is armed 250 ms after the second end and hears only the trailing bed.
+    const floors = posts.flatMap((m) => (m.t === 'floorSnapshot' ? [[m.epoch, m.floorDb]] : []));
+    expect(floors.map(([epoch]) => epoch)).toEqual([1, 2]);
+    expect(floors.every(([, db]) => Number.isFinite(db))).toBe(true);
+    expect(spies).toHaveLength(1);
+    expect(spies[0]!.resets).toEqual([
+      [1, 'silero', undefined, false],
+      [2, 'silero', floors[0]![1], false],
+      [3, 'silero', floors[1]![1], false],
+    ]);
   });
 });
