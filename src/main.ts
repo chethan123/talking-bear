@@ -1,7 +1,9 @@
-// Bootstrap and wiring (plan §3.3, §7 M1, §7 M3): platform services, the settings store, the audio engine,
-// the session store, the M1 placeholder UI (canvas circle + text overlays) and the M3 settings sheet, with
-// `data-state` on main#app for hook-free smoke tests (plan §4.9.3).
+// Bootstrap and wiring (plan §3.3, §7 M1, §7 M3, §7 M4): platform services, the settings store, the audio
+// engine, the session store, the bear (BearView: Juni on the canvas stage, driven by the session's `anim` effects
+// and the replay's processed envelope), the M1 text overlays and the M3 settings sheet, with `data-state` on
+// main#app for hook-free smoke tests (plan §4.9.3).
 import './ui/styles.css';
+import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
 import type { Overlay, SessionState, StateName } from './app/events.ts';
 import { realClock } from './app/clock.ts';
 import { initialSessionState, overlayFor } from './app/machine.ts';
@@ -13,7 +15,7 @@ import { createSfx, M1_SYNTHS } from './audio/sfx.ts';
 import { createMicPermission } from './platform/permissions.ts';
 import { createVisibility } from './platform/visibility.ts';
 import { createWakeLock } from './platform/wake-lock.ts';
-import { mountCircle } from './ui/circle.ts';
+import { mountDebugOverlay } from './ui/debug-overlay.ts';
 import { mountOverlay } from './ui/overlay.ts';
 import { mountSettingsSheet } from './ui/settings-sheet.ts';
 
@@ -60,6 +62,8 @@ async function boot(): Promise<void> {
 
   const permission0 = await permission.query();
   let showOverlay: (o: Overlay) => void = noop;
+  // The bear exists once the UI is mounted below; the session emits no effect before its first event.
+  let bear: BearView | null = null;
   session = createSession(initialSessionState(permission0), {
     engine,
     makePlayer: createPlayer,
@@ -68,6 +72,8 @@ async function boot(): Promise<void> {
     visibility,
     permission,
     clock,
+    onAnim: (ev) => bear?.onAnim(ev),
+    onPlayStarted: (id, startCtxTime) => bear?.onPlayStarted(id, startCtxTime),
     onUi: (o) => showOverlay(o),
   });
 
@@ -75,25 +81,38 @@ async function boot(): Promise<void> {
   // before the UI is mounted, so no pointer input can reach the session before the hooks are listening.
   if (import.meta.env.VITE_BEAR_TEST_HOOKS === '1') {
     const { installTestHooks } = await import('./test-hooks.ts');
-    installTestHooks({ session, engine, visibility });
+    installTestHooks({ session, engine, visibility, bear: () => bear });
   }
 
   const s = session;
-  // Settings (plan §7 M3): the voice preset goes to the reducer now and on every change, and Quiet mode to
-  // the engine on every change. The sheet writes the store and also sets Quiet itself; a repeated setQuiet
-  // is idempotent.
-  s.dispatch({ t: 'settingsChanged', preset: presetFor(settings.get()) });
-  settings.subscribe((st) => {
-    s.dispatch({ t: 'settingsChanged', preset: presetFor(st) });
-    engine.setQuiet(st.quietMode);
-  });
-
-  const circle = mountCircle(app, {
+  // The bear (plan §7 M4) is the stage: mounted first, so the overlays and the sheet sit above it. Its pointer
+  // input keeps the M1 tap behaviour. `?L=<ms>` overrides the display-latency constant for X-A2.
+  const view = mountBearView(app, {
     visibility,
     now: () => clock.now(),
     state: () => s.state().name,
     dispatch: (e) => s.dispatch(e),
+    engine,
+    seed: Math.floor(Math.random() * 2 ** 32),
+    latencyMs: latencyFromQuery(location.search),
   });
+  bear = view;
+  // Reduced motion (plan §4.6.6): the OS setting or the parent's Gentle mode.
+  const motion = matchMedia('(prefers-reduced-motion: reduce)');
+  const applyMotion = (): void => view.setReducedMotion(motion.matches || settings.get().gentleMode);
+  applyMotion();
+  motion.addEventListener('change', applyMotion);
+
+  // Settings (plan §7 M3): the voice preset goes to the reducer now and on every change, Quiet mode to the
+  // engine and Gentle mode to the bear on every change. The sheet writes the store and also sets Quiet itself;
+  // a repeated setQuiet is idempotent.
+  s.dispatch({ t: 'settingsChanged', preset: presetFor(settings.get()) });
+  settings.subscribe((st) => {
+    s.dispatch({ t: 'settingsChanged', preset: presetFor(st) });
+    engine.setQuiet(st.quietMode);
+    applyMotion();
+  });
+
   showOverlay = mountOverlay(app, (e) => s.dispatch(e));
   mountSettingsSheet(app, {
     store: settings,
@@ -101,20 +120,21 @@ async function boot(): Promise<void> {
     state: () => s.state().name,
   });
 
+  // Developer overlay (plan §7 M2, M4): the frame loop's p95 frame time and fps.
+  if (new URLSearchParams(location.search).get('debug') === '1') {
+    mountDebugOverlay(app, { frameStats: (out) => view.frameStats(out), clock });
+  }
+
   let shown: StateName | null = null;
   const render = (st: SessionState): void => {
     if (st.name === shown) return;
     shown = st.name;
     app.dataset.state = st.name;
-    circle.setState(st.name);
   };
   // The initial state produces no `ui` effect and no subscriber call.
   render(s.state());
   showOverlay(overlayFor(s.state()));
   s.subscribe(render);
-  s.subscribeLevel((e) => {
-    if (e.t === 'level') circle.setLevel(e.db);
-  });
 }
 
 void boot();

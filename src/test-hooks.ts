@@ -9,7 +9,11 @@
 // - The output tap: after the first `ctxRunning`, a `test-tap` AudioWorkletNode goes between the master bus
 //   and `destination`; the last 15 s of what it saw are kept in a preallocated ring. Test-only: the samples
 //   are never stored or downloaded (plan Q2), only handed to the spec that asks for them.
+// - The bear (#81): `showPose` renders one key pose for the full-app screenshots, and `frameLog` returns the
+//   bear's X-A2 frame log (rAF time, mouth clip time, envelope index per drawn frame).
 
+import type { BearView, FrameLogEntry } from './anim/bear-view.ts';
+import { POSES, type PoseName } from './anim/poses.ts';
 import type { Effect, SessionEvent, StateName } from './app/events.ts';
 import type { Session } from './app/session.ts';
 import tapUrl from './audio/test-tap.worklet.ts?worker&url';
@@ -48,6 +52,14 @@ export interface BearTestApi {
   outputSamples(): number[];
   /** The sample rate of outputSamples(): the AudioContext's rate, or NaN before there is a context. */
   outputSampleRate(): number;
+  /**
+   * Stops the bear's frame loop and renders key pose `POSES[name]` once, on a canvas of `cssWidth × cssHeight`
+   * CSS px (default 500 × 700) at DPR 1, with the design box fitted and centred. Throws for an unknown name or
+   * before the bear is mounted.
+   */
+  showPose(name: string, opts?: { cssWidth?: number; cssHeight?: number }): void;
+  /** The bear's last 600 drawn frames, oldest first; [] before the bear is mounted. */
+  frameLog(): FrameLogEntry[];
 }
 
 declare global {
@@ -60,6 +72,16 @@ export interface TestHookDeps {
   session: Session;
   engine: Pick<Engine, 'context'> & OutputTapHost;
   visibility: Visibility;
+  /** The bear, once main.ts has mounted it (after the hooks are installed). */
+  bear: () => Pick<BearView, 'showPose' | 'frameLog'> | null;
+}
+
+/** Default canvas size of `showPose`: the renderer screenshots' 500 × 700 CSS px (#75). */
+const POSE_CSS_WIDTH = 500;
+const POSE_CSS_HEIGHT = 700;
+
+function isPoseName(name: string): name is PoseName {
+  return Object.hasOwn(POSES, name);
 }
 
 /** Seconds of tap output kept. */
@@ -174,6 +196,13 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
     },
     outputSamples: () => (ring === null ? [] : ring.trimmed()),
     outputSampleRate: () => engine.context()?.sampleRate ?? Number.NaN,
+    showPose(name, opts) {
+      if (!isPoseName(name)) throw new Error(`showPose: unknown pose ${name}`);
+      const bear = deps.bear();
+      if (bear === null) throw new Error('showPose: the bear is not mounted yet');
+      bear.showPose(POSES[name], opts?.cssWidth ?? POSE_CSS_WIDTH, opts?.cssHeight ?? POSE_CSS_HEIGHT);
+    },
+    frameLog: () => deps.bear()?.frameLog() ?? [],
   };
   window.__bearTest = api;
   return api;
