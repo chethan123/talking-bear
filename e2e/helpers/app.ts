@@ -3,6 +3,7 @@ import { expect, test, type Page } from '@playwright/test';
 import type { Effect, SessionEvent, StateName } from '../../src/app/events.ts';
 import { PRESETS } from '../../src/dsp/types.ts';
 import { yinF0 } from '../../src/dsp/yin.ts';
+import { SILERO_NOT_READY_MESSAGE } from '../../src/workers/vad-core.ts';
 import { expectNoEnforcedViolations, installCspRecorder } from './csp';
 
 // Shared helpers for the e2e specs (plan §4.9.3, §7 M1, §7 M3), on top of the e2e test hooks, window.__bearTest
@@ -26,7 +27,16 @@ export interface Step extends LogEntry {
   e: SessionEvent;
 }
 
-interface BearTestHooks {
+/** A VAD backend `__bearTest.setVadBackend` can pin (src/audio/engine.ts `VadBackend`). */
+export type VadBackend = 'silero' | 'energy';
+
+/** A `__bearTest.workerEvents` event: the worker's VAD status, as the engine forwards it (src/audio/engine.ts). */
+export type WorkerEvent =
+  | { t: 'vadReady'; backend: 'silero' }
+  | { t: 'vadStats'; p95Ms: number }
+  | { t: 'vadError'; message: string };
+
+export interface BearTestHooks {
   log: LogEntry[];
   events: { t: number; e: SessionEvent }[];
   state(): StateName;
@@ -34,6 +44,9 @@ interface BearTestHooks {
   maxLevelDb(sinceMs: number): number;
   outputSamples(): number[];
   outputSampleRate(): number;
+  setVadBackend(b: VadBackend): void;
+  vadBackend(): VadBackend;
+  workerEvents: { t: number; e: WorkerEvent }[];
 }
 
 declare global {
@@ -103,9 +116,27 @@ export interface Woke {
   at: number;
 }
 
+/** What `wake` sets up before the tap. */
+export interface WakeOptions {
+  /**
+   * Pins the VAD backend (`__bearTest.setVadBackend`) after boot and before the tap, so every arm uses it. The
+   * default is the app's, DEFAULT_VAD_BACKEND (Silero); specs whose synthetic fixtures Silero doesn't treat as
+   * speech pin 'energy' (issue #51).
+   */
+  vad?: VadBackend;
+}
+
 /** Opens the app (CSP recorder first), taps it awake and waits up to 10 s for Listening. */
-export async function wake(page: Page): Promise<Woke> {
+export async function wake(page: Page, opts: WakeOptions = {}): Promise<Woke> {
   await openApp(page);
+  const { vad } = opts;
+  if (vad !== undefined) {
+    await page.evaluate((b) => {
+      const h = window.__bearTest;
+      if (h === undefined) throw new Error('window.__bearTest is missing');
+      h.setVadBackend(b);
+    }, vad);
+  }
   await tapToWake(page);
   await expect(page.locator(APP)).toHaveAttribute('data-state', 'Listening', { timeout: 10_000 });
   const at = Date.now();
@@ -333,37 +364,53 @@ function readSidecar(fixture: string): Sidecar {
   throw new Error(`${url.pathname}: expected { sampleRate, speech: [{ start, end }], f0? }`);
 }
 
+/** expectLoop's per-fixture expectations; the defaults are the vowel fixtures'. */
+export interface LoopOptions extends WakeOptions {
+  /** The fixture's speech span in seconds (its sidecar must agree); default 1.5. */
+  speechSec?: number;
+  /** The replay's f0 tolerance, relative to f0 × p; default 0.03 (±3 %). */
+  f0Tolerance?: number;
+  /** The VAD's speech span tolerance against the sidecar's, in seconds; default 0.13. */
+  vadToleranceSec?: number;
+}
+
 /**
- * One full loop on a vowel fixture (the `loop-*` specs): wake, a non-silent mic, the loop's state changes
- * within 15 s, the replay length within processVoice's bounds, the VAD's speech span against the fixture's,
- * the replay's pitch and peak, and no `arm` while gated. `f0` is the fixture's vowel f0 in Hz (its sidecar must
- * agree).
+ * One full loop on a fixture (the `loop-*` specs): wake, a non-silent mic, the loop's state changes within
+ * 15 s, the replay length within processVoice's bounds, the VAD's speech span against the fixture's, the
+ * replay's pitch and peak, and no `arm` while gated. `f0` is the fixture's f0 in Hz (its sidecar must agree).
  */
-export async function expectLoop(page: Page, fixture: string, f0: number): Promise<void> {
+export async function expectLoop(
+  page: Page,
+  fixture: string,
+  f0: number,
+  opts: LoopOptions = {},
+): Promise<void> {
+  const { speechSec: wantSpeechSec = 1.5, f0Tolerance = 0.03, vadToleranceSec = 0.13, vad } = opts;
   const meta = readSidecar(fixture);
   expect(meta.f0, `${fixture}.json f0`).toBe(f0);
   expect(meta.speech, `${fixture}.json: one speech span`).toHaveLength(1);
   const speechSec = (meta.speech[0]!.end - meta.speech[0]!.start) / meta.sampleRate;
-  expect(speechSec, `${fixture}.json: speech length`).toBe(1.5);
+  expect(speechSec, `${fixture}.json: speech length`).toBe(wantSpeechSec);
 
   // 1–2. Wake, a non-silent mic, then one loop within 15 s of wake.
-  const woke = await wake(page);
+  const woke = await wake(page, vad === undefined ? {} : { vad });
   await expectMicSignal(page);
   const ended = await waitForLoop(page, woke, 15_000);
 
   // 3. The replay's length: the take trimmed by processVoice, then divided by p (issue #66).
   const take = await lastTake(page);
-  expect(take.reason, 'the vowel ended in silence').toBe('silence');
+  expect(take.reason, 'the speech ended in silence').toBe('silence');
   const processed = await processedDuration(page);
   expectProcessedDuration(processed, take, speechSec, PITCH_RATIO);
 
-  // 4. VAD accuracy against the fixture (energy backend: 10 ms hops; the margin covers the fade envelope).
+  // 4. VAD accuracy against the fixture: a flat margin, by default the energy backend's (10 ms hops; it covers
+  // the vowels' fade envelope).
   const vadSec = (take.lastSpeechFrame - take.startFrame) / take.sr;
   expect(Math.abs(vadSec - speechSec), `VAD speech ${vadSec} s, fixture ${speechSec} s`).toBeLessThanOrEqual(
-    0.13,
+    vadToleranceSec,
   );
 
-  // 5. The replay's pitch: the vowel's f0 × p, ±3 %.
+  // 5. The replay's pitch: the fixture's f0 × p, within f0Tolerance.
   const { samples, rate } = await page.evaluate(() => {
     const h = window.__bearTest;
     if (h === undefined) throw new Error('window.__bearTest is missing');
@@ -375,7 +422,7 @@ export async function expectLoop(page: Page, fixture: string, f0: number): Promi
   expect(
     Math.abs(outF0 - wantF0) / wantF0,
     `yinF0(outputSamples()) = ${outF0} Hz, want ${wantF0} Hz`,
-  ).toBeLessThanOrEqual(0.03);
+  ).toBeLessThanOrEqual(f0Tolerance);
 
   // 6. The replay's sample peak at the output tap, after the master gain and Quiet mode.
   const peak = peakDbfs(samples);
@@ -398,4 +445,58 @@ export async function expectLoop(page: Page, fixture: string, f0: number): Promi
       `loop ${((all[ended]!.t - woke.logT) / 1000).toFixed(2)} s`,
     ].join('; '),
   );
+}
+
+/**
+ * Issue #51 Validation 2: the last take's segment came from the Silero backend.
+ * - The take was armed asking for Silero (`__bearTest.vadBackend()`: no spec pinned 'energy').
+ * - An epoch that asks for Silero before the worker has its model runs on energy, and the worker says so once
+ *   with `vadError` SILERO_NOT_READY_MESSAGE; if that epoch is still idle when the model arrives, it switches to
+ *   Silero, before the worker posts `vadReady` (#46). Any other `vadError` (`silero failed: …`) leaves the epoch
+ *   on energy. So between the take's arm and its `seg` start (by `t`) there may be no `vadError` except a
+ *   not-ready error followed by a `vadReady` before that start, and some `vadReady` must precede the start.
+ * The window opens at the step whose effects include that arm, not at its `armed` event: the worker's error can
+ * arrive before the worklet's `armed`.
+ */
+export async function expectSileroTake(page: Page): Promise<void> {
+  const { armedWith, workerEvents } = await page.evaluate(() => {
+    const h = window.__bearTest;
+    if (h === undefined) throw new Error('window.__bearTest is missing');
+    return { armedWith: h.vadBackend(), workerEvents: h.workerEvents };
+  });
+  expect(armedWith, 'the backend the take was armed with').toBe('silero');
+  const all = await steps(page);
+  const endAt = all.findLastIndex((s) => s.from === 'Recording' && s.to === 'Processing');
+  const startAt = all.findLastIndex((s, i) => i < endAt && s.from === 'Listening' && s.to === 'Recording');
+  const start = all[startAt];
+  if (start?.e.t !== 'seg' || start.e.ev.kind !== 'start') {
+    throw new Error(
+      `no seg start moved Listening → Recording before the last take; state changes: ${pathOf(all)}`,
+    );
+  }
+  const { epoch } = start.e;
+  const armedAt = all.findLastIndex((s, i) => i < startAt && s.e.t === 'armed' && s.e.epoch === epoch);
+  const armAt = all.findLastIndex((s, i) => i < armedAt && s.effects.includes('arm'));
+  const arm = all[armAt];
+  if (armedAt < 0 || arm === undefined) throw new Error(`no arm effect and armed event for epoch ${epoch}`);
+  const ready = workerEvents.filter((w) => w.e.t === 'vadReady').map((w) => w.t);
+  const errors: { t: number; message: string }[] = [];
+  for (const w of workerEvents) {
+    if (w.e.t === 'vadError' && w.t >= arm.t && w.t <= start.t) errors.push({ t: w.t, message: w.e.message });
+  }
+  const failing = errors.filter(
+    (err) => err.message !== SILERO_NOT_READY_MESSAGE || !ready.some((t) => t > err.t && t <= start.t),
+  );
+  console.log(
+    `silero take: epoch ${epoch}, arm at ${arm.t.toFixed(1)} ms, seg start at ${start.t.toFixed(1)} ms; ` +
+      `vadReady at ${ready.map((t) => t.toFixed(1)).join(', ') || 'never'} ms; ${errors.length} vadError(s) in between`,
+  );
+  expect(
+    failing.map((err) => `${err.t.toFixed(1)} ms: ${err.message}`),
+    `vadErrors between the arm and the seg start, other than '${SILERO_NOT_READY_MESSAGE}' recovered by a vadReady before the start`,
+  ).toEqual([]);
+  expect(
+    ready.some((t) => t <= start.t),
+    'a vadReady before the seg start',
+  ).toBe(true);
 }
