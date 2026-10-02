@@ -152,10 +152,15 @@ async function boot(): Promise<void> {
     },
   });
 
-  // Developer overlay (plan §7 M2, M4, M6): the frame loop's p95 frame time and fps, and storage persistence
-  // and usage.
+  // Developer overlay (plan §7 M2, M4, M6): the frame loop's p95 frame time and fps, storage persistence and
+  // usage, and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted).
   if (new URLSearchParams(location.search).get('debug') === '1') {
-    mountDebugOverlay(app, { frameStats: (out) => view.frameStats(out), clock, storage });
+    mountDebugOverlay(app, {
+      frameStats: (out) => view.frameStats(out),
+      clock,
+      storage,
+      vad: { engine, session: s },
+    });
   }
 
   let shown: StateName | null = null;

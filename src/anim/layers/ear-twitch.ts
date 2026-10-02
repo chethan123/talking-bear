@@ -48,13 +48,19 @@ function checkIndex(i: number, name: string): void {
   if (!Number.isInteger(i) || i < 0) throw new RangeError(`${name} must be an integer >= 0`);
 }
 
+// The doubles kept between updates live in a `Float64Array`, one slot each: V8's mid tier boxes a double written to
+// a class field as a new heap number on every write (#214).
+/** Seconds until the next twitch. */
+const WAIT = 0;
+/** Seconds since the latest twitch's scheduled time. */
+const SINCE = 1;
+
 class EarTwitch implements EarTwitchLayer {
   readonly #earL: number;
   readonly #earR: number;
   #primed = false;
-  /** Seconds until the next twitch. */
-  #wait = 0;
-  #since = Number.POSITIVE_INFINITY;
+  /** The doubles kept between updates, by slot. */
+  readonly #s = new Float64Array(2);
   #count = 0;
   #right = 0;
 
@@ -63,6 +69,7 @@ class EarTwitch implements EarTwitchLayer {
     checkIndex(springs.earR, 'earR');
     this.#earL = springs.earL;
     this.#earR = springs.earR;
+    this.#s[SINCE] = Number.POSITIVE_INFINITY;
   }
 
   get count(): number {
@@ -74,25 +81,26 @@ class EarTwitch implements EarTwitchLayer {
   }
 
   get sinceTwitch(): number {
-    return this.#since;
+    return this.#s[SINCE]!;
   }
 
   update(dt: number, pose: Pose, ctx: AnimContext): void {
     const rng = ctx.rng;
     const springs = ctx.springs;
+    const s = this.#s;
     if (this.#earL >= springs.pos.length || this.#earR >= springs.pos.length) {
       throw new RangeError('ear spring index out of range');
     }
     if (!this.#primed) {
       this.#primed = true;
-      this.#wait = uniform(rng, EAR_TWITCH_MIN, EAR_TWITCH_MAX);
+      s[WAIT] = uniform(rng, EAR_TWITCH_MIN, EAR_TWITCH_MAX);
     }
-    this.#since += dt;
-    this.#wait -= dt;
-    if (this.#wait <= 0) {
-      this.#since = -this.#wait;
+    s[SINCE] = s[SINCE]! + dt;
+    s[WAIT] = s[WAIT]! - dt;
+    if (s[WAIT] <= 0) {
+      s[SINCE] = -s[WAIT];
       this.#count++;
-      this.#wait += uniform(rng, EAR_TWITCH_MIN, EAR_TWITCH_MAX);
+      s[WAIT] = s[WAIT] + uniform(rng, EAR_TWITCH_MIN, EAR_TWITCH_MAX);
       if (rng() < 0.5) {
         this.#right++;
         springs.impulse(this.#earR, EAR_TWITCH_DV);

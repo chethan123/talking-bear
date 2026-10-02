@@ -5,12 +5,16 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import type { AnimEvent } from '../app/events.ts';
+import type { RegionId } from '../input/region-ids.ts';
+import { REACTIONS } from '../reactions/table.ts';
+import type { Reaction } from '../reactions/table.ts';
 import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
+import { REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
-import { directorReduce, evaluate, initialDirector, mouthCloseScale } from './director.ts';
-import type { DirectorState, DirInput, DirState } from './director.ts';
+import { directorReduce, directorStep, evaluate, initialDirector, mouthCloseScale } from './director.ts';
+import type { DirectorState, DirInput, DirOut, DirState, GestureKind } from './director.ts';
 import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
 import type { Pose } from './pose.ts';
 
@@ -54,7 +58,7 @@ const KINDS: readonly AnimKind[] = Object.values(SAMPLES).map((ev) => ev.e);
 const CLIP_NAMES = ['wake', 'sleep', 'earTwitch', 'confused', 'shrug'] as const;
 type ClipName = (typeof CLIP_NAMES)[number];
 
-/** Issue #79 "Base mapping". Reacting and Sustained: a test-only representative (M4 never enters them). */
+/** Issue #79 "Base mapping"; Reacting and Sustained are Idle's (#91). */
 const BASE_OF_STATE: Record<DirState, BaseName> = {
   Asleep: 'asleep',
   Waking: 'idle',
@@ -70,7 +74,7 @@ const BASE_OF_STATE: Record<DirState, BaseName> = {
 /** The mouth channels, which only the mouth layer writes. */
 const MOUTH: readonly number[] = [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth];
 
-/** Plan decision D1: the outcome of every (state, event) pair. */
+/** Plan decision D1: the outcome of every (state, event) pair; #91 changed Reacting's and Sustained's idle and attentive. */
 const D1 = `
 state      wake    sleep   doze    idle  attentive  thinking  talk     talkEnd  confused earTwitch shrug reaction
 Asleep     Waking  =       =       Idle  =          =         =        =        clip     clip      clip  =
@@ -79,8 +83,8 @@ Idle       Waking  Asleep  Dozing  =     Attentive  =         =        =        
 Attentive  Waking  Asleep  =       Idle  =          Thinking  =        =        clip     clip      clip  =
 Thinking   Waking  Asleep  =       Idle  =          =         Talking  =        clip     clip      clip  =
 Talking    Waking  Asleep  =       Idle  =          =         =        Idle     clip     clip      clip  =
-Reacting   Waking  Asleep  =       Idle  =          =         =        =        clip     clip      clip  =
-Sustained  Waking  Asleep  =       Idle  =          =         =        =        clip     clip      clip  =
+Reacting   Waking  Asleep  =       =     Attentive  =         =        =        clip     clip      clip  =
+Sustained  Waking  Asleep  =       =     Attentive  =         =        =        clip     clip      clip  =
 Dozing     Waking  Asleep  =       Idle  Attentive  =         =        =        clip     clip      clip  =
 `;
 
@@ -125,6 +129,15 @@ function run(s: DirectorState, ...inputs: DirInput[]): DirectorState {
   return r;
 }
 
+/** The reaction fields of a director with no reaction history (`initialDirector`'s). */
+const NO_REACTION = {
+  reaction: null,
+  queued: null,
+  cooldowns: [],
+  repeats: [],
+  gentle: false,
+} as const satisfies Partial<DirectorState>;
+
 /**
  * A consistent state in `name` entered at `t0`: `prevBase` differs from `base` and its fade finished at
  * `t0 − 1`, so a transition that forgets to move `prevBase` or `fadeStart` shows. Waking plays its wake clip,
@@ -141,6 +154,7 @@ function stateIn(name: DirState, t0 = 10): DirectorState {
     clip: name === 'Waking' ? { name: 'wake', start: t0 } : null,
     talk: name === 'Talking' ? { id: 3, startCtxTime: null } : null,
     mouthCloseStart: name === 'Talking' ? null : t0 - 1,
+    ...NO_REACTION,
   };
 }
 
@@ -155,6 +169,12 @@ function variants(name: DirState): DirectorState[] {
 function deepFreeze(s: DirectorState): DirectorState {
   if (s.clip !== null) Object.freeze(s.clip);
   if (s.talk !== null) Object.freeze(s.talk);
+  if (s.reaction !== null) Object.freeze(s.reaction);
+  if (s.queued !== null) Object.freeze(s.queued);
+  for (const c of s.cooldowns) Object.freeze(c);
+  for (const e of s.repeats) Object.freeze(e);
+  Object.freeze(s.cooldowns);
+  Object.freeze(s.repeats);
   return Object.freeze(s);
 }
 
@@ -175,6 +195,11 @@ function expectedEnter(s: DirectorState, target: DirState, now: number): Directo
     clip,
     talk: target === 'Talking' ? { id: 7, startCtxTime: null } : null,
     mouthCloseStart: target === 'Talking' ? null : s.name === 'Talking' ? now : s.mouthCloseStart,
+    reaction: s.reaction,
+    queued: s.queued,
+    cooldowns: s.cooldowns,
+    repeats: s.repeats,
+    gentle: s.gentle,
   };
 }
 
@@ -184,8 +209,9 @@ function endOf(name: ClipName, start: number): number {
 }
 
 // ---- Validation 1: every edge of the plan §3.5 diagram that M4 covers ------------------------------------------
-// Not covered in M4 (reaction rules, M5 / #91): Idle → Reacting, Idle → Sustained, Reacting → Idle,
-// Sustained → Idle. Sources come from `stateIn`, where prevBase ≠ base, so each base change must move prevBase.
+// The reaction edges (Idle → Reacting, Idle → Sustained, Reacting → Idle, Sustained → Idle, Dozing → Idle on a
+// gesture) are tested under "#91" below. Sources come from `stateIn`, where prevBase ≠ base, so each base change
+// must move prevBase.
 describe('Validation 1: §3.5 diagram edges', () => {
   it('[*] → Asleep: initialDirector', () => {
     expect(initialDirector(2)).toStrictEqual({
@@ -197,6 +223,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
   });
 
@@ -210,6 +237,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'wake', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -226,6 +254,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -239,6 +268,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -252,6 +282,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -267,6 +298,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'earTwitch', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -280,6 +312,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: { id: 7, startCtxTime: null },
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
   });
 
@@ -293,6 +326,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 10.5,
+      ...NO_REACTION,
     });
   });
 
@@ -306,6 +340,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -319,6 +354,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -332,6 +368,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: null,
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -345,6 +382,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'wake', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -358,6 +396,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'sleep', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 
@@ -371,6 +410,7 @@ describe('Validation 1: §3.5 diagram edges', () => {
       clip: { name: 'sleep', start: 10.5 },
       talk: null,
       mouthCloseStart: 9,
+      ...NO_REACTION,
     });
   });
 });
@@ -434,6 +474,7 @@ describe('session sequences', () => {
       clip: { name: 'wake', start: 1 },
       talk: null,
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
     const wakeEnd = endOf('wake', 1);
     expect(directorReduce(s, tick(wakeEnd - 1e-9))).toBe(s);
@@ -469,6 +510,7 @@ describe('session sequences', () => {
       clip: null,
       talk: null,
       mouthCloseStart: null,
+      ...NO_REACTION,
     });
   });
 
@@ -975,5 +1017,1215 @@ describe('evaluate: no allocation (10 000 evaluations, heap growth < 1 MB)', () 
     });
     expect(kept).toHaveLength(N);
     expect(growth).toBeGreaterThanOrEqual(1_048_576);
+  });
+});
+
+// ==== #91: the reaction rules ===================================================================================
+/** The table's reaction `name`. */
+function R(name: string): Reaction {
+  const r = REACTIONS[name];
+  if (r === undefined) throw new Error(`no reaction ${name}`);
+  return r;
+}
+
+/** The director input for reaction `r` (a table name or a made-up reaction) on (region, gesture) at `now`. */
+function gest(
+  r: Reaction | string,
+  region: RegionId,
+  gesture: GestureKind,
+  now: number,
+  dirX?: -1 | 1,
+): DirInput {
+  const reaction = typeof r === 'string' ? R(r) : r;
+  return dirX === undefined
+    ? { k: 'gesture', r: reaction, region, gesture, now }
+    : { k: 'gesture', r: reaction, region, gesture, now, dirX };
+}
+const release = (now: number): DirInput => ({ k: 'release', now });
+/** The end of one contact's sustained gesture: `stroke end` or `longPress end` (Decision 16). */
+const releaseOf = (region: RegionId, gesture: GestureKind, now: number): DirInput => ({
+  k: 'release',
+  now,
+  region,
+  gesture,
+});
+const gentle = (on: boolean): DirInput => ({ k: 'setGentle', on });
+/** A nose tap down; the recogniser's multi-poke `count` ≥ 3 makes it a big sneeze (#90). */
+const noseTap = (now: number, count = 1): DirInput =>
+  gest(count >= 3 ? 'bigSneeze' : 'sneeze', 'nose', 'tap', now);
+const flick = (now: number): DirInput => gest('wobble', 'headTop', 'flick', now);
+const tickle = (now: number): DirInput => gest('giggle', 'belly', 'tickle', now);
+const petStroke = (now: number, dirX?: -1 | 1): DirInput => gest('pet', 'headTop', 'stroke', now, dirX);
+/** `n` belly tickles from `t0`, `stepMs` apart (the recogniser's tickle rate is one per 600 ms). */
+const tickles = (t0: number, n: number, stepMs = 600): DirInput[] =>
+  Array.from({ length: n }, (_, k) => tickle(t0 + (k * stepMs) / 1000));
+
+/** The session event the table's reaction `name` outputs with `sfx`. */
+function toSess(name: string, sfx: Reaction['sfx']): DirOut {
+  return { k: 'toSession', ev: { t: 'reaction', name, priority: R(name).priority, sfx } };
+}
+const TAP_HAPTIC: DirOut = { k: 'haptic', pattern: [12] };
+
+/** The reaction names of the `toSession` outputs. */
+function sessionNames(out: readonly DirOut[]): string[] {
+  return out.flatMap((o) => (o.k === 'toSession' ? [o.ev.name] : []));
+}
+
+/** Folds `directorStep` over `inputs` (checking `directorReduce` agrees), with every output. */
+function stepAll(s0: DirectorState, ...inputs: DirInput[]): { s: DirectorState; out: DirOut[] } {
+  let s = s0;
+  const out: DirOut[] = [];
+  for (const i of inputs) {
+    const r = directorStep(s, i);
+    expect(r.state, `directorReduce agrees on ${i.k}`).toStrictEqual(directorReduce(s, i));
+    s = r.state;
+    out.push(...r.out);
+  }
+  return { s, out };
+}
+
+/**
+ * Steps `s0` through `inputs` (each with a `now`, in order) with 120 Hz ticks at k/120 s between them, from the
+ * first input on to `until`; a tick at an input's time comes after it. Records every output and state with its time.
+ */
+function drive(
+  s0: DirectorState,
+  inputs: readonly DirInput[],
+  until: number,
+): { s: DirectorState; out: { at: number; o: DirOut }[]; states: { at: number; s: DirectorState }[] } {
+  let s = s0;
+  const out: { at: number; o: DirOut }[] = [];
+  const states: { at: number; s: DirectorState }[] = [];
+  const apply = (i: DirInput, at: number): void => {
+    const r = directorStep(s, i);
+    s = r.state;
+    for (const o of r.out) out.push({ at, o });
+    states.push({ at, s });
+  };
+  const times = inputs.map((i) => (i.k === 'setGentle' ? Number.NaN : i.now));
+  let k = Math.ceil(times[0]! * 120);
+  inputs.forEach((i, j) => {
+    while (k / 120 < times[j]!) apply(tick(k / 120), k++ / 120);
+    apply(i, times[j]!);
+  });
+  while (k / 120 <= until) apply(tick(k / 120), k++ / 120);
+  return { s, out, states };
+}
+
+/** `t` through `1 − smoothstep`: the ease-out weight of a released clip (#91). */
+const easeOut = (u: number): number => 1 - u * u * (3 - 2 * u);
+
+describe('#91 Validation 1: priority interruption and the queue', () => {
+  it('a P2 while a P3 is held is queued (no output) and starts when the P3 ends within 500 ms', () => {
+    const held = stepAll(stateIn('Idle'), gest('noseWrinkle', 'nose', 'longPress', 11));
+    expect(held.s).toMatchObject({ name: 'Sustained', since: 11, clip: { name: 'noseWrinkle', start: 11 } });
+    expect(held.out).toStrictEqual([toSess('noseWrinkle', null)]);
+    const queued = stepAll(held.s, gest('hardBlinkL', 'eyeL', 'tap', 12));
+    expect(queued.out).toStrictEqual([]);
+    expect(queued.s).toMatchObject({ name: 'Sustained', clip: { name: 'noseWrinkle', start: 11 } });
+    expect(queued.s.queued).toStrictEqual({
+      r: R('hardBlinkL'),
+      region: 'eyeL',
+      gesture: 'tap',
+      dirX: null,
+      at: 12,
+      announced: false,
+    });
+    const released = stepAll(queued.s, release(12.0625));
+    expect(released.out).toStrictEqual([]);
+    const end = 12.0625 + 0.4; // the P3 ends 400 ms after its release: 462.5 ms after the P2 was queued
+    expect(directorReduce(released.s, tick(end - 1e-9))).toBe(released.s);
+    const played = stepAll(released.s, tick(end));
+    expect(played.s).toMatchObject({
+      name: 'Reacting',
+      since: end,
+      clip: { name: 'hardBlinkL', start: end },
+      queued: null,
+    });
+    expect(played.s.reaction?.r).toBe(R('hardBlinkL'));
+    expect(played.out).toStrictEqual([toSess('hardBlinkL', 'hmph'), TAP_HAPTIC, { k: 'mood', annoy: 0.2 }]);
+  });
+
+  it('… and is dropped when the P3 ends more than 500 ms after it was queued', () => {
+    const s = stepAll(
+      stateIn('Idle'),
+      gest('noseWrinkle', 'nose', 'longPress', 11),
+      gest('hardBlinkL', 'eyeL', 'tap', 12),
+      release(12.25),
+    ).s;
+    expect(directorReduce(s, tick(12.5))).toBe(s); // 500 ms after queuing: still queued
+    const dropped = stepAll(s, tick(12.5 + 1e-9));
+    expect(dropped.s).toMatchObject({ name: 'Sustained', queued: null });
+    expect(dropped.out).toStrictEqual([]);
+    const ended = stepAll(dropped.s, tick(12.25 + 0.4));
+    expect(ended.s).toMatchObject({ name: 'Idle', reaction: null, clip: null, queued: null });
+    expect(ended.out).toStrictEqual([]);
+  });
+
+  it('a one-shot ends at its clip end: a P2 queued under a P4 starts then; one queued too early is dropped', () => {
+    const big = stepAll(stateIn('Idle'), noseTap(11, 3)).s;
+    expect(big.reaction?.r).toBe(R('bigSneeze'));
+    const end = 11 + REACTION_CLIPS.bigSneeze.duration;
+    const queued = stepAll(big, gest('cheekPuffL', 'cheekL', 'tap', end - 0.3)).s;
+    expect(queued.queued?.r).toBe(R('cheekPuffL'));
+    expect(directorReduce(queued, tick(end - 1e-9))).toBe(queued);
+    const played = stepAll(queued, tick(end));
+    expect(played.s).toMatchObject({
+      name: 'Reacting',
+      clip: { name: 'cheekPuffL', start: end },
+      queued: null,
+    });
+    expect(played.out).toStrictEqual([toSess('cheekPuffL', 'pop'), TAP_HAPTIC]);
+    const stale = stepAll(big, gest('cheekPuffL', 'cheekL', 'tap', end - 0.6), tick(end));
+    expect(stale.s).toMatchObject({ name: 'Idle', since: end, clip: null, reaction: null, queued: null });
+    expect(stale.out).toStrictEqual([]);
+  });
+
+  it('a P3 over a P2 interrupts it, and an equal priority interrupts too', () => {
+    const tap = stepAll(stateIn('Idle'), noseTap(11)).s;
+    expect(tap).toMatchObject({ name: 'Reacting', since: 11, clip: { name: 'sneeze', start: 11 } });
+    const p3 = stepAll(tap, gest('earDroopL', 'earL', 'longPress', 11.2));
+    expect(p3.s).toMatchObject({ name: 'Sustained', since: 11.2, clip: { name: 'earDroopL', start: 11.2 } });
+    expect(p3.s.reaction?.r).toBe(R('earDroopL'));
+    expect(p3.out).toStrictEqual([toSess('earDroopL', 'purr')]);
+    const p2 = stepAll(tap, gest('bellyBoing', 'belly', 'tap', 11.1));
+    expect(p2.s).toMatchObject({ name: 'Reacting', since: 11.1, clip: { name: 'bellyBoing', start: 11.1 } });
+    expect(p2.out).toStrictEqual([toSess('bellyBoing', 'boingHehe'), TAP_HAPTIC]);
+  });
+
+  it('a newer queued reaction replaces the queued one (queue length 1)', () => {
+    const s = stepAll(
+      stateIn('Idle'),
+      gest('bellyRub', 'belly', 'longPress', 11),
+      noseTap(11.2),
+      gest('cheekPuffR', 'cheekR', 'tap', 11.3),
+    ).s;
+    expect(s.queued).toMatchObject({ r: R('cheekPuffR'), at: 11.3 });
+    expect(s.reaction?.r).toBe(R('bellyRub'));
+  });
+
+  it('hug (P4) interrupts a running dizzy or laugh fit; an all-over giggle (P3) is queued behind a hug', () => {
+    const dizzy = stepAll(stateIn('Idle'), flick(11), flick(12), flick(13)).s;
+    expect(dizzy.reaction?.r).toBe(R('dizzy'));
+    const hug = stepAll(dizzy, gest('hug', 'belly', 'hug', 13.5));
+    expect(hug.s).toMatchObject({ name: 'Sustained', since: 13.5, clip: { name: 'hug', start: 13.5 } });
+    expect(hug.out).toStrictEqual([toSess('hug', 'squeal'), { k: 'mood', joy: 0.2 }]);
+    const laugh = stepAll(stateIn('Idle'), ...tickles(11, 7)).s;
+    expect(laugh.reaction?.r).toBe(R('laughFit'));
+    expect(stepAll(laugh, gest('hug', 'belly', 'hug', 15)).s.reaction?.r).toBe(R('hug'));
+    const allOver = stepAll(hug.s, gest('giggle', 'belly', 'allOver', 14));
+    expect(allOver.out).toStrictEqual([]);
+    expect(allOver.s.reaction?.r).toBe(R('hug'));
+    expect(allOver.s.queued?.r).toBe(R('giggle'));
+  });
+});
+
+describe('#91 Validation 2: cooldown (800 ms per region and gesture kind)', () => {
+  it('a second tap on the nose within 800 ms produces no output and changes nothing', () => {
+    const first = stepAll(stateIn('Idle'), noseTap(11));
+    expect(first.out).toStrictEqual([toSess('sneeze', 'sneeze'), TAP_HAPTIC]);
+    for (const t of [11.1, 11.5, 11 + 0.8 - 1e-9]) {
+      const r = directorStep(first.s, noseTap(t, 2));
+      expect(r.out, `${t}`).toStrictEqual([]);
+      expect(r.state, `${t}`).toBe(first.s);
+    }
+    const later = directorStep(first.s, noseTap(11 + 0.8, 2));
+    expect(later.out).toStrictEqual([toSess('sneeze', 'sneeze'), TAP_HAPTIC]);
+    expect(later.state.clip).toStrictEqual({ name: 'sneeze', start: 11 + 0.8 });
+  });
+
+  it('is per (region, gesture kind): another gesture on the same region, or another region, plays', () => {
+    const s = stepAll(stateIn('Idle'), gest('tuftBoing', 'headTop', 'tap', 11)).s;
+    expect(stepAll(s, flick(11.2)).out[0]).toStrictEqual(toSess('wobble', 'whoa'));
+    expect(stepAll(s, noseTap(11.2)).out[0]).toStrictEqual(toSess('sneeze', 'sneeze'));
+  });
+
+  it('a queued reaction starts no cooldown; a reaction that starts does, and prunes expired ones', () => {
+    const s = stepAll(stateIn('Idle'), gest('bellyRub', 'belly', 'longPress', 11), noseTap(11.2)).s;
+    expect(s.cooldowns).toStrictEqual([{ region: 'belly', gesture: 'longPress', at: 11, priority: 3 }]);
+    const later = stepAll(s, release(11.3), tick(11.75), noseTap(12)).s;
+    expect(later.cooldowns).toStrictEqual([{ region: 'nose', gesture: 'tap', at: 12, priority: 2 }]);
+  });
+});
+
+describe('#91 Validation 3: escalation', () => {
+  it('3 head flicks within 3 s → dizzy (P4)', () => {
+    for (const ts of [
+      [11, 12, 13],
+      [11, 12.5, 14],
+    ]) {
+      const r = stepAll(stateIn('Idle'), ...ts.map(flick));
+      expect(sessionNames(r.out), ts.join(' ')).toStrictEqual(['wobble', 'wobble', 'dizzy']);
+      expect(r.out.at(-1)).toStrictEqual(toSess('dizzy', 'whoa'));
+      expect(r.s).toMatchObject({ name: 'Reacting', clip: { name: 'dizzy', start: ts[2] } });
+      expect(r.s.reaction?.r).toBe(R('dizzy'));
+    }
+  });
+
+  it('3 flicks spread over 3.5 s do not escalate', () => {
+    const r = stepAll(stateIn('Idle'), flick(11), flick(12.75), flick(14.5));
+    expect(sessionNames(r.out)).toStrictEqual(['wobble', 'wobble', 'wobble']);
+    expect(r.s.clip).toStrictEqual({ name: 'wobble', start: 14.5 });
+  });
+
+  it('after an escalation the count starts over', () => {
+    const r = stepAll(
+      stateIn('Idle'),
+      flick(11),
+      flick(12),
+      flick(13),
+      flick(16.6),
+      flick(17.5),
+      flick(18.4),
+    );
+    expect(sessionNames(r.out)).toStrictEqual(['wobble', 'wobble', 'dizzy', 'wobble', 'wobble', 'dizzy']);
+  });
+
+  it('belly tickles every 600 ms reach laughFit once the run exceeds 3 s, with the input at 3600 ms', () => {
+    const six = stepAll(stateIn('Idle'), ...tickles(11, 6));
+    expect(sessionNames(six.out)).toStrictEqual(['giggle']); // the input at 3000 ms: not longer than 3 s yet
+    expect(six.s).toMatchObject({ name: 'Sustained' });
+    expect(six.s.reaction?.r).toBe(R('giggle'));
+    const seven = stepAll(six.s, tickle(11 + 3.6));
+    expect(seven.out).toStrictEqual([
+      toSess('laughFit', 'giggle'),
+      { k: 'haptic', pattern: [8, 40, 8, 40, 8] },
+    ]);
+    expect(seven.s).toMatchObject({ name: 'Reacting', since: 14.6, clip: { name: 'laughFit', start: 14.6 } });
+    expect(seven.s.reaction?.r).toBe(R('laughFit'));
+  });
+
+  it('with a 900 ms gap in between, the run starts over: no laughFit until 3 s after the gap', () => {
+    const ts = [0, 600, 1200, 2100, 2700, 3300, 3900, 4500, 5100].map((ms) => 11 + ms / 1000);
+    const r = stepAll(stateIn('Idle'), ...ts.map(tickle));
+    expect(sessionNames(r.out)).toStrictEqual(['giggle']);
+    expect(r.s.reaction?.runStart).toBe(11 + 2100 / 1000);
+    expect(stepAll(r.s, tickle(11 + 5.7)).out[0]).toStrictEqual(toSess('laughFit', 'giggle'));
+  });
+
+  it('Gentle: neither escalates to its full clip; dizzyGentle and laughFitGentle play instead', () => {
+    const g = stepAll(stateIn('Idle'), gentle(true)).s;
+    expect(g.gentle).toBe(true);
+    const d = stepAll(g, flick(11), flick(12), flick(13));
+    expect(d.s.clip).toStrictEqual({ name: 'dizzyGentle', start: 13 });
+    expect(d.s.reaction?.clip).toBe('dizzyGentle');
+    const l = stepAll(g, ...tickles(11, 7));
+    expect(l.s.clip).toStrictEqual({ name: 'laughFitGentle', start: 14.6 });
+    expect(stepAll(g, gentle(true)).s).toBe(g);
+    expect(stepAll(g, gentle(false)).s).toStrictEqual({ ...g, gentle: false });
+  });
+
+  it('Gentle: gentle clips; bigSneeze plays bigSneezeGentle, hug its own clip; a target without one is skipped', () => {
+    const g = stepAll(stateIn('Idle'), gentle(true)).s;
+    expect(stepAll(g, noseTap(11)).s.clip?.name).toBe('sneezeGentle');
+    expect(stepAll(g, noseTap(11, 3)).s.clip?.name).toBe('bigSneezeGentle');
+    expect(stepAll(g, flick(11)).s.clip?.name).toBe('wobbleGentle');
+    expect(stepAll(g, gest('hug', 'belly', 'hug', 11)).s.clip?.name).toBe('hug');
+    expect(stepAll(g, petStroke(11)).s.clip?.name).toBe('pet');
+    // A made-up repeat escalation to hug, which has no gentle clip: skipped in Gentle mode (the base plays).
+    const toHug: Reaction = { ...R('wobble'), escalation: { to: 'hug', count: 3, withinMs: 3000 } };
+    const three = (s: DirectorState): DirOut[] =>
+      stepAll(s, ...[11, 12, 13].map((t) => gest(toHug, 'headTop', 'flick', t))).out;
+    expect(sessionNames(three(g))).toStrictEqual(['wobble', 'wobble', 'wobble']);
+    expect(sessionNames(three(stateIn('Idle')))).toStrictEqual(['wobble', 'wobble', 'hug']);
+  });
+
+  it('repeat-based defaults are ×3 within 4 s; an unknown target never escalates', () => {
+    const dflt: Reaction = { ...R('wobble'), escalation: { to: 'dizzy' } };
+    const at = (...ts: number[]): string[] =>
+      sessionNames(stepAll(stateIn('Idle'), ...ts.map((t) => gest(dflt, 'headTop', 'flick', t))).out);
+    expect(at(11, 12.5, 15)).toStrictEqual(['wobble', 'wobble', 'dizzy']);
+    expect(at(11, 13, 15.1)).toStrictEqual(['wobble', 'wobble', 'wobble']);
+    const unknown: Reaction = { ...R('wobble'), escalation: { to: 'nope', count: 2 } };
+    const u = stepAll(
+      stateIn('Idle'),
+      gest(unknown, 'headTop', 'flick', 11),
+      gest(unknown, 'headTop', 'flick', 12),
+    );
+    expect(sessionNames(u.out)).toStrictEqual(['wobble', 'wobble']);
+    const unknownRun: Reaction = { ...R('giggle'), escalation: { to: 'nope', continuousMs: 1000 } };
+    const ur = stepAll(
+      stateIn('Idle'),
+      ...[11, 11.6, 12.2].map((t) => gest(unknownRun, 'belly', 'tickle', t)),
+    );
+    expect(sessionNames(ur.out)).toStrictEqual(['giggle']);
+    // Without maxGapMs a run never restarts.
+    const noGap: Reaction = { ...R('giggle'), escalation: { to: 'laughFit', continuousMs: 1000 } };
+    const ng = stepAll(
+      stateIn('Idle'),
+      gest(noGap, 'belly', 'tickle', 11),
+      gest(noGap, 'belly', 'tickle', 12.5),
+    );
+    expect(sessionNames(ng.out)).toStrictEqual(['giggle', 'laughFit']);
+  });
+
+  it('a nose tap with count 3 inside the cooldown still produces bigSneeze (P4)', () => {
+    const r = stepAll(stateIn('Idle'), noseTap(11), noseTap(11.2, 2), noseTap(11.4, 3));
+    expect(r.out).toStrictEqual([
+      toSess('sneeze', 'sneeze'),
+      TAP_HAPTIC,
+      toSess('bigSneeze', 'bigSneeze'),
+      TAP_HAPTIC,
+    ]);
+    expect(r.s).toMatchObject({ name: 'Reacting', clip: { name: 'bigSneeze', start: 11.4 } });
+    // The cooldown is now the big sneeze's: a fourth quick tap (count 4) is ignored.
+    expect(directorStep(r.s, noseTap(11.6, 4)).out).toStrictEqual([]);
+  });
+});
+
+describe('#91 Validation 4: Sustained', () => {
+  it('release → Idle after exactly 400 ms (tick-driven); a held sustained clip never ends', () => {
+    const held = stepAll(stateIn('Idle'), gest('bellyRub', 'belly', 'longPress', 11));
+    expect(held.s).toMatchObject({ name: 'Sustained', since: 11, clip: { name: 'bellyRub', start: 11 } });
+    expect(held.out).toStrictEqual([toSess('bellyRub', 'sigh')]);
+    expect(directorReduce(held.s, tick(100))).toBe(held.s);
+    const rel = stepAll(held.s, release(12));
+    expect(rel.out).toStrictEqual([]);
+    expect(rel.s).toMatchObject({ name: 'Sustained', clip: { name: 'bellyRub', start: 11 } });
+    expect(rel.s.reaction?.release).toBe(12);
+    const end = 12 + 0.4;
+    expect(directorReduce(rel.s, tick(end - 1e-9))).toBe(rel.s);
+    expect(directorReduce(rel.s, tick(end))).toStrictEqual({
+      ...rel.s,
+      name: 'Idle',
+      since: end,
+      clip: null,
+      reaction: null,
+    });
+    const d = drive(held.s, [release(12)], 13);
+    const firstIdle = d.states.find((x) => x.s.name === 'Idle');
+    expect(firstIdle?.at).toBe(1488 / 120);
+    expect(firstIdle!.at).toBeGreaterThanOrEqual(end);
+    expect(d.states.every((x) => (x.at < end ? x.s.name === 'Sustained' : x.s.name === 'Idle'))).toBe(true);
+  });
+
+  it('evaluate eases a released clip out: × 1 at the release, × 0.5 at +200 ms, × 0 from +400 ms', () => {
+    const rel = stepAll(stateIn('Idle', 0), gest('bellyRub', 'belly', 'longPress', 11), release(12)).s;
+    for (const [dt, w] of [
+      [-0.5, 1],
+      [0, 1],
+      [0.1, easeOut(0.25)],
+      [0.2, 0.5],
+      [0.4, 0],
+      [0.45, 0],
+    ] as const) {
+      const now = 12 + dt;
+      const base = evaluate({ ...rel, clip: null }, now, createPose());
+      const want = addPose(
+        base,
+        sampleClip(REACTION_CLIPS.bellyRub, now - 11, createPose()),
+        w,
+        createPose(),
+      );
+      expect(bodyDiff(evaluate(rel, now, createPose()), want), `+${dt}`).toBeLessThan(1e-9);
+    }
+  });
+
+  it('pet inputs every 50 ms for 3 s: one pet clip, purr at most every 1200 ms, haptic and mood once', () => {
+    const times = Array.from({ length: 61 }, (_, k) => 11 + (k * 50) / 1000);
+    const d = drive(
+      stateIn('Idle'),
+      times.map((t) => petStroke(t)),
+      14.5,
+    );
+    const purrs = d.out.filter((x) => x.o.k === 'toSession');
+    expect(purrs.map((x) => x.o)).toStrictEqual([
+      toSess('pet', 'purr'),
+      toSess('pet', 'purr'),
+      toSess('pet', 'purr'),
+    ]);
+    expect(purrs.map((x) => x.at)).toStrictEqual([times[0], times[24], times[48]]);
+    for (let j = 1; j < purrs.length; j++)
+      expect(purrs[j]!.at - purrs[j - 1]!.at).toBeGreaterThanOrEqual(1.2 - 1e-9);
+    expect(d.out.filter((x) => x.o.k !== 'toSession')).toStrictEqual([
+      { at: 11, o: { k: 'haptic', pattern: [15, 35, 15, 35, 15, 35] } },
+      { at: 11, o: { k: 'mood', joy: 0.2 } },
+    ]);
+    expect(new Set(d.states.map((x) => x.s.clip?.start))).toStrictEqual(new Set([11]));
+    expect(d.s).toMatchObject({ name: 'Sustained', clip: { name: 'pet', start: 11 } });
+  });
+
+  it('releasing squish outputs sfx pop, releasing highFiveL sfx hi; a release with nothing held changes nothing', () => {
+    const squish = stepAll(stateIn('Idle'), gest('squish', 'cheekL', 'pinch', 11), release(11.5));
+    expect(squish.out).toStrictEqual([toSess('squish', null), toSess('squish', 'pop')]);
+    const high = stepAll(stateIn('Idle'), gest('highFiveL', 'pawL', 'longPress', 11), release(11.5));
+    expect(high.out).toStrictEqual([toSess('highFiveL', null), toSess('highFiveL', 'hi')]);
+    for (const s of [stateIn('Idle'), stepAll(stateIn('Idle'), noseTap(11)).s, squish.s]) {
+      const r = directorStep(s, release(11.6));
+      expect(r.state).toBe(s);
+      expect(r.out).toStrictEqual([]);
+    }
+  });
+
+  it('a finite clip under a held gesture restarts once ended: tickles every 600 ms for 2.4 s restart giggle twice', () => {
+    const ts = [0, 600, 1200, 1800, 2400].map((ms) => 11 + ms / 1000);
+    const d = drive(stateIn('Idle'), ts.map(tickle), 13.5);
+    const starts = [
+      ...new Set(d.states.flatMap((x) => (x.s.clip?.name === 'giggle' ? [x.s.clip.start] : []))),
+    ];
+    expect(starts).toStrictEqual([ts[0], ts[2], ts[4]]);
+    expect(starts.length - 1).toBeGreaterThanOrEqual(2);
+    // Between its end and the next refresh the slot is empty while the reaction stays held.
+    expect(d.states.some((x) => x.s.clip === null)).toBe(true);
+    expect(d.states.every((x) => x.s.name === 'Sustained')).toBe(true);
+    // A refresh while the clip still plays (600 ms < 800 ms) doesn't restart it.
+    expect(d.states.find((x) => x.at === ts[1])?.s.clip).toStrictEqual({ name: 'giggle', start: ts[0] });
+    expect(sessionNames(d.out.map((x) => x.o))).toStrictEqual(['giggle']);
+  });
+
+  it('the ear long-press plays its purr once per press', () => {
+    const r = stepAll(
+      stateIn('Idle'),
+      gest('earDroopL', 'earL', 'longPress', 11),
+      release(13),
+      tick(13.4),
+      gest('earDroopL', 'earL', 'longPress', 14),
+    );
+    expect(r.out).toStrictEqual([toSess('earDroopL', 'purr'), toSess('earDroopL', 'purr')]);
+  });
+});
+
+describe('#91 Validation 5: Attentive and Thinking (session rows 23, 27)', () => {
+  it('a tap reaction plays its clip additively: the base state stays, and toSession is still output', () => {
+    for (const name of ['Attentive', 'Thinking'] as const) {
+      const s = stateIn(name);
+      const r = stepAll(s, noseTap(10.5));
+      expect(r.s).toStrictEqual({
+        ...s,
+        clip: { name: 'sneeze', start: 10.5 },
+        reaction: r.s.reaction,
+        cooldowns: [{ region: 'nose', gesture: 'tap', at: 10.5, priority: 2 }],
+      });
+      expect(r.s.reaction?.r).toBe(R('sneeze'));
+      expect(r.out).toStrictEqual([toSess('sneeze', 'sneeze'), TAP_HAPTIC]);
+      const done = directorReduce(r.s, tick(10.5 + REACTION_CLIPS.sneeze.duration));
+      expect(done).toStrictEqual({ ...r.s, clip: null, reaction: null });
+    }
+  });
+
+  it('a held reaction in Attentive eases out after its release and ends 400 ms later, still Attentive', () => {
+    const s = stepAll(stateIn('Attentive'), petStroke(10.5), release(11)).s;
+    expect(s).toMatchObject({ name: 'Attentive', since: 10, clip: { name: 'pet', start: 10.5 } });
+    expect(directorReduce(s, tick(11 + 0.4))).toMatchObject({
+      name: 'Attentive',
+      since: 10,
+      clip: null,
+      reaction: null,
+    });
+  });
+
+  it('session moves keep an additive reaction: thinking keeps it; a misfire idle → Sustained or Reacting', () => {
+    const pet = stepAll(stateIn('Attentive'), petStroke(10.5)).s;
+    const thinking = directorReduce(pet, anim({ e: 'thinking' }, 10.6));
+    expect(thinking).toMatchObject({ name: 'Thinking', clip: { name: 'pet', start: 10.5 } });
+    expect(thinking.reaction).toBe(pet.reaction);
+    expect(directorReduce(pet, anim({ e: 'idle' }, 10.6))).toMatchObject({
+      name: 'Sustained',
+      since: 10.6,
+      base: 'idle',
+      prevBase: 'attentive',
+      fadeStart: 10.6,
+      clip: { name: 'pet', start: 10.5 },
+    });
+    const sneeze = stepAll(stateIn('Thinking'), noseTap(10.5)).s;
+    expect(directorReduce(sneeze, anim({ e: 'idle' }, 10.6))).toMatchObject({
+      name: 'Reacting',
+      since: 10.6,
+    });
+  });
+
+  it('Reacting and Sustained: attentive → Attentive with the reaction playing on; idle and doze change nothing', () => {
+    for (const s of [stepAll(stateIn('Idle'), noseTap(11)).s, stepAll(stateIn('Idle'), petStroke(11)).s]) {
+      const r = directorReduce(s, anim({ e: 'attentive' }, 11.1));
+      expect(r).toMatchObject({
+        name: 'Attentive',
+        since: 11.1,
+        base: 'attentive',
+        prevBase: 'idle',
+        clip: s.clip,
+      });
+      expect(r.reaction).toBe(s.reaction);
+      expect(directorReduce(s, anim({ e: 'idle' }, 11.1))).toBe(s);
+      expect(directorReduce(s, anim({ e: 'doze' }, 11.1))).toBe(s);
+    }
+  });
+});
+
+describe('#91 Validation 6: Talking (session rows 29–31)', () => {
+  it('P2 → a 150 ms flinch clip, the base stays Talking, and the reaction is output with sfx null', () => {
+    const s = stateIn('Talking');
+    const r = stepAll(s, noseTap(10.5));
+    expect(r.s).toStrictEqual({
+      ...s,
+      clip: { name: 'flinch', start: 10.5 },
+      cooldowns: [{ region: 'nose', gesture: 'tap', at: 10.5, priority: 2 }],
+    });
+    expect(r.out).toStrictEqual([toSess('sneeze', null), TAP_HAPTIC]);
+    const squash = (t: number): number =>
+      evaluate(r.s, t, createPose())[Ch.BodySquash]! - evaluate(s, t, createPose())[Ch.BodySquash]!;
+    expect(squash(10.5)).toBe(0);
+    expect(squash(10.55)).toBeCloseTo(-0.03, 6);
+    expect(squash(10.65)).toBe(0);
+    expect(directorReduce(r.s, tick(10.65)).clip).toBeNull();
+  });
+
+  it('P3 → output with its sfx; the session then stops playback and its talkEnd moves the director to it', () => {
+    const r = stepAll(stateIn('Talking'), gest('earDroopL', 'earL', 'longPress', 10.5));
+    expect(r.out).toStrictEqual([toSess('earDroopL', 'purr')]);
+    expect(r.s).toMatchObject({ name: 'Talking', clip: null, reaction: null });
+    expect(r.s.queued).toMatchObject({ r: R('earDroopL'), at: 10.5, announced: true });
+    const end = stepAll(r.s, anim({ e: 'talkEnd' }, 10.52));
+    expect(end.out).toStrictEqual([]);
+    expect(end.s).toMatchObject({
+      name: 'Sustained',
+      since: 10.52,
+      base: 'idle',
+      prevBase: 'talking',
+      fadeStart: 10.52,
+      talk: null,
+      mouthCloseStart: 10.52,
+      clip: { name: 'earDroopL', start: 10.52 },
+      queued: null,
+    });
+    expect(end.s.cooldowns).toBe(r.s.cooldowns); // started once, at the gesture
+  });
+
+  it('P4 → output with its sfx and a Reacting at talkEnd; without a talkEnd within 500 ms it is dropped', () => {
+    const r = stepAll(stateIn('Talking'), noseTap(10.5, 3));
+    expect(r.out).toStrictEqual([toSess('bigSneeze', 'bigSneeze'), TAP_HAPTIC]);
+    expect(stepAll(r.s, anim({ e: 'talkEnd' }, 10.6)).s).toMatchObject({
+      name: 'Reacting',
+      clip: { name: 'bigSneeze', start: 10.6 },
+    });
+    expect(directorReduce(r.s, tick(11))).toBe(r.s);
+    const dropped = directorReduce(r.s, tick(11 + 1e-9));
+    expect(dropped).toMatchObject({ name: 'Talking', queued: null });
+    expect(directorReduce(r.s, anim({ e: 'talkEnd' }, 11.1))).toMatchObject({ name: 'Idle', clip: null });
+  });
+
+  it('a flinch plays only on a free clip slot', () => {
+    const busy: DirectorState = { ...stateIn('Talking'), clip: { name: 'confused', start: 10.4 } };
+    const r = stepAll(busy, noseTap(10.5));
+    expect(r.s.clip).toBe(busy.clip);
+    expect(r.out[0]).toStrictEqual(toSess('sneeze', null));
+  });
+
+  it("a flinch over a released reaction whose clip had ended outlives that reaction's end", () => {
+    const giggling = stepAll(
+      stateIn('Thinking'),
+      tickle(10.5),
+      tick(10.5 + REACTION_CLIPS.giggle.duration),
+      release(11.4),
+    ).s;
+    expect(giggling).toMatchObject({ name: 'Thinking', clip: null });
+    const talking = stepAll(giggling, anim({ e: 'talk', id: 9 }, 11.5), noseTap(11.7)).s;
+    expect(talking.clip).toStrictEqual({ name: 'flinch', start: 11.7 });
+    expect(directorReduce(talking, tick(11.4 + 0.4))).toMatchObject({
+      name: 'Talking',
+      reaction: null,
+      clip: { name: 'flinch', start: 11.7 },
+    });
+  });
+
+  it('talk keeps a sustained reaction (held or easing out) additive, forgets a one-shot, and drops the queue', () => {
+    const pet = stepAll(stateIn('Thinking'), petStroke(10.5)).s;
+    const talking = stepAll(pet, anim({ e: 'talk', id: 9 }, 11));
+    expect(talking.out).toStrictEqual([]);
+    expect(talking.s).toMatchObject({ name: 'Talking', clip: { name: 'pet', start: 10.5 }, queued: null });
+    expect(talking.s.reaction).toBe(pet.reaction);
+    expect(directorReduce(talking.s, tick(100))).toBe(talking.s); // held: it never ends by itself
+    // A P2 meanwhile: no flinch over the held pet, only the output.
+    const p2 = stepAll(talking.s, noseTap(11.1));
+    expect(p2.s.clip).toStrictEqual({ name: 'pet', start: 10.5 });
+    expect(p2.out).toStrictEqual([toSess('sneeze', null), TAP_HAPTIC]);
+    const squishing = stepAll(stateIn('Thinking'), gest('squish', 'cheekL', 'pinch', 10.5)).s;
+    const released = stepAll(squishing, release(10.6), anim({ e: 'talk', id: 9 }, 10.7)).s;
+    expect(released.reaction?.release).toBe(10.6);
+    expect(directorReduce(released, tick(10.6 + 0.4))).toMatchObject({
+      name: 'Talking',
+      clip: null,
+      reaction: null,
+    });
+    const sneeze = stepAll(stateIn('Thinking'), noseTap(10.5), anim({ e: 'talk', id: 9 }, 10.6)).s;
+    expect(sneeze).toMatchObject({ name: 'Talking', clip: { name: 'sneeze', start: 10.5 }, reaction: null });
+    expect(directorReduce(sneeze, tick(10.5 + REACTION_CLIPS.sneeze.duration)).clip).toBeNull();
+  });
+
+  it('a pet held through the utterance never barges in on the replay (plan review finding 1)', () => {
+    /** Pet stroke updates every 50 ms over [fromMs, toMs]. */
+    const pets = (fromMs: number, toMs: number): DirInput[] =>
+      Array.from({ length: (toMs - fromMs) / 50 + 1 }, (_, k) => petStroke((fromMs + k * 50) / 1000));
+    const before = stepAll(
+      stateIn('Attentive'),
+      ...pets(10_000, 11_150),
+      anim({ e: 'thinking' }, 11.2),
+      ...pets(11_250, 13_000),
+      anim({ e: 'talk', id: 4 }, 13.01),
+    );
+    expect(sessionNames(before.out)).toStrictEqual(['pet', 'pet', 'pet']); // the purr loop before Talking
+    const during = stepAll(before.s, ...pets(13_050, 14_500));
+    expect(during.out).toStrictEqual([]);
+    expect(during.s).toMatchObject({ name: 'Talking', clip: { name: 'pet', start: 10 } });
+    expect(during.s.reaction).toMatchObject({ release: null, last: 14.5 });
+    const released = stepAll(during.s, release(14.55));
+    expect(released.out).toStrictEqual([]);
+    expect(released.s.reaction?.release).toBe(14.55);
+    const press = stepAll(released.s, gest('earDroopL', 'earL', 'longPress', 14.6));
+    expect(press.out).toStrictEqual([toSess('earDroopL', 'purr')]);
+    expect(press.s.queued).toMatchObject({ r: R('earDroopL'), announced: true });
+    // Still held at talkEnd: Sustained again, and the purr loop resumes.
+    const ended = stepAll(during.s, anim({ e: 'talkEnd' }, 14.6), petStroke(14.65));
+    expect(ended.s).toMatchObject({ name: 'Sustained', since: 14.6, clip: { name: 'pet', start: 10 } });
+    expect(ended.out).toStrictEqual([toSess('pet', 'purr')]);
+    // Released at talkEnd: Sustained until its ease-out ends.
+    const after = stepAll(released.s, anim({ e: 'talkEnd' }, 14.7));
+    expect(after.s).toMatchObject({ name: 'Sustained', since: 14.7 });
+    expect(directorReduce(after.s, tick(14.55 + 0.4))).toMatchObject({
+      name: 'Idle',
+      reaction: null,
+      clip: null,
+    });
+  });
+
+  it('a held squish released while Talking outputs no pop; a tickle run held through Talking does not escalate there', () => {
+    const squish = stepAll(
+      stateIn('Thinking'),
+      gest('squish', 'cheekL', 'pinch', 10.5),
+      anim({ e: 'talk', id: 9 }, 10.7),
+      release(10.9),
+    );
+    expect(squish.out).toStrictEqual([toSess('squish', null)]);
+    const tickling = stepAll(stateIn('Thinking'), ...tickles(10, 2), anim({ e: 'talk', id: 9 }, 10.7));
+    const talking = stepAll(tickling.s, ...tickles(11.2, 8));
+    expect(talking.out).toStrictEqual([]);
+    expect(talking.s.reaction?.r).toBe(R('giggle'));
+    expect(talking.s.reaction?.runStart).toBe(10);
+    const ended = stepAll(talking.s, anim({ e: 'talkEnd' }, 15.5), tickle(15.6));
+    expect(sessionNames(ended.out)).toStrictEqual(['laughFit']);
+  });
+
+  it('M36: talk drops a queued reaction', () => {
+    const s = stepAll(stateIn('Thinking'), gest('noseWrinkle', 'nose', 'longPress', 10.5), noseTap(10.6)).s;
+    expect(s.queued?.r).toBe(R('sneeze'));
+    expect(directorReduce(s, anim({ e: 'talk', id: 9 }, 10.7)).queued).toBeNull();
+  });
+
+  it('M39: a queued (announced) reaction never starts while Talking, only at talkEnd', () => {
+    const s = stepAll(
+      stateIn('Thinking'),
+      gest('squish', 'cheekL', 'pinch', 10.5),
+      release(10.9),
+      anim({ e: 'talk', id: 9 }, 11),
+      gest('earDroopL', 'earL', 'longPress', 11.1),
+      tick(10.9 + 0.4),
+    ).s;
+    expect(s).toMatchObject({ name: 'Talking', reaction: null });
+    expect(s.queued).toMatchObject({ r: R('earDroopL'), announced: true });
+    expect(directorReduce(s, anim({ e: 'talkEnd' }, 11.35))).toMatchObject({
+      name: 'Sustained',
+      clip: { name: 'earDroopL', start: 11.35 },
+    });
+  });
+
+  it('M61: repeats count while Talking: the third flick hands dizzy to the session', () => {
+    const r = stepAll(stateIn('Talking'), flick(10.5), flick(11.4), flick(12.3));
+    expect(r.out.at(-1)).toStrictEqual(toSess('dizzy', 'whoa'));
+    expect(r.s.queued).toMatchObject({ r: R('dizzy'), announced: true });
+  });
+});
+
+describe('#91 Validation 7: anim reaction events are ignored', () => {
+  it('in every state, with and without an active or queued reaction: the same state and no output', () => {
+    const states: DirectorState[] = [
+      ...STATES.map((n) => stateIn(n)),
+      stepAll(stateIn('Idle'), noseTap(11)).s,
+      stepAll(stateIn('Idle'), petStroke(11)).s,
+      stepAll(stateIn('Attentive'), petStroke(11)).s,
+      stepAll(stateIn('Talking'), gest('earDroopL', 'earL', 'longPress', 11)).s,
+      stepAll(stateIn('Idle'), gest('bellyRub', 'belly', 'longPress', 11), noseTap(11.2)).s,
+    ];
+    for (const s of states) {
+      for (const priority of [1, 2, 3, 4] as const) {
+        const r = directorStep(s, anim({ e: 'reaction', name: 'sneeze', priority }, 11.3));
+        expect(r.state).toBe(s);
+        expect(r.out).toStrictEqual([]);
+      }
+    }
+  });
+});
+
+describe('#91 gates, session events and the mirrored pet', () => {
+  it('Asleep and Waking ignore gestures (the app sends tapBear there)', () => {
+    for (const s of [stateIn('Asleep'), stateIn('Waking')]) {
+      for (const i of [noseTap(10.5), petStroke(10.5), noseTap(10.5, 3), release(10.6)]) {
+        const r = directorStep(s, i);
+        expect(r.state).toBe(s);
+        expect(r.out).toStrictEqual([]);
+      }
+    }
+  });
+
+  it('Dozing: a gesture moves to Idle first, then is handled as in Idle', () => {
+    const r = stepAll(stateIn('Dozing'), noseTap(10.5));
+    expect(r.s).toMatchObject({
+      name: 'Reacting',
+      since: 10.5,
+      base: 'idle',
+      prevBase: 'dozing',
+      fadeStart: 10.5,
+      clip: { name: 'sneeze', start: 10.5 },
+    });
+    const cooled: DirectorState = {
+      ...stateIn('Dozing'),
+      cooldowns: [{ region: 'nose', gesture: 'tap', at: 10.2, priority: 2 }],
+    };
+    const ignored = stepAll(cooled, noseTap(10.5));
+    expect(ignored.out).toStrictEqual([]);
+    expect(ignored.s).toMatchObject({ name: 'Idle', since: 10.5, prevBase: 'dozing', reaction: null });
+  });
+
+  it('wake and sleep end the reaction and drop the queue', () => {
+    const s = stepAll(stateIn('Idle'), gest('bellyRub', 'belly', 'longPress', 11), noseTap(11.2)).s;
+    expect(directorReduce(s, anim({ e: 'wake' }, 11.3))).toMatchObject({
+      name: 'Waking',
+      clip: { name: 'wake', start: 11.3 },
+      reaction: null,
+      queued: null,
+    });
+    expect(directorReduce(s, anim({ e: 'sleep' }, 11.3))).toMatchObject({
+      name: 'Asleep',
+      clip: { name: 'sleep', start: 11.3 },
+      reaction: null,
+      queued: null,
+    });
+  });
+
+  it('session additive clips wait while a reaction is active, even after its clip ended', () => {
+    const held = stepAll(stateIn('Idle'), tickle(11), tick(11 + REACTION_CLIPS.giggle.duration)).s;
+    expect(held).toMatchObject({ name: 'Sustained', clip: null });
+    expect(directorReduce(held, anim({ e: 'earTwitch' }, 12))).toBe(held);
+  });
+
+  it('a leftward pet stroke plays the mirrored pet (HeadRot negated); dirX means nothing to other clips', () => {
+    const right = stepAll(stateIn('Idle', 0), petStroke(11, 1)).s;
+    const left = stepAll(stateIn('Idle', 0), petStroke(11, -1)).s;
+    expect(right.clip?.name).toBe('pet');
+    expect(left.clip?.name).toBe('petMirrored');
+    expect(left.reaction?.clip).toBe('petMirrored');
+    const DEG6 = 6 * DEG;
+    for (const t of [11.2, 11.4, 12]) {
+      const base = evaluate(stateIn('Idle', 0), t, createPose());
+      const r = evaluate(right, t, createPose());
+      const l = evaluate(left, t, createPose());
+      expect(l[Ch.HeadRot]! - base[Ch.HeadRot]!).toBeCloseTo(-(r[Ch.HeadRot]! - base[Ch.HeadRot]!), 12);
+      for (let i = 0; i < CH_COUNT; i++) if (i !== Ch.HeadRot) expect(l[i], `${i}`).toBe(r[i]);
+    }
+    expect(evaluate(left, 11.4, createPose())[Ch.HeadRot]! - BASE.idle[Ch.HeadRot]!).toBeCloseTo(-DEG6, 6);
+    expect(stepAll(stateIn('Idle'), gest('pet', 'belly', 'stroke', 11, -1)).s.clip?.name).toBe('petMirrored');
+    expect(stepAll(stateIn('Idle'), gest('blush', 'cheekL', 'stroke', 11, -1)).s.clip?.name).toBe('blush');
+  });
+
+  it('every reaction clip of the table is known to evaluate, and an unknown input kind changes nothing', () => {
+    for (const r of Object.values(REACTIONS)) {
+      for (const clip of [r.clip, r.gentleClip].filter((c) => c !== undefined))
+        expect(Object.hasOwn(REACTION_CLIPS, clip), clip).toBe(true);
+    }
+    const bogus: DirInput = { k: 'tick', now: 11 };
+    Reflect.set(bogus, 'k', 'bogus');
+    for (const s of [stateIn('Idle'), stepAll(stateIn('Idle'), petStroke(11)).s]) {
+      expect(directorReduce(s, bogus)).toBe(s);
+      expect(directorStep(s, bogus).out).toStrictEqual([]);
+    }
+  });
+});
+
+describe('#91 plan review: edge rules (M16, M19, M21) and a non-finite time', () => {
+  it('M16: the repeat count starts over after an escalation, even when another reaction ends it', () => {
+    const r = stepAll(
+      stateIn('Idle'),
+      flick(11),
+      flick(11.9),
+      flick(12.8),
+      gest('hug', 'belly', 'hug', 13),
+      release(13.2),
+      tick(13.2 + 0.4),
+      flick(13.7),
+    );
+    expect(sessionNames(r.out)).toStrictEqual(['wobble', 'wobble', 'dizzy', 'hug', 'wobble']);
+    expect(r.s.clip).toStrictEqual({ name: 'wobble', start: 13.7 });
+  });
+
+  it('M19: a gap of exactly maxGapMs continues the run', () => {
+    const exact: Reaction = {
+      ...R('giggle'),
+      escalation: { to: 'laughFit', continuousMs: 3000, maxGapMs: 750 },
+    };
+    const r = stepAll(
+      stateIn('Idle'),
+      ...[10, 10.75, 11.5, 12.25, 13, 13.25].map((t) => gest(exact, 'belly', 'tickle', t)),
+    );
+    expect(sessionNames(r.out)).toStrictEqual(['giggle', 'laughFit']);
+    expect(r.s.clip).toStrictEqual({ name: 'laughFit', start: 13.25 });
+  });
+
+  it('M21: a refresh restarts an ended finite clip even before any tick has cleared it', () => {
+    expect(stepAll(stateIn('Idle'), tickle(11), tickle(11.8125)).s.clip).toStrictEqual({
+      name: 'giggle',
+      start: 11.8125,
+    });
+  });
+
+  it('a tick, gesture or release at a non-finite time changes nothing and outputs nothing', () => {
+    const held = stepAll(stateIn('Idle'), petStroke(11)).s;
+    for (const now of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      for (const i of [release(now), tick(now), petStroke(now), noseTap(now)]) {
+        const r = directorStep(held, i);
+        expect(r.state, `${i.k} at ${now}`).toBe(held);
+        expect(r.out).toStrictEqual([]);
+      }
+    }
+    // The reaction is still held, and a real release still ends it.
+    const ended = stepAll(held, release(Number.NaN), tick(1e9), release(12), tick(12 + 0.4)).s;
+    expect(ended).toMatchObject({ name: 'Idle', reaction: null });
+  });
+});
+
+describe('#91 code review: release identity, a queued sustained reaction, Talking priority', () => {
+  it('P14: a release drops a queued sustained reaction behind a one-shot, so it never starts held', () => {
+    const r = stepAll(
+      stateIn('Idle', 0),
+      flick(6),
+      flick(7),
+      flick(8),
+      gest('pet', 'belly', 'stroke', 11.2),
+      gest('pet', 'belly', 'stroke', 11.25),
+    );
+    expect(r.s.queued).toMatchObject({ r: R('pet'), region: 'belly', gesture: 'stroke' });
+    const after = stepAll(r.s, release(11.3), tick(11.5));
+    expect(after.s).toMatchObject({ name: 'Idle', reaction: null, queued: null });
+    expect(after.out).toStrictEqual([]);
+  });
+
+  it('P15: a release drops a queued sustained reaction behind a released one', () => {
+    const r = stepAll(
+      stateIn('Idle', 0),
+      gest('hug', 'belly', 'hug', 6),
+      release(7),
+      petStroke(7.1),
+      release(7.2),
+      tick(7 + 0.4),
+    );
+    expect(r.s).toMatchObject({ name: 'Idle', reaction: null, queued: null });
+    expect(r.out).toStrictEqual([toSess('hug', 'squeal'), { k: 'mood', joy: 0.2 }]);
+  });
+
+  it('A2: in Talking a P3 below the carried-over hug is queued unannounced; a P4 still hands off', () => {
+    const talking = stepAll(
+      stateIn('Thinking'),
+      gest('hug', 'belly', 'hug', 10),
+      anim({ e: 'talk', id: 9 }, 11),
+    ).s;
+    const allOver = stepAll(talking, gest('giggle', 'belly', 'allOver', 12));
+    expect(allOver.out).toStrictEqual([]);
+    expect(allOver.s).toMatchObject({ name: 'Talking', clip: { name: 'hug', start: 10 } });
+    expect(allOver.s.queued).toMatchObject({ r: R('giggle'), announced: false });
+    const ended = directorReduce(allOver.s, anim({ e: 'talkEnd' }, 12.01));
+    expect(ended).toMatchObject({ name: 'Sustained', clip: { name: 'hug', start: 10 } });
+    expect(ended.reaction?.r).toBe(R('hug'));
+    const dizzy = stepAll(talking, flick(11.1), flick(12), flick(12.9));
+    expect(dizzy.out.at(-1)).toStrictEqual(toSess('dizzy', 'whoa'));
+    expect(dizzy.s.queued).toMatchObject({ r: R('dizzy'), announced: true });
+  });
+
+  it('in Talking, an unannounced queued reaction is dropped when the reaction it waited on ends', () => {
+    const s = stepAll(
+      stateIn('Thinking'),
+      gest('hug', 'belly', 'hug', 10),
+      anim({ e: 'talk', id: 9 }, 11),
+      gest('giggle', 'belly', 'allOver', 12),
+      releaseOf('belly', 'hug', 12.1),
+    ).s;
+    expect(s.queued).toMatchObject({ r: R('giggle'), announced: false }); // another gesture's: kept
+    expect(directorReduce(s, tick(12.1 + 0.4))).toMatchObject({
+      name: 'Talking',
+      reaction: null,
+      queued: null,
+    });
+  });
+
+  it("B2: one contact's release ends only the reaction its gesture started", () => {
+    const s = stepAll(
+      stateIn('Idle'),
+      gest('headPress', 'headTop', 'longPress', 10),
+      gest('bellyRub', 'belly', 'longPress', 10.5),
+    ).s;
+    expect(s.reaction).toMatchObject({ r: R('bellyRub'), region: 'belly', gesture: 'longPress' });
+    const head = directorStep(s, releaseOf('headTop', 'longPress', 11));
+    expect(head.state).toBe(s); // the belly is still held
+    expect(head.out).toStrictEqual([]);
+    const belly = stepAll(s, releaseOf('belly', 'longPress', 12), tick(12 + 0.4));
+    expect(belly.s).toMatchObject({ name: 'Idle', reaction: null });
+  });
+
+  it("B3: a stroke's release drops its queued pet and keeps the hug; an identity-less release then ends the hug", () => {
+    const s = stepAll(stateIn('Idle'), gest('hug', 'belly', 'hug', 10), petStroke(10.5)).s;
+    expect(s.queued).toMatchObject({ r: R('pet'), region: 'headTop', gesture: 'stroke' });
+    const stroke = stepAll(s, releaseOf('headTop', 'stroke', 11));
+    expect(stroke.out).toStrictEqual([]);
+    expect(stroke.s).toMatchObject({ name: 'Sustained', queued: null });
+    expect(stroke.s.reaction).toMatchObject({ r: R('hug'), release: null });
+    const all = stepAll(stroke.s, release(12), tick(12 + 0.4));
+    expect(all.s).toMatchObject({ name: 'Idle', reaction: null, queued: null });
+  });
+
+  it('an identity-less release releases the held reaction and drops a queued sustained one, not a one-shot', () => {
+    const sustained = stepAll(
+      stateIn('Idle'),
+      gest('hug', 'belly', 'hug', 10),
+      petStroke(10.5),
+      release(11),
+    ).s;
+    expect(sustained.reaction?.release).toBe(11);
+    expect(sustained.queued).toBeNull();
+    const oneShot = stepAll(
+      stateIn('Idle'),
+      gest('bellyRub', 'belly', 'longPress', 10),
+      noseTap(10.9),
+      release(11),
+    );
+    expect(oneShot.s.reaction?.release).toBe(11);
+    expect(oneShot.s.queued?.r).toBe(R('sneeze'));
+    expect(stepAll(oneShot.s, tick(11 + 0.4)).s).toMatchObject({
+      name: 'Reacting',
+      clip: { name: 'sneeze' },
+    });
+  });
+
+  it('M30: a released reaction still blocks a lower priority until its ease-out ends', () => {
+    const r = stepAll(stateIn('Idle'), gest('squish', 'cheekL', 'pinch', 10), release(11), noseTap(11.2));
+    expect(r.out).toStrictEqual([toSess('squish', null), toSess('squish', 'pop')]);
+    expect(r.s.queued?.r).toBe(R('sneeze'));
+    expect(directorReduce(r.s, tick(11 + 0.4)).reaction?.r).toBe(R('sneeze'));
+  });
+
+  it('N21: the same reaction after its release is a new run, not a refresh', () => {
+    const r = stepAll(stateIn('Idle'), petStroke(10), release(11), petStroke(11.1));
+    expect(r.s.reaction).toMatchObject({ start: 11.1, release: null });
+    expect(r.out.slice(-3)).toStrictEqual([
+      toSess('pet', 'purr'),
+      { k: 'haptic', pattern: [15, 35, 15, 35, 15, 35] },
+      { k: 'mood', joy: 0.2 },
+    ]);
+  });
+
+  it("N27: the release ease-out scales only the released reaction's own clip, not a flinch", () => {
+    const s = stepAll(
+      stateIn('Thinking'),
+      tickle(10),
+      anim({ e: 'talk', id: 9 }, 10.2),
+      tick(10.9),
+      release(11),
+      noseTap(11.1),
+    ).s;
+    expect(s.clip).toStrictEqual({ name: 'flinch', start: 11.1 });
+    const squash = evaluate(s, 11.15, createPose())[Ch.BodySquash]!;
+    expect(Math.abs(squash - Math.fround(BASE.talking[Ch.BodySquash]! + Math.fround(-0.03)))).toBeLessThan(
+      1e-9,
+    );
+  });
+});
+
+// ---- #91 property: random gesture, release, gentle and session sequences ------------------------------------
+describe('#91 property: random gesture and session sequences', () => {
+  /** A spread of gesture inputs: taps, the big sneeze, long-presses, strokes, tickles, flicks, pinch, hug, all-over. */
+  const GESTURES: readonly ((now: number, dirX: -1 | 1) => DirInput)[] = [
+    (now) => noseTap(now),
+    (now) => noseTap(now, 3),
+    (now) => gest('hardBlinkL', 'eyeL', 'tap', now),
+    (now) => gest('noseWrinkle', 'nose', 'longPress', now),
+    (now) => gest('highFiveR', 'pawR', 'longPress', now),
+    (now, dirX) => petStroke(now, dirX),
+    (now) => gest('againstFur', 'headTop', 'stroke', now),
+    (now) => tickle(now),
+    (now) => flick(now),
+    (now) => gest('squish', 'cheekL', 'pinch', now),
+    (now) => gest('hug', 'belly', 'hug', now),
+    (now) => gest('giggle', 'belly', 'allOver', now),
+  ];
+  type Kind = AnimKind | 'tick' | 'gesture' | 'release' | 'releaseOf' | 'gentleOn' | 'gentleOff';
+  const STEP = fc.record({
+    kind: fc.constantFrom<Kind>(
+      ...KINDS,
+      'tick',
+      'tick',
+      'tick',
+      'gesture',
+      'gesture',
+      'gesture',
+      'release',
+      'releaseOf',
+      'releaseOf',
+      'gentleOn',
+      'gentleOff',
+    ),
+    g: fc.integer({ min: 0, max: GESTURES.length - 1 }),
+    dirX: fc.constantFrom<-1 | 1>(-1, 1),
+    dt: fc.integer({ min: 0, max: 120 }), // 10 ms grid, 0–1.2 s
+  });
+  const KNOWN_CLIPS = new Set([
+    ...Object.keys(SESSION_CLIPS),
+    ...Object.keys(REACTION_CLIPS),
+    'flinch',
+    'petMirrored',
+  ]);
+
+  function input(kind: Kind, g: number, dirX: -1 | 1, now: number): DirInput {
+    switch (kind) {
+      case 'tick':
+        return tick(now);
+      case 'gesture':
+        return GESTURES[g]!(now, dirX);
+      case 'release':
+        return release(now);
+      case 'releaseOf': {
+        // The end of one contact: the release of gesture `g`'s region and kind (Decision 16).
+        const gi = GESTURES[g]!(now, dirX);
+        return gi.k === 'gesture' ? releaseOf(gi.region, gi.gesture, now) : release(now);
+      }
+      case 'gentleOn':
+        return gentle(true);
+      case 'gentleOff':
+        return gentle(false);
+      default:
+        return anim(SAMPLES[kind], now);
+    }
+  }
+
+  it('keeps the invariants, agrees with directorReduce, is pure, and outputs only table reactions (300 runs)', () => {
+    fc.assert(
+      fc.property(fc.array(STEP, { minLength: 1, maxLength: 80 }), (seq) => {
+        let s = initialDirector(0);
+        let now = 0;
+        const pose = createPose().fill(Number.NaN);
+        for (const [j, m] of MOUTH.entries()) pose[m] = 100 + j;
+        for (const { kind, g, dirX, dt } of seq) {
+          now += dt / 100;
+          const prev = deepFreeze(s);
+          const snapshot = structuredClone(prev);
+          const i = input(kind, g, dirX, now);
+          const { state: r, out } = directorStep(prev, i);
+          expect(prev).toStrictEqual(snapshot); // frozen input, never written
+          expect(directorReduce(prev, i)).toStrictEqual(r);
+          expect(r === prev || !isDeepStrictEqual(r, prev)).toBe(true);
+          expect(r.base).toBe(BASE_OF_STATE[r.name]);
+          expect(r.talk !== null).toBe(r.name === 'Talking');
+          if (r.name === 'Reacting' || r.name === 'Sustained') {
+            expect(r.reaction).not.toBeNull();
+            expect(r.reaction!.r.sustained).toBe(r.name === 'Sustained');
+          }
+          if (r.name === 'Asleep' || r.name === 'Waking') {
+            expect(r.reaction).toBeNull();
+            expect(r.queued).toBeNull();
+          }
+          if (r.name === 'Idle' || r.name === 'Dozing') expect(r.reaction).toBeNull();
+          if (r.name === 'Talking') {
+            expect(r.reaction === null || r.reaction.r.sustained).toBe(true); // a sustained one carried over
+            // Announced, or queued behind a higher-priority carried-over reaction (code review finding 2).
+            expect(
+              r.queued === null ||
+                r.queued.announced ||
+                (r.reaction !== null && r.queued.r.priority < r.reaction.r.priority),
+            ).toBe(true);
+          }
+          // Every contact up: nothing sustained stays held or queued (code review findings 1 and 3).
+          if (i.k === 'release' && i.region === undefined) {
+            expect(r.reaction === null || !r.reaction.r.sustained || r.reaction.release !== null).toBe(true);
+            expect(r.queued === null || !r.queued.r.sustained).toBe(true);
+          }
+          // While Talking, the carried-over reaction's refreshes and release output nothing (finding 1).
+          const carried = prev.name === 'Talking' ? prev.reaction : null;
+          if (
+            carried !== null &&
+            carried.release === null &&
+            (i.k === 'release' || (i.k === 'gesture' && i.r.name === carried.r.name))
+          )
+            expect(out).toStrictEqual([]);
+          if (r.reaction !== null && !r.reaction.r.sustained) expect(r.reaction.release).toBeNull();
+          if (r.clip !== null) {
+            expect(KNOWN_CLIPS.has(r.clip.name), r.clip.name).toBe(true);
+            expect(r.clip.start).toBeLessThanOrEqual(now);
+          }
+          if (prev.name === 'Asleep' || prev.name === 'Waking') {
+            if (i.k === 'gesture' || i.k === 'release') expect(r).toBe(prev);
+          }
+          for (const o of out) {
+            if (o.k === 'toSession') {
+              const t = REACTIONS[o.ev.name];
+              expect(t, o.ev.name).toBeDefined();
+              expect(o.ev.priority).toBe(t!.priority);
+              expect([t!.sfx, t!.sfxOnRelease ?? null, null]).toContain(o.ev.sfx);
+            }
+          }
+          evaluate(r, now, pose);
+          for (const [j, m] of MOUTH.entries()) expect(pose[m]).toBe(100 + j);
+          for (let c = 0; c < CH_COUNT; c++)
+            if (!MOUTH.includes(c)) expect(Number.isFinite(pose[c])).toBe(true);
+          s = r;
+        }
+      }),
+      { numRuns: 300 },
+    );
+  });
+});
+
+/** A held pet (its clip is `sustained`): nothing is due on any tick. */
+const heldPet = (): DirectorState => stepAll(stateIn('Idle'), petStroke(11)).s;
+
+describe('#91 allocation: quiet ticks and the release ease-out', () => {
+  it('10 000 ticks while a reaction is held: the same state, and directorStep the same frozen result', () => {
+    const s = heldPet();
+    const tickIn = { k: 'tick' as const, now: 11 };
+    let first = directorStep(s, tickIn);
+    let sameState = 0;
+    let sameStep = 0;
+    for (let i = 0; i < 10_000; i++) {
+      tickIn.now = 11.01 + i * 0.01;
+      const r = directorStep(s, tickIn);
+      if (r.state === s) sameState++;
+      if (r === first) sameStep++;
+      first = r;
+    }
+    expect(sameState).toBe(10_000);
+    expect(sameStep).toBe(10_000);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(first.out).toHaveLength(0);
+    expect(countAllocations(() => void directorStep(s, tickIn))).toBe(0);
+  });
+
+  it('grows the heap by < 1 MB over 100 000 quiet directorStep ticks, once V8 has optimised it', () => {
+    const s = heldPet();
+    const tickIn = { k: 'tick' as const, now: 11 };
+    const runAll = (): void => {
+      for (let i = 0; i < 100_000; i++) {
+        tickIn.now = 11 + i * 1e-4;
+        directorStep(s, tickIn);
+      }
+    };
+    forceGc();
+    for (let w = 0; w < 3; w++) runAll();
+    const LIMIT = 1_048_576;
+    let best = heapGrowth(runAll);
+    for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(runAll));
+    expect(best).toBeLessThan(LIMIT);
+  });
+
+  it('evaluate of a released reaction easing out makes no array allocation', () => {
+    const s = stepAll(stateIn('Idle'), petStroke(11), release(12)).s;
+    const out = createPose();
+    expect(
+      countAllocations(() => {
+        for (let i = 0; i < 1000; i++) evaluate(s, 12 + i * 0.0005, out);
+      }),
+    ).toBe(0);
   });
 });

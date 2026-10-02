@@ -209,3 +209,25 @@ body {
 .debug-line {
   margin: 0;
 }
+
+/* The VAD plot (debug-overlay.ts, #56): 320 × 160 at the top right, below the settings gear, never taking pointer
+   events. On narrow screens it sits below the overlay's text lines instead of over them. */
+.debug-plot {
+  position: fixed;
+  top: 64px;
+  right: 8px;
+  z-index: 2;
+  width: 320px;
+  max-width: calc(100vw - 16px);
+  height: auto;
+  aspect-ratio: 2;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 70%);
+  pointer-events: none;
+}
+
+@media (max-width: 679px) {
+  .debug-plot {
+    top: 136px;
+  }
+}
