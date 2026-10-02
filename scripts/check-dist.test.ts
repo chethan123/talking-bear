@@ -143,7 +143,8 @@ describe('precacheUrls', () => {
   });
 
   it('ignores the runtime url properties (no quote after the colon)', () => {
-    expect(precacheUrls('const i=({url:e})=>e.href;n({url:t.href,request:t});')).toEqual([]);
+    // The trailing string literal makes the test fail if the opening quote of the value ever becomes optional.
+    expect(precacheUrls('const i=({url:e})=>e.href;n({url:t.href,request:t});const m="x";')).toEqual([]);
   });
 });
 
@@ -204,6 +205,16 @@ describe('checkDist', () => {
       ]);
     });
 
+    it('checks a symlinked file like any other file', () => {
+      const target = join(tempDir(), 'extra.js');
+      writeFileSync(target, 'var extra;');
+      const dir = writeTree(goodTree('production'));
+      symlinkSync(target, join(dir, 'assets/extra.js'), 'file');
+      expect(checkDist(dir, 'production')).toEqual([
+        expect.stringMatching(/^rule 1 \(precache\): assets\/extra\.js is not in /),
+      ]);
+    });
+
     it('fails without sw.js', () => {
       const dir = writeTree(omit(goodTree('production'), 'sw.js'));
       expect(checkDist(dir, 'production')).toEqual(['rule 1 (precache): sw.js not found']);
@@ -236,6 +247,16 @@ describe('checkDist', () => {
         'index.html': `<html><body><script type="module">${DATA_IMPORT}</script></body></html>`,
       });
       expect(checkDist(dir, 'production')).toEqual([]);
+    });
+
+    it('matches case-insensitively (schemes and media types are)', () => {
+      const dir = writeTree({
+        ...goodTree('production'),
+        'assets/index-abc.js': 'import("DATA:Text/JavaScript,1");',
+      });
+      expect(checkDist(dir, 'production')).toEqual([
+        'rule 2 (data-js): assets/index-abc.js contains data:text/javascript',
+      ]);
     });
   });
 
@@ -412,6 +433,16 @@ describe('checkDist', () => {
         `rule 7 (manifest): screenshots[1].src /screenshots/desktop-1.webp does not exist in ${dir}`,
       ]);
     });
+
+    it.each(['//icons/icon-192.png', 'https://cdn.example/icons/icon-192.png'])(
+      'fails an off-site icon src %s',
+      (src) => {
+        const dir = withManifest(JSON.stringify({ ...MANIFEST, icons: [{ src }] }));
+        expect(checkDist(dir, 'production')).toEqual([
+          `rule 7 (manifest): icons[0].src ${src} does not exist in ${dir}`,
+        ]);
+      },
+    );
 
     it('fails icons that are not an array, and entries without a string src', () => {
       const dir = withManifest(

@@ -12,7 +12,7 @@
 //      precaches it), screenshots/** (installer only), *.br, *.gz, *.map, and a root workbox-*.js (the Workbox
 //      runtime, if it is ever un-inlined; generateSW writes it next to sw.js). The exemption is anchored to the
 //      root so the app's own assets/workbox-window.prod.es5-*.js stays checked.
-//   2. No dist/**/*.js contains `data:text/javascript`.
+//   2. No dist/**/*.js contains `data:text/javascript`, in any letter case.
 //   3. production: no file (of any type) contains a test-hook needle (`__bearTest`, `setVadBackend`, #223).
 //      e2e (positive control): each needle appears in at least one file. Requiring each needle, not just one, keeps
 //      the production list honest: if a hook is renamed or removed, this fails in the same change, which is where
@@ -22,7 +22,7 @@
 //   5. dist/lab does not exist: lab pages, with their trace and download flows, never ship.
 //   6. If any *.bin (the Silero weights) ships, licenses.txt exists and contains "Silero Team".
 //   7. manifest.webmanifest parses as a JSON object with name "Talking Bear", and every icons[].src and
-//      screenshots[].src names a file in dist.
+//      screenshots[].src names a file in dist (`/icons/…`; `//host/…` and absolute URLs fail).
 //
 // The observed sw.js (vite-plugin-pwa 1.3.0, generateSW, inlineWorkboxRuntime; checked on main 8034412) is one
 // minified file without importScripts. precacheAndRoute is inlined and renamed, and its keys are unquoted:
@@ -58,6 +58,8 @@ const PRECACHE_URL = /["']?url["']?\s*:\s*["']([^"']+)["']/g;
 const WORKLET_CHUNK = /^assets\/capture\.worklet-[^/]*\.js$/;
 const WORKLET_FORBIDDEN = [/\bimport\b/, /\bdocument\b/, /(?:^|[^.\w$])self\b/];
 const DATA_JS = 'data:text/javascript';
+/** URI schemes and media types are case-insensitive. Not global, so `.test()` keeps no lastIndex state. */
+const DATA_JS_RE = /data:text\/javascript/i;
 const LICENCE_MARK = 'Silero Team';
 const MANIFEST_NAME = 'Talking Bear';
 /** Characters of context printed on each side of a forbidden worklet match. */
@@ -138,7 +140,7 @@ function checkPrecache(files, contents) {
  */
 function checkNoDataJs(files, contents) {
   return files
-    .filter((f) => f.endsWith('.js') && contents.get(f)?.includes(DATA_JS) === true)
+    .filter((f) => f.endsWith('.js') && DATA_JS_RE.test(contents.get(f)?.toString('latin1') ?? ''))
     .map((f) => `${f} contains ${DATA_JS}`);
 }
 
@@ -227,10 +229,11 @@ function checkManifest(distDir, files, contents) {
       continue;
     }
     list.forEach((entry, i) => {
-      // A src is site-root-relative (`/icons/…`) and must name a file in this dist's file list.
+      // A src is site-root-relative (`/icons/…`) and must name a file in this dist's file list. Only one leading
+      // slash is stripped: a protocol-relative `//host/…` or an absolute URL points off-site and fails.
       const src = typeof entry === 'object' && entry !== null ? entry.src : undefined;
       if (typeof src !== 'string') out.push(`${key}[${i}].src is not a string`);
-      else if (!files.includes(src.replace(/^\/+/, ''))) {
+      else if (!files.includes(src.replace(/^\//, ''))) {
         out.push(`${key}[${i}].src ${src} does not exist in ${distDir}`);
       }
     });
@@ -248,13 +251,16 @@ export function checkDist(distDir, mode) {
   if (!MODES.includes(mode)) return [`mode must be production or e2e, got ${JSON.stringify(mode)}`];
   /** @type {string[]} */
   let files;
+  /** @type {Map<string, Buffer>} */
+  let contents;
   try {
     files = listFiles(distDir);
+    // Every file is read once here, so an unreadable one (EACCES, …) is a violation, not a stack trace.
+    contents = new Map(files.map((f) => [f, readFileSync(join(distDir, f))]));
   } catch (err) {
     return [`cannot read ${distDir}: ${message(err)}`];
   }
   if (files.length === 0) return [`${distDir} contains no files (build first)`];
-  const contents = new Map(files.map((f) => [f, readFileSync(join(distDir, f))]));
   /** @type {[string, string[]][]} */
   const rules = [
     ['1 (precache)', checkPrecache(files, contents)],
