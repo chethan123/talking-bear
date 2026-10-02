@@ -19,6 +19,7 @@
     "format:check": "prettier --check .",
     "typecheck": "tsc -b",
     "test": "vitest run --project node --project worklet",
+    "test:coverage": "vitest run --project node --project worklet --coverage",
     "test:browser": "vitest run --project browser",
     "e2e": "pnpm build:e2e && playwright test",
     "fixtures": "node scripts/gen-fixtures.ts",
