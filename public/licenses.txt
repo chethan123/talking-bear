@@ -33,3 +33,63 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+vite-plugin-pwa (service worker registration)
+---------------------------------------------
+
+Upstream: https://github.com/vite-pwa/vite-plugin-pwa
+Version: 1.3.0 (npm vite-plugin-pwa)
+Source file: dist/client/build/register.js, the virtual:pwa-register module
+Shipped as: its registerSW(), in the app's main script
+Licence: MIT. The full licence text, copied verbatim from the package's LICENSE file:
+
+MIT License
+
+Copyright (c) 2020-PRESENT Anthony Fu <https://github.com/antfu>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Workbox (service worker runtime and workbox-window)
+---------------------------------------------------
+
+Upstream: https://github.com/GoogleChrome/workbox
+Version: 7.4.1 (npm; commit 62b9d8ba8eb3c1a2ab8aac9d84c90cda7865d6a3, the gitHead of every package below)
+Packages: workbox-build, workbox-core, workbox-precaching, workbox-routing, workbox-strategies, workbox-window
+Shipped as: sw.js and workbox-window.prod.es5-*.js. vite-plugin-pwa's generateSW writes sw.js from workbox-build's service worker template and bundles into it the code the template uses from workbox-core, workbox-precaching, workbox-routing and workbox-strategies. The lazily loaded workbox-window.prod.es5-*.js is workbox-window's build/workbox-window.prod.es5.mjs, which also bundles code from workbox-core.
+Licence: MIT. The full licence text, copied verbatim from each package's LICENSE file (the six files are identical):
+
+Copyright 2018 Google LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
