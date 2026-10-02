@@ -16,9 +16,18 @@
 //   mean of the band-limited hop levels over the segment's speech frames is at least X dB (`proximityDb`,
 //   default PROXIMITY_DB) above the floor its `floorSnapshot` carried at the onset.
 //
+// Feature trace (`setTrace`, for lab/vad-trace and the debug overlay; plan §7 M2): while it is on, every hop's
+// raw (unfiltered) and band-limited dB and voicing score, and every Silero frame's p (the model's output, before
+// onset blocking) and inference time, are collected and posted as a `traceBatch` once a batch holds
+// TRACE_BATCH_HOPS hops (250 ms), at the end of the frame that completes it; `reset` and trace off flush a
+// partial batch. Voicing is then computed on every hop on both backends, and the pre-gate never skips, so the
+// trace is complete. The values are the ones the VAD itself uses (bandDb is the gate's level, voicing the
+// energy path's score); nothing upstream of them changes, and with the trace off nothing changes at all.
+//
 // Pure TypeScript: no worker globals (`post` is injected; the clock defaults to `performance.now`), so the
 // whole core runs in Node tests. The per-frame path doesn't allocate: every buffer is preallocated, and
-// objects are created only for the messages it posts.
+// objects are created only for the messages it posts (and, with the trace on, the five arrays each
+// `traceBatch` transfers).
 
 import {
   ENERGY_HOP,
@@ -76,6 +85,15 @@ const P95_INDEX = Math.ceil(0.95 * VAD_STATS_WINDOW) - 1;
 /** Proximity gate: band-limited hop levels (and their ctx frames) kept for the active level, 10 s of hops. */
 export const PROXIMITY_HISTORY_HOPS = 1000;
 
+/** Feature trace: a `traceBatch` is posted once this many hops (250 ms) have been collected. */
+export const TRACE_BATCH_HOPS = 25;
+/** Hops the trace accumulators hold: a batch, plus the rest of the frame that completes it (a frame completes
+ *  at most ⌈512 / 160⌉ = 4 hops), which opens the next batch. */
+const TRACE_HOP_CAPACITY = TRACE_BATCH_HOPS + Math.ceil(VAD_FRAME / ENERGY_HOP);
+/** Silero frames the trace accumulators hold. Every frame whose p joins a batch first adds ≥ 3 hops to it, so
+ *  a batch gets at most ⌈25 / 3⌉ = 9; TRACE_BATCH_HOPS is a safe bound. */
+const TRACE_SILERO_CAPACITY = TRACE_BATCH_HOPS;
+
 /** One energy hop in ms (10). */
 const HOP_MS = (ENERGY_HOP * 1000) / VAD_RATE;
 
@@ -103,6 +121,8 @@ export class VadCore {
   private readonly scratch = new Float32Array(VAD_FRAME);
   /** Hop accumulator: holds the first `hopFill` samples of the next 10 ms hop. */
   private readonly hop = new Float32Array(ENERGY_HOP);
+  /** The same hop's raw (unfiltered) samples, for the trace's rawDb. */
+  private readonly rawHop = new Float32Array(ENERGY_HOP);
   /** Reused per hop; the gate reads `db` only. */
   private readonly features: FrameFeatures = { frame: 0, db: 0, floorDb: Number.NaN };
   private readonly voicing: Voicing = createVoicing(VAD_RATE);
@@ -118,6 +138,20 @@ export class VadCore {
   private readonly histDb = new Float32Array(PROXIMITY_HISTORY_HOPS);
   /** Ctx frame of the epoch's hop j at j % PROXIMITY_HISTORY_HOPS (Float64: ctx frames outgrow 2^24). */
   private readonly histFrame = new Float64Array(PROXIMITY_HISTORY_HOPS);
+  /** Trace accumulators (see TRACE_HOP_CAPACITY, TRACE_SILERO_CAPACITY): per hop raw dB, band-limited dB,
+   *  voicing and ctx frame; per Silero frame p, inference time (ms) and firstFrame. */
+  private readonly trRaw = new Float32Array(TRACE_HOP_CAPACITY);
+  private readonly trBand = new Float32Array(TRACE_HOP_CAPACITY);
+  private readonly trVoicing = new Float32Array(TRACE_HOP_CAPACITY);
+  private readonly trHopFrame = new Float64Array(TRACE_HOP_CAPACITY);
+  private readonly trP = new Float32Array(TRACE_SILERO_CAPACITY);
+  private readonly trMs = new Float32Array(TRACE_SILERO_CAPACITY);
+  private readonly trSilFrame = new Float64Array(TRACE_SILERO_CAPACITY);
+  /** Hops and Silero frames held by the trace accumulators (both 0 while the trace is off). */
+  private trHops = 0;
+  private trSil = 0;
+  /** The feature trace is on. */
+  private traceOn = false;
   /** Inferences over the core's lifetime. */
   private inferences = 0;
   /** The model handed over by `setModel`, used from the next `reset` (or at once by a late switch). */
@@ -198,12 +232,23 @@ export class VadCore {
   }
 
   /**
+   * Turns the feature trace on or off (it starts off, and stays as set across `reset`). Turning it off flushes
+   * the partial batch, if any.
+   */
+  setTrace(on: boolean): void {
+    if (on === this.traceOn) return;
+    if (!on) this.flushTrace();
+    this.traceOn = on;
+  }
+
+  /**
    * Starts a new listen: `epoch` becomes current, and the filter, hop remainder, segmenter, gate (restored to
    * `restoreFloorDb` when it is finite), voicing history, hop history, pre-gate ring and epoch start are reset,
    * and so is the model's LSTM state. The epoch runs on Silero iff `vad === 'silero'` and a model is set; a
    * Silero request without a model posts SILERO_NOT_READY_MESSAGE and runs on energy. `pregate === true`
    * enables the pre-gate. `proximityDb` is the proximity gate's X for the epoch's Silero segments
-   * (PROXIMITY_DB when undefined or NaN).
+   * (PROXIMITY_DB when undefined or NaN). With the trace on, the previous epoch's partial batch is flushed
+   * first.
    */
   reset(
     epoch: number,
@@ -212,6 +257,7 @@ export class VadCore {
     pregate?: boolean,
     proximityDb?: number,
   ): void {
+    if (this.traceOn) this.flushTrace();
     this.epoch = epoch;
     this.filter.reset();
     this.hopFill = 0;
@@ -252,10 +298,12 @@ export class VadCore {
     }
     const x = this.filter.process(pcm16k, this.scratch);
     const hop = this.hop;
+    const rawHop = this.rawHop;
     this.gateOpen = false;
     for (let i = 0; i < VAD_FRAME; i++) {
       if (this.hopFill === 0) this.hopFirstFrame = firstFrame + (i * this.ctxRate) / VAD_RATE;
       hop[this.hopFill] = x[i]!;
+      rawHop[this.hopFill] = pcm16k[i]!;
       this.hopFill++;
       if (this.hopFill === ENERGY_HOP) {
         this.hopFill = 0;
@@ -264,6 +312,7 @@ export class VadCore {
     }
     const m = this.silero;
     if (m !== null) this.stepSilero(epoch, firstFrame, pcm16k, m);
+    if (this.trHops >= TRACE_BATCH_HOPS) this.postTrace(epoch, TRACE_BATCH_HOPS);
   }
 
   private stepHop(epoch: number, ctxFrame: number): void {
@@ -287,8 +336,19 @@ export class VadCore {
     const win = this.voiceWin;
     win.copyWithin(0, ENERGY_HOP);
     win.set(this.hop, VOICING_WINDOW - ENERGY_HOP);
-    if (this.silero === null) {
-      const voiced = this.voicing.score(win) > VOICED_THRESHOLD;
+    const energyPath = this.silero === null;
+    // The trace needs the score on the Silero path too; it is the same score the energy path uses.
+    const score = energyPath || this.traceOn ? this.voicing.score(win) : 0;
+    if (this.traceOn) {
+      const k = this.trHops;
+      this.trRaw[k] = frameDb(this.rawHop, 0, ENERGY_HOP);
+      this.trBand[k] = db;
+      this.trVoicing[k] = score;
+      this.trHopFrame[k] = ctxFrame;
+      this.trHops = k + 1;
+    }
+    if (energyPath) {
+      const voiced = score > VOICED_THRESHOLD;
       const prob = gate.active && ctxFrame >= this.onsetBlockEnd ? 1 : 0;
       const wasInSpeech = this.seg.inSpeech;
       let ev: SegEvent | null = segmenterStep(this.seg, ENERGY_SEG_PARAMS, ctxFrame, prob);
@@ -308,7 +368,8 @@ export class VadCore {
   private stepSilero(epoch: number, firstFrame: number, raw: Float32Array, m: SileroModel): void {
     if (this.pregate) {
       this.closedFrames = this.gateOpen ? 0 : this.closedFrames + 1;
-      if (!this.gateOpen && !this.seg.inSpeech && this.closedFrames > PREGATE_HOLD_FRAMES) {
+      // The trace suspends skipping (it needs p for every frame); the hold count still runs.
+      if (!this.traceOn && !this.gateOpen && !this.seg.inSpeech && this.closedFrames > PREGATE_HOLD_FRAMES) {
         // Skip: keep the raw frame for the warm-up (the oldest goes once the ring is full) and feed p = 0.
         const n = PREGATE_WARMUP_FRAMES;
         this.ringFrames[(this.ringStart + this.ringCount) % n]!.set(raw);
@@ -340,6 +401,14 @@ export class VadCore {
       this.ringStart = 0;
       this.ringCount = 0;
       return;
+    }
+    if (this.traceOn) {
+      // The model's p (before onset blocking) and this inference's time, the newest in the stats ring.
+      const k = this.trSil;
+      this.trP[k] = p;
+      this.trMs[k] = this.times[(this.inferences - 1) % VAD_STATS_WINDOW]!;
+      this.trSilFrame[k] = firstFrame;
+      this.trSil = k + 1;
     }
     if (firstFrame < this.onsetBlockEnd) p = 0;
     let ev: SegEvent | null = segmenterStep(this.seg, SILERO_SEG_PARAMS, firstFrame, p);
@@ -383,6 +452,46 @@ export class VadCore {
       this.post({ t: 'vadStats', p95Ms: s[P95_INDEX]! });
     }
     return p;
+  }
+
+  /**
+   * Posts the first `n` collected hops and every collected Silero frame as a `traceBatch` of `epoch`, in
+   * freshly allocated arrays (transferred by the worker), and keeps the hops past `n` for the next batch.
+   */
+  private postTrace(epoch: number, n: number): void {
+    const hops = this.trHops;
+    const sil = this.trSil;
+    const rawDb = new Float32Array(n);
+    const bandDb = new Float32Array(n);
+    const voicing = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      rawDb[i] = this.trRaw[i]!;
+      bandDb[i] = this.trBand[i]!;
+      voicing[i] = this.trVoicing[i]!;
+    }
+    const sileroP = new Float32Array(sil);
+    const inferMs = new Float32Array(sil);
+    for (let j = 0; j < sil; j++) {
+      sileroP[j] = this.trP[j]!;
+      inferMs[j] = this.trMs[j]!;
+    }
+    const hop0Frame = n > 0 ? this.trHopFrame[0]! : Number.NaN;
+    const sil0Frame = sil > 0 ? this.trSilFrame[0]! : Number.NaN;
+    this.trRaw.copyWithin(0, n, hops);
+    this.trBand.copyWithin(0, n, hops);
+    this.trVoicing.copyWithin(0, n, hops);
+    this.trHopFrame.copyWithin(0, n, hops);
+    this.trHops = hops - n;
+    this.trSil = 0;
+    this.post({ t: 'traceBatch', epoch, hop0Frame, sil0Frame, rawDb, bandDb, voicing, sileroP, inferMs });
+  }
+
+  /** Posts the partial batch of the current epoch, if any, and empties the trace accumulators. */
+  private flushTrace(): void {
+    const epoch = this.epoch;
+    if (epoch !== null && (this.trHops > 0 || this.trSil > 0)) this.postTrace(epoch, this.trHops);
+    this.trHops = 0;
+    this.trSil = 0;
   }
 
   private emit(epoch: number, ev: SegEvent, floorDb: number): void {
