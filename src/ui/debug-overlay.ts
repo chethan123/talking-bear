@@ -254,7 +254,7 @@ export function batchBackend(b: TraceBatch): VadBackendName | null {
   return b.bandDb.length >= HOPS_PER_VAD_FRAME ? 'energy' : null;
 }
 
-/** A fixed-capacity ring of timed samples (ctx frame, value, tag); when full, a push overwrites the oldest. */
+/** A fixed-capacity ring of timed samples (ctx frame, value, tag); when full, a new one overwrites the oldest. */
 class TimedRing {
   readonly frames: Float64Array;
   readonly values: Float64Array;
@@ -270,13 +270,15 @@ class TimedRing {
     this.tags = new Float64Array(capacity);
   }
 
-  push(frame: number, value: number, tag: number): void {
+  /**
+   * Makes room for a new newest sample, overwriting the oldest when full, and returns its array index; the caller
+   * writes `frames`, `values` and `tags` there. (Handing the numbers over as arguments could box them.)
+   */
+  claim(): number {
     const i = this.next;
-    this.frames[i] = frame;
-    this.values[i] = value;
-    this.tags[i] = tag;
     this.next = i + 1 === this.frames.length ? 0 : i + 1;
     if (this.size < this.frames.length) this.size++;
+    return i;
   }
 
   /** The array index of the k-th newest sample (k = 0: the newest), for 0 ≤ k < size. */
@@ -319,207 +321,122 @@ export function createVadPlot(
   canvas: HTMLCanvasElement,
   dpr: number = Math.min(window.devicePixelRatio || 1, MAX_DPR),
 ): VadPlot {
-  canvas.width = Math.round(DEBUG_PLOT_WIDTH * dpr);
-  canvas.height = Math.round(DEBUG_PLOT_HEIGHT * dpr);
-  const g = canvas.getContext('2d');
-  if (g !== null) {
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.font = LEGEND_FONT;
-    g.textBaseline = 'top';
-  }
-  const plotH = DEBUG_PLOT_HEIGHT - DEBUG_GATE_BAR_PX;
-  const hops = new TimedRing(HOP_RING);
-  const sils = new TimedRing(SILERO_RING);
-  const levels = new TimedRing(LEVEL_RING);
-  const marks = new TimedRing(MARK_RING);
-  const gate = initialEnergyGateState();
-  const feat: FrameFeatures = { frame: 0, db: 0, floorDb: Number.NaN };
-  // The plot's changing numbers live in a typed array: a fractional number stored in a closure variable would be
-  // boxed (allocated) on every store.
-  const geo = new Float64Array(GEO_SIZE);
-  geo[G_GATE_EPOCH] = Number.NaN;
-  geo[G_LAST_SYNCED] = Number.NEGATIVE_INFINITY;
-  geo[G_LAST_END] = Number.NaN;
-  geo[G_SPAN] = 1;
-  /** Bumped by every append (a small integer, never boxed): draw() skips when neither this nor the end frame
-   *  changed. */
-  let version = 0;
-  let lastVersion = -1;
+  return new VadPlotImpl(canvas, dpr);
+}
 
-  /** Takes the floor of the newest `level` of `epoch` posted before ctx frame geo[G_LIMIT], unless already
-   *  taken. */
-  function sync(epoch: number): void {
-    const limit = geo[G_LIMIT]!;
-    let prev = Number.POSITIVE_INFINITY;
-    for (let k = 0; k < levels.size; k++) {
-      const i = levels.at(k);
-      const f = levels.frames[i]!;
-      if (f > prev) return; // older than a restarted timeline (a new AudioContext)
-      prev = f;
-      if (f >= limit) continue;
-      if (levels.tags[i] === epoch && f > geo[G_LAST_SYNCED]!) {
-        const floorDb = levels.values[i]!;
-        gate.floorDb = floorDb;
-        gate.initialized = Number.isFinite(floorDb);
-        geo[G_LAST_SYNCED] = f;
-      }
-      return;
+// The plot's per-draw and per-hop helpers are module functions and prototype methods, never per-plot closures:
+// every call site then has one target, which V8 inlines, so no number gets boxed on its way in or out.
+
+const PLOT_H = DEBUG_PLOT_HEIGHT - DEBUG_GATE_BAR_PX;
+
+/** The x of ctx frame `f` in the window `geo` holds (G_T0, G_SPAN). */
+function plotX(geo: Float64Array, f: number): number {
+  return ((f - geo[G_T0]!) / geo[G_SPAN]!) * DEBUG_PLOT_WIDTH;
+}
+
+/** The y of a Silero p, clamped to 0–1. */
+function plotYP(p: number): number {
+  return (1 - Math.min(1, Math.max(0, p))) * PLOT_H;
+}
+
+/** The y of a level in dBFS, clamped to the dB axis. */
+function plotYDb(db: number): number {
+  const d = Math.min(DEBUG_PLOT_DB_MAX, Math.max(DEBUG_PLOT_DB_MIN, db));
+  return ((DEBUG_PLOT_DB_MAX - d) / (DEBUG_PLOT_DB_MAX - DEBUG_PLOT_DB_MIN)) * PLOT_H;
+}
+
+/** The Silero thresholds' dashed lines (SILERO_SEG_PARAMS, 0.5 and 0.35). */
+const Y_POS = plotYP(SILERO_SEG_PARAMS.posThreshold);
+const Y_NEG = plotYP(SILERO_SEG_PARAMS.negThreshold);
+
+/**
+ * One series, newest to oldest, in `color`: on the dB axis if `db`, else on the p axis. Points more than
+ * GAP_STEPS steps (geo[G_STEP]) apart aren't joined; a non-finite value lifts the pen.
+ */
+function strokeSeries(
+  c: CanvasRenderingContext2D,
+  ring: TimedRing,
+  geo: Float64Array,
+  db: boolean,
+  color: string,
+): void {
+  const gap = GAP_STEPS * geo[G_STEP]!;
+  const t0 = geo[G_T0]!;
+  c.strokeStyle = color;
+  c.beginPath();
+  let prev = Number.POSITIVE_INFINITY;
+  let pen = false;
+  for (let k = 0; k < ring.size; k++) {
+    const i = ring.at(k);
+    const f = ring.frames[i]!;
+    if (f > prev) break; // older than a restarted timeline (a new AudioContext)
+    const v = ring.values[i]!;
+    if (Number.isFinite(v)) {
+      const px = plotX(geo, f);
+      const py = db ? plotYDb(v) : plotYP(v);
+      if (pen && prev - f <= gap) c.lineTo(px, py);
+      else c.moveTo(px, py);
+      pen = true;
+    } else {
+      pen = false;
     }
+    prev = f;
+    if (f < t0) break; // one point past the left edge, so the line reaches it
   }
+  c.stroke();
+}
 
-  const x = (f: number): number => ((f - geo[G_T0]!) / geo[G_SPAN]!) * DEBUG_PLOT_WIDTH;
-  const yP = (p: number): number => (1 - Math.min(1, Math.max(0, p))) * plotH;
-  const yDb = (db: number): number =>
-    ((DEBUG_PLOT_DB_MAX - Math.min(DEBUG_PLOT_DB_MAX, Math.max(DEBUG_PLOT_DB_MIN, db))) /
-      (DEBUG_PLOT_DB_MAX - DEBUG_PLOT_DB_MIN)) *
-    plotH;
-
-  /** One series, newest to oldest: `db` picks the axis; points more than GAP_STEPS steps (geo[G_STEP]) apart
-   *  aren't joined. */
-  function stroke(c: CanvasRenderingContext2D, ring: TimedRing, db: boolean, color: string): void {
-    const gap = GAP_STEPS * geo[G_STEP]!;
-    const t0 = geo[G_T0]!;
-    c.strokeStyle = color;
-    c.beginPath();
-    let prev = Number.POSITIVE_INFINITY;
-    let pen = false;
-    for (let k = 0; k < ring.size; k++) {
-      const i = ring.at(k);
-      const f = ring.frames[i]!;
-      if (f > prev) break;
-      const v = ring.values[i]!;
-      if (Number.isFinite(v)) {
-        const px = x(f);
-        const py = db ? yDb(v) : yP(v);
-        if (pen && prev - f <= gap) c.lineTo(px, py);
-        else c.moveTo(px, py);
-        pen = true;
-      } else {
-        pen = false;
-      }
-      prev = f;
-      if (f < t0) break; // one point past the left edge, so the line reaches it
+/** The energy-gate bar: one rectangle per run of contiguous open hops (hop length geo[G_HOP]). */
+function drawGateBar(c: CanvasRenderingContext2D, hops: TimedRing, geo: Float64Array): void {
+  const hop = geo[G_HOP]!;
+  const t0 = geo[G_T0]!;
+  c.fillStyle = DEBUG_PLOT_COLORS.egate;
+  let inRun = false;
+  let runStart = 0;
+  let runEnd = 0;
+  let prev = Number.POSITIVE_INFINITY;
+  for (let k = 0; k < hops.size; k++) {
+    const i = hops.at(k);
+    const f = hops.frames[i]!;
+    if (f > prev || f + hop < t0) break; // an older timeline, or left of the window
+    prev = f;
+    const open = hops.tags[i] === 1;
+    if (open && inRun && runStart - (f + hop) <= hop / 2) {
+      runStart = f; // the run reaches one hop further back
+      continue;
     }
-    c.stroke();
-  }
-
-  /** The energy-gate bar: one rectangle per run of contiguous open hops (hop length geo[G_HOP]). */
-  function gateBar(c: CanvasRenderingContext2D): void {
-    const hop = geo[G_HOP]!;
-    const t0 = geo[G_T0]!;
-    c.fillStyle = DEBUG_PLOT_COLORS.egate;
-    let inRun = false;
-    let runStart = 0;
-    let runEnd = 0;
-    let prev = Number.POSITIVE_INFINITY;
-    for (let k = 0; k < hops.size; k++) {
-      const i = hops.at(k);
-      const f = hops.frames[i]!;
-      if (f > prev || f + hop < t0) break; // an older timeline, or left of the window
-      prev = f;
-      const open = hops.tags[i] === 1;
-      if (open && inRun && runStart - (f + hop) <= hop / 2) {
-        runStart = f; // the run reaches one hop further back
-        continue;
-      }
-      if (inRun) c.fillRect(x(runStart), plotH, x(runEnd) - x(runStart), DEBUG_GATE_BAR_PX);
-      inRun = open;
-      runStart = f;
-      runEnd = f + hop;
+    if (inRun) {
+      const xa = plotX(geo, runStart);
+      c.fillRect(xa, PLOT_H, plotX(geo, runEnd) - xa, DEBUG_GATE_BAR_PX);
     }
-    if (inRun) c.fillRect(x(runStart), plotH, x(runEnd) - x(runStart), DEBUG_GATE_BAR_PX);
+    inRun = open;
+    runStart = f;
+    runEnd = f + hop;
   }
-
-  function markers(c: CanvasRenderingContext2D): void {
-    const t0 = geo[G_T0]!;
-    let prev = Number.POSITIVE_INFINITY;
-    for (let k = 0; k < marks.size; k++) {
-      const i = marks.at(k);
-      const f = marks.frames[i]!;
-      if (f > prev || f < t0) break;
-      prev = f;
-      const kind = marks.tags[i];
-      c.fillStyle =
-        kind === MARK_START
-          ? DEBUG_PLOT_COLORS.start
-          : kind === MARK_END
-            ? DEBUG_PLOT_COLORS.end
-            : DEBUG_PLOT_COLORS.misfire;
-      c.fillRect(Math.round(x(f)) - 1, 0, 2, plotH);
-    }
+  if (inRun) {
+    const xa = plotX(geo, runStart);
+    c.fillRect(xa, PLOT_H, plotX(geo, runEnd) - xa, DEBUG_GATE_BAR_PX);
   }
+}
 
-  return {
-    trace(b, rate) {
-      const hop = (rate * ENERGY_HOP) / VAD_RATE;
-      const sil = (rate * VAD_FRAME) / VAD_RATE;
-      const epoch = b.epoch;
-      if (epoch !== geo[G_GATE_EPOCH]) {
-        geo[G_GATE_EPOCH] = epoch;
-        geo[G_LAST_SYNCED] = Number.NEGATIVE_INFINITY;
-        gate.floorDb = Number.NaN;
-        gate.initialized = false;
-        gate.active = false;
-      }
-      const band = b.bandDb;
-      for (let i = 0; i < band.length; i++) {
-        const f = b.hop0Frame + i * hop;
-        geo[G_LIMIT] = f - hop / 2;
-        sync(epoch);
-        const db = band[i]!;
-        feat.frame = f;
-        feat.db = db;
-        energyGateStep(gate, feat, DEFAULT_ENERGY_PARAMS);
-        hops.push(f, db, gate.active ? 1 : 0);
-      }
-      const p = b.sileroP;
-      for (let j = 0; j < p.length; j++) sils.push(b.sil0Frame + j * sil, p[j]!, 0);
-      version++;
-    },
-    level(epoch, frame, floorDb) {
-      levels.push(frame, floorDb, epoch);
-      version++;
-    },
-    seg(ev) {
-      marks.push(ev.frame, 0, ev.kind === 'start' ? MARK_START : ev.kind === 'end' ? MARK_END : MARK_MISFIRE);
-      version++;
-    },
-    draw(endFrame, rate) {
-      if (g === null || (endFrame === geo[G_LAST_END] && version === lastVersion)) return;
-      geo[G_LAST_END] = endFrame;
-      lastVersion = version;
-      const hop = (rate * ENERGY_HOP) / VAD_RATE;
-      geo[G_HOP] = hop;
-      geo[G_SPAN] = DEBUG_PLOT_SECONDS * rate;
-      geo[G_T0] = endFrame - DEBUG_PLOT_SECONDS * rate;
-      g.clearRect(0, 0, DEBUG_PLOT_WIDTH, DEBUG_PLOT_HEIGHT);
-      g.lineWidth = 1;
-      g.strokeStyle = DEBUG_PLOT_COLORS.threshold;
-      g.setLineDash(DASH);
-      g.beginPath();
-      const yPos = yP(SILERO_SEG_PARAMS.posThreshold);
-      const yNeg = yP(SILERO_SEG_PARAMS.negThreshold);
-      g.moveTo(0, yPos);
-      g.lineTo(DEBUG_PLOT_WIDTH, yPos);
-      g.moveTo(0, yNeg);
-      g.lineTo(DEBUG_PLOT_WIDTH, yNeg);
-      g.stroke();
-      g.setLineDash(SOLID);
-      gateBar(g);
-      g.lineWidth = 1.5;
-      geo[G_STEP] = hop;
-      stroke(g, hops, true, DEBUG_PLOT_COLORS.band);
-      geo[G_STEP] = LEVEL_HOPS * hop;
-      stroke(g, levels, true, DEBUG_PLOT_COLORS.floor);
-      geo[G_STEP] = (rate * VAD_FRAME) / VAD_RATE;
-      stroke(g, sils, false, DEBUG_PLOT_COLORS.p);
-      markers(g);
-      drawLegend(g);
-    },
-    gateOpen(k) {
-      return k >= 0 && k < hops.size && hops.tags[hops.at(k)] === 1;
-    },
-  };
+/** The segment markers in the window: 2 px columns, green start, red end, grey misfire. */
+function drawMarkers(c: CanvasRenderingContext2D, marks: TimedRing, geo: Float64Array): void {
+  const t0 = geo[G_T0]!;
+  let prev = Number.POSITIVE_INFINITY;
+  for (let k = 0; k < marks.size; k++) {
+    const i = marks.at(k);
+    const f = marks.frames[i]!;
+    if (f > prev || f < t0) break;
+    prev = f;
+    const kind = marks.tags[i];
+    c.fillStyle =
+      kind === MARK_START
+        ? DEBUG_PLOT_COLORS.start
+        : kind === MARK_END
+          ? DEBUG_PLOT_COLORS.end
+          : DEBUG_PLOT_COLORS.misfire;
+    c.fillRect(Math.round(plotX(geo, f)) - 1, 0, 2, PLOT_H);
+  }
 }
 
 /** The plot's legend, top left, in the series' colours. */
@@ -532,6 +449,159 @@ function drawLegend(c: CanvasRenderingContext2D): void {
   c.fillText('floor', 46, 3);
   c.fillStyle = DEBUG_PLOT_COLORS.egate;
   c.fillText('egate', 82, 3);
+}
+
+class VadPlotImpl implements VadPlot {
+  private readonly g: CanvasRenderingContext2D | null;
+  private readonly hops = new TimedRing(HOP_RING);
+  private readonly sils = new TimedRing(SILERO_RING);
+  private readonly levels = new TimedRing(LEVEL_RING);
+  private readonly marks = new TimedRing(MARK_RING);
+  /** The replayed energy gate and the features object it steps on. */
+  private readonly gate = initialEnergyGateState();
+  private readonly feat: FrameFeatures = { frame: 0, db: 0, floorDb: Number.NaN };
+  /** The plot's changing numbers (the G_* slots): a fractional number in an object field or a closure variable
+   *  can be boxed (allocated) on a store; in a Float64Array it never is. */
+  private readonly geo = new Float64Array(GEO_SIZE);
+  /** Bumped by every append (a small integer, never boxed); draw() skips while neither it nor the end frame
+   *  changed. */
+  private version = 0;
+  private lastVersion = -1;
+
+  constructor(canvas: HTMLCanvasElement, dpr: number) {
+    canvas.width = Math.round(DEBUG_PLOT_WIDTH * dpr);
+    canvas.height = Math.round(DEBUG_PLOT_HEIGHT * dpr);
+    const g = canvas.getContext('2d');
+    if (g !== null) {
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.font = LEGEND_FONT;
+      g.textBaseline = 'top';
+    }
+    this.g = g;
+    this.geo[G_SPAN] = 1;
+    this.geo[G_LAST_END] = Number.NaN;
+    this.geo[G_GATE_EPOCH] = Number.NaN;
+    this.geo[G_LAST_SYNCED] = Number.NEGATIVE_INFINITY;
+  }
+
+  trace(b: TraceBatch, rate: number): void {
+    const geo = this.geo;
+    const gate = this.gate;
+    const feat = this.feat;
+    const hops = this.hops;
+    const sils = this.sils;
+    const hop = (rate * ENERGY_HOP) / VAD_RATE;
+    const sil = (rate * VAD_FRAME) / VAD_RATE;
+    const epoch = b.epoch;
+    if (epoch !== geo[G_GATE_EPOCH]) {
+      geo[G_GATE_EPOCH] = epoch;
+      geo[G_LAST_SYNCED] = Number.NEGATIVE_INFINITY;
+      gate.floorDb = Number.NaN;
+      gate.initialized = false;
+      gate.active = false;
+    }
+    const band = b.bandDb;
+    for (let i = 0; i < band.length; i++) {
+      const f = b.hop0Frame + i * hop;
+      geo[G_LIMIT] = f - hop / 2;
+      this.sync(epoch);
+      const db = band[i]!;
+      feat.frame = f;
+      feat.db = db;
+      energyGateStep(gate, feat, DEFAULT_ENERGY_PARAMS);
+      const h = hops.claim();
+      hops.frames[h] = f;
+      hops.values[h] = db;
+      hops.tags[h] = gate.active ? 1 : 0;
+    }
+    const p = b.sileroP;
+    for (let j = 0; j < p.length; j++) {
+      const k = sils.claim();
+      sils.frames[k] = b.sil0Frame + j * sil;
+      sils.values[k] = p[j]!;
+      sils.tags[k] = 0;
+    }
+    this.version++;
+  }
+
+  level(epoch: number, frame: number, floorDb: number): void {
+    const levels = this.levels;
+    const i = levels.claim();
+    levels.frames[i] = frame;
+    levels.values[i] = floorDb;
+    levels.tags[i] = epoch;
+    this.version++;
+  }
+
+  seg(ev: SegEvent): void {
+    const kind = ev.kind === 'start' ? MARK_START : ev.kind === 'end' ? MARK_END : MARK_MISFIRE;
+    const marks = this.marks;
+    const i = marks.claim();
+    marks.frames[i] = ev.frame;
+    marks.values[i] = 0;
+    marks.tags[i] = kind;
+    this.version++;
+  }
+
+  draw(endFrame: number, rate: number): void {
+    const g = this.g;
+    const geo = this.geo;
+    if (g === null || (endFrame === geo[G_LAST_END] && this.version === this.lastVersion)) return;
+    geo[G_LAST_END] = endFrame;
+    this.lastVersion = this.version;
+    const hop = (rate * ENERGY_HOP) / VAD_RATE;
+    geo[G_HOP] = hop;
+    geo[G_SPAN] = DEBUG_PLOT_SECONDS * rate;
+    geo[G_T0] = endFrame - DEBUG_PLOT_SECONDS * rate;
+    g.clearRect(0, 0, DEBUG_PLOT_WIDTH, DEBUG_PLOT_HEIGHT);
+    g.lineWidth = 1;
+    g.strokeStyle = DEBUG_PLOT_COLORS.threshold;
+    g.setLineDash(DASH);
+    g.beginPath();
+    g.moveTo(0, Y_POS);
+    g.lineTo(DEBUG_PLOT_WIDTH, Y_POS);
+    g.moveTo(0, Y_NEG);
+    g.lineTo(DEBUG_PLOT_WIDTH, Y_NEG);
+    g.stroke();
+    g.setLineDash(SOLID);
+    drawGateBar(g, this.hops, geo);
+    g.lineWidth = 1.5;
+    geo[G_STEP] = hop;
+    strokeSeries(g, this.hops, geo, true, DEBUG_PLOT_COLORS.band);
+    geo[G_STEP] = LEVEL_HOPS * hop;
+    strokeSeries(g, this.levels, geo, true, DEBUG_PLOT_COLORS.floor);
+    geo[G_STEP] = (rate * VAD_FRAME) / VAD_RATE;
+    strokeSeries(g, this.sils, geo, false, DEBUG_PLOT_COLORS.p);
+    drawMarkers(g, this.marks, geo);
+    drawLegend(g);
+  }
+
+  gateOpen(k: number): boolean {
+    return k >= 0 && k < this.hops.size && this.hops.tags[this.hops.at(k)] === 1;
+  }
+
+  /** Takes the floor of the newest `level` of `epoch` posted before ctx frame geo[G_LIMIT], unless already
+   *  taken. */
+  private sync(epoch: number): void {
+    const geo = this.geo;
+    const levels = this.levels;
+    const limit = geo[G_LIMIT]!;
+    let prev = Number.POSITIVE_INFINITY;
+    for (let k = 0; k < levels.size; k++) {
+      const i = levels.at(k);
+      const f = levels.frames[i]!;
+      if (f > prev) return; // older than a restarted timeline (a new AudioContext)
+      prev = f;
+      if (f >= limit) continue;
+      if (levels.tags[i] === epoch && f > geo[G_LAST_SYNCED]!) {
+        const floorDb = levels.values[i]!;
+        this.gate.floorDb = floorDb;
+        this.gate.initialized = Number.isFinite(floorDb);
+        geo[G_LAST_SYNCED] = f;
+      }
+      return;
+    }
+  }
 }
 
 /**
