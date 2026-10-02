@@ -9,7 +9,15 @@ import type { Player, SessionDeps, Sfx } from './session.ts';
 /** The parts of the session's dependencies that effects use. */
 export type EffectDeps = Pick<
   SessionDeps,
-  'engine' | 'makePlayer' | 'makeSfx' | 'wakeLock' | 'clock' | 'onAnim' | 'onUi' | 'onApplyUpdate'
+  | 'engine'
+  | 'makePlayer'
+  | 'makeSfx'
+  | 'wakeLock'
+  | 'clock'
+  | 'onAnim'
+  | 'onPlayStarted'
+  | 'onUi'
+  | 'onApplyUpdate'
 >;
 
 /** How effects talk back to the session. */
@@ -79,7 +87,15 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
     // getChannelData().set() copies from any Float32Array; copyToChannel wants a Float32Array<ArrayBuffer>.
     buffer.getChannelData(0).set(p.pcm);
     // The voice chain already pitched the clip (plan §4.3.4): it plays at rate 1.
-    return pl.play(buffer, 1).done;
+    const handle = pl.play(buffer, 1);
+    // The mouth (#81) samples the envelope against this start. A throwing listener must not end a replay that
+    // is already audible.
+    try {
+      deps.onPlayStarted?.(id, handle.startCtxTime);
+    } catch (err) {
+      console.error('effects: onPlayStarted failed', err);
+    }
+    return handle.done;
   }
 
   /**
