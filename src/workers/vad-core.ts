@@ -90,8 +90,9 @@ export const TRACE_BATCH_HOPS = 25;
 /** Hops the trace accumulators hold: a batch, plus the rest of the frame that completes it (a frame completes
  *  at most ⌈512 / 160⌉ = 4 hops), which opens the next batch. */
 const TRACE_HOP_CAPACITY = TRACE_BATCH_HOPS + Math.ceil(VAD_FRAME / ENERGY_HOP);
-/** Silero frames the trace accumulators hold. Every frame whose p joins a batch first adds ≥ 3 hops to it, so
- *  a batch gets at most ⌈25 / 3⌉ = 9; TRACE_BATCH_HOPS is a safe bound. */
+/** Silero frames the trace accumulators hold. A frame's p joins the batch its hops fill first: every such frame
+ *  but the one that completes the batch adds 3 or 4 hops to it, so a batch gets at most ⌈25 / 3⌉ = 9 values;
+ *  TRACE_BATCH_HOPS is a safe bound. */
 const TRACE_SILERO_CAPACITY = TRACE_BATCH_HOPS;
 
 /** One energy hop in ms (10). */
