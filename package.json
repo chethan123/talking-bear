@@ -24,6 +24,7 @@
     "fixtures": "node scripts/gen-fixtures.ts",
     "corpus": "node scripts/gen-corpus.ts",
     "gen:bear": "node scripts/gen-bear-parts.ts",
+    "gen:vad-fingerprint": "node scripts/gen-vad-fingerprint.ts",
     "silero:fetch": "node scripts/fetch-silero-onnx.ts",
     "silero:extract": "node scripts/extract-silero-weights.ts",
     "parity": "node scripts/fetch-silero-onnx.ts && node scripts/silero-parity.ts",
