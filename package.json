@@ -9,8 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "check:worklet": "node scripts/check-worklet-chunk.ts dist",
-    "check:no-hooks": "node scripts/check-no-hooks.ts dist",
+    "check:dist": "node scripts/check-dist.mjs dist production",
     "preview": "vite preview --port 4173 --strictPort",
     "build:e2e": "vite build --mode e2e --outDir dist-e2e",
     "preview:e2e": "vite preview --outDir dist-e2e --port 4173 --strictPort",
