@@ -5,9 +5,10 @@
 //
 // Exit 0 after printing a table (file, raw, br, gz: sizes in bytes, `-` where no variant was written) and a summary
 // line. Exit 1 on a usage error or when the dir or a file can't be read or written.
-// Plain Node ESM with no dependencies, like check-dist.mjs: the Dockerfile's web stage runs it as the last step on
-// the dist it embeds (build → check-dist → size-limit → precompress, plan §9), so check-dist and size-limit see the
-// uncompressed bytes. main() runs only when this file is executed directly; the tests import the helpers.
+// Plain Node ESM without package dependencies (it reuses listFiles from check-dist.mjs): the Dockerfile's web stage
+// (plan §4.8.2, #106) runs it as the last step on the dist it embeds (build → check-dist → size-limit → precompress,
+// plan §9), so check-dist and size-limit see the uncompressed bytes. main() runs only when this file is executed
+// directly; the tests import the helpers.
 //
 // Rules:
 //   1. Only files whose last extension is html, js, css, json, webmanifest, svg or bin, in any letter case (the Go
