@@ -4,7 +4,7 @@
 // while a dispatch is running. Named timers use the injected `Clock` only, never the global timers.
 
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
-import type { Player, SessionDeps, Sfx } from './session.ts';
+import type { Player, SessionDeps, Sfx, SfxScheduled } from './session.ts';
 
 /** The parts of the session's dependencies that effects use. */
 export type EffectDeps = Pick<
@@ -26,6 +26,8 @@ export interface EffectIo {
   dispatch(e: SessionEvent): void;
   /** The session's current state (already the new state while a transition's effects run). */
   state(): SessionState;
+  /** An `sfx` effect was scheduled: its seq, id and the context time its sound ends (`sfx.play`'s `endCtxTime`). */
+  sfxScheduled?(e: SfxScheduled): void;
 }
 
 export interface EffectRunner {
@@ -159,7 +161,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
       return;
     }
     try {
-      s.play(fx.id);
+      const { endCtxTime } = s.play(fx.id);
+      io.sfxScheduled?.({ seq: fx.seq, id: fx.id, endCtxTime });
     } catch (err) {
       console.error('effects: sfx failed', err); // earlier sfx may still be audible: wait for them below
     }
