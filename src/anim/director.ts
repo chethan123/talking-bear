@@ -24,6 +24,12 @@
  * Idle at once and the wake clip plays on. Every other transition keeps the playing clip too, except
  * `sleep`, which ends with Asleep.
  *
+ * **Cut crossfade** (#240). A step that puts another clip into the slot while the one playing hasn't ended (an
+ * interrupting reaction, an additive one in Attentive or Thinking, a reaction starting over the flinch, `wake` or
+ * `sleep`) keeps the outgoing clip as `prevClip`, and `evaluate` fades it out under the incoming one over 100 ms.
+ * A second cut inside that fade keeps whichever outgoing clip moves the pose less at that instant, so it never
+ * jumps more than a plain cut would. The first tick from `cutAt` + 100 ms clears `prevClip`. See `crossfade`.
+ *
  * **Mouth.** Leaving Talking sets `mouthCloseStart = now` and clears `talk`; `talk` clears
  * `mouthCloseStart`, so every talk starts with the mouth fully open to the mouth layer.
  *
@@ -130,6 +136,12 @@ export interface DirectorState {
   fadeStart: number;
   /** The clip currently playing (a session clip, a reaction clip or the flinch); `start` on the director clock. */
   clip: { name: string; start: number } | null;
+  /**
+   * The clip a cut replaced while it was still playing (#240), faded out under `clip` for 100 ms from `cutAt`
+   * (s); null otherwise. It plays on in time from `start`. `release` is its reaction's release time when that
+   * reaction was easing out at the cut (the ease-out goes on under the fade), else null.
+   */
+  prevClip: { name: string; start: number; cutAt: number; release: number | null } | null;
   talk: { id: number; startCtxTime: number | null } | null;
   /** talkEnd → the mouth closes over 200 ms from here (`mouthCloseScale`). */
   mouthCloseStart: number | null;
@@ -197,6 +209,8 @@ const QUEUE_S = 0.5;
 const COOLDOWN_S = 0.8;
 /** A released sustained reaction eases out over this long, then ends (s). */
 const RELEASE_S = 0.4;
+/** A clip cut while playing fades out under the incoming one over this long (s, #240). */
+const CUT_S = 0.1;
 /** Repeat-based escalation defaults (plan §3.5): the same reaction ×3 within 4 s. */
 const REPEAT_COUNT = 3;
 const REPEAT_WITHIN_MS = 4000;
@@ -257,6 +271,8 @@ const CLIPS: ReadonlyMap<string, Clip> = new Map<string, Clip>([
 
 /** Scratch pose for the clip sample in `evaluate`, allocated once so `evaluate` never allocates. */
 const CLIP_DELTA: Pose = createPose();
+/** Scratch pose for the cut clip's sample in `evaluate` (#240), allocated once like `CLIP_DELTA`. */
+const PREV_DELTA: Pose = createPose();
 
 /** The director at start-up: Asleep, on the `asleep` base, with nothing playing. */
 export function initialDirector(now: number): DirectorState {
@@ -267,6 +283,7 @@ export function initialDirector(now: number): DirectorState {
     prevBase: 'asleep',
     fadeStart: now,
     clip: null,
+    prevClip: null,
     talk: null,
     mouthCloseStart: null,
     reaction: null,
@@ -795,6 +812,63 @@ function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
   }
 }
 
+/** Scratch poses for `crossfade`'s choice at a second cut (#240): the pose before it, and with each choice. */
+const CUT_FROM: Pose = createPose();
+const CUT_KEEP: Pose = createPose();
+const CUT_NEW: Pose = createPose();
+
+/** The largest |a − b| over the channels `evaluate` writes (every channel but the mouth's). */
+function poseJump(a: Pose, b: Pose): number {
+  let m = 0;
+  for (let c = 0; c < CH_COUNT; c++) {
+    if (c === Ch.Jaw || c === Ch.MouthW || c === Ch.MouthRound || c === Ch.Teeth) continue;
+    const d = a[c]! - b[c]!;
+    if (d > m) m = d;
+    else if (-d > m) m = -d;
+  }
+  return m;
+}
+
+/**
+ * The cut crossfade's bookkeeping for one step from `s` to `next` (#240), done here once for every handler:
+ * - **Cut:** the step put another clip (another name or start) into the slot while `s`'s clip hadn't ended:
+ *   `next` gets that outgoing clip as `prevClip`, cut at the input's time, with its reaction's release when it
+ *   was easing out. Whether it had ended is judged on `s`, so a held clip counts as playing even when the same
+ *   step ends its reaction (`wake`, `sleep`). A clip dropped with no successor is no cut.
+ * - **A second cut,** inside the fade of `s.prevClip` (weight k > 0): either the older `prevClip` stays (`next`
+ *   carries it, as every handler spreads `s`) and the clip being cut drops out, or the clip being cut becomes
+ *   `prevClip` and the older one drops out. It keeps the choice that moves the pose less at the cut (`evaluate`
+ *   of each against `s`; a tie keeps the older one). On the same base, keeping the older one moves it by
+ *   (1 − k)·|cut − incoming|, never more than a plain cut, so the choice never pops worse than no crossfade.
+ * - **Expiry:** the first tick at or after `cutAt` + 100 ms clears `prevClip`.
+ * Otherwise it returns `next` itself. A step that changes nothing, with no `prevClip`, returns at the first line
+ * and reads no time (the frame's quiet tick, #229).
+ */
+function crossfade(s: DirectorState, next: DirectorState, i: DirInput): DirectorState {
+  if (next === s && s.prevClip === null) return s;
+  if (i.k === 'setGentle') return next;
+  const old = s.clip;
+  const cur = next.clip;
+  if (
+    old !== null &&
+    cur !== null &&
+    (cur.name !== old.name || cur.start !== old.start) &&
+    i.now < clipEnd(s, old)
+  ) {
+    const a = s.reaction;
+    const releasedAt = a !== null && a.release !== null && a.clip === old.name ? a.release : null;
+    const now = i.now;
+    const cut = { ...next, prevClip: { name: old.name, start: old.start, cutAt: now, release: releasedAt } };
+    const q = s.prevClip;
+    if (q === null || now >= q.cutAt + CUT_S) return cut;
+    evaluate(s, now, CUT_FROM);
+    const keepJump = poseJump(evaluate(next, now, CUT_KEEP), CUT_FROM);
+    return keepJump <= poseJump(evaluate(cut, now, CUT_NEW), CUT_FROM) ? next : cut;
+  }
+  const p = next.prevClip;
+  return p !== null && i.k === 'tick' && i.now >= p.cutAt + CUT_S ? { ...next, prevClip: null } : next;
+}
+
 /** The outputs of the step in progress (`directorStep` is not re-entrant). */
 const SCRATCH: DirOut[] = [];
 const NO_OUT: readonly DirOut[] = Object.freeze([]);
@@ -808,7 +882,7 @@ let quiet: DirStep = Object.freeze({ state: initialDirector(0), out: NO_OUT });
  */
 export function directorStep(s: DirectorState, i: DirInput): DirStep {
   SCRATCH.length = 0;
-  const state = step(s, i, SCRATCH);
+  const state = crossfade(s, step(s, i, SCRATCH), i);
   if (SCRATCH.length === 0) {
     if (quiet.state !== state) quiet = Object.freeze({ state, out: NO_OUT });
     return quiet;
@@ -818,13 +892,17 @@ export function directorStep(s: DirectorState, i: DirInput): DirStep {
 
 /** The director reducer: `directorStep(s, i).state`, without collecting the outputs. */
 export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
-  return i.k === 'tick' ? tick(s, i, null) : step(s, i, null);
+  return crossfade(s, i.k === 'tick' ? tick(s, i, null) : step(s, i, null), i);
 }
 
 /**
  * Writes the director's pose at `now` into `out` and returns `out`: the crossfade
  * `prevBase + (base − prevBase)·t`, `t = clamp((now − fadeStart)/0.15, 0, 1)`, plus the active clip's sample;
  * a released reaction's clip × its 400 ms ease-out, `1 − smoothstep((now − release)/0.4)`.
+ * While a clip plays and `prevClip` was cut less than 100 ms ago (#240), the clip term is
+ * `clip·w·(1 − k) + prevClip·wp·k` with `k = 1 − smoothstep((now − cutAt)/0.1)`: exactly the outgoing clip at the
+ * cut and the incoming one from +100 ms. `prevClip` is sampled at `now − start` (it plays on) and `wp` is its own
+ * release ease-out (1 without one). Without a clip in the slot nothing is blended.
  * The mouth channels (`Jaw`, `MouthW`, `MouthRound`, `Teeth`) are never written: the mouth layer owns them.
  * Never allocates.
  */
@@ -835,6 +913,9 @@ export function evaluate(s: DirectorState, now: number, out: Pose): Pose {
   const t = f < 1 ? (f > 0 ? f : 0) : 1;
   let withClip = false;
   let w = 1;
+  /** The cut clip's weight `k` (0: no blend) and its own release ease-out. */
+  let k = 0;
+  let wp = 1;
   const playing = s.clip;
   if (playing !== null) {
     const c = CLIPS.get(playing.name);
@@ -846,13 +927,28 @@ export function evaluate(s: DirectorState, now: number, out: Pose): Pose {
         const u = (now - r.release) / RELEASE_S;
         w = u > 0 ? (u < 1 ? 1 - u * u * (3 - 2 * u) : 0) : 1;
       }
+      const p = s.prevClip;
+      if (p !== null) {
+        const u = (now - p.cutAt) / CUT_S;
+        const pc = u < 1 ? CLIPS.get(p.name) : undefined;
+        if (pc !== undefined) {
+          sampleClip(pc, now - p.start, PREV_DELTA);
+          k = u > 0 ? 1 - u * u * (3 - 2 * u) : 1;
+          if (p.release !== null) {
+            const v = (now - p.release) / RELEASE_S;
+            wp = v > 0 ? (v < 1 ? 1 - v * v * (3 - 2 * v) : 0) : 1;
+          }
+        }
+      }
     }
   }
   for (let i = 0; i < CH_COUNT; i++) {
     if (i === Ch.Jaw || i === Ch.MouthW || i === Ch.MouthRound || i === Ch.Teeth) continue;
     const ai = a[i]!;
     const v = ai + (b[i]! - ai) * t;
-    out[i] = withClip ? v + CLIP_DELTA[i]! * w : v;
+    if (!withClip) out[i] = v;
+    else if (k > 0) out[i] = v + CLIP_DELTA[i]! * w * (1 - k) + PREV_DELTA[i]! * wp * k;
+    else out[i] = v + CLIP_DELTA[i]! * w;
   }
   return out;
 }

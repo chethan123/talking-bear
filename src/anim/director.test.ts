@@ -129,8 +129,9 @@ function run(s: DirectorState, ...inputs: DirInput[]): DirectorState {
   return r;
 }
 
-/** The reaction fields of a director with no reaction history (`initialDirector`'s). */
+/** The reaction fields of a director with no reaction history, and no cut clip (`initialDirector`'s). */
 const NO_REACTION = {
+  prevClip: null,
   reaction: null,
   queued: null,
   cooldowns: [],
@@ -168,6 +169,7 @@ function variants(name: DirState): DirectorState[] {
 /** Freezes `s` and its nested objects, so any write by the reducer throws (ES modules are strict). */
 function deepFreeze(s: DirectorState): DirectorState {
   if (s.clip !== null) Object.freeze(s.clip);
+  if (s.prevClip !== null) Object.freeze(s.prevClip);
   if (s.talk !== null) Object.freeze(s.talk);
   if (s.reaction !== null) Object.freeze(s.reaction);
   if (s.queued !== null) Object.freeze(s.queued);
@@ -186,6 +188,11 @@ function expectedEnter(s: DirectorState, target: DirState, now: number): Directo
   if (target === 'Waking') clip = { name: 'wake', start: now };
   else if (target === 'Asleep') clip = { name: 'sleep', start: now };
   else clip = s.clip?.name === 'sleep' ? null : s.clip;
+  // #240: a new clip over one still playing cuts it (these states hold no reaction, so no release).
+  const old = s.clip;
+  const oldName = CLIP_NAMES.find((n) => n === old?.name);
+  const cut =
+    clip !== null && clip !== old && old !== null && oldName !== undefined && now < endOf(oldName, old.start);
   return {
     name: target,
     since: now,
@@ -193,6 +200,7 @@ function expectedEnter(s: DirectorState, target: DirState, now: number): Directo
     prevBase: moved ? s.base : s.prevBase,
     fadeStart: moved ? now : s.fadeStart,
     clip,
+    prevClip: cut ? { name: old.name, start: old.start, cutAt: now, release: null } : s.prevClip,
     talk: target === 'Talking' ? { id: 7, startCtxTime: null } : null,
     mouthCloseStart: target === 'Talking' ? null : s.name === 'Talking' ? now : s.mouthCloseStart,
     reaction: s.reaction,
