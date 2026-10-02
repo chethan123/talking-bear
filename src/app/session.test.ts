@@ -864,20 +864,20 @@ describe('play effect (runner)', () => {
   });
 });
 
-describe('a processed result the reducer does not replay is released at once', () => {
-  /** From Listening: armed, seg start, seg end → Processing for take 1. */
-  function toProcessing(h: Harness): number {
-    h.eng.emit({ t: 'armed', epoch: 1, armFrame: 1000 });
-    h.eng.emit({ t: 'seg', epoch: 1, ev: { kind: 'start', frame: 48_000 } });
-    h.eng.emit({
-      t: 'seg',
-      epoch: 1,
-      ev: { kind: 'end', frame: 110_000, lastSpeechFrame: 96_000, reason: 'silence' },
-    });
-    expect(stateOf(h)).toBe('Processing');
-    return h.session.state().takeId;
-  }
+/** From Listening: armed, seg start, seg end → Processing for take 1. */
+function toProcessing(h: Harness): number {
+  h.eng.emit({ t: 'armed', epoch: 1, armFrame: 1000 });
+  h.eng.emit({ t: 'seg', epoch: 1, ev: { kind: 'start', frame: 48_000 } });
+  h.eng.emit({
+    t: 'seg',
+    epoch: 1,
+    ev: { kind: 'end', frame: 110_000, lastSpeechFrame: 96_000, reason: 'silence' },
+  });
+  expect(stateOf(h)).toBe('Processing');
+  return h.session.state().takeId;
+}
 
+describe('a processed result the reducer does not replay is released at once', () => {
   it('a late reply after the processing watchdog (Cooldown): released, never played', async () => {
     const h = setup();
     await toListening(h);
