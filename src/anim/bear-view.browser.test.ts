@@ -40,8 +40,9 @@ const DEG = Math.PI / 180;
 /** One 60 Hz vsync, in ms. */
 const VSYNC = 1000 / 60;
 
-// The reduced-motion test needs a clip that writes `HeadRot`, and no session clip does yet (M5's reaction
-// clips will): give `confused` a HeadRot track (0 → 0.2 rad at 0.45 s → 0) on top of its own tracks.
+// The reduced-motion tests need a clip that writes `HeadRot` and the squash and wobble channels no session clip
+// writes yet (M5's reaction clips will): give `confused` a HeadRot track (0 → 0.2 rad at 0.45 s → 0) and small
+// HeadSquishX/Y, TuftRot and KerchiefA/B tracks on top of its own tracks.
 vi.mock('./clips/session.ts', async (importOriginal) => {
   const mod = await importOriginal<typeof import('./clips/session.ts')>();
   const { Ch: channels } = await import('./pose.ts'); // vi.mock is hoisted above this file's imports
@@ -62,6 +63,22 @@ vi.mock('./clips/session.ts', async (importOriginal) => {
               { t: confused.duration, v: 0 },
             ],
           },
+          ...(
+            [
+              [channels.HeadSquishX, 0.05],
+              [channels.HeadSquishY, -0.05],
+              [channels.TuftRot, 0.1],
+              [channels.KerchiefA, 0.1],
+              [channels.KerchiefB, -0.1],
+            ] as const
+          ).map(([ch, peak]) => ({
+            ch,
+            keys: [
+              { t: 0, v: 0 },
+              { t: 0.45, v: peak },
+              { t: confused.duration, v: 0 },
+            ],
+          })),
         ],
       },
     },
@@ -345,7 +362,11 @@ describe('the mouth is fed by the processed envelope', () => {
     const before = drawnFrames(h);
     for (let k = 0; k < 60; k++) {
       const t = PERF0 + 3 + k * VSYNC;
-      h.stepTo(t);
+      if (k === 30) {
+        // The app clock runs 5 ms ahead of this frame's rAF time: the mouth samples at the rAF time (D6).
+        h.clock.t = t + 5;
+        h.frames.step(t);
+      } else h.stepTo(t);
       const clipTime = (t - PERF0) / 1000 + DISPLAY_LATENCY_MS / 1000;
       mouthFromEnvelope(ramp, clipTime, pose);
       expect(h.view.pose()[Ch.Jaw], `frame ${k}`).toBeCloseTo(pose[Ch.Jaw]!, 6);
@@ -398,6 +419,7 @@ describe('the mouth is fed by the processed envelope', () => {
     h.audio.processed.set(7, { envelope: ramp });
     h.clock.t = PERF0;
     toThinking(h);
+    h.audio.processed.set(6, { envelope: ramp });
     h.view.onPlayStarted(6, START);
     h.anim({ e: 'talk', id: 7 });
     h.stepTo(PERF0 + 500);
@@ -425,6 +447,32 @@ describe('the mouth is fed by the processed envelope', () => {
     h.stepTo(PERF0 + 1220);
     expect(h.view.frameLog().at(-1)).toMatchObject({ clipTime: null, envIndex: -1 });
     expect(h.view.pose()[Ch.Jaw]).toBe(0);
+  });
+});
+
+describe('the closing mouth after talkEnd', () => {
+  test('keeps every rAF drawn while it closes, then Idle throttles to 30 fps again', () => {
+    const PERF0 = 10_000;
+    const h = harness({ latencyMs: 0 });
+    h.audio.ctx = fakeOutput(50, PERF0);
+    h.audio.processed.set(7, { envelope: envelope(300, () => 0.8) });
+    h.clock.t = PERF0 - 100;
+    toThinking(h);
+    h.view.onPlayStarted(7, 50);
+    h.anim({ e: 'talk', id: 7 });
+    h.stepTo(PERF0 + 1000);
+    h.anim({ e: 'talkEnd' }); // Idle; the base crossfade ends at +150 ms, the mouth closes by +200 ms
+    const period = 1000 / 120;
+    const drawn: boolean[] = [];
+    for (let i = 1; i <= 72; i++) {
+      const before = drawnFrames(h);
+      h.stepTo(PERF0 + 1000 + i * period);
+      drawn.push(drawnFrames(h) > before);
+    }
+    // +8.3 … +200 ms: every vsync drawn (after +150 ms only because the mouth is still closing).
+    expect(drawn.slice(0, 24)).toEqual(Array.from({ length: 24 }, () => true));
+    // +258 … +592 ms: 30 fps at 120 Hz.
+    expect(drawn.slice(30, 70).filter(Boolean)).toHaveLength(10);
   });
 });
 
@@ -512,6 +560,94 @@ describe('the frame loop', () => {
     expect(after.filter(Boolean)).toHaveLength(15);
   });
 
+  test('Dozing runs no gaze (D5): no saccade moves the iris or the head, while Idle at the same seed does', () => {
+    const idle = harness(); // seed 1234
+    const dozing = harness();
+    toIdle(idle);
+    toIdle(dozing);
+    dozing.anim({ e: 'doze' });
+    let idleIris = 0;
+    let dozingGaze = 0;
+    for (let i = 0; i < 300; i++) {
+      // 5 s: the first saccade is due 1.5–4 s after the gaze starts
+      idle.run(1);
+      dozing.run(1);
+      const p = idle.view.pose();
+      const q = dozing.view.pose();
+      idleIris = Math.max(idleIris, Math.abs(p[Ch.IrisX]!) + Math.abs(p[Ch.IrisY]!));
+      dozingGaze = Math.max(
+        dozingGaze,
+        Math.abs(q[Ch.IrisX]!),
+        Math.abs(q[Ch.IrisY]!),
+        Math.abs(q[Ch.HeadRot]!),
+      );
+    }
+    expect(dozing.view.director().name).toBe('Dozing');
+    expect(idleIris, 'Idle looks around within 5 s').toBeGreaterThan(0.1);
+    expect(dozingGaze, 'Dozing: iris and head follow stay at 0').toBe(0);
+    expect(dozing.view.pose()[Ch.HeadTilt]).toBeCloseTo(-3 * DEG, 6); // the dozing base, no head follow
+  });
+
+  test('a throttled frame loses no animation time: Asleep at 15 fps breathes exactly like Asleep drawn every rAF', () => {
+    const throttled = harness();
+    const every = harness();
+    const vsync = (): void => {
+      throttled.run(1);
+      every.run(1);
+      every.anim({ e: 'doze' }); // ignored while Asleep, but the next rAF is drawn
+    };
+    for (let i = 0; i < 600; i++) vsync(); // 10 s at 60 Hz
+    let before = drawnFrames(throttled);
+    for (let i = 0; i < 120; i++) vsync();
+    expect(drawnFrames(throttled) - before, 'the throttled view draws at 15 fps').toBe(30);
+    // End on a frame the throttled view draws, so both poses are of the same rAF time.
+    before = drawnFrames(throttled);
+    while (drawnFrames(throttled) === before) vsync();
+    expect(every.view.director().name).toBe('Asleep');
+    for (const ch of [Ch.BellyJiggle, Ch.BodySquash]) {
+      expect(Math.abs(throttled.view.pose()[ch]! - every.view.pose()[ch]!), `channel ${ch}`).toBeLessThan(
+        1e-4,
+      );
+    }
+  });
+
+  test('a saccade that starts in a frame’s last substep draws every rAF until the iris settles (D17)', () => {
+    // 120 Hz vsyncs, so a frame drawn right after the previous one runs exactly one substep.
+    const PERIOD = 1000 / 120;
+    // Probe (same seed): force every vsync and find the first frame whose pose shows the iris move. The drawn
+    // layers lag one substep (alpha ≈ 0 at one substep per frame), so the saccade ran in the frame before it.
+    const probe = harness(); // seed 1234
+    toIdle(probe);
+    let shown = -1;
+    for (let i = 1; i <= 600 && shown < 0; i++) {
+      probe.run(1, PERIOD);
+      probe.anim({ e: 'idle' }); // ignored in Idle, but the next rAF is drawn
+      if (Math.abs(probe.view.pose()[Ch.IrisX]!) + Math.abs(probe.view.pose()[Ch.IrisY]!) > 1e-6) shown = i;
+    }
+    expect(shown, 'a saccade within 5 s').toBeGreaterThan(1);
+    const saccade = shown - 1;
+    // The view under test replays the probe's frames up to the saccade's frame, whose only (so last) substep
+    // steps the springs before the gaze retargets them: every spring velocity is still 0 after it.
+    const h = harness();
+    toIdle(h);
+    for (let i = 1; i <= saccade; i++) {
+      h.run(1, PERIOD);
+      if (i < saccade) h.anim({ e: 'idle' });
+    }
+    const drawn: boolean[] = [];
+    for (let i = 0; i < 168; i++) {
+      // 1.4 s: the next saccade is ≥ 1.5 s after this one
+      const before = drawnFrames(h);
+      h.run(1, PERIOD);
+      drawn.push(drawnFrames(h) > before);
+    }
+    expect(drawn.slice(0, 4), 'every rAF right after the saccade').toEqual([true, true, true, true]);
+    let last = 0;
+    for (let i = 1; i < drawn.length; i++) if (drawn[i] && drawn[i - 1]) last = i;
+    expect(last + 41, 'it settles well before the next saccade').toBeLessThanOrEqual(drawn.length);
+    expect(drawn.slice(last + 1, last + 41).filter(Boolean), 'then 30 fps again').toHaveLength(10);
+  });
+
   test('a moving state draws every rAF: the base crossfade, a clip, Attentive', () => {
     const h = harness();
     h.run(30);
@@ -597,10 +733,15 @@ describe('reduced motion', () => {
       toIdle(h);
       h.anim({ e: 'attentive' });
       h.run(400); // 6.7 s: saccades, blinks and breathing
+      h.anim({ e: 'confused' }); // this file's mock: squish, tuft and kerchief tracks peak at 0.45 s
+      h.run(27);
     }
+    expect(REDUCED_MOTION_SCALE).toBe(0.3);
     const pa = a.view.pose();
     const pb = b.view.pose();
-    expect(pa[Ch.BodyLean]).not.toBe(0);
+    // Attentive's 3° lean (no clip or layer writes BodyLean) is 0.9° in reduced motion.
+    expect(pa[Ch.BodyLean]).toBeCloseTo(3 * DEG, 6);
+    expect(pb[Ch.BodyLean]).toBeCloseTo(0.9 * DEG, 6);
     for (const ch of [
       Ch.BodySquash,
       Ch.BodyLean,
@@ -610,6 +751,7 @@ describe('reduced motion', () => {
       Ch.KerchiefA,
       Ch.KerchiefB,
     ]) {
+      expect(Math.abs(pa[ch]!), `channel ${ch} moves in the plain view`).toBeGreaterThan(1e-3);
       expect(pb[ch], `channel ${ch}`).toBeCloseTo(pa[ch]! * REDUCED_MOTION_SCALE, 7);
     }
     for (const ch of [Ch.LidL, Ch.LidR, Ch.IrisX, Ch.IrisY, Ch.Jaw, Ch.BellyJiggle, Ch.BrowL]) {
@@ -650,7 +792,7 @@ describe('springs-map', () => {
     const indices = Object.values(SPRING);
     expect(new Set(indices).size).toBe(indices.length);
     expect(indices.toSorted((x, y) => x - y)).toEqual(Array.from({ length: SPRING_COUNT }, (_, i) => i));
-    expect(SPRING_PARAMS).toHaveLength(SPRING_COUNT);
+    expect(SPRING_COUNT).toBe(Object.keys(SPRING).length);
     expect(SPRING_PARAMS[SPRING.headRot]).toBe(GAZE_SPRING);
     expect(SPRING_PARAMS[SPRING.headTilt]).toBe(GAZE_SPRING);
     expect(SPRING_PARAMS[SPRING.earL]).toBe(EAR_SPRING);

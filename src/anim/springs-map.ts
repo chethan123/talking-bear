@@ -20,16 +20,16 @@ export const SPRING = {
   earR: 3,
 } as const;
 
-/** Number of springs: the size of the app's `SpringBank`. */
-export const SPRING_COUNT = 4;
-
-/** Spring constants, indexed by `SPRING` value. */
+/** Spring constants, indexed by `SPRING` value. #89 appends an entry per new index. */
 export const SPRING_PARAMS: readonly { readonly freqHz: number; readonly zeta: number }[] = [
   GAZE_SPRING,
   GAZE_SPRING,
   EAR_SPRING,
   EAR_SPRING,
 ];
+
+/** Number of springs: the size of the app's `SpringBank` (one per `SPRING_PARAMS` entry). */
+export const SPRING_COUNT = SPRING_PARAMS.length;
 
 /**
  * `bank.set(i, freqHz, max(zeta, minZeta))` for every spring of `SPRING_PARAMS`. Reduced motion passes

@@ -22,7 +22,9 @@
  *
  * **Throttling** (`minFrameMs`): 30 fps while the director is Idle or Dozing and nothing moves but breathing and
  * blinks, 15 fps while Asleep and nothing moves but breathing; every frame otherwise. "Moves" is: a clip, a
- * spring with |v| > 1e-3, the 150 ms base crossfade, a live mouth clip, or a layer weight still ramping.
+ * spring with |v| > 1e-3, a layer other than breathing and blink still changing its output (the gaze iris eases
+ * with a 15 ms time constant and is no spring; ear twitch and mood too), the 150 ms base crossfade, a live mouth
+ * clip, or a layer weight still ramping.
  *
  * **Reduced motion** (`setReducedMotion`; main.ts passes `prefers-reduced-motion: reduce` OR Gentle mode): the
  * squash, sway and wobble channels (`BodySquash`, `BodyLean`, `HeadSquishX/Y`, `TuftRot`, `KerchiefA/B`, and the
@@ -32,9 +34,11 @@
  * or Error, otherwise in an awake state a `poke` test-beep reaction, or `poke2` for a second tap within 300 ms
  * and 100 px.
  *
- * **Allocation.** Nothing allocates per frame: every buffer is preallocated, the loop's callbacks are created
- * once, and the doubles kept between frames live in a `Float64Array`. Director transitions (events, a clip's
- * end) allocate a new director state; that is per event, not per frame.
+ * **Allocation.** This module's own code allocates nothing per frame: every buffer is preallocated, the loop's
+ * callbacks are created once, and the doubles kept between frames live in a `Float64Array`. Director transitions
+ * (events, a clip's end) allocate a new director state; that is per event, not per frame. The upstream modules a
+ * frame calls (renderer, mouth layer, layers) still box a few transient doubles per frame (≈ 0.6 KB, nothing
+ * retained): follow-up #214.
  */
 import type { AnimEvent, SessionEvent, StateName } from '../app/events.ts';
 import { AWAKE } from '../app/machine.ts';
@@ -64,6 +68,11 @@ export const REDUCED_MOTION_SCALE = 0.3;
 export const REDUCED_MOTION_MIN_ZETA = 0.9;
 /** A spring moving faster than this (|v|, units/s) keeps the loop at full rate. */
 export const SPRING_REST_SPEED = 1e-3;
+/**
+ * A layer channel whose value changed by more than this between the last two substeps (in its own units: design
+ * units, radians, 0–1) keeps the loop at full rate.
+ */
+export const LAYER_REST_DELTA = 1e-4;
 /** The director's base crossfade (plan §3.5): the loop runs at full rate while one is in progress. */
 const BASE_FADE_S = 0.15;
 /** Layer weights ramp to a new state's values over this long, like the base crossfade. */
@@ -77,6 +86,14 @@ export const DOUBLE_TAP_PX = 100;
 export const LATENCY_OVERRIDE_MAX_MS = 200;
 /** Default seed of the layers' RNG; main.ts passes a random one. */
 const DEFAULT_SEED = 0x5eed;
+
+/**
+ * The layer channels whose motion keeps the loop at full rate: every channel except the breathing layer's
+ * (`BodySquash`, `BellyJiggle`) and the blink layer's (`LidL`, `LidR`), which plan §4.6.6 lets run throttled.
+ */
+const WATCHED_LAYER_CHANNELS: readonly number[] = Array.from({ length: CH_COUNT }, (_, ch) => ch).filter(
+  (ch) => ch !== Ch.BodySquash && ch !== Ch.BellyJiggle && ch !== Ch.LidL && ch !== Ch.LidR,
+);
 
 /** The channels reduced motion scales by `REDUCED_MOTION_SCALE` (besides the clip's part of `HeadRot`). */
 const REDUCED_CHANNELS: readonly number[] = [
@@ -278,6 +295,16 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     );
   }
 
+  /** Whether a watched layer channel changed by more than `LAYER_REST_DELTA` over the last substep. */
+  function layersMoving(): boolean {
+    for (let k = 0; k < WATCHED_LAYER_CHANNELS.length; k++) {
+      const ch = WATCHED_LAYER_CHANNELS[k]!;
+      const d = curLayers[ch]! - prevLayers[ch]!;
+      if (d > LAYER_REST_DELTA || d < -LAYER_REST_DELTA) return true;
+    }
+    return false;
+  }
+
   function springsMoving(): boolean {
     const v = springs.vel;
     for (let i = 0; i < v.length; i++) {
@@ -375,6 +402,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
           mouthId !== -1 ||
           T[NOW]! - s.fadeStart < BASE_FADE_S ||
           springsMoving() ||
+          layersMoving() ||
           weightsRamping();
         if (moving) return 0;
         if (s.name === 'Asleep') return 1000 / ASLEEP_FPS;
