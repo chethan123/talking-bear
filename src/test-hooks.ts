@@ -5,7 +5,8 @@
 // - `log` / `events`: one entry per event the session reduced, including those that keep the state
 //   (from === to), so specs can also check effects such as "no `arm` while Playing".
 // - `setVisibility` drives the app's single visibility source (platform/visibility.ts).
-// - `maxLevelDb`: the input level probe, from the engine's `level` events.
+// - `maxLevelDb` / `levels`: the input level probe, from the engine's `level` events (frames and dB only, never
+//   audio). `levels` lets the loop specs tell a capture gap of the fake mic (digital silence) from a VAD result.
 // - The output tap: after the first `ctxRunning`, a `test-tap` AudioWorkletNode goes between the master bus
 //   and `destination`; the last 15 s of what it saw are kept in a preallocated ring. Test-only: the samples
 //   are never stored or downloaded (plan Q2), only handed to the spec that asks for them.
@@ -59,6 +60,11 @@ export interface BearTestApi {
   /** The max `level.db` among the level events of the last `sinceMs` ms, or −Infinity if there are none. */
   maxLevelDb(sinceMs: number): number;
   /**
+   * The level events of the last `sinceMs` ms, oldest first: each one's ctx frame (the first frame of its 10 ms
+   * hop) and dB. Aggregate numbers only, never audio. All-zero input (a capture gap) reads −120 dB.
+   */
+  levels(sinceMs: number): { frame: number; db: number }[];
+  /**
    * The output tap's ring (the last 15 s) from its first to its last sample with |x| > 1e-4, both included, as
    * a plain array; [] before the tap exists or when nothing louder has played.
    */
@@ -107,7 +113,10 @@ function isPoseName(name: string): name is PoseName {
 const OUTPUT_RING_SEC = 15;
 /** outputSamples() trims everything before the first and after the last sample above this magnitude. */
 const SILENCE = 1e-4;
-/** Level events kept for maxLevelDb (≈ 4 min: the worker posts one every third 10 ms hop, ≈ 33 per second). */
+/**
+ * Level events kept for maxLevelDb and levels (≈ 4 min: the worker posts one every third 10 ms hop, ≈ 33 per
+ * second).
+ */
 const LEVEL_CAPACITY = 8192;
 
 /** A preallocated ring of the latest `capacity` samples. */
@@ -158,15 +167,17 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
     return ctx === null ? -1 : Math.round(ctx.currentTime * ctx.sampleRate);
   };
 
-  // ---- level probe: a preallocated ring of (performance.now(), db) --------------------------------------
+  // ---- level probe: a preallocated ring of (performance.now(), db, ctx frame) -----------------------------
   const levelT = new Float64Array(LEVEL_CAPACITY);
   const levelDb = new Float64Array(LEVEL_CAPACITY);
+  const levelFrame = new Float64Array(LEVEL_CAPACITY);
   let levelCount = 0;
   session.subscribeLevel((e) => {
     if (e.t !== 'level') return;
     const i = levelCount % LEVEL_CAPACITY;
     levelT[i] = performance.now();
     levelDb[i] = e.db;
+    levelFrame[i] = e.frame;
     levelCount++;
   });
 
@@ -222,6 +233,19 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
         if (levelDb[i]! > max) max = levelDb[i]!;
       }
       return max;
+    },
+    levels(sinceMs) {
+      const since = performance.now() - sinceMs;
+      // The newest n entries are in range: entries are in time order, so the first older one ends the count.
+      const kept = Math.min(levelCount, LEVEL_CAPACITY);
+      let n = 0;
+      while (n < kept && levelT[(levelCount - 1 - n) % LEVEL_CAPACITY]! >= since) n++;
+      const out: { frame: number; db: number }[] = [];
+      for (let k = levelCount - n; k < levelCount; k++) {
+        const i = k % LEVEL_CAPACITY;
+        out.push({ frame: levelFrame[i]!, db: levelDb[i]! });
+      }
+      return out;
     },
     outputSamples: () => (ring === null ? [] : ring.trimmed()),
     outputSampleRate: () => engine.context()?.sampleRate ?? Number.NaN,
