@@ -421,22 +421,43 @@ function earFlatten(s: Side): Clip {
 
 // ---- eyes and cheeks ----------------------------------------------------------------------------------------
 
-/** The paw-rub arm raise of a hard blink. */
-const RUB_ARM = 60 * DEG;
+/**
+ * The paw rub of a hard blink: the arm on that side rises 150° ("up" sign) to bring the paw up beside the face at
+ * eye height. The arms draw behind the head, so a paw over the eye would be hidden; beside it, against the side of
+ * the face, is the closest visible reach (the arm is 170 units long, the eye 332 units from the shoulder, so a 60°
+ * raise only swings the paw out at the side, below the shoulder).
+ */
+const RUB_ARM = 150 * DEG;
 /** The rub: the raised arm dips this much twice. */
 const RUB_DIP = 8 * DEG;
+/** The head leans into the paw by this much (`HeadRot`, toward the paw's side). */
+const RUB_LEAN = 10 * DEG;
+/** The rubbed eye stays this squeezed while the paw rubs it. */
+const RUB_LID = 0.7;
 
 /**
- * Tap on an eye ("hmph!", mild grumpiness, no pain): the lids shut hard for 150 ms, the paw on that side rises
- * 60° to rub and goes back, the brows go down 3.
+ * Tap on an eye ("hmph!", mild grumpiness, no pain): the lids shut hard for 150 ms, then the paw on that side rises
+ * to the side of the face and rubs that eye twice while the head leans into it and the eye stays squeezed, and
+ * everything goes back; the brows go down 3.
  */
 function hardBlink(s: Side): Clip {
   const up = ARM_UP[s];
+  const rubbed = s === 'L' ? Ch.LidL : Ch.LidR;
+  const other = s === 'L' ? Ch.LidR : Ch.LidL;
   return {
     name: `hardBlink${s}`,
     duration: 1.0,
     tracks: [
-      ...lids(k(0, 0, 'out'), k(0.05, 1), k(0.2, 1, 'in'), k(0.3, 0)),
+      track(
+        rubbed,
+        k(0, 0, 'out'),
+        k(0.05, 1),
+        k(0.2, 1, 'inOut'),
+        k(0.3, RUB_LID),
+        k(0.75, RUB_LID, 'inOut'),
+        k(0.95, 0),
+      ),
+      track(other, k(0, 0, 'out'), k(0.05, 1), k(0.2, 1, 'in'), k(0.3, 0)),
       track(
         ARM[s],
         k(0, 0, 'inOut'),
@@ -444,6 +465,14 @@ function hardBlink(s: Side): Clip {
         k(0.42, up * (RUB_ARM - RUB_DIP), 'inOut'),
         k(0.54, up * RUB_ARM, 'inOut'),
         k(0.66, up * (RUB_ARM - RUB_DIP), 'inOut'),
+        k(1.0, 0),
+      ),
+      // The head rolls toward the raised paw: counter-clockwise for the left one.
+      track(
+        Ch.HeadRot,
+        k(0, 0, 'inOut'),
+        k(0.3, -up * RUB_LEAN),
+        k(0.66, -up * RUB_LEAN, 'inOut'),
         k(1.0, 0),
       ),
       ...brows(k(0, 0, 'out'), k(0.1, -3), k(0.8, -3, 'inOut'), k(1.0, 0)),

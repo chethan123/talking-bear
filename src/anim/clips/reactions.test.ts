@@ -1,9 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { BONES } from '../../art/bear-parts.gen.ts';
 import { sampleClip } from '../clip.ts';
 import type { Clip } from '../clip.ts';
 import { EAR_SPRING, GAZE_SPRING } from '../layers/index.ts';
 import { Ch, CH_COUNT, createPose } from '../pose.ts';
+import type { Pose } from '../pose.ts';
+import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from '../rig.ts';
 import { SpringBank } from '../springs.ts';
 import {
   BELLY_SPRING,
@@ -108,6 +111,37 @@ function zeros(c: Clip, ch: number): number[] {
   const ts = grid(c);
   const xs = series(c, ch);
   return ts.filter((_, i) => i > 0 && xs[i] === 0 && xs[i - 1] !== 0);
+}
+
+// `createRig` builds a `Path2D` per part; Node has none and the bone matrices don't need them.
+vi.stubGlobal(
+  'Path2D',
+  class {
+    readonly d: string | undefined;
+    constructor(d?: string) {
+      this.d = d;
+    }
+  },
+);
+const RIG = createRig();
+const BONE_BUF = new Float32Array(BONE_COUNT * MAT);
+
+/** Where bone `id`'s pivot is drawn (design units) in `pose`: its rest pivot through its bone matrix. */
+function posedPivot(pose: Pose, id: string): [number, number] {
+  boneMatrices(RIG, pose, BONE_BUF);
+  const b = boneIndex(id);
+  const [x, y] = BONES[b]!.pivot;
+  const o = b * MAT;
+  const m = BONE_BUF;
+  return [m[o]! * x + m[o + 2]! * y + m[o + 4]!, m[o + 1]! * x + m[o + 3]! * y + m[o + 5]!];
+}
+
+/** The distance from paw `side` to eye `side` (design units) in hardBlink`side` at `t`, or at rest for null. */
+function pawToEye(side: 'L' | 'R', t: number | null): number {
+  const pose = t === null ? createPose() : sampleClip(REACTION_CLIPS[`hardBlink${side}`], t, createPose());
+  const [px, py] = posedPivot(pose, `paw${side}`);
+  const [ex, ey] = posedPivot(pose, `eye${side}`);
+  return Math.hypot(px - ex, py - ey);
 }
 
 /** The largest |value| of each channel over `grid(c)`. */
@@ -477,18 +511,42 @@ describe('REACTION_CLIPS: content (issue #89 "Clips")', () => {
     expect(Math.max(...series(c, s === 'L' ? Ch.EarFoldL : Ch.EarFoldR))).toBeCloseTo(0.6, 6);
   });
 
-  it.each(['L', 'R'] as const)('hardBlink%s: lids 1 for 150 ms, that arm 60° up and back, brows −3', (s) => {
-    const c = clip(`hardBlink${s}`);
-    for (const t of [0.05, 0.1, 0.15, 0.2]) {
-      expect(at(c, t, Ch.LidL), `at ${t}`).toBe(1);
-      expect(at(c, t, Ch.LidR), `at ${t}`).toBe(1);
+  it.each(['L', 'R'] as const)(
+    'hardBlink%s: lids 1 for 150 ms, that paw up 150° beside the face rubbing the squeezed eye, head leaning in, brows −3',
+    (s) => {
+      const c = clip(`hardBlink${s}`);
+      for (const t of [0.05, 0.1, 0.15, 0.2]) {
+        expect(at(c, t, Ch.LidL), `at ${t}`).toBe(1);
+        expect(at(c, t, Ch.LidR), `at ${t}`).toBe(1);
+      }
+      // Arms up: ArmRotL +θ, ArmRotR −θ (ORCH-ANSWER on #89); the head rolls toward the raised paw.
+      const sign = s === 'L' ? 1 : -1;
+      const arm = series(c, s === 'L' ? Ch.ArmRotL : Ch.ArmRotR).map((v) => sign * v);
+      expect(Math.max(...arm)).toBeCloseTo(150 * DEG, 6);
+      expect(Math.min(...arm)).toBeGreaterThanOrEqual(0);
+      const lean = series(c, Ch.HeadRot).map((v) => -sign * v);
+      expect(Math.max(...lean)).toBeCloseTo(10 * DEG, 6);
+      expect(Math.min(...lean)).toBeGreaterThanOrEqual(0);
+      expect(channels(c)).not.toContain(s === 'L' ? Ch.ArmRotR : Ch.ArmRotL);
+      // The rubbed eye stays squeezed through the rub; the other one reopens.
+      for (const t of [0.3, 0.42, 0.54, 0.66, 0.75]) {
+        expect(at(c, t, s === 'L' ? Ch.LidL : Ch.LidR), `at ${t}`).toBeCloseTo(0.7, 6);
+        expect(at(c, t, s === 'L' ? Ch.LidR : Ch.LidL), `at ${t}`).toBe(0);
+      }
+      expect(Math.min(...series(c, Ch.BrowL))).toBe(-3);
+    },
+  );
+
+  it('hardBlink: at the rub the paw is up beside the face, much closer to the rubbed eye, the same on both sides', () => {
+    for (const side of ['L', 'R'] as const) {
+      const rest = pawToEye(side, null);
+      for (const t of [0.3, 0.54]) expect(pawToEye(side, t), `${side} at ${t}`).toBeLessThan(0.6 * rest);
+      // Above the shoulder (both shoulders pivot at y 700), not swung out below it.
+      expect(
+        posedPivot(sampleClip(clip(`hardBlink${side}`), 0.3, createPose()), `paw${side}`)[1],
+      ).toBeLessThan(700);
     }
-    const arm = series(c, s === 'L' ? Ch.ArmRotL : Ch.ArmRotR);
-    // Arms up: ArmRotL +θ, ArmRotR −θ (ORCH-ANSWER on #89).
-    const up = s === 'L' ? Math.max(...arm) : -Math.min(...arm);
-    expect(up).toBeCloseTo(60 * DEG, 6);
-    expect(channels(c)).not.toContain(s === 'L' ? Ch.ArmRotR : Ch.ArmRotL);
-    expect(Math.min(...series(c, Ch.BrowL))).toBe(-3);
+    expect(pawToEye('L', 0.3)).toBeCloseTo(pawToEye('R', 0.3), 3);
   });
 
   it('cheekPuffL / cheekPuffR: CheekPuff 0 → 1 → 0, the same motion on both sides', () => {
