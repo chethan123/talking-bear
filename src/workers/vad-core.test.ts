@@ -1089,6 +1089,90 @@ interface Comparison {
   report: string;
 }
 
+/** A real-model reading, and the zero readings taken right after it. */
+interface RealStep {
+  reading: HeapReading;
+  after: HeapReading[];
+}
+
+/** What selectExcess makes of the readings so far. */
+interface Selection extends Comparison {
+  /** Comparisons made (0: the measurement proves nothing). */
+  comparisons: number;
+  /** Real readings it used: the steps after it stopped are ignored. */
+  used: number;
+  /** True once two comparisons agree, or MAX_REAL_READINGS were used: no more real readings are needed. */
+  stopped: boolean;
+}
+
+/** A zero level's line in the report. */
+function zeroLine(label: string, readings: HeapReading[]): string {
+  return `${label}: ${readings.map(shown).join(', ')}; level ${gcFreeMedian(readings)}`;
+}
+
+/**
+ * The selection rule of growthOverZero, over recorded readings, so that recorded sequences can test it: the
+ * settling zero readings (reported, unused), the first zero level, then each real reading with the zero level after
+ * it. A real reading is compared only when it is GC-free and the zero levels just before and just after it agree
+ * within AGREE; the comparison is the reading minus the lower of the two levels, and one below −AGREE is impossible
+ * (heapUsed fell without a GC), so it is left out. The excess is the smallest comparison that another one agrees
+ * with (within AGREE), or the smallest if none agree; it stops at the first agreeing pair or at MAX_REAL_READINGS.
+ */
+function selectExcess(settling: HeapReading[], first: HeapReading[], steps: RealStep[]): Selection {
+  const lines = [zeroLine('zero, settling (unused)', settling), zeroLine('zero', first)];
+  let before = gcFreeMedian(first);
+  const compared: number[] = [];
+  let used = 0;
+  for (const { reading, after } of steps) {
+    if (used === MAX_REAL_READINGS || !Number.isNaN(smallestCorroborated(compared))) break;
+    used++;
+    const level = gcFreeMedian(after);
+    let note = 'not compared (a GC, or the zero level moved)';
+    if (!reading.gc && Math.abs(level - before) <= AGREE) {
+      const d = reading.bytes - Math.min(before, level);
+      if (d < -AGREE) {
+        note = 'not compared (heap fell without a GC)';
+      } else {
+        compared.push(d);
+        note = `excess ${d}`;
+      }
+    }
+    lines.push(`real ${used}: ${shown(reading)}; ${note}`, zeroLine('zero', after));
+    before = level;
+  }
+  const corroborated = smallestCorroborated(compared);
+  const excess = Number.isNaN(corroborated) ? Math.min(...compared) : corroborated;
+  const how = Number.isNaN(corroborated)
+    ? 'the smallest comparison: none agree'
+    : 'the smallest comparison another agrees with';
+  const last =
+    compared.length === 0
+      ? 'no comparison could be made (every real reading had a GC, or the zero level moved around it)'
+      : `excess ${excess} B per 1000 frames, ${how}`;
+  return {
+    excess,
+    report: [...lines, last].join('\n'),
+    comparisons: compared.length,
+    used,
+    stopped: used === MAX_REAL_READINGS || !Number.isNaN(corroborated),
+  };
+}
+
+/** GC-free readings of `bytes` (for selectExcess's tests). */
+function gcFreeReadings(...bytes: number[]): HeapReading[] {
+  return bytes.map((b) => ({ bytes: b, gc: false }));
+}
+
+/** A reading of `bytes` during which a GC ran (for selectExcess's tests). */
+function gcReading(bytes: number): HeapReading {
+  return { bytes, gc: true };
+}
+
+/** A real reading (GC-free if given as bytes) and the zero readings after it (for selectExcess's tests). */
+function realStep(reading: number | HeapReading, after: HeapReading[]): RealStep {
+  return { reading: typeof reading === 'number' ? { bytes: reading, gc: false } : reading, after };
+}
+
 /**
  * How much more the heap grows over 1000 frames of `model` than over 1000 frames of a zero model, on the
  * Silero path with the given pre-gate, with both measured in the same optimisation state.
@@ -1109,53 +1193,26 @@ interface Comparison {
  * of the real path differ by whole boxed doubles (16 B per frame), and a lone reading far from the others (the
  * first run after a tier-up, say) can't decide alone. Real readings stop as soon as two comparisons agree, after at
  * most MAX_REAL_READINGS; then, if none agree, the excess is the smallest comparison. It fails if no comparison
- * could be made.
+ * could be made. selectExcess holds that rule.
  */
 function growthOverZero(model: SileroModel, pregate: boolean): Comparison {
   const real = heapRunner(model, pregate);
   const zero = heapRunner(zeroModel(), pregate);
   real(400);
   zero(50_000); // about 1.5 s, 3.5 s under coverage: well past the 11 000 frames TurboFan needs
-  const lines: string[] = [];
-  const zeroLevel = (label: string): number => {
-    const readings: HeapReading[] = [];
-    for (let i = 0; i < ZERO_READINGS; i++) readings.push(heapGrowth(() => zero(1000)));
-    const level = gcFreeMedian(readings);
-    lines.push(`${label}: ${readings.map(shown).join(', ')}; level ${level}`);
-    return level;
-  };
-  zeroLevel('zero, settling (unused)');
-  let before = zeroLevel('zero');
-  const compared: number[] = [];
-  for (let k = 1; k <= MAX_REAL_READINGS && Number.isNaN(smallestCorroborated(compared)); k++) {
+  const zeroReadings = (): HeapReading[] =>
+    Array.from({ length: ZERO_READINGS }, () => heapGrowth(() => zero(1000)));
+  const settling = zeroReadings();
+  const first = zeroReadings();
+  const steps: RealStep[] = [];
+  let selection = selectExcess(settling, first, steps);
+  while (!selection.stopped) {
     const reading = heapGrowth(() => real(1000));
-    const at = lines.push('') - 1;
-    const after = zeroLevel('zero');
-    let note = 'not compared (a GC, or the zero level moved)';
-    if (!reading.gc && Math.abs(after - before) <= AGREE) {
-      const d = reading.bytes - Math.min(before, after);
-      if (d < -AGREE) {
-        note = 'not compared (heap fell without a GC)';
-      } else {
-        compared.push(d);
-        note = `excess ${d}`;
-      }
-    }
-    lines[at] = `real ${k}: ${shown(reading)}; ${note}`;
-    before = after;
+    steps.push({ reading, after: zeroReadings() });
+    selection = selectExcess(settling, first, steps);
   }
-  const corroborated = smallestCorroborated(compared);
-  const excess = Number.isNaN(corroborated) ? Math.min(...compared) : corroborated;
-  const how = Number.isNaN(corroborated)
-    ? 'the smallest comparison: none agree'
-    : 'the smallest comparison another agrees with';
-  const last =
-    compared.length === 0
-      ? 'no comparison could be made (every real reading had a GC, or the zero level moved around it)'
-      : `excess ${excess} B per 1000 frames, ${how}`;
-  const report = [...lines, last].join('\n');
-  expect(compared.length, report).toBeGreaterThan(0);
-  return { excess, report };
+  expect(selection.comparisons, selection.report).toBeGreaterThan(0);
+  return { excess: selection.excess, report: selection.report };
 }
 
 describe('no allocation on the per-frame path', () => {
@@ -1199,6 +1256,106 @@ describe('no allocation on the per-frame path', () => {
     const leak = growthOverZero(leaky, false);
     expect(kept.every((v) => v !== undefined)).toBe(true);
     expect(leak.excess, leak.report).toBeGreaterThanOrEqual(LIMIT);
+  });
+
+  describe('selectExcess, on readings recorded on #226', () => {
+    const settling = gcFreeReadings(28704, 26936, 27584, 28144, 27600);
+
+    it('rejects a real reading whose zero levels straddle a tier step, and takes later ones (NC-n1 under load)', () => {
+      const s = selectExcess(settling, gcFreeReadings(26704, 22680, 22680, 22800, 22680), [
+        realStep(94936, gcFreeReadings(22680, 22680, 22680, 22736, 22680)),
+        realStep(94680, gcFreeReadings(22680, 6192, 22064, 480, 424)),
+        realStep(72424, gcFreeReadings(424, 424, 424, 480, 424)),
+        realStep(72480, gcFreeReadings(424, 424, 480, 424, 424)),
+      ]);
+      expect(s.report.split('\n').slice(2), s.report).toEqual([
+        'real 1: 94936; excess 72256',
+        'zero: 22680, 22680, 22680, 22736, 22680; level 22680',
+        'real 2: 94680; not compared (a GC, or the zero level moved)',
+        'zero: 22680, 6192, 22064, 480, 424; level 6192',
+        'real 3: 72424; not compared (a GC, or the zero level moved)',
+        'zero: 424, 424, 424, 480, 424; level 424',
+        'real 4: 72480; excess 72056',
+        'zero: 424, 424, 480, 424, 424; level 424',
+        'excess 72056 B per 1000 frames, the smallest comparison another agrees with',
+      ]);
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([72056, 2, 4, true]);
+    });
+
+    it('leaves out a GC-free fall of heapUsed (a comparison below −AGREE), then takes the agreeing pair', () => {
+      const s = selectExcess(
+        gcFreeReadings(163576, 167816, 145952, 145912, 145952),
+        gcFreeReadings(145952, 145856, 145952, 146008, 151816),
+        [
+          realStep(34368, gcFreeReadings(170704, 145952, 145856, 146008, 145952)),
+          realStep(161856, gcFreeReadings(145856, 145952, 145952, 145912, 145952)),
+          realStep(161952, gcFreeReadings(145952, 145856, 145952, 146008, 145856)),
+        ],
+      );
+      expect(s.report).toContain('real 1: 34368; not compared (heap fell without a GC)');
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([15904, 2, 3, true]);
+    });
+
+    it('takes the smallest comparison when none agree after MAX_REAL_READINGS', () => {
+      const level = gcFreeReadings(424, 424, 424, 480, 424);
+      const s = selectExcess(settling, level, [
+        realStep(32424, level),
+        realStep(48728, level),
+        realStep(gcReading(16480), level),
+        realStep(gcReading(16424), level),
+      ]);
+      expect(s.report).toContain('real 3: 16480 (GC); not compared (a GC, or the zero level moved)');
+      expect(s.report).toContain('excess 32000 B per 1000 frames, the smallest comparison: none agree');
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([32000, 2, 4, true]);
+    });
+
+    it('takes the smaller of an agreeing pair, never a lone low reading, and subtracts the lower level', () => {
+      const s = selectExcess(settling, gcFreeReadings(22680, 22680, 22680, 22736, 22680), [
+        realStep(26920, gcFreeReadings(22680, 22680, 22680, 22736, 22680)),
+        realStep(94680, gcFreeReadings(22736, 22736, 22680, 22736, 22800)),
+        realStep(94736, gcFreeReadings(22680, 22680, 22680, 22736, 22680)),
+      ]);
+      expect(s.report).toContain('real 2: 94680; excess 72000');
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([72000, 3, 3, true]);
+    });
+
+    it('agrees within AGREE: a 3 104 B pair at the 2-boxed-double level is enough to stop', () => {
+      const level = gcFreeReadings(158168, 158072, 158168, 158224, 158168);
+      const s = selectExcess(settling, level, [
+        realStep(190424, level),
+        realStep(193528, level),
+        realStep(150856, level),
+      ]);
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([32256, 2, 2, true]);
+    });
+
+    it('makes no comparison when every real reading had a GC, and says so', () => {
+      const level = gcFreeReadings(22680, 22680, 22680, 22736, 22680);
+      const s = selectExcess(settling, level, [
+        realStep(gcReading(38936), level),
+        realStep(gcReading(38680), level),
+        realStep(gcReading(38680), level),
+        realStep(gcReading(38736), level),
+        realStep(38680, level),
+      ]);
+      expect(s.report.split('\n').at(-1)).toBe(
+        'no comparison could be made (every real reading had a GC, or the zero level moved around it)',
+      );
+      expect([s.comparisons, s.used, s.stopped]).toEqual([0, 4, true]);
+    });
+
+    it('keeps reading until two comparisons agree: only the 3rd and 4th do here', () => {
+      const level = gcFreeReadings(424, 424, 480, 424, 424);
+      const steps = [
+        realStep(48728, level),
+        realStep(32728, level),
+        realStep(16480, level),
+        realStep(16424, level),
+      ];
+      expect(selectExcess(settling, level, steps.slice(0, 3)).stopped).toBe(false);
+      const s = selectExcess(settling, level, steps);
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([16000, 4, 4, true]);
+    });
   });
 });
 
