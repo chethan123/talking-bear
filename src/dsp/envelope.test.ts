@@ -144,6 +144,15 @@ function tracks(env: Envelope): Float32Array[] {
   return [env.jaw, env.width, env.round, env.teeth];
 }
 
+/** 1 s at 48 kHz: loud broadband noise (100 Hz–20 kHz), then quiet noise, so every track and n vary. */
+function broadband(): Float32Array {
+  const fs = 48000;
+  const x = new Float32Array(fs);
+  addBandNoise(x, 0, fs / 2, fs, 100, 20000, 31, 0.3);
+  addBandNoise(x, fs / 2, fs, fs, 100, 20000, 32, 0.01);
+  return x;
+}
+
 describe('analyzeEnvelope', () => {
   describe('silence (validation 1)', () => {
     it.each(RATES)('1 s of zeros gives all four tracks exactly 0 at %i Hz', (fs) => {
@@ -430,5 +439,50 @@ describe('analyzeEnvelope', () => {
       analyzeEnvelope(x, 48000, 1.6);
       expect(x).toEqual(copy);
     });
+  });
+
+  describe('scaleBandsWithP (X-A3, lab/envelope)', () => {
+    it('omitted opts, {} and { scaleBandsWithP: true } give identical tracks (the default scales with p)', () => {
+      const x = broadband();
+      const base = analyzeEnvelope(x, 48000, 1.6);
+      expect(analyzeEnvelope(x, 48000, 1.6, {})).toEqual(base);
+      expect(analyzeEnvelope(x, 48000, 1.6, { scaleBandsWithP: true })).toEqual(base);
+    });
+
+    it.each([0.75, 1.6, 2, 2.2])('false at p = %s gives exactly the p = 1 tracks (the fixed edges)', (p) => {
+      const x = broadband();
+      const fixed = analyzeEnvelope(x, 48000, p, { scaleBandsWithP: false });
+      expect(fixed).toEqual(analyzeEnvelope(x, 48000, 1));
+      // Not vacuous: with the default scaling the same p moves the edges and changes width.
+      expect(analyzeEnvelope(x, 48000, p).width).not.toEqual(fixed.width);
+    });
+
+    it('a 1600 Hz tone at p = 2 is in E_hi with the fixed edges (width 1) and in E_lo when scaled (width 0)', () => {
+      const x = segments(48000, [{ sec: 0.3, tones: [[0.4, 1600]] }]);
+      const fixed = analyzeEnvelope(x, 48000, 2, { scaleBandsWithP: false }).width;
+      const scaled = analyzeEnvelope(x, 48000, 2).width;
+      for (let i = 3; i < 27; i++) {
+        expect(fixed[i]!, `fixed width[${i}]`).toBeGreaterThan(0.97);
+        expect(scaled[i]!, `scaled width[${i}]`).toBeLessThan(0.03);
+      }
+    });
+
+    it('jaw does not depend on the band edges: identical with scaleBandsWithP true and false', () => {
+      const x = broadband();
+      for (const p of [0.75, 2]) {
+        expect(analyzeEnvelope(x, 48000, p, { scaleBandsWithP: false }).jaw).toEqual(
+          analyzeEnvelope(x, 48000, p).jaw,
+        );
+      }
+    });
+
+    it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+      'still throws RangeError for pitchRatio = %d with scaleBandsWithP: false',
+      (p) => {
+        expect(() => analyzeEnvelope(new Float32Array(100), 48000, p, { scaleBandsWithP: false })).toThrow(
+          RangeError,
+        );
+      },
+    );
   });
 });

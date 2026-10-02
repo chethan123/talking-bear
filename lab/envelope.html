@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: envelope (X-A3)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./envelope.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>Mouth envelope of spoken phrases</h1>
+    <p>
+      X-A3 (plan §5, §4.6.2): after the app's voice chain, do vowels separate in the mouth's width and round
+      tracks, and should the analysis band edges scale with the pitch ratio p? Pick a voice, press Open mic
+      (the app's own constraints: all browser processing off), keep or type the phrase, then press the button,
+      wait about half a second, say the phrase, wait about half a second and release (at most 5 s). The page
+      runs the app's voice chain on the phrase and plots its jaw, width, round and teeth tracks twice: with
+      the band edges × p, as the app does, and with the fixed edges. The table keeps the mean jaw, width and
+      round over the phrase's vowel-dominant frames (voiced, and within 15 dB of its loudest frame). Say the
+      10 suggested phrases with each voice, then press Copy table.
+    </p>
+    <p>
+      Privacy (plan Q2): each phrase is held in memory only while the button is down and while it is
+      processed, then zeroed at once. A hold that is interrupted, or a page that is hidden, discards the
+      phrase unprocessed. Only the latest phrase's envelope (for the plot) and the per-phrase means are kept.
+      Nothing captured is stored or exported; Copy table and Copy log copy text only.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
