@@ -45,13 +45,35 @@ export type MainToWorker =
     }
   | { t: 'process'; id: number; pcm: Float32Array; sampleRate: number; preset: VoicePreset }
   // The context sample rate and the worker's end of the worklet↔worker channel (transferred).
-  | { t: 'init'; ctxRate: number; port: MessagePort };
+  | { t: 'init'; ctxRate: number; port: MessagePort }
+  // The feature trace (lab/vad-trace, the debug overlay): `traceBatch` messages while on; off flushes the
+  // partial batch. The worker keeps the setting across `reset` and `init`.
+  | { t: 'trace'; on: boolean };
 export type WorkerToMain =
   | { t: 'seg'; epoch: number; ev: SegEvent } // frames in ctx-rate indices
   | { t: 'level'; epoch: number; frame: number; db: number; floorDb: number } // ~30 Hz, UI/debug
   | { t: 'floorSnapshot'; epoch: number; floorDb: number } // taken at onset, restored at re-arm
   | { t: 'vadStats'; p95Ms: number }
   | { t: 'vadReady'; backend: 'silero' } // the worker's Silero model is loaded and set
+  // The feature trace, every 25 hops (250 ms) while `trace` is on, and the partial batch on `reset` / trace off.
+  // Per 10 ms hop: dBFS of the unfiltered and of the band-limited 16 kHz hop, and the voicing score; per 32 ms
+  // Silero frame: the model's p (before onset blocking) and its inference time in ms (both empty unless the
+  // epoch runs on Silero). hop0Frame / sil0Frame: ctx frames of the batch's first hop / first Silero frame
+  // (NaN when that stream is empty). While the trace stays on, each batch starts where the previous one of its
+  // epoch ended. Turned on mid-epoch, the first batch starts at the next hop to complete, so its hop0Frame can
+  // precede its sil0Frame. Turned on before an epoch's first frame, the first batch has hop0Frame = sil0Frame =
+  // that frame's firstFrame.
+  | {
+      t: 'traceBatch';
+      epoch: number;
+      hop0Frame: number;
+      sil0Frame: number;
+      rawDb: Float32Array;
+      bandDb: Float32Array;
+      voicing: Float32Array;
+      sileroP: Float32Array;
+      inferMs: Float32Array;
+    }
   // The voice chain's result (src/dsp/voice.ts): `pcm` plays at rate 1, `envelope` is computed from exactly that
   // buffer, and `clipped` flags a clipped take (plan §4.4; M8's "too loud" reaction).
   | {
@@ -70,8 +92,9 @@ export type AudioMessage = MainToWorklet | WorkletToWorker | WorkletToMain | Mai
 export type Transfer = Transferable[];
 
 /**
- * The objects `msg` must transfer: the `pcm` / `pcm16k` buffers, the `port` of `init`, and the envelope
- * track buffers of `processed`. Pass the result as the transfer list of `postMessage`.
+ * The objects `msg` must transfer: the `pcm` / `pcm16k` buffers, the `port` of `init`, the envelope
+ * track buffers of `processed`, and the five stream buffers of `traceBatch`. Pass the result as the transfer
+ * list of `postMessage`.
  *
  * A view's whole underlying `ArrayBuffer` is transferred (and detached), so never send a view of a buffer
  * you keep using. A buffer shared by several views is listed once, because a duplicate entry makes
@@ -97,12 +120,20 @@ export function transferList(msg: AudioMessage): Transfer {
       addBuffer(out, msg.envelope.round);
       addBuffer(out, msg.envelope.teeth);
       break;
+    case 'traceBatch':
+      addBuffer(out, msg.rawDb);
+      addBuffer(out, msg.bandDb);
+      addBuffer(out, msg.voicing);
+      addBuffer(out, msg.sileroP);
+      addBuffer(out, msg.inferMs);
+      break;
     case 'arm':
     case 'disarm':
     case 'take':
     case 'armed':
     case 'takeFailed':
     case 'reset':
+    case 'trace':
     case 'seg':
     case 'level':
     case 'floorSnapshot':

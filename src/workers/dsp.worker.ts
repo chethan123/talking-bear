@@ -8,6 +8,9 @@
 // emits as a hashed asset next to this chunk). Once decoded, the model is handed to the current VadCore and
 // `vadReady` is posted; a later `init` reuses it. Until then, and if loading fails, epochs that ask for Silero
 // run on the energy backend.
+//
+// Feature trace (`trace`): the setting is kept here and handed to every VadCore, so it survives a later
+// `init`; the VadCore posts the `traceBatch` messages, whose five stream buffers are transferred.
 
 import {
   transferList,
@@ -31,6 +34,8 @@ let port: MessagePort | null = null;
 let model: SileroModel | null = null;
 /** A weights fetch is in flight. */
 let loading = false;
+/** The feature trace is on (the last `trace` message). */
+let traceOn = false;
 
 function post(msg: WorkerToMain): void {
   self.postMessage(msg, transferList(msg));
@@ -98,6 +103,7 @@ function init(ctxRate: number, next: MessagePort): void {
   port = next;
   port.addEventListener('message', onFrame);
   port.start(); // addEventListener, unlike the onmessage setter, doesn't start the port's message queue
+  if (traceOn) nextCore.setTrace(true);
   if (model !== null) attachModel(nextCore, model);
   else loadModel();
 }
@@ -116,6 +122,14 @@ function onMainMessage(e: MessageEvent<MainToWorker>): void {
       try {
         if (core === null) throw new Error('reset before init');
         core.reset(msg.epoch, msg.vad, msg.restoreFloorDb, msg.pregate, msg.proximityDb);
+      } catch (err) {
+        postError('vad', err);
+      }
+      break;
+    case 'trace':
+      try {
+        traceOn = msg.on;
+        core?.setTrace(traceOn);
       } catch (err) {
         postError('vad', err);
       }
