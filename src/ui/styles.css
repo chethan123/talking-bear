@@ -104,3 +104,74 @@ body {
   font-size: 1.125rem;
   font-weight: 600;
 }
+
+/* M3 settings (settings-sheet.ts): the gear in the top-right corner and its modal sheet. */
+.settings-gear {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 70%);
+  color: #202124;
+  font: inherit;
+  font-size: 1.75rem;
+  line-height: 48px;
+}
+
+.settings-sheet {
+  box-sizing: border-box;
+  width: calc(100% - 32px);
+  max-width: 28rem;
+  padding: 24px;
+  border: 0;
+  border-radius: 16px;
+  background: #fff;
+  color: #202124;
+  box-shadow: 0 4px 24px rgb(0 0 0 / 20%);
+}
+
+.settings-sheet::backdrop {
+  background: rgb(0 0 0 / 30%);
+}
+
+.settings-sheet h2 {
+  margin: 0 0 12px;
+  font-size: 1.25rem;
+}
+
+.settings-group {
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+}
+
+.settings-group legend {
+  padding: 0;
+  font-weight: 600;
+}
+
+.settings-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  font-size: 1.125rem;
+}
+
+.settings-option input[type='radio'],
+.settings-option input[type='checkbox'] {
+  width: 24px;
+  height: 24px;
+  margin: 0;
+}
+
+.settings-range {
+  flex: 1;
+  min-height: 48px;
+  margin: 0;
+}
