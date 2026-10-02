@@ -3,7 +3,10 @@ import { describe, expect, it } from 'vitest';
 import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
 import type { Pose } from './pose.ts';
 
-/** The channel table exactly as issue #74 specifies it; later tasks index poses by these numbers. */
+/**
+ * The channel table exactly as issue #74 specifies it, plus `IrisConverge` appended by #222; later tasks index
+ * poses by these numbers.
+ */
 const SPEC_CHANNELS = {
   HeadRot: 0,
   HeadTilt: 1,
@@ -40,6 +43,7 @@ const SPEC_CHANNELS = {
   KerchiefA: 32,
   KerchiefB: 33,
   Stars: 34,
+  IrisConverge: 35,
 };
 
 function poseFrom(value: (i: number) => number): Pose {
@@ -133,8 +137,8 @@ describe('Ch and CH_COUNT', () => {
     expect(Ch).toEqual(SPEC_CHANNELS);
   });
 
-  it('number the CH_COUNT = 35 channels 0 … 34, each exactly once', () => {
-    expect(CH_COUNT).toBe(35);
+  it('number the CH_COUNT = 36 channels 0 … 35, each exactly once', () => {
+    expect(CH_COUNT).toBe(36);
     const values = Object.values(Ch).toSorted((x, y) => x - y);
     expect(values).toEqual(Array.from({ length: CH_COUNT }, (_, i) => i));
   });

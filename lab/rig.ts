@@ -126,7 +126,7 @@ const DELTA: Range = { min: -0.5, max: 0.5, step: 0.005, scale: 1, unit: 'delta'
 /** Lids, mouth, folds, wrinkle, puff, blush, stars phase. */
 const UNIT: Range = { min: 0, max: 1, step: 0.01, scale: 1, unit: 'unit' };
 const HEAD_OFFSET: Range = { min: -50, max: 50, step: 0.5, scale: 1, unit: 'units' };
-/** `IrisX` / `IrisY`: at most 10 design units (pose.ts). */
+/** `IrisX` / `IrisY` / `IrisConverge`: at most 10 design units (pose.ts). */
 const IRIS: Range = { min: -10, max: 10, step: 0.1, scale: 1, unit: 'units' };
 /** Brows (positive up) and `NoseY` (positive down): design units. */
 const SMALL_OFFSET: Range = { min: -20, max: 20, step: 0.5, scale: 1, unit: 'units' };
@@ -170,6 +170,7 @@ const RANGES: { readonly [K in ChName]: Range } = {
   KerchiefA: ROT,
   KerchiefB: ROT,
   Stars: UNIT,
+  IrisConverge: IRIS,
 };
 
 const CH_NAMES = Object.keys(Ch).filter((name): name is ChName => name in Ch);

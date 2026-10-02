@@ -9,6 +9,8 @@
  * - `Jaw`, `MouthW`, `MouthRound`, `Teeth`, the lids (0 open, 1 closed), `EarFold*`, `NoseWrinkle`,
  *   `CheekPuff`, `Blush` and `Stars` run from 0 to 1;
  * - `IrisX` / `IrisY` are design units, at most 10;
+ * - `IrisConverge` is design units: + moves each iris toward the face's centre line (the left eye's +x, the right
+ *   eye's −x, in eye-bone space), − apart (#222);
  * - brows are design units, positive is up.
  *
  * `Ch` is a const object rather than a TS `enum`, so the module stays erasable syntax only.
@@ -49,10 +51,11 @@ export const Ch = {
   KerchiefA: 32,
   KerchiefB: 33,
   Stars: 34,
+  IrisConverge: 35,
 } as const;
 
 /** Number of pose channels: the length of every `Pose`. */
-export const CH_COUNT = 35;
+export const CH_COUNT = 36;
 
 /** One value per channel, indexed by `Ch`; length `CH_COUNT`. */
 export type Pose = Float32Array;

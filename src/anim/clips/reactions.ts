@@ -279,14 +279,17 @@ const bigSneeze: Clip = (() => {
 })();
 
 /**
- * Long-press on the nose: the nose wrinkles and the eyes look down at the finger on it. The rig has one
- * `IrisX`/`IrisY` pair for both eyes, so they can't cross: both irises move 6 units toward the nose (down).
+ * Long-press on the nose: the nose wrinkles and the eyes go cross-eyed at the finger on it: `IrisConverge`
+ * moves each iris 6 units toward the face's centre line (#222).
  */
 const noseWrinkle: Clip = {
   name: 'noseWrinkle',
   duration: 0.2,
   sustained: true,
-  tracks: [track(Ch.NoseWrinkle, k(0, 0, 'out'), k(0.2, 1)), track(Ch.IrisY, k(0, 0, 'out'), k(0.2, 6))],
+  tracks: [
+    track(Ch.NoseWrinkle, k(0, 0, 'out'), k(0.2, 1)),
+    track(Ch.IrisConverge, k(0, 0, 'out'), k(0.2, 6)),
+  ],
 };
 
 // ---- head top -----------------------------------------------------------------------------------------------
