@@ -20,13 +20,17 @@ export const BELLY_PHASE = 0.2;
 const TAU = 2 * Math.PI;
 
 class Breathing implements Layer {
-  /** Breathing phase in cycles, kept in [0, 1) so long runs lose no precision. */
-  #phase = 0;
+  /**
+   * Breathing phase in cycles, kept in [0, 1) so long runs lose no precision. A one-slot `Float64Array`, not a
+   * class field: V8's mid tier boxes a double written to a class field as a new heap number on every write (#214).
+   */
+  readonly #phase = new Float64Array(1);
 
   update(dt: number, pose: Pose, ctx: AnimContext): void {
-    const phase = this.#phase + dt * BREATH_HZ;
-    this.#phase = phase - Math.floor(phase);
-    const a = TAU * this.#phase;
+    const p = this.#phase;
+    const phase = p[0]! + dt * BREATH_HZ;
+    p[0] = phase - Math.floor(phase);
+    const a = TAU * p[0];
     const amp = ctx.weights.breathing * BREATH_AMP;
     pose[Ch.BodySquash] = pose[Ch.BodySquash]! + amp * Math.sin(a);
     pose[Ch.BellyJiggle] = pose[Ch.BellyJiggle]! + amp * Math.sin(a + TAU * BELLY_PHASE);

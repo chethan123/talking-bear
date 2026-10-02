@@ -40,16 +40,24 @@
  *   end) a crossing in the clip's last ~200 ms can still leave 1–2 units, which then drop in one frame.
  *
  * **Time.** Everything the layer computes runs on clip time t: the interpolation, the 30 ms derivative window
- * and the brow decay. `now` (milliseconds, `performance.now()` by default) is only passed to `clipTimeNow`,
- * which extrapolates the context's last output timestamp to the present.
+ * and the brow decay: t = clipTimeNow(ctx, start, now) + L, computed as `outputContextTimeNow(ctx, now) − start + L`
+ * (clipTimeNow's own definition). `now` (milliseconds, `performance.now()` by default) is only passed to
+ * `outputContextTimeNow`, which extrapolates the context's last output timestamp to the present.
  *
- * **Allocation.** Nothing here allocates per call: no object or array literals, closures or spreads. The two
- * larger helpers, which V8 may leave un-inlined once `update` is near its inlining budget (`writeMouth`,
- * `#fireCrossings`), get their double input through a preallocated slot instead of an argument, since a double
- * passed to a call that is not inlined is boxed on the heap on every call. The small helpers (`framePos`,
- * `trackAt`) are inlined.
+ * **Allocation.** Nothing here allocates per call: no object or array literals, closures or spreads. Until V8
+ * has fully optimised the frame (its mid tier runs it for the first ~10 000–20 000 frames, #214), it boxes a
+ * double as a new heap number wherever one crosses into a call or a class field, so:
+ * - the doubles the layer keeps between updates live in a `Float64Array` (`START`, `CLIP_TIME`, `LAST_X`, `X`,
+ *   `BROW_AMP`, `BROW_T`), not in class fields;
+ * - the two larger helpers, which V8 may leave un-inlined (`writeMouth`, `#fireCrossings`), get their double
+ *   input through a preallocated slot instead of an argument, and the start time is subtracted here rather than
+ *   passed to `clipTimeNow`;
+ * - the head-bob clamp and the finiteness check are written out instead of calling `Math.min`, `Math.max` and
+ *   `Number.isFinite`.
+ *
+ * The small helpers (`framePos`, `trackAt`) are inlined.
  */
-import { clipTimeNow } from '../../audio/output-clock.ts';
+import { outputContextTimeNow } from '../../audio/output-clock.ts';
 import type { OutputClockCtx } from '../../audio/output-clock.ts';
 import type { Envelope } from '../../dsp/types.ts';
 import { DISPLAY_LATENCY_MS } from '../constants.ts';
@@ -155,30 +163,37 @@ export function mouthFromEnvelope(env: Envelope, clipTimeSec: number, out: Pose)
   return out;
 }
 
+// Slots of the doubles kept between updates (see **Allocation**).
+/** `startCtxTime` of the clip. */
+const START = 0;
+/** Clip time of the last update. */
+const CLIP_TIME = 1;
+/** Frame position of the furthest sample of this clip so far (−∞ before the first); crossings up to it fired. */
+const LAST_X = 2;
+/** Frame position of the current sample, which `#fireCrossings` reads (see **Allocation**). */
+const X = 3;
+/** The brow lift is BROW_AMP at clip time BROW_T, decaying with `BROW_TAU`. */
+const BROW_AMP = 4;
+const BROW_T = 5;
+
 export class MouthLayer {
   /** L, the display-latency compensation in milliseconds: the layer samples at clipTimeNow + L / 1000. */
   latencyMs: number;
 
   /** The playing clip's envelope; the layer holds this reference until the next `setClip`. */
   #env: Envelope | null = null;
-  #start = 0;
-  #clipTime = Number.NaN;
   #envIndex = -1;
-  /** Frame position of the furthest sample of this clip so far (−∞ before the first); crossings up to it fired. */
-  #lastX = Number.NEGATIVE_INFINITY;
-  /** Frame position of the current sample, which `#fireCrossings` reads (see **Allocation**). */
-  #x = Number.NaN;
-  /** The brow lift is #browAmp at clip time #browT, decaying with `BROW_TAU`. */
-  #browAmp = 0;
-  #browT = 0;
+  /** The doubles kept between updates, by slot. */
+  readonly #s = new Float64Array(6);
 
   constructor(latencyMs: number = DISPLAY_LATENCY_MS) {
     this.latencyMs = latencyMs;
+    this.setClip(null, 0);
   }
 
   /** Clip time (s, L included) of the last `update`; NaN before the first update of a clip and without a clip. */
   get clipTime(): number {
-    return this.#clipTime;
+    return this.#s[CLIP_TIME]!;
   }
 
   /** `envelopeIndex` at the last `update`'s clip time; −1 outside the clip and without a clip. */
@@ -193,14 +208,15 @@ export class MouthLayer {
    * brow lift at once; from then on, `null` makes `update` write a closed mouth and add nothing.
    */
   setClip(env: Envelope | null, startCtxTime: number): void {
+    const s = this.#s;
     this.#env = env;
-    this.#start = startCtxTime;
-    this.#clipTime = Number.NaN;
+    s[START] = startCtxTime;
+    s[CLIP_TIME] = Number.NaN;
     this.#envIndex = -1;
-    this.#lastX = Number.NEGATIVE_INFINITY;
-    this.#x = Number.NaN;
-    this.#browAmp = 0;
-    this.#browT = 0;
+    s[LAST_X] = Number.NEGATIVE_INFINITY;
+    s[X] = Number.NaN;
+    s[BROW_AMP] = 0;
+    s[BROW_T] = 0;
   }
 
   /**
@@ -215,36 +231,43 @@ export class MouthLayer {
       zeroMouth(pose);
       return;
     }
-    const t = clipTimeNow(ctx, this.#start, now ?? performanceNow) + this.latencyMs / 1000;
+    const s = this.#s;
+    // clipTimeNow(ctx, start, now) + L, with the start subtracted here rather than passed to a call.
+    const t = outputContextTimeNow(ctx, now ?? performanceNow) - s[START]! + this.latencyMs / 1000;
     const x = framePos(t);
     const jaw = env.jaw;
     mouthPos[0] = x;
     writeMouth(env, pose);
-    this.#clipTime = t;
+    s[CLIP_TIME] = t;
     this.#envIndex = x >= 0 && x < jaw.length ? Math.floor(x) : -1; // envelopeIndex(env, t), from the same x
-    if (!Number.isFinite(t)) return;
+    // Number.isFinite(t), written out: `t − t` is 0 exactly when t is finite (NaN and ±∞ give NaN).
+    if (t - t !== 0) return;
 
     const rate = (trackAt(jaw, x) - trackAt(jaw, framePos(t - HEAD_BOB_WINDOW))) / HEAD_BOB_WINDOW;
-    pose[Ch.HeadY] = pose[Ch.HeadY]! - HEAD_BOB * Math.max(-1, Math.min(1, rate / HEAD_BOB_RATE));
+    // clamp(rate / HEAD_BOB_RATE, −1, 1), written out.
+    const r = rate / HEAD_BOB_RATE;
+    const bob = r < -1 ? -1 : r > 1 ? 1 : r;
+    pose[Ch.HeadY] = pose[Ch.HeadY]! - HEAD_BOB * bob;
 
-    this.#x = x;
+    s[X] = x;
     this.#fireCrossings(jaw);
-    if (this.#browAmp > 0) {
-      const age = t - this.#browT;
-      const lift = this.#browAmp * Math.exp(-(age > 0 ? age : 0) / BROW_TAU);
+    if (s[BROW_AMP]! > 0) {
+      const age = t - s[BROW_T]!;
+      const lift = s[BROW_AMP]! * Math.exp(-(age > 0 ? age : 0) / BROW_TAU);
       pose[Ch.BrowL] = pose[Ch.BrowL]! + lift;
       pose[Ch.BrowR] = pose[Ch.BrowR]! + lift;
     }
   }
 
   /**
-   * Fires every upward crossing of `BROW_THRESHOLD` in (#lastX, #x], in order, then advances #lastX to #x.
+   * Fires every upward crossing of `BROW_THRESHOLD` in (lastX, x], in order, then advances lastX to x.
    * Segment s runs from frame s to frame s + 1; segment −1 is the jump from the jaw of 0 before the clip to
    * frame 0, which crosses at x = 0. Each crossing adds `BROW_LIFT` at its clip time to the decayed lift.
    */
   #fireCrossings(jaw: Float32Array): void {
-    const x = this.#x;
-    const lastX = this.#lastX;
+    const st = this.#s;
+    const x = st[X]!;
+    const lastX = st[LAST_X]!;
     if (!(x > lastX)) return;
     const last = Math.min(jaw.length - 2, Math.floor(x));
     for (let s = Math.max(-1, Math.floor(lastX)); s <= last; s++) {
@@ -254,12 +277,12 @@ export class MouthLayer {
         const xc = s < 0 ? 0 : s + (BROW_THRESHOLD - j0) / (j1 - j0);
         if (xc > lastX && xc <= x) {
           const tc = xc * HOP_SEC;
-          const age = tc - this.#browT;
-          this.#browAmp = this.#browAmp * Math.exp(-(age > 0 ? age : 0) / BROW_TAU) + BROW_LIFT;
-          this.#browT = tc;
+          const age = tc - st[BROW_T]!;
+          st[BROW_AMP] = st[BROW_AMP]! * Math.exp(-(age > 0 ? age : 0) / BROW_TAU) + BROW_LIFT;
+          st[BROW_T] = tc;
         }
       }
     }
-    this.#lastX = x;
+    st[LAST_X] = x;
   }
 }
