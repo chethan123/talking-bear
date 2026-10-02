@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: VAD trace (real-voice feature traces)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./vad-trace.ts"></script>
+  </head>
+  <body>
+    <p><a href="./">All labs</a></p>
+    <h1>VAD trace: real-voice feature traces</h1>
+    <p>
+      Plan §7 M2: records real-voice feature traces on D1, the primary source for tuning the VAD. The page
+      listens only: the app's own microphone constraints (all browser processing off), Silero on every 32 ms
+      frame, and nothing is ever played. Every 10 ms it keeps the raw and the band-limited level and the
+      voicing score, every 32 ms the Silero speech probability, and the hold-to-talk marks on the same frame
+      clock.
+    </p>
+    <p>
+      Choose the session (A for tuning, B for gating), the condition, the placement, the speaker and the
+      script. Each cell's script is preselected: S1 to S6 hold 30 short phrases each, and noise is the 15 min
+      noise-only recording (switch to it by hand for fan and TV noise). Press Start and keep this page in
+      front: a wake lock keeps the screen on, and if the wake lock is refused (battery saver), set the screen
+      timeout to 30 min first. Hiding the page, a muted or lost microphone, a stopped audio context or a
+      stalled trace ends the recording with an error, and that trace can't be exported. Hold the big button,
+      or a key of a Bluetooth page-turner (Space, Page Down, Page Up, Right arrow or Enter), for the whole of
+      each phrase: press just before you start speaking and let go just after you finish. The next phrase
+      appears 2 s after you let go. Press Stop at the end: the page records 1.5 s more, then stops. The
+      noise-only recording stops by itself after 15 min.
+    </p>
+    <p>
+      Export saves 2 files; if Chrome asks to download multiple files, choose Allow, then check that both
+      trace-….json and trace-….bin are in Downloads. They are named
+      <code>trace-&lt;session&gt;-&lt;condition&gt;-&lt;placement&gt;-&lt;speaker&gt;-&lt;UTC time&gt;</code>;
+      rename them to <code>trace.json</code> and <code>trace.bin</code> in their own folder
+      <code>test/traces/session-&lt;A|B&gt;/&lt;condition&gt;-&lt;placement&gt;[-child]/</code>
+      (scripts/vad-eval.ts finds only trace.json). Export stays available until Discard or the next Start, and
+      the setup is locked until then. A run stopped before the end of its script still exports, but the line
+      next to Export flags it as incomplete: not a protocol trace.
+    </p>
+    <p>
+      Privacy (plan Q2): feature traces only, never audio. The page never cuts a clip from the capture ring,
+      and levels, voicing scores and speech probabilities can't be turned back into speech. Nothing is stored
+      in the browser: the two trace files leave the page only when Export is pressed, and leaving the page
+      discards everything.
+    </p>
+    <main id="lab"></main>
+  </body>
+</html>
