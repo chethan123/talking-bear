@@ -384,6 +384,18 @@ function expectRgbNear(
   }
 }
 
+/** The run of non-sclera pixels (blue < 200: iris #E3A43A, pupil #1A1216) through canvas pixel (x, y), as [first, last] x. */
+function irisRun(g: CanvasRenderingContext2D, x: number, y: number): [number, number] {
+  const row = g.getImageData(0, y, CSS_WIDTH, 1).data;
+  const inside = (px: number): boolean => row[4 * px + 2]! < 200;
+  expect(inside(x), 'the probe pixel is iris or pupil').toBe(true);
+  let first = x;
+  while (first > 0 && inside(first - 1)) first--;
+  let last = x;
+  while (last < CSS_WIDTH - 1 && inside(last + 1)) last++;
+  return [first, last];
+}
+
 describe('blush and context reset (pixel checks, no screenshot)', () => {
   test('the squish blush is 0.35·#F2A07B over what lies under it; render resets a dirty context', () => {
     const { g, view } = mount(CSS_WIDTH, CSS_HEIGHT);
@@ -494,6 +506,37 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
       2,
       'the iris outside the sclera is clipped away',
     );
+  });
+
+  test('IrisConverge 6 moves the left iris +6 and the right iris −6 in screen x, at the neutral pose (#222)', () => {
+    const rig = createRig();
+    const SCALE = 4;
+    const converged = createPose();
+    converged[Ch.IrisConverge] = 6;
+    for (const [id, shift] of [
+      ['irisL', 6],
+      ['irisR', -6],
+    ] as const) {
+      // Zoom ×4 onto the iris's rest centre, at the canvas centre: 1 design unit = 4 px.
+      const [x0, y0, x1, y1] = PARTS[partIndex(id)]!.bbox;
+      const cx = (x0 + x1) / 2;
+      const cy = (y0 + y1) / 2;
+      const { g } = mount(CSS_WIDTH, CSS_HEIGHT);
+      const view: View = { scale: SCALE, ox: CSS_WIDTH / 2 - SCALE * cx, oy: CSS_HEIGHT / 2 - SCALE * cy };
+      const px = CSS_WIDTH / 2;
+      const py = CSS_HEIGHT / 2;
+      render(g, rig, createPose(), view);
+      const [n0, n1] = irisRun(g, px, py);
+      render(g, rig, converged, view);
+      const [c0, c1] = irisRun(g, px, py);
+      // Neutral: the run is the whole iris (diameter 60 units = 240 px), centred on its rest centre.
+      expect(Math.abs(n1 + 1 - n0 - SCALE * (x1 - x0)), `${id}: neutral iris width`).toBeLessThanOrEqual(2);
+      expect(Math.abs((n0 + n1 + 1) / 2 - px), `${id}: neutral iris centre`).toBeLessThanOrEqual(1);
+      // Converged: the same width (not clipped by the sclera), its centre moved by shift design units in screen x.
+      expect(c1 - c0, `${id}: converged iris width`).toBe(n1 - n0);
+      const moved = ((c0 + c1 + 1) / 2 - (n0 + n1 + 1) / 2) / SCALE;
+      expect(Math.abs(moved - shift), `${id}: moved ${moved} design units`).toBeLessThanOrEqual(0.25);
+    }
   });
 
   test('render applies the view offset: centred fits on 700×700 (ox 100) and 500×900 (oy 100)', () => {
