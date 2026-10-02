@@ -651,6 +651,7 @@ function onTraceBatch(e: TraceBatch): void {
     stopCapture(r, `${TAIL_SECONDS} s tail recorded`);
   }
   showValues();
+  drawHold(); // the noise-only time left
   drawPlot();
 }
 
@@ -766,6 +767,7 @@ function dropHold(r: Recording, why: string): void {
   if (r.hold === null) return;
   log(`${why}: the press at ctx frame ${r.hold.press} is still held, dropped`);
   r.hold = null;
+  if (resizePending) sizeHold();
   drawHold();
 }
 
@@ -794,7 +796,7 @@ function press(source: HoldSource): boolean {
 /**
  * The release of the hold `source` started: release = Math.round(ctx.currentTime · ctx.sampleRate). A hold
  * shorter than MIN_HOLD_SECONDS is dropped; otherwise it becomes a label, and in a short-phrase script the next
- * phrase appears NEXT_PHRASE_DELAY_MS later.
+ * phrase appears NEXT_PHRASE_DELAY_MS later (after the last phrase, the script is done at once).
  */
 function release(source: HoldSource): void {
   const r = rec;
@@ -816,7 +818,12 @@ function release(source: HoldSource): void {
     );
     if (seconds > LONG_HOLD_SECONDS) log(`long hold: ${fmt(seconds, 2)} s > ${LONG_HOLD_SECONDS} s`);
     if (r.setup.scriptId !== NOISE_SCRIPT_ID && r.phrase < PHRASES_PER_SCRIPT) {
-      r.countdownEnd = performance.now() + NEXT_PHRASE_DELAY_MS;
+      if (r.phrase + 1 < PHRASES_PER_SCRIPT) {
+        r.countdownEnd = performance.now() + NEXT_PHRASE_DELAY_MS;
+      } else {
+        r.phrase = PHRASES_PER_SCRIPT;
+        log(`script ${r.setup.scriptId} done: press Stop`);
+      }
     }
   }
   showValues();
@@ -1346,7 +1353,6 @@ function tick(): void {
     if (now >= r.countdownEnd) {
       r.countdownEnd = null;
       r.phrase++;
-      if (r.phrase >= PHRASES_PER_SCRIPT) log(`script ${r.setup.scriptId} done: press Stop`);
       showValues();
     }
     drawHold();
