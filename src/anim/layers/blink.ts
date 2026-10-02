@@ -26,14 +26,6 @@ const SINGLE = BLINK_CLOSE + BLINK_HOLD + BLINK_OPEN;
 /** A double: blink, gap, blink = 0.44 s. */
 const DOUBLE = 2 * SINGLE + BLINK_DOUBLE_GAP;
 
-/** Lid of one blink `t` seconds after its onset: 0 before it and after it ends. */
-function singleLid(t: number): number {
-  if (t < 0 || t >= SINGLE) return 0;
-  if (t < BLINK_CLOSE) return t / BLINK_CLOSE;
-  if (t < BLINK_CLOSE + BLINK_HOLD) return 1;
-  return 1 - (t - BLINK_CLOSE - BLINK_HOLD) / BLINK_OPEN;
-}
-
 export interface BlinkLayer extends Layer {
   /** Blink events started so far; a double counts once. */
   readonly count: number;
@@ -45,15 +37,24 @@ export interface BlinkLayer extends Layer {
   readonly sinceOnset: number;
 }
 
+// The doubles kept between updates live in a `Float64Array`, one slot each: V8's mid tier boxes a double written to
+// a class field as a new heap number on every write (#214).
+/** Seconds until the next onset. */
+const WAIT = 0;
+/** Seconds since the latest onset. */
+const SINCE = 1;
+
 class Blink implements BlinkLayer {
   #primed = false;
-  /** Seconds until the next onset. */
-  #wait = 0;
-  /** Seconds since the latest onset. */
-  #t = Number.POSITIVE_INFINITY;
+  /** The doubles kept between updates, by slot. */
+  readonly #s = new Float64Array(2);
   #double = false;
   #count = 0;
   #doubles = 0;
+
+  constructor() {
+    this.#s[SINCE] = Number.POSITIVE_INFINITY;
+  }
 
   get count(): number {
     return this.#count;
@@ -64,30 +65,36 @@ class Blink implements BlinkLayer {
   }
 
   get sinceOnset(): number {
-    return this.#t;
+    return this.#s[SINCE]!;
   }
 
   update(dt: number, pose: Pose, ctx: AnimContext): void {
+    const s = this.#s;
     if (!this.#primed) {
       this.#primed = true;
-      this.#wait = exponential(ctx.rng, BLINK_MEAN_INTERVAL);
+      s[WAIT] = exponential(ctx.rng, BLINK_MEAN_INTERVAL);
     }
-    this.#t += dt;
-    this.#wait -= dt;
-    if (this.#wait <= 0) {
+    s[SINCE] = s[SINCE]! + dt;
+    s[WAIT] = s[WAIT]! - dt;
+    if (s[WAIT] <= 0) {
       // The onset fell inside this step, −wait seconds before its end: start the lid there, not at the step.
-      this.#t = -this.#wait;
+      s[SINCE] = -s[WAIT];
       this.#double = ctx.rng() < BLINK_DOUBLE_RATIO;
       this.#count++;
       if (this.#double) this.#doubles++;
       // The next onset is an exponential interval after this one, but never before this event has ended.
-      this.#wait += Math.max(exponential(ctx.rng, BLINK_MEAN_INTERVAL), this.#double ? DOUBLE : SINGLE);
+      s[WAIT] = s[WAIT] + Math.max(exponential(ctx.rng, BLINK_MEAN_INTERVAL), this.#double ? DOUBLE : SINGLE);
     }
-    const t = this.#t;
-    const lid =
-      this.#double && t >= SINGLE + BLINK_DOUBLE_GAP
-        ? singleLid(t - SINGLE - BLINK_DOUBLE_GAP)
-        : singleLid(t);
+    const t = s[SINCE];
+    // Time into the current single blink: a double's second blink starts SINGLE + BLINK_DOUBLE_GAP after the onset.
+    const u = this.#double && t >= SINGLE + BLINK_DOUBLE_GAP ? t - SINGLE - BLINK_DOUBLE_GAP : t;
+    // The lid of one blink `u` seconds after its onset, 0 before and after it; written out rather than a helper,
+    // since a call V8 does not inline boxes the double it returns.
+    let lid: number;
+    if (u < 0 || u >= SINGLE) lid = 0;
+    else if (u < BLINK_CLOSE) lid = u / BLINK_CLOSE;
+    else if (u < BLINK_CLOSE + BLINK_HOLD) lid = 1;
+    else lid = 1 - (u - BLINK_CLOSE - BLINK_HOLD) / BLINK_OPEN;
     const v = ctx.weights.blink * lid;
     pose[Ch.LidL] = pose[Ch.LidL]! + v;
     pose[Ch.LidR] = pose[Ch.LidR]! + v;
