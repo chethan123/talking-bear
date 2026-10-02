@@ -6,6 +6,12 @@
 // (the drift guard), so changing a module without updating this file fails `pnpm test`, and updating it
 // changes the hash. `constraints` is the production object itself (the issue's `constraints: CONSTRAINTS`).
 //
+// `revision` covers what the values can't: the implementation. The logged scalars can change while every
+// value here stays the same (the resampler's kernel, the biquads, frameDb, the voicing normalisation, the
+// Silero model code). fingerprint.test.ts catches that: it runs a synthetic signal through the front end and
+// compares the streams with fingerprint.golden.json, which records the revision it was generated under
+// (scripts/gen-vad-fingerprint.ts, `pnpm gen:vad-fingerprint`).
+//
 // DOM-free at runtime (mic.ts references no DOM value at module scope), so Node scripts, the DSP worker and
 // the page can all import it. Relative imports end in `.ts` and the syntax is erasable (CLAUDE.md rule 11).
 // src/audio/mic.ts must keep that too (no imports, or only `.ts` relative ones): Node scripts (the T42/T50
@@ -14,6 +20,13 @@
 import { CONSTRAINTS } from '../audio/mic.ts';
 
 export interface FrontEndConfig {
+  /**
+   * Revision of the front end's implementation: an integer >= 1. Bump it when the logged scalars change
+   * while the values below stay the same; it is part of the hash, so a bump marks every committed trace
+   * stale. A change to src/dsp/silero/weights.bin also moves sileroP and needs a bump. Then regenerate
+   * fingerprint.golden.json with `pnpm gen:vad-fingerprint` (fingerprint.test.ts fails until then).
+   */
+  readonly revision: number;
   /** The capture worklet's 16 kHz decimator (`createResampler(sampleRate, VAD_RATE)`, default options). */
   readonly decimator: {
     readonly zeroCrossings: number;
@@ -42,6 +55,7 @@ export interface FrontEndConfig {
 }
 
 export const FRONT_END_CONFIG: FrontEndConfig = {
+  revision: 1,
   decimator: { zeroCrossings: 8, beta: 6, cutoff: 0.9 / 3 },
   gateFilter: { hpfHz: [200, 200], lpfHz: 3400 },
   constraints: CONSTRAINTS,
