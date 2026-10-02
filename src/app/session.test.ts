@@ -1160,7 +1160,7 @@ describe('errors', () => {
 });
 
 describe('wiring', () => {
-  it('engine level, vadError, vadReady and vadStats go only to subscribeLevel listeners; other engine events are dispatched', async () => {
+  it('engine level, vadError, vadReady, vadStats and traceBatch go only to subscribeLevel listeners; other engine events are dispatched', async () => {
     const h = setup();
     await toListening(h);
     const errors = spyError();
@@ -1171,11 +1171,23 @@ describe('wiring', () => {
     const vadError: LevelEvent = { t: 'vadError', message: 'x' };
     const ready: LevelEvent = { t: 'vadReady', backend: 'silero' };
     const stats: LevelEvent = { t: 'vadStats', p95Ms: 4.5 };
+    const trace: LevelEvent = {
+      t: 'traceBatch',
+      epoch: 1,
+      hop0Frame: 480,
+      sil0Frame: Number.NaN,
+      rawDb: new Float32Array(25),
+      bandDb: new Float32Array(25),
+      voicing: new Float32Array(25),
+      sileroP: new Float32Array(0),
+      inferMs: new Float32Array(0),
+    };
     h.eng.emit(level);
     h.eng.emit(vadError);
     h.eng.emit(ready);
     h.eng.emit(stats);
-    expect(got).toEqual([level, vadError, ready, stats]);
+    h.eng.emit(trace);
+    expect(got).toEqual([level, vadError, ready, stats, trace]);
     expect(h.transitions).toHaveLength(count);
     expect(errors).not.toHaveBeenCalled();
     h.eng.emit({ t: 'armed', epoch: 1, armFrame: 1234 });

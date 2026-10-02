@@ -1,6 +1,6 @@
 // The engine in a real Chromium (Vitest Browser Mode): real AudioContext, capture worklet (loaded from the Vite
 // dev server), DSP worker and the fake microphone (--use-fake-device-for-media-stream: a 400 Hz beep every
-// 500 ms). One engine is shared by tests 1–15, which run in order; tests 16–18 use fresh engines.
+// 500 ms). One engine is shared by tests 1–15, which run in order; tests 16–20 use fresh engines.
 //
 // Test-only patches on this page, installed before the engines exist and removed in afterAll: `Worker` records
 // every instance and terminate() call (and can be told to fail its next construction), `getUserMedia` records
@@ -185,7 +185,7 @@ function withoutLevels(events: readonly EngineEvent[]): EngineEvent[] {
 
 const { log, onEvent, waitFor, count } = createRecorder();
 let engine: Engine;
-/** Engines of tests 16–18, closed in afterAll. */
+/** Engines of tests 16–20, closed in afterAll. */
 const freshEngines: Engine[] = [];
 let sr = 0;
 let armFrame = 0;
@@ -586,4 +586,49 @@ describe('engine (Browser Mode, fake media)', () => {
     d.engine.releaseProcessed(2);
     expect(d.engine.getProcessed(2)).toBeUndefined();
   }, 10_000);
+
+  test('20: setTrace(true) delivers traceBatch events within 1 s; a restarted worker keeps tracing; setTrace(false) stops them', async () => {
+    const rec = createRecorder();
+    const e = createEngine({ connectWorkletOutput: false, onEvent: rec.onEvent });
+    freshEngines.push(e);
+    await e.resume();
+    e.openMic(1);
+    await rec.waitFor('micGranted', 0, 5000);
+    e.arm(1);
+    await rec.waitFor('armed', 0, 3000, (ev) => ev.epoch === 1);
+
+    let from = rec.log.length;
+    const t0 = performance.now();
+    e.setTrace(true);
+    const first = await rec.waitFor('traceBatch', from, 1000, (ev) => ev.epoch === 1);
+    expect(performance.now() - t0).toBeLessThanOrEqual(1000);
+    const b = first.event;
+    expect(b.rawDb).toHaveLength(25);
+    expect(b.bandDb).toHaveLength(25);
+    expect(b.voicing).toHaveLength(25);
+    for (const db of b.rawDb) expect(Number.isFinite(db) && db >= -120, `rawDb ${db}`).toBe(true);
+    for (const v of b.voicing) {
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThanOrEqual(1);
+    }
+    // Either backend: Silero frames carry a p and a time each; without Silero both are empty and sil0Frame NaN.
+    expect(b.inferMs).toHaveLength(b.sileroP.length);
+    expect(Number.isNaN(b.sil0Frame)).toBe(b.sileroP.length === 0);
+    const second = await rec.waitFor('traceBatch', first.index + 1, 1000, (ev) => ev.epoch === 1);
+    const hops25 = (25 * sr) / 100;
+    expect(Math.abs(second.event.hop0Frame - b.hop0Frame - hops25)).toBeLessThanOrEqual(1);
+
+    // A new worker gets the setting after its init: no second setTrace(true).
+    from = rec.log.length;
+    e.restartWorker();
+    e.arm(2);
+    await rec.waitFor('traceBatch', from, 1500, (ev) => ev.epoch === 2);
+
+    // Off: the partial batch (and any batch already on its way) may still arrive, then nothing.
+    e.setTrace(false);
+    await sleep(600);
+    from = rec.log.length;
+    await sleep(600);
+    expect(rec.count('traceBatch', from)).toBe(0);
+  }, 15_000);
 });

@@ -46,7 +46,10 @@ export interface SessionDeps {
 }
 
 /** Engine events that never reach the reducer. */
-export type LevelEvent = Extract<EngineEvent, { t: 'level' | 'vadError' | 'vadReady' | 'vadStats' }>;
+export type LevelEvent = Extract<
+  EngineEvent,
+  { t: 'level' | 'vadError' | 'vadReady' | 'vadStats' | 'traceBatch' }
+>;
 export type TransitionListener = (from: StateName, to: StateName, e: SessionEvent, effects: Effect[]) => void;
 
 export interface Session {
@@ -55,12 +58,12 @@ export interface Session {
   subscribe(cb: (s: SessionState) => void): () => void;
   /** Multi-listener version of onTransition (UI, test hooks). */
   addTransitionListener(cb: TransitionListener): () => void;
-  /** Engine `level`, `vadError`, `vadReady` and `vadStats` events (not dispatched to the reducer). */
+  /** Engine `level`, `vadError`, `vadReady`, `vadStats` and `traceBatch` events (not dispatched to the reducer). */
   subscribeLevel(cb: (e: LevelEvent) => void): () => void;
   /**
-   * The engine's event sink: `level`, `vadError`, `vadReady` and `vadStats` go to the `subscribeLevel`
-   * listeners, every other engine event is dispatched. `createEngine` takes its `onEvent` before the session
-   * exists, so main.ts relays to it:
+   * The engine's event sink: `level`, `vadError`, `vadReady`, `vadStats` and `traceBatch` go to the
+   * `subscribeLevel` listeners, every other engine event is dispatched. `createEngine` takes its `onEvent`
+   * before the session exists, so main.ts relays to it:
    *
    * ```ts
    * let session: Session | undefined;
@@ -206,7 +209,13 @@ export function createSession(initial: SessionState, deps: SessionDeps): Session
     addTransitionListener: (cb) => transitionListeners.add(cb),
     subscribeLevel: (cb) => levelListeners.add(cb),
     onEngineEvent(e) {
-      if (e.t === 'level' || e.t === 'vadError' || e.t === 'vadReady' || e.t === 'vadStats')
+      if (
+        e.t === 'level' ||
+        e.t === 'vadError' ||
+        e.t === 'vadReady' ||
+        e.t === 'vadStats' ||
+        e.t === 'traceBatch'
+      )
         levelListeners.notify(e);
       else dispatch(e);
     },
