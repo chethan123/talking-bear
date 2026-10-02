@@ -114,6 +114,12 @@ body {
   font-weight: 600;
 }
 
+/* A disabled sheet button (the settings restart until an update is ready) is clearly not the teal one. */
+.sheet-button:disabled {
+  background: #dfe6e4;
+  color: #5f6368;
+}
+
 /* M3 settings (settings-sheet.ts): the gear in the top-right corner and its modal sheet. */
 .settings-gear {
   position: fixed;
