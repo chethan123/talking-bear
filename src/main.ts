@@ -1,7 +1,7 @@
-// Bootstrap and wiring (plan §3.3, §7 M1, §7 M3, §7 M4): platform services, the settings store, the audio
-// engine, the session store, the bear (BearView: Juni on the canvas stage, driven by the session's `anim` effects
-// and the replay's processed envelope), the M1 text overlays and the M3 settings sheet, with `data-state` on
-// main#app for hook-free smoke tests (plan §4.9.3).
+// Bootstrap and wiring (plan §3.3, §7 M1, §7 M3, §7 M4, §7 M6): platform services, the settings store, the audio
+// engine, the service worker and install prompt (pwa/register.ts), the session store, the bear (BearView: Juni on
+// the canvas stage, driven by the session's `anim` effects and the replay's processed envelope), the M1 text
+// overlays and the M3 settings sheet, with `data-state` on main#app for hook-free smoke tests (plan §4.9.3).
 import './ui/styles.css';
 import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
 import type { Overlay, SessionState, StateName } from './app/events.ts';
@@ -13,11 +13,13 @@ import { createEngine } from './audio/engine.ts';
 import { createPlayer } from './audio/player.ts';
 import { createSfx, M1_SYNTHS } from './audio/sfx.ts';
 import { createMicPermission } from './platform/permissions.ts';
+import { createStorage } from './platform/storage.ts';
 import { createVisibility } from './platform/visibility.ts';
 import { createWakeLock } from './platform/wake-lock.ts';
+import { setupPwa } from './pwa/register.ts';
 import { mountDebugOverlay } from './ui/debug-overlay.ts';
 import { mountOverlay } from './ui/overlay.ts';
-import { mountSettingsSheet } from './ui/settings-sheet.ts';
+import { mountSettingsSheet, type SettingsSheet } from './ui/settings-sheet.ts';
 
 const noop = (): void => {};
 
@@ -48,6 +50,7 @@ async function boot(): Promise<void> {
   const wakeLock = createWakeLock(navigator, visibility);
   const permission = createMicPermission(navigator, visibility);
   const settings = createSettingsStore(settingsStorage());
+  const storage = createStorage(navigator);
 
   // createEngine takes its event sink before the session exists; the engine emits nothing until an effect has
   // called it, so relaying through `session` loses nothing (Session.onEngineEvent).
@@ -59,6 +62,25 @@ async function boot(): Promise<void> {
   // Quiet mode (plan §4.3.4): the engine builds its master bus with the stored value, so it holds from the
   // first sound, with no ramp.
   engine.setQuiet(settings.get().quietMode);
+
+  // The service worker and the install prompt (plan §4.5, §4.7), set up before the first await so the
+  // `beforeinstallprompt` listener is in place early. `updateReady` is relayed to the session once it exists
+  // (caught up below), and both PWA signals refresh the settings sheet's Install and restart buttons.
+  let sheet: SettingsSheet | null = null;
+  let installAvailable = false;
+  const pwa = setupPwa({
+    dispatch: (e) => {
+      session?.dispatch(e);
+      sheet?.refreshPwa();
+    },
+    visibility,
+    clock,
+    storage,
+    onInstallAvailable: (available) => {
+      installAvailable = available;
+      sheet?.refreshPwa();
+    },
+  });
 
   const permission0 = await permission.query();
   let showOverlay: (o: Overlay) => void = noop;
@@ -75,7 +97,11 @@ async function boot(): Promise<void> {
     onAnim: (ev) => bear?.onAnim(ev),
     onPlayStarted: (id, startCtxTime) => bear?.onPlayStarted(id, startCtxTime),
     onUi: (o) => showOverlay(o),
+    // Row 38: on a hide that leaves the session Asleep or Paused with an update ready, activate it synchronously.
+    onApplyUpdate: () => pwa.applyUpdate(),
   });
+  // An update found before the session existed (its relayed dispatch was dropped).
+  if (pwa.updateReady()) session.dispatch({ t: 'updateReady' });
 
   // E2E hooks (plan §4.9.3): dead-code-eliminated from production builds, where the flag is unset. Installed
   // before the UI is mounted, so no pointer input can reach the session before the hooks are listening.
@@ -114,15 +140,22 @@ async function boot(): Promise<void> {
   });
 
   showOverlay = mountOverlay(app, (e) => s.dispatch(e));
-  mountSettingsSheet(app, {
+  sheet = mountSettingsSheet(app, {
     store: settings,
     bus: { setQuiet: (on) => engine.setQuiet(on) },
     state: () => s.state().name,
+    pwa: {
+      installAvailable: () => installAvailable,
+      promptInstall: () => pwa.promptInstall(),
+      updateReady: () => pwa.updateReady(),
+      applyUpdate: () => pwa.applyUpdate(),
+    },
   });
 
-  // Developer overlay (plan §7 M2, M4): the frame loop's p95 frame time and fps.
+  // Developer overlay (plan §7 M2, M4, M6): the frame loop's p95 frame time and fps, and storage persistence
+  // and usage.
   if (new URLSearchParams(location.search).get('debug') === '1') {
-    mountDebugOverlay(app, { frameStats: (out) => view.frameStats(out), clock });
+    mountDebugOverlay(app, { frameStats: (out) => view.frameStats(out), clock, storage });
   }
 
   let shown: StateName | null = null;
