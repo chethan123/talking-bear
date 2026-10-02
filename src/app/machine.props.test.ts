@@ -7,8 +7,16 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import { SessionSim, type MicMode, type SimRng, type Transition } from '../../test/session-sim.ts';
-import { DEFAULT_CONFIG, type Permission, type SessionEvent, type StateName } from './events.ts';
-import { GATED, MIC_OPEN, reduce } from './machine.ts';
+import { PRESETS, type VoicePreset } from '../dsp/types.ts';
+import {
+  DEFAULT_CONFIG,
+  type Effect,
+  type Permission,
+  type SessionEvent,
+  type SessionState,
+  type StateName,
+} from './events.ts';
+import { GATED, MIC_OPEN, TABLE, reduce } from './machine.ts';
 
 /** At least 300 runs per property, each a sequence of up to 400 steps (issue #29). */
 const RUNS = 300;
@@ -66,6 +74,42 @@ const workerFailureOk = (prev: StateName, next: StateName, restarts: number): bo
   prev === 'Waking'
     ? next === 'Error' || (next === 'Waking' && restarts === 0)
     : next === 'Cooldown' || next === 'Error';
+
+/** The own keys whose values differ (by `Object.is`) between `a` and `b`, or that only one of them has. */
+function changedKeys(a: object, b: object): string[] {
+  const out = Object.keys(a).filter(
+    (k) => !Object.hasOwn(b, k) || !Object.is(Reflect.get(a, k), Reflect.get(b, k)),
+  );
+  for (const k of Object.keys(b)) if (!Object.hasOwn(a, k)) out.push(k);
+  return out;
+}
+
+/** Value equality of presets, field by field, as the reducer decides whether a preset changed. */
+const samePreset = (a: VoicePreset, b: VoicePreset): boolean => changedKeys(a, b).length === 0;
+
+/** Property 10's probe preset that differs from `p`: Chipmunk, or Big bear when `p` is Chipmunk. */
+const otherPreset = (p: VoicePreset): VoicePreset =>
+  samePreset(p, PRESETS.chipmunk) ? PRESETS.bigbear : PRESETS.chipmunk;
+
+/**
+ * Property 10 (issue #210): what is wrong when `settingsChanged{preset}` takes `prev` to `next` with
+ * `effects`, or null. No effects; an equal preset keeps the very same state object; another changes only
+ * `preset`.
+ */
+function settingsChangedViolation(
+  prev: SessionState,
+  preset: VoicePreset,
+  next: SessionState,
+  effects: readonly Effect[],
+): string | null {
+  if (effects.length > 0) return `emitted [${effects.map((fx) => fx.k).join(', ')}]`;
+  if (samePreset(preset, prev.preset)) {
+    return next === prev ? null : 'returned a new state object for an equal preset';
+  }
+  const changed = changedKeys(prev, next);
+  if (changed.length !== 1 || changed[0] !== 'preset') return `changed [${changed.join(', ')}], not [preset]`;
+  return samePreset(next.preset, preset) ? null : `stored ${JSON.stringify(next.preset)}`;
+}
 
 /**
  * Runs a walk with user events allowed. `onTransition` sees every transition after its effects were applied;
@@ -328,5 +372,43 @@ describe('session reducer properties (plan §4.9.1)', () => {
     expect(trace).toMatch(/^reached Listening\ntrace \(\d+ events\):\n/);
     expect(trace).toMatch(/ inject tapBear: Asleep -> /); // only a tap leaves Asleep
     expect(trace).toMatch(/: \w+ -> Listening \[/);
+  });
+
+  it('10: settingsChanged changes only the preset and emits nothing (equal preset: same state)', () => {
+    const injectedIn = new Set<StateName>();
+    const probedIn = new Set<StateName>();
+    let keptByWalk = 0; // injected with a preset equal to the current one
+    let changedByWalk = 0;
+    let customByWalk = 0; // injected with a Custom preset from the slider's grid
+    property((w) => {
+      runWalk(
+        w,
+        (t, sim) => {
+          if (t.event.t !== 'settingsChanged') return;
+          injectedIn.add(t.prev.name);
+          if (t.next === t.prev) keptByWalk++;
+          else changedByWalk++;
+          if (t.event.preset.id === 'custom') customByWalk++;
+          const why = settingsChangedViolation(t.prev, t.event.preset, t.next, t.effects);
+          if (why !== null) fail(sim, `P10: ${fmt(t.event)} in ${t.prev.name} ${why}`);
+        },
+        (sim) => {
+          // Probes: another preset, and an equal one as a new object (as presetFor builds every Custom one).
+          const s = sim.state;
+          probedIn.add(s.name);
+          for (const preset of [otherPreset(s.preset), { ...s.preset }]) {
+            const e: SessionEvent = { t: 'settingsChanged', preset };
+            const out = reduce(s, e);
+            const why = settingsChangedViolation(s, preset, out.state, out.effects);
+            if (why !== null) fail(sim, `P10: ${fmt(e)} in ${s.name} ${why} (probe)`);
+          }
+        },
+      );
+    });
+    expect(injectedIn.size).toBeGreaterThanOrEqual(10);
+    expect(keptByWalk).toBeGreaterThan(0);
+    expect(changedByWalk).toBeGreaterThan(0);
+    expect(customByWalk).toBeGreaterThan(0);
+    expect([...probedIn].toSorted()).toEqual(Object.keys(TABLE).toSorted());
   });
 });
