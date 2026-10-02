@@ -1882,3 +1882,181 @@ describe('#91 plan review: edge rules (M16, M19, M21) and a non-finite time', ()
     expect(ended).toMatchObject({ name: 'Idle', reaction: null });
   });
 });
+
+// ---- #91 property: random gesture, release, gentle and session sequences ------------------------------------
+describe('#91 property: random gesture and session sequences', () => {
+  /** A spread of gesture inputs: taps, the big sneeze, long-presses, strokes, tickles, flicks, pinch, hug, all-over. */
+  const GESTURES: readonly ((now: number, dirX: -1 | 1) => DirInput)[] = [
+    (now) => noseTap(now),
+    (now) => noseTap(now, 3),
+    (now) => gest('hardBlinkL', 'eyeL', 'tap', now),
+    (now) => gest('noseWrinkle', 'nose', 'longPress', now),
+    (now) => gest('highFiveR', 'pawR', 'longPress', now),
+    (now, dirX) => petStroke(now, dirX),
+    (now) => gest('againstFur', 'headTop', 'stroke', now),
+    (now) => tickle(now),
+    (now) => flick(now),
+    (now) => gest('squish', 'cheekL', 'pinch', now),
+    (now) => gest('hug', 'belly', 'hug', now),
+    (now) => gest('giggle', 'belly', 'allOver', now),
+  ];
+  type Kind = AnimKind | 'tick' | 'gesture' | 'release' | 'gentleOn' | 'gentleOff';
+  const STEP = fc.record({
+    kind: fc.constantFrom<Kind>(
+      ...KINDS,
+      'tick',
+      'tick',
+      'tick',
+      'gesture',
+      'gesture',
+      'gesture',
+      'release',
+      'gentleOn',
+      'gentleOff',
+    ),
+    g: fc.integer({ min: 0, max: GESTURES.length - 1 }),
+    dirX: fc.constantFrom<-1 | 1>(-1, 1),
+    dt: fc.integer({ min: 0, max: 120 }), // 10 ms grid, 0–1.2 s
+  });
+  const KNOWN_CLIPS = new Set([
+    ...Object.keys(SESSION_CLIPS),
+    ...Object.keys(REACTION_CLIPS),
+    'flinch',
+    'petMirrored',
+  ]);
+
+  function input(kind: Kind, g: number, dirX: -1 | 1, now: number): DirInput {
+    switch (kind) {
+      case 'tick':
+        return tick(now);
+      case 'gesture':
+        return GESTURES[g]!(now, dirX);
+      case 'release':
+        return release(now);
+      case 'gentleOn':
+        return gentle(true);
+      case 'gentleOff':
+        return gentle(false);
+      default:
+        return anim(SAMPLES[kind], now);
+    }
+  }
+
+  it('keeps the invariants, agrees with directorReduce, is pure, and outputs only table reactions (300 runs)', () => {
+    fc.assert(
+      fc.property(fc.array(STEP, { minLength: 1, maxLength: 80 }), (seq) => {
+        let s = initialDirector(0);
+        let now = 0;
+        const pose = createPose().fill(Number.NaN);
+        for (const [j, m] of MOUTH.entries()) pose[m] = 100 + j;
+        for (const { kind, g, dirX, dt } of seq) {
+          now += dt / 100;
+          const prev = deepFreeze(s);
+          const snapshot = structuredClone(prev);
+          const i = input(kind, g, dirX, now);
+          const { state: r, out } = directorStep(prev, i);
+          expect(prev).toStrictEqual(snapshot); // frozen input, never written
+          expect(directorReduce(prev, i)).toStrictEqual(r);
+          expect(r === prev || !isDeepStrictEqual(r, prev)).toBe(true);
+          expect(r.base).toBe(BASE_OF_STATE[r.name]);
+          expect(r.talk !== null).toBe(r.name === 'Talking');
+          if (r.name === 'Reacting' || r.name === 'Sustained') {
+            expect(r.reaction).not.toBeNull();
+            expect(r.reaction!.r.sustained).toBe(r.name === 'Sustained');
+          }
+          if (r.name === 'Asleep' || r.name === 'Waking') {
+            expect(r.reaction).toBeNull();
+            expect(r.queued).toBeNull();
+          }
+          if (r.name === 'Idle' || r.name === 'Dozing') expect(r.reaction).toBeNull();
+          if (r.name === 'Talking') {
+            expect(r.reaction === null || r.reaction.r.sustained).toBe(true); // a sustained one carried over
+            expect(r.queued === null || r.queued.announced).toBe(true);
+          }
+          // While Talking, the carried-over reaction's refreshes and release output nothing (finding 1).
+          const carried = prev.name === 'Talking' ? prev.reaction : null;
+          if (
+            carried !== null &&
+            carried.release === null &&
+            (i.k === 'release' || (i.k === 'gesture' && i.r.name === carried.r.name))
+          )
+            expect(out).toStrictEqual([]);
+          if (r.reaction !== null && !r.reaction.r.sustained) expect(r.reaction.release).toBeNull();
+          if (r.clip !== null) {
+            expect(KNOWN_CLIPS.has(r.clip.name), r.clip.name).toBe(true);
+            expect(r.clip.start).toBeLessThanOrEqual(now);
+          }
+          if (prev.name === 'Asleep' || prev.name === 'Waking') {
+            if (i.k === 'gesture' || i.k === 'release') expect(r).toBe(prev);
+          }
+          for (const o of out) {
+            if (o.k === 'toSession') {
+              const t = REACTIONS[o.ev.name];
+              expect(t, o.ev.name).toBeDefined();
+              expect(o.ev.priority).toBe(t!.priority);
+              expect([t!.sfx, t!.sfxOnRelease ?? null, null]).toContain(o.ev.sfx);
+            }
+          }
+          evaluate(r, now, pose);
+          for (const [j, m] of MOUTH.entries()) expect(pose[m]).toBe(100 + j);
+          for (let c = 0; c < CH_COUNT; c++)
+            if (!MOUTH.includes(c)) expect(Number.isFinite(pose[c])).toBe(true);
+          s = r;
+        }
+      }),
+      { numRuns: 300 },
+    );
+  });
+});
+
+/** A held pet (its clip is `sustained`): nothing is due on any tick. */
+const heldPet = (): DirectorState => stepAll(stateIn('Idle'), petStroke(11)).s;
+
+describe('#91 allocation: quiet ticks and the release ease-out', () => {
+  it('10 000 ticks while a reaction is held: the same state, and directorStep the same frozen result', () => {
+    const s = heldPet();
+    const tickIn = { k: 'tick' as const, now: 11 };
+    let first = directorStep(s, tickIn);
+    let sameState = 0;
+    let sameStep = 0;
+    for (let i = 0; i < 10_000; i++) {
+      tickIn.now = 11.01 + i * 0.01;
+      const r = directorStep(s, tickIn);
+      if (r.state === s) sameState++;
+      if (r === first) sameStep++;
+      first = r;
+    }
+    expect(sameState).toBe(10_000);
+    expect(sameStep).toBe(10_000);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(first.out).toHaveLength(0);
+    expect(countAllocations(() => void directorStep(s, tickIn))).toBe(0);
+  });
+
+  it('grows the heap by < 1 MB over 100 000 quiet directorStep ticks, once V8 has optimised it', () => {
+    const s = heldPet();
+    const tickIn = { k: 'tick' as const, now: 11 };
+    const runAll = (): void => {
+      for (let i = 0; i < 100_000; i++) {
+        tickIn.now = 11 + i * 1e-4;
+        directorStep(s, tickIn);
+      }
+    };
+    forceGc();
+    for (let w = 0; w < 3; w++) runAll();
+    const LIMIT = 1_048_576;
+    let best = heapGrowth(runAll);
+    for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(runAll));
+    expect(best).toBeLessThan(LIMIT);
+  });
+
+  it('evaluate of a released reaction easing out makes no array allocation', () => {
+    const s = stepAll(stateIn('Idle'), petStroke(11), release(12)).s;
+    const out = createPose();
+    expect(
+      countAllocations(() => {
+        for (let i = 0; i < 1000; i++) evaluate(s, 12 + i * 0.0005, out);
+      }),
+    ).toBe(0);
+  });
+});
