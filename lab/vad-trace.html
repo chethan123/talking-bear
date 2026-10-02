@@ -35,10 +35,11 @@
       trace-….json and trace-….bin are in Downloads. They are named
       <code>trace-&lt;session&gt;-&lt;condition&gt;-&lt;placement&gt;-&lt;speaker&gt;-&lt;UTC time&gt;</code>;
       rename them to <code>trace.json</code> and <code>trace.bin</code> in their own folder
-      <code>test/traces/session-&lt;A|B&gt;/&lt;condition&gt;-&lt;placement&gt;[-child]/</code>
-      (scripts/vad-eval.ts finds only trace.json). Export stays available until Discard or the next Start, and
-      the setup is locked until then. A run stopped before the end of its script still exports, but the line
-      next to Export flags it as incomplete: not a protocol trace.
+      <code>test/traces/session-&lt;A|B&gt;/&lt;condition&gt;-&lt;placement&gt;[-child]/</code> (noise-only:
+      <code>&lt;condition&gt;-noise/</code>) (scripts/vad-eval.ts finds only trace.json). Export stays
+      available until Discard or the next Start, and the setup is locked until then. A run stopped before the
+      end of its script still exports, but the line next to Export flags it as incomplete: not a protocol
+      trace.
     </p>
     <p>
       Privacy (plan Q2): feature traces only, never audio. The page never cuts a clip from the capture ring,
