@@ -12,7 +12,6 @@
 
 import { DEFAULT_VAD_BACKEND } from '../src/audio/constants.ts';
 import { createEngine, type EngineEvent } from '../src/audio/engine.ts';
-import type { MainToWorker } from '../src/audio/messages.ts';
 import { CONSTRAINTS } from '../src/audio/mic.ts';
 import { WEIGHTS_SHA256 } from '../src/dsp/silero/weights.ts';
 import { createVisibility } from '../src/platform/visibility.ts';
@@ -275,7 +274,13 @@ const holdButton = el('button', { type: 'button', id: 'hold', 'aria-label': 'Hol
 const plotCanvas = el('canvas', { class: 'lab-spectrum', id: 'plot' });
 
 const rateValue = el('dd', { id: 'rate' }, '–');
-const backendValue = el('dd', { id: 'backend' }, '–');
+/**
+ * The trace needs Silero p on every frame (plan §7 M2). createEngine's arm() sends the DSP worker `reset{vad}`
+ * with DEFAULT_VAD_BACKEND (this page never calls the e2e-only setVadBackend), so the effective backend is the
+ * default; the first batch's check (onTraceBatch) fails the recording unless Silero ran from the epoch's first
+ * frame.
+ */
+const backendValue = el('dd', { id: 'backend' }, `${DEFAULT_VAD_BACKEND} (default)`);
 const wakeValue = el('dd', { id: 'wake' }, '–');
 const elapsedValue = el('dd', { id: 'elapsed' }, '–');
 const n10Value = el('dd', { id: 'n10' }, '0');
@@ -336,45 +341,6 @@ const log = logPanel(root);
 function describe(value: unknown): string {
   return value instanceof Error ? `${value.name}: ${value.message}` : String(value);
 }
-
-// ---- Silero on every frame (until T40) ----------------------------------------------------------------------
-
-/** Resets the shim rewrote to `vad: 'silero'` since the page loaded (logged at each Stop). */
-let shimRewrites = 0;
-
-function isReset(m: unknown): m is Extract<MainToWorker, { t: 'reset' }> {
-  return typeof m === 'object' && m !== null && 't' in m && m.t === 'reset';
-}
-
-/**
- * The trace needs Silero p on every frame (plan §7 M2 "Silero runs continuously"), but createEngine's arm()
- * sends the DSP worker `reset{vad: DEFAULT_VAD_BACKEND}`, and the default stays 'energy' until T40 (#51) makes
- * Silero the default; on the energy backend the worker logs no Silero p at all. Until then this page's Worker
- * class is a subclass that sends a copy of each `reset` with `vad: 'silero'` and passes every other message
- * through unchanged. The engine resolves `Worker` when it creates its worker, after this runs, so its DSP
- * worker gets the rewrite. Once DEFAULT_VAD_BACKEND is 'silero' nothing is installed. The first batch's check
- * (onTraceBatch) still verifies that Silero ran from the epoch's first frame. Returns whether it installed.
- */
-function installSileroResetShim(): boolean {
-  if (DEFAULT_VAD_BACKEND === 'silero') return false;
-  const Base = globalThis.Worker;
-  class SileroResetWorker extends Base {
-    override postMessage(message: unknown, options?: Transferable[] | StructuredSerializeOptions): void {
-      let m = message;
-      if (isReset(message) && message.vad !== 'silero') {
-        m = { ...message, vad: 'silero' };
-        shimRewrites++;
-      }
-      if (Array.isArray(options)) super.postMessage(m, options);
-      else super.postMessage(m, options);
-    }
-  }
-  globalThis.Worker = SileroResetWorker;
-  return true;
-}
-
-const shimInstalled = installSileroResetShim();
-backendValue.textContent = shimInstalled ? 'silero (reset shim until T40 / #51)' : 'silero (default)';
 
 // ---- engine ---------------------------------------------------------------------------------------------------
 
@@ -692,7 +658,6 @@ function teardown(r: Recording): void {
   engine.suspend().catch((err: unknown) => log(`suspend failed: ${describe(err)}`));
   wakeLock.set(false);
   for (const w of waiters) w.resolve(null);
-  if (shimInstalled) log(`reset shim: ${shimRewrites} reset(s) rewritten to silero`);
 }
 
 /** The trace is complete. */
