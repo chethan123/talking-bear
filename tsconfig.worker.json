@@ -15,7 +15,5 @@
     "skipLibCheck": true
   },
   "include": ["src/workers/**/*.ts", "src/dsp/**/*.ts"],
-  "exclude": ["**/*.test.ts", "**/*.browser.test.ts"],
-  // Keeps `tsc -b` from failing with TS18003 (no inputs) before the first src/workers or src/dsp file exists.
-  "references": []
+  "exclude": ["**/*.test.ts", "**/*.browser.test.ts"]
 }
