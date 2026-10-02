@@ -1,6 +1,9 @@
 // The M3 settings sheet (plan §7 M3, issue #66): a gear button in the top-right corner opens a modal sheet with
 // the voice preset (Bear cub, Chipmunk, Big bear, Custom), the custom pitch slider (0.7–2.2, enabled only for
 // Custom) and Quiet mode. Development text only: M8 moves the sheet behind a 1 s long-press and adds more.
+// M6 (issue #98, plan §4.5, §4.7) adds Install, shown only while an install prompt is available, and
+// "New version – restart", enabled only while an update is ready (and ignored while Recording, Processing or
+// Playing, like the gear).
 //
 // CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/textContent only,
 // never HTML strings, and nothing sets a `style` attribute; styles.css styles it.
@@ -18,6 +21,8 @@ export const SETTINGS_TEXT = {
   custom: 'Custom',
   customPitch: 'Custom pitch',
   quietMode: 'Quiet mode',
+  install: 'Install',
+  restart: 'New version – restart',
   close: 'Close',
 } as const;
 
@@ -34,6 +39,18 @@ export const SHEET_BLOCKED: ReadonlySet<StateName> = new Set<StateName>([
 
 const VOICES: readonly Settings['voice'][] = ['cub', 'chipmunk', 'bigbear', 'custom'];
 
+/** The PWA side of the sheet (src/pwa/register.ts, plus the install availability main.ts tracks). */
+export interface SheetPwa {
+  /** True while an install prompt is available: Install is shown only then. */
+  installAvailable(): boolean;
+  /** Shows the install prompt; called synchronously from the Install click (user activation). */
+  promptInstall(): Promise<void>;
+  /** True once a new version is waiting: the restart is enabled only then. */
+  updateReady(): boolean;
+  /** Activates the waiting version; the page reloads. */
+  applyUpdate(): void;
+}
+
 export interface SettingsSheetDeps {
   /** The settings store: read when the sheet opens, written on every change. */
   store: Pick<SettingsStore, 'get' | 'set'>;
@@ -41,13 +58,19 @@ export interface SettingsSheetDeps {
   bus: { setQuiet(on: boolean): void };
   /** The session's current state: the gear does nothing while it is in `SHEET_BLOCKED`. */
   state(): StateName;
+  /** Install and restart (M6). Without it the sheet has neither button. */
+  pwa?: SheetPwa;
 }
 
 export interface SettingsSheet {
   /** Opens the sheet with the store's current values; false (and nothing happens) in a `SHEET_BLOCKED` state. */
   open(): boolean;
   close(): void;
+  /** Re-reads `pwa.installAvailable()` and `pwa.updateReady()` into the buttons; call it when either changes. */
+  refreshPwa(): void;
 }
+
+const noop = (): void => {};
 
 /** Each mount names its radio group uniquely, so two sheets in one document never share a group. */
 let mounts = 0;
@@ -125,7 +148,36 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
     dialog.close();
   });
 
-  dialog.append(title, voices, pitchLabel, labelled(quiet, SETTINGS_TEXT.quietMode), close);
+  dialog.append(title, voices, pitchLabel, labelled(quiet, SETTINGS_TEXT.quietMode));
+
+  /** Install and restart, if the app passed its PWA side. */
+  let refreshPwa: () => void = noop;
+  const { pwa } = deps;
+  if (pwa !== undefined) {
+    const install = element('button', 'sheet-button', SETTINGS_TEXT.install);
+    install.type = 'button';
+    install.addEventListener('click', () => {
+      void pwa.promptInstall();
+      refreshPwa();
+    });
+    const restart = element('button', 'sheet-button', SETTINGS_TEXT.restart);
+    restart.type = 'button';
+    // The sheet stays open while the bear runs: never reload in the middle of a take or a replay.
+    restart.addEventListener('click', () => {
+      if (pwa.updateReady() && !SHEET_BLOCKED.has(deps.state())) pwa.applyUpdate();
+    });
+    refreshPwa = () => {
+      const hideInstall = !pwa.installAvailable();
+      const disableRestart = !pwa.updateReady();
+      // A control that goes away under the focus would leave it on <body>, outside the modal sheet.
+      const focused = document.activeElement;
+      if ((hideInstall && focused === install) || (disableRestart && focused === restart)) close.focus();
+      install.hidden = hideInstall;
+      restart.disabled = disableRestart;
+    };
+    dialog.append(install, restart);
+  }
+  dialog.append(close);
 
   /** Shows the store's current values. */
   function render(s: Settings): void {
@@ -133,6 +185,7 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
     pitch.value = String(s.customPitch);
     pitch.disabled = s.voice !== 'custom';
     quiet.checked = s.quietMode;
+    refreshPwa();
   }
 
   function open(): boolean {
@@ -152,6 +205,9 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
     open,
     close: () => {
       dialog.close();
+    },
+    refreshPwa: () => {
+      refreshPwa();
     },
   };
 }

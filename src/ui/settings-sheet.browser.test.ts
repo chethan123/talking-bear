@@ -1,5 +1,6 @@
-// Browser Mode tests for the M3 settings sheet (settings-sheet.ts, issue #66). styles.css is imported, so the
-// gear's size and corner are the real ones; the store is the real one (in memory) with `set` spied on.
+// Browser Mode tests for the M3 settings sheet (settings-sheet.ts, issue #66) and its M6 Install and restart
+// buttons (issue #98). styles.css is imported, so the gear's size and corner are the real ones; the store is the
+// real one (in memory) with `set` spied on.
 
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock, type MockInstance } from 'vitest';
 import type { StateName } from '../app/events.ts';
@@ -9,6 +10,7 @@ import {
   SETTINGS_TEXT,
   SHEET_BLOCKED,
   type SettingsSheetDeps,
+  type SheetPwa,
 } from './settings-sheet.ts';
 import './styles.css';
 
@@ -209,6 +211,144 @@ describe('settings sheet', () => {
     input(SETTINGS_TEXT.quietMode).click();
     expect(root.querySelectorAll('[style]').length).toBe(0);
     closeButton().click();
+    expect(root.querySelectorAll('[style]').length).toBe(0);
+  });
+});
+
+// ---- M6 Install and restart (#98) ----
+
+/** A fake PWA side: flags the test flips, and spies for the two actions. */
+function fakePwa() {
+  const flags = { install: false, ready: false };
+  const promptInstall = vi.fn(async (): Promise<void> => {});
+  const applyUpdate = vi.fn<() => void>();
+  const pwa: SheetPwa = {
+    installAvailable: () => flags.install,
+    promptInstall,
+    updateReady: () => flags.ready,
+    applyUpdate,
+  };
+  return { flags, promptInstall, applyUpdate, pwa };
+}
+
+/** The dialog's button whose text is `text`, if any. */
+function maybeButton(text: string): HTMLButtonElement | undefined {
+  return Array.from(dialog().querySelectorAll('button')).find((x) => x.textContent === text);
+}
+
+function button(text: string): HTMLButtonElement {
+  const b = maybeButton(text);
+  if (b === undefined) throw new Error(`no ${text} button`);
+  return b;
+}
+
+describe('M6 Install and restart (#98)', () => {
+  test('without the PWA side, the sheet has neither button', () => {
+    mountSettingsSheet(root, harness().deps);
+    expect(maybeButton(SETTINGS_TEXT.install)).toBeUndefined();
+    expect(maybeButton(SETTINGS_TEXT.restart)).toBeUndefined();
+  });
+
+  test('Install is shown only while an install prompt is available, and a click prompts once', () => {
+    const f = fakePwa();
+    const sheet = mountSettingsSheet(root, { ...harness().deps, pwa: f.pwa });
+    sheet.open();
+    const install = button(SETTINGS_TEXT.install);
+    expect(install.type).toBe('button');
+    expect(install.hidden).toBe(true);
+    expect(install.getBoundingClientRect().height).toBe(0);
+    f.flags.install = true;
+    sheet.refreshPwa();
+    expect(install.hidden).toBe(false);
+    expect(install.getBoundingClientRect().height).toBeGreaterThanOrEqual(48);
+    install.click();
+    expect(f.promptInstall).toHaveBeenCalledTimes(1);
+    // Opening re-reads the flags too.
+    sheet.close();
+    f.flags.install = false;
+    sheet.open();
+    expect(install.hidden).toBe(true);
+  });
+
+  test('"New version – restart" is enabled only while an update is ready, and applies it', () => {
+    const f = fakePwa();
+    const sheet = mountSettingsSheet(root, { ...harness().deps, pwa: f.pwa });
+    sheet.open();
+    const restart = button(SETTINGS_TEXT.restart);
+    expect(restart.type).toBe('button');
+    expect(restart.hidden).toBe(false);
+    expect(restart.disabled).toBe(true);
+    expect(restart.getBoundingClientRect().height).toBeGreaterThanOrEqual(48);
+    // Disabled, it doesn't look like the enabled teal button (styles.css, D14).
+    expect(getComputedStyle(restart).backgroundColor).toBe('rgb(223, 230, 228)');
+    expect(getComputedStyle(restart).color).toBe('rgb(95, 99, 104)');
+    restart.click();
+    expect(f.applyUpdate).not.toHaveBeenCalled();
+    f.flags.ready = true;
+    sheet.refreshPwa();
+    expect(restart.disabled).toBe(false);
+    expect(getComputedStyle(restart).backgroundColor).toBe('rgb(47, 122, 109)');
+    restart.click();
+    expect(f.applyUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  test('the restart does nothing while the bear is Recording, Processing or Playing', () => {
+    const h = harness();
+    const f = fakePwa();
+    f.flags.ready = true;
+    const sheet = mountSettingsSheet(root, { ...h.deps, pwa: f.pwa });
+    sheet.open(); // in Listening
+    const restart = button(SETTINGS_TEXT.restart);
+    expect(restart.disabled).toBe(false);
+    for (const name of SHEET_BLOCKED) {
+      h.state.name = name;
+      restart.click();
+      expect(f.applyUpdate, name).not.toHaveBeenCalled();
+    }
+    h.state.name = 'Cooldown';
+    restart.click();
+    expect(f.applyUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  test('focus moves to Close when the focused Install is hidden', () => {
+    const f = fakePwa();
+    f.flags.install = true;
+    const sheet = mountSettingsSheet(root, { ...harness().deps, pwa: f.pwa });
+    sheet.open();
+    const install = button(SETTINGS_TEXT.install);
+    install.focus();
+    expect(document.activeElement).toBe(install);
+    f.flags.install = false;
+    sheet.refreshPwa();
+    expect(install.hidden).toBe(true);
+    expect(document.activeElement).toBe(closeButton());
+  });
+
+  test('an Install click reports through refreshPwa: Install hides and focus lands on Close', () => {
+    const f = fakePwa();
+    f.flags.install = true;
+    // Like register.ts: the prompt is used up, and reported unavailable, before promptInstall's first await.
+    f.promptInstall.mockImplementation(async () => {
+      f.flags.install = false;
+    });
+    const sheet = mountSettingsSheet(root, { ...harness().deps, pwa: f.pwa });
+    sheet.open();
+    const install = button(SETTINGS_TEXT.install);
+    install.focus();
+    install.click();
+    expect(f.promptInstall).toHaveBeenCalledTimes(1);
+    expect(install.hidden).toBe(true);
+    expect(document.activeElement).toBe(closeButton());
+  });
+
+  test('no element under the mount root has a style attribute with both buttons shown', () => {
+    const f = fakePwa();
+    f.flags.install = true;
+    f.flags.ready = true;
+    const sheet = mountSettingsSheet(root, { ...harness().deps, pwa: f.pwa });
+    sheet.open();
+    expect(button(SETTINGS_TEXT.install).hidden).toBe(false);
+    expect(button(SETTINGS_TEXT.restart).disabled).toBe(false);
     expect(root.querySelectorAll('[style]').length).toBe(0);
   });
 });
