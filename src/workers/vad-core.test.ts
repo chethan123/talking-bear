@@ -995,18 +995,24 @@ function forceGc(): void {
   exposedGc();
 }
 
+/** One heap reading: the `heapUsed` growth in bytes, and whether any GC ran while it was measured. */
+interface HeapReading {
+  bytes: number;
+  gc: boolean;
+}
+
 /**
  * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
- * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it is flagged `gc`.
  */
-function heapGrowth(fn: () => void): number {
+function heapGrowth(fn: () => void): HeapReading {
   forceGc();
   const profiler = new GCProfiler();
   profiler.start();
   const before = process.memoryUsage().heapUsed;
   fn();
-  const growth = process.memoryUsage().heapUsed - before;
-  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+  const bytes = process.memoryUsage().heapUsed - before;
+  return { bytes, gc: profiler.stop().statistics.length > 0 };
 }
 
 /** The one `post` of every core in the allocation tests, so the call site sees a single closure. */
@@ -1039,54 +1045,117 @@ function heapRunner(model: SileroModel, pregate: boolean): (n: number) => void {
   };
 }
 
-/** The smallest finite growth over up to `runs` runs, stopping early once `done(best)`. */
-function bestGrowth(run: () => void, done: (best: number) => boolean = () => false, runs = 20): number {
-  let best = Number.POSITIVE_INFINITY;
-  for (let trial = 0; trial < runs && !(Number.isFinite(best) && done(best)); trial++) {
-    best = Math.min(best, heapGrowth(run));
+/** Zero-model readings per zero level. */
+const ZERO_READINGS = 5;
+/**
+ * Two zero levels agree when they differ by at most this, in bytes per 1000 frames (4 B per frame, a quarter of one
+ * boxed double): the levels of one tier state differ by at most about 1 600 B, and a tier step moves them by 5 000 B
+ * or more. For comparisons it is only the tolerance within which one corroborates another.
+ */
+const AGREE = 4096;
+/** Real-model readings at most; two usually suffice. Each costs about 1.1 s, or about 13 s under v8 coverage. */
+const MAX_REAL_READINGS = 4;
+
+/** A reading as the report shows it. */
+function shown(r: HeapReading): string {
+  return r.gc ? `${r.bytes} (GC)` : String(r.bytes);
+}
+
+/** The median of the GC-free readings, or NaN if fewer than 3 are GC-free. */
+function gcFreeMedian(readings: HeapReading[]): number {
+  const free = readings
+    .filter((r) => !r.gc)
+    .map((r) => r.bytes)
+    .toSorted((a, b) => a - b);
+  if (free.length < 3) return Number.NaN;
+  const m = free.length >> 1;
+  return free.length % 2 === 1 ? free[m]! : (free[m - 1]! + free[m]!) / 2;
+}
+
+/** The smallest of `values` that another one of them agrees with (within AGREE), or NaN if none does. */
+function smallestCorroborated(values: number[]): number {
+  let best = Number.NaN;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i]!;
+    const agreed = values.some((w, j) => j !== i && Math.abs(v - w) <= AGREE);
+    if (agreed && (Number.isNaN(best) || v < best)) best = v;
   }
-  expect(Number.isFinite(best)).toBe(true);
   return best;
 }
 
-/** The lower quartile of the finite growths over `runs` runs: a rare reading far below the rest (seen
- *  under v8 coverage with the path already optimised) can't become the baseline. */
-function lowGrowth(run: () => void, runs = 20): number {
-  const finite: number[] = [];
-  for (let trial = 0; trial < runs; trial++) {
-    const g = heapGrowth(run);
-    if (Number.isFinite(g)) finite.push(g);
-  }
-  expect(finite.length).toBeGreaterThanOrEqual(10);
-  finite.sort((a, b) => a - b);
-  return finite[Math.floor(finite.length / 4)]!;
+/** How much more the heap grows per 1000 frames of a model than of the zero model, and every reading behind it. */
+interface Comparison {
+  excess: number;
+  report: string;
 }
 
 /**
  * How much more the heap grows over 1000 frames of `model` than over 1000 frames of a zero model, on the
- * Silero path with the given pre-gate, once V8 has optimised that path: `model`'s best growth over up to 5
- * runs (they stop once `done(excess)`) minus the lower quartile of the zero model's 20 readings.
+ * Silero path with the given pre-gate, with both measured in the same optimisation state.
  *
- * Both cores share VadCore's per-frame path. It runs once per frame, so V8 needs about 11 000 frames to
- * optimise it with TurboFan, with or without coverage; below TurboFan it boxes doubles, about 200 B per frame
- * of a real model more than an optimised zero model. A path optimised on the zero model alone is deoptimised
- * once `model` and its non-zero p reach it, and re-tiers only after another 11 000 frames of `model`: about
- * 2 minutes under v8 coverage. So `model` runs first, and its own loops tier up meanwhile; then the cheap
- * zero model takes the shared path to TurboFan with both models in its feedback, and every measured run
- * starts in that steady state.
+ * Both cores share VadCore's per-frame path. It runs once per frame, so V8 needs about 11 000 frames to optimise
+ * it with TurboFan; a path optimised on the zero model alone is deoptimised once `model` reaches it (#204). So
+ * `model` runs first, and its own loops tier up meanwhile; then the cheap zero model takes the shared path to
+ * TurboFan with both models in its feedback.
+ *
+ * V8 compiles on background threads, so under CPU load later tier-ups of the shared path still land during the
+ * measurement and move both models' growth together (#226: the zero level stepped from 22 680 to 424 B, or from
+ * 158 168 to 134 856 B, after the warm-up). So each real reading is compared only with the zero levels just before
+ * and just after it (each the median of 5 zero readings), and only when those two levels agree within AGREE: no
+ * shared tier-up larger than AGREE is visible between the two levels. A comparison below −AGREE is impossible (the
+ * real path allocates at least what the zero path does, plus the boxed p), so it means heapUsed fell without a GC
+ * during the real reading, and it is left out. The excess is the smallest comparison that another one agrees with
+ * (within AGREE): a per-frame allocation in VadCore or the model shows in every comparison, V8's compiled variants
+ * of the real path differ by whole boxed doubles (16 B per frame), and a lone reading far from the others (the
+ * first run after a tier-up, say) can't decide alone. Real readings stop as soon as two comparisons agree, after at
+ * most MAX_REAL_READINGS; then, if none agree, the excess is the smallest comparison. It fails if no comparison
+ * could be made.
  */
-function growthOverZero(model: SileroModel, pregate: boolean, done: (excess: number) => boolean): number {
+function growthOverZero(model: SileroModel, pregate: boolean): Comparison {
   const real = heapRunner(model, pregate);
   const zero = heapRunner(zeroModel(), pregate);
   real(400);
   zero(50_000); // about 1.5 s, 3.5 s under coverage: well past the 11 000 frames TurboFan needs
-  const base = lowGrowth(() => zero(1000));
-  const best = bestGrowth(
-    () => real(1000),
-    (b) => done(b - base),
-    5,
-  );
-  return best - base;
+  const lines: string[] = [];
+  const zeroLevel = (label: string): number => {
+    const readings: HeapReading[] = [];
+    for (let i = 0; i < ZERO_READINGS; i++) readings.push(heapGrowth(() => zero(1000)));
+    const level = gcFreeMedian(readings);
+    lines.push(`${label}: ${readings.map(shown).join(', ')}; level ${level}`);
+    return level;
+  };
+  zeroLevel('zero, settling (unused)');
+  let before = zeroLevel('zero');
+  const compared: number[] = [];
+  for (let k = 1; k <= MAX_REAL_READINGS && Number.isNaN(smallestCorroborated(compared)); k++) {
+    const reading = heapGrowth(() => real(1000));
+    const at = lines.push('') - 1;
+    const after = zeroLevel('zero');
+    let note = 'not compared (a GC, or the zero level moved)';
+    if (!reading.gc && Math.abs(after - before) <= AGREE) {
+      const d = reading.bytes - Math.min(before, after);
+      if (d < -AGREE) {
+        note = 'not compared (heap fell without a GC)';
+      } else {
+        compared.push(d);
+        note = `excess ${d}`;
+      }
+    }
+    lines[at] = `real ${k}: ${shown(reading)}; ${note}`;
+    before = after;
+  }
+  const corroborated = smallestCorroborated(compared);
+  const excess = Number.isNaN(corroborated) ? Math.min(...compared) : corroborated;
+  const how = Number.isNaN(corroborated)
+    ? 'the smallest comparison: none agree'
+    : 'the smallest comparison another agrees with';
+  const last =
+    compared.length === 0
+      ? 'no comparison could be made (every real reading had a GC, or the zero level moved around it)'
+      : `excess ${excess} B per 1000 frames, ${how}`;
+  const report = [...lines, last].join('\n');
+  expect(compared.length, report).toBeGreaterThan(0);
+  return { excess, report };
 }
 
 describe('no allocation on the per-frame path', () => {
@@ -1113,7 +1182,8 @@ describe('no allocation on the per-frame path', () => {
     'the Silero path (pregate %s) grows the heap < 64 KB per 1000 frames more than a zero model',
     { timeout: 120_000 },
     (pregate) => {
-      expect(growthOverZero(createSilero(W), pregate, (excess) => excess < LIMIT)).toBeLessThan(LIMIT);
+      const { excess, report } = growthOverZero(createSilero(W), pregate);
+      expect(excess, report).toBeLessThan(LIMIT);
     },
   );
 
@@ -1125,10 +1195,10 @@ describe('no allocation on the per-frame path', () => {
     leaky.onProcess = (x) => {
       kept[leaky.calls % 1000] = x.subarray(1);
     };
-    // Retry until a run is GC-free: +Infinity alone would pass the bound without proving anything.
-    const leak = growthOverZero(leaky, false, () => true);
+    // growthOverZero fails unless a GC-free real reading was compared, so the leak can't pass on no evidence.
+    const leak = growthOverZero(leaky, false);
     expect(kept.every((v) => v !== undefined)).toBe(true);
-    expect(leak).toBeGreaterThanOrEqual(LIMIT);
+    expect(leak.excess, leak.report).toBeGreaterThanOrEqual(LIMIT);
   });
 });
 
