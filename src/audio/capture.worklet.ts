@@ -5,6 +5,8 @@
 //   start-up transient at arm), and while armed its output is cut into 512-sample frames posted to the DSP
 //   worker, tagged with the ctx-rate frame index of their first sample (the resampler's timing contract puts
 //   output j at input j / ratio, so the group delay is already removed);
+//   the ring and the decimator are fed one and the same stream, so every tag is a ring frame even where
+//   currentFrame doesn't step by one quantum (issue #237, see process());
 //   deferred `take`s are streamed to the main thread in chunks of ≤ CHUNK_MAX frames, one chunk per quantum.
 // The output is silence.
 //
@@ -27,6 +29,14 @@ const TAKE_QUEUE = 4;
 const NO_CHANNELS: readonly Float32Array[] = [];
 /** Transfer list of the messages that carry no buffer (`armed`, `takeFailed`). */
 const NO_TRANSFER: Transferable[] = [];
+/**
+ * ZERO_RUNS[n] is n zero samples (n = 0…QUANTUM), views made once at load: the decimator's input over a
+ * currentFrame jump, without allocating in process().
+ */
+const ZEROS = new Float32Array(QUANTUM);
+const ZERO_RUNS: readonly Float32Array[] = Array.from({ length: QUANTUM + 1 }, (_, n) =>
+  ZEROS.subarray(0, n),
+);
 
 /** A ctx-frame index that ring reads accept. */
 function isFrame(v: unknown): v is number {
@@ -74,8 +84,14 @@ class CaptureProcessor extends AudioWorkletProcessor implements AudioWorkletProc
   #framePos = 0;
   /** Global decimator output counter. */
   #outIndex = 0;
-  /** currentFrame of the first quantum: decimator output j sits at streamBase + j / ratio. */
+  /**
+   * The ring frame of the decimator's input sample 0: the ring's first frame, or the frame of the quantum
+   * that re-anchored the decimator after a gap over #maxZeroFeed. From there on the decimator is fed exactly
+   * the ring's frames, zero-filled gaps included, so its output j sits at ring frame streamBase + j / ratio.
+   */
   #streamBase = Number.NaN;
+  /** The longest currentFrame gap fed to the decimator as zeros: 1 s of frames. Longer ones re-anchor it. */
+  readonly #maxZeroFeed: number;
 
   #worker: MessagePort | null = null;
   #armed = false;
@@ -102,6 +118,7 @@ class CaptureProcessor extends AudioWorkletProcessor implements AudioWorkletProc
     this.#hpf = butterworthHighpass(sampleRate, HPF_CLIP_HZ);
     this.#ring = new RingBuffer(Math.ceil(this.#ringFrames));
     this.#dec = createResampler(sampleRate, VAD_RATE);
+    this.#maxZeroFeed = Math.round(sampleRate);
     this.#decOut = new Float32Array(Math.ceil(QUANTUM * this.#dec.ratio) + 2);
     for (let i = 0; i < TAKE_QUEUE; i++) {
       this.#takes.push({ epoch: 0, id: 0, fromFrame: 0, toFrame: 0, sent: 0, seq: 0 });
@@ -123,25 +140,47 @@ class CaptureProcessor extends AudioWorkletProcessor implements AudioWorkletProc
   }
 
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
-    const cf = currentFrame;
-    if (Number.isNaN(this.#streamBase)) this.#streamBase = cf;
-    this.#downmix(inputs[0] ?? NO_CHANNELS);
-    this.#hpf.process(this.#mono, this.#hp);
-    // Guard: a non-integer or repeated currentFrame (never seen in a browser) must not make write() throw.
+    // This quantum's frame (issue #237). Chrome doesn't always step currentFrame by one quantum per call: it
+    // can jump ahead (at start-up, by up to 4,480 frames in local runs and ≈ 9,800 in the failing CI run),
+    // and it can repeat, then catch up. A jump leaves a gap that the ring zero-fills, and the decimator is
+    // fed the same zeros: otherwise its tags, counted from streamBase, fall behind the ring by the gap, and a
+    // take cut by them misses the gap's length of its tail. A gap over 1 s re-anchors the decimator instead,
+    // so a huge jump costs no more than a small one. A currentFrame at or behind the ring's end (the normal
+    // step, a repeat, or not a safe integer) continues the ring. With an empty ring, a quantum without a
+    // valid currentFrame is dropped.
     const ring = this.#ring;
-    if (Number.isSafeInteger(cf) && !(cf < ring.endFrame)) ring.write(this.#hp, cf);
-    if (this.#armPending) {
-      this.#armPending = false;
-      this.#armed = true;
-      this.#epoch = this.#pendingEpoch;
-      this.#armFrame = cf;
-      this.#fill = 0;
-      const msg = this.#armedMsg;
-      msg.epoch = this.#epoch;
-      msg.armFrame = cf;
-      this.port.postMessage(msg, NO_TRANSFER);
+    const cf = currentFrame;
+    const frame = ring.isEmpty ? cf : Number.isSafeInteger(cf) && cf > ring.endFrame ? cf : ring.endFrame;
+    if (Number.isSafeInteger(frame)) {
+      this.#downmix(inputs[0] ?? NO_CHANNELS);
+      this.#hpf.process(this.#mono, this.#hp);
+      const gap = ring.isEmpty ? 0 : frame - ring.endFrame;
+      if (ring.isEmpty) this.#streamBase = frame;
+      ring.write(this.#hp, frame);
+      if (gap > this.#maxZeroFeed) {
+        // After a reset the decimator's history is zeros, as after a long gap, and its outputs sit at ring
+        // frames frame + j / ratio again. The partial frame and the outputs still due before the gap are
+        // dropped.
+        this.#dec.reset();
+        this.#streamBase = frame;
+        this.#outIndex = 0;
+        this.#fill = 0;
+      } else {
+        for (let left = gap; left > 0; left -= QUANTUM) this.#decimate(ZERO_RUNS[Math.min(left, QUANTUM)]!);
+      }
+      if (this.#armPending) {
+        this.#armPending = false;
+        this.#armed = true;
+        this.#epoch = this.#pendingEpoch;
+        this.#armFrame = frame;
+        this.#fill = 0;
+        const msg = this.#armedMsg;
+        msg.epoch = this.#epoch;
+        msg.armFrame = frame;
+        this.port.postMessage(msg, NO_TRANSFER);
+      }
+      this.#decimate(this.#hp);
     }
-    this.#decimate();
     this.#serveTake();
     const out = outputs[0];
     if (out !== undefined) for (let c = 0; c < out.length; c++) out[c]!.fill(0);
@@ -169,11 +208,14 @@ class CaptureProcessor extends AudioWorkletProcessor implements AudioWorkletProc
     }
   }
 
-  /** Runs the decimator on this quantum; while armed, frames outputs at positions ≥ armFrame. */
-  #decimate(): void {
+  /**
+   * Runs the decimator on x: this quantum, or up to QUANTUM zeros of a gap. While armed, frames outputs at
+   * positions ≥ armFrame.
+   */
+  #decimate(x: Float32Array): void {
     const dec = this.#dec;
     const decOut = this.#decOut;
-    const n = dec.processInto(this.#hp, decOut);
+    const n = dec.processInto(x, decOut);
     for (let j = 0; j < n; j++) {
       const pos = this.#streamBase + this.#outIndex / dec.ratio;
       if (this.#armed && pos >= this.#armFrame) {
