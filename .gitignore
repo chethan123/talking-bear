@@ -4,6 +4,7 @@ dist-*/
 coverage/
 test-results/
 playwright-report/
+.vitest/
 .cache/
 *.log
 .env*.local
