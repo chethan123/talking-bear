@@ -32,7 +32,10 @@ export const BONE_COUNT = BONES.length;
 export const PartKind = {
   /** Drawn under its bone matrix [× mirror], with its own fill and opacity. */
   plain: 0,
-  /** `iris*`, `pupil*`, `highlight*`: translated by (`IrisX`, `IrisY`) in eye-bone space; clipped to the sclera. */
+  /**
+   * `iris*`, `pupil*`, `highlight*`: translated by (`IrisX` ± `IrisConverge`, `IrisY`) in eye-bone space (+ for the
+   * left eye, − for the right); clipped to the sclera.
+   */
   gaze: 1,
   /** `lidUpperL`: scaled in y about its bbox top by `LidL`. */
   lidL: 2,
@@ -65,7 +68,10 @@ interface Drive {
   readonly sy?: Term;
 }
 
-/** Issue #75's channel → bone table. `IrisX/Y` and `LidL/R` are part-level (`partMatrix`); `Blush` is the renderer's alpha. */
+/**
+ * Issue #75's channel → bone table. `IrisX/Y`, `IrisConverge` and `LidL/R` are part-level (`partMatrix`); `Blush` is
+ * the renderer's alpha.
+ */
 const DRIVES: Readonly<Record<string, Drive>> = {
   head: {
     rot: [Ch.HeadRot, 1],
@@ -122,6 +128,18 @@ for (const [id, drive] of Object.entries(DRIVES)) {
 }
 
 const GAZE_PARTS = ['irisL', 'pupilL', 'highlightL', 'irisR', 'pupilR', 'highlightR'] as const;
+/**
+ * Per part, `PARTS` order: the sign `IrisConverge` moves a gaze part with in eye-bone x. +1 for the eye whose
+ * bone pivot is left of the mirror axis at rest (`eyeL`), −1 for the one right of it (`eyeR`), 0 for every
+ * other part. So + moves both irises toward the face's centre line (#222).
+ */
+const IRIS_SIDE = new Int8Array(PARTS.length);
+for (const id of GAZE_PARTS) {
+  const i = partIndex(id);
+  const x = BONES[PARTS[i]!.bone]!.pivot[0];
+  if (x === MIRROR_X / 2) throw new Error(`gaze part ${id}: its eye bone sits on the centre line`);
+  IRIS_SIDE[i] = x < MIRROR_X / 2 ? 1 : -1;
+}
 const BLUSH_PARTS = ['blushL', 'blushR'] as const;
 const LID_L = partIndex('lidUpperL');
 const LID_R = partIndex('lidUpperR');
@@ -232,7 +250,8 @@ export function boneMatrices(rig: Rig, pose: Pose, out: Float32Array): Float32Ar
 /**
  * Writes the draw matrix of `PARTS[part]` to `out[o … o + 5]`: its bone's matrix from `bones` (the output of
  * `boneMatrices`) × the part-level transform × the mirror for a `mirror: true` copy. Part-level:
- * - `gaze` parts: `translate(IrisX, IrisY)`, in eye-bone space;
+ * - `gaze` parts: `translate(IrisX + side·IrisConverge, IrisY)`, in eye-bone space, with side +1 for the left eye
+ *   and −1 for the right (toward the face's centre line);
  * - `lidL` / `lidR`: `scaleY = LidL / LidR` clamped to [0, 1], about the bbox top (`y = minY`);
  * - mirror: `translate(MIRROR_X, 0) scale(−1, 1)`, right-most, so it applies to the part only.
  * Never allocates.
@@ -255,7 +274,7 @@ export function partMatrix(
   let f = bones[q + 5]!;
   const kind = rig.kind[part]!;
   if (kind === PartKind.gaze) {
-    const ix = pose[Ch.IrisX]!;
+    const ix = pose[Ch.IrisX]! + IRIS_SIDE[part]! * pose[Ch.IrisConverge]!;
     const iy = pose[Ch.IrisY]!;
     e += a * ix + c * iy;
     f += b * ix + d * iy;

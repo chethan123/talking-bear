@@ -241,6 +241,7 @@ describe('boneMatrices', () => {
         Ch.LidR,
         Ch.IrisX,
         Ch.IrisY,
+        Ch.IrisConverge,
         Ch.Blush,
         Ch.Stars,
       ].map((ch) => [ch, 0.7] as const),
@@ -274,6 +275,33 @@ describe('partMatrix', () => {
     ]);
     const head = local('head', Math.PI / 2);
     expectClose(partOf(turned, 'irisL'), mul(head, T(10, 0)));
+  });
+
+  it('IrisConverge moves the left eye’s iris, pupil and highlight +v and the right eye’s −v in eye-bone x (#222)', () => {
+    const pose = withChannels([[Ch.IrisConverge, 6]]);
+    for (const id of ['irisL', 'pupilL', 'highlightL']) expectClose(partOf(pose, id), T(6, 0));
+    for (const id of ['irisR', 'pupilR', 'highlightR']) expectClose(partOf(pose, id), T(-6, 0));
+    for (const id of ['scleraL', 'lidUpperL', 'lidLowerL', 'scleraR', 'lidUpperR', 'lidLowerR', 'noseTip'])
+      expect(Array.from(partOf(pose, id)), id).toEqual(Array.from(partOf(createPose(), id)));
+    // It adds to the gaze offset: IrisX 4, IrisY −2, IrisConverge 6 → left (10, −2), right (−2, −2).
+    const both = withChannels([
+      [Ch.IrisX, 4],
+      [Ch.IrisY, -2],
+      [Ch.IrisConverge, 6],
+    ]);
+    expectClose(partOf(both, 'irisL'), T(10, -2));
+    expectClose(partOf(both, 'irisR'), T(-2, -2));
+    // Negative values move the irises apart.
+    expectClose(partOf(withChannels([[Ch.IrisConverge, -3]]), 'pupilL'), T(-3, 0));
+    expectClose(partOf(withChannels([[Ch.IrisConverge, -3]]), 'pupilR'), T(3, 0));
+    // In eye-bone space: with the head turned π/2 the offset turns with the face.
+    const turned = withChannels([
+      [Ch.HeadRot, Math.PI / 2],
+      [Ch.IrisConverge, 6],
+    ]);
+    const head = local('head', Math.PI / 2);
+    expectClose(partOf(turned, 'irisL'), mul(head, T(6, 0)));
+    expectClose(partOf(turned, 'irisR'), mul(head, T(-6, 0)));
   });
 
   it('LidL / LidR scale the upper lids in y about their bbox top, clamped to [0, 1]', () => {
