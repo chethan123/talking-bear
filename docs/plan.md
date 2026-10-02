@@ -1716,7 +1716,7 @@ talking-bear/
 │   ├── research/spikes/            # throwaway planning experiments (excluded from lint/build; delete as modules land)
 │   ├── device-notes.md             # experiment results per device / Chrome version
 │   └── adr/                        # one short ADR per gated decision (VAD backend, default voice, …)
-├── package.json  pnpm-lock.yaml  pnpm-workspace.yaml (onlyBuiltDependencies allow-list)  .npmrc
+├── package.json  pnpm-lock.yaml  pnpm-workspace.yaml (saveExact, allowBuilds allow-list)
 ├── tsconfig.json                   # references: app, worklet, worker, node, test
 ├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json  tsconfig.test.json
 ├── vite.config.ts  vitest.config.ts  playwright.config.ts
@@ -2014,7 +2014,7 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 
 ## 8. Dependencies
 
-Versions were checked against the npm registry on 2026-09-26 [V]. They are pinned exactly (`save-exact=true` in `.npmrc`).
+Versions were checked against the npm registry on 2026-09-26 [V]. They are pinned exactly (`saveExact: true` in `pnpm-workspace.yaml`; pnpm 12 reads only auth and registry keys from `.npmrc`).
 
 pnpm's `minimumReleaseAge` delays brand-new releases by 24 h [V R66]. Several pins (vite 8.3.1, vitest 5.0.2, size-limit 14.0.1, `@types/node` 24.19.0, `oxlint-tsgolint` 7.0.2003) were published ≤ 48 h before this plan, so M1 either waits a day or adds them to `minimumReleaseAgeExclude` explicitly.
 
@@ -2171,7 +2171,7 @@ Notes:
   - Provenance with `mode=max` embeds build materials (repo URL, commit, Dockerfile, build args) in the public image. None of that is secret here. Use `mode=min` if you'd rather not publish them.
 - **Caching in a privileged workflow.** `cache-from: type=gha` restores BuildKit layers, including the `pnpm install` layer, so it *is* a dependency cache. setup-node advises against automatic caching in privileged workflows [V R67]. Hence the release job reads only its own `scope=release`, which PR and main runs never write. The alternative is a cold release build, which takes a few minutes.
 - **arm64 coverage.** `go test` runs on the build platform, and `image-smoke` is amd64-only. So the release job smoke-tests the arm64 image under QEMU before pushing. A native `ubuntu-24.04-arm` runner is an alternative if one is available to this private repo [M].
-- **pnpm build scripts.** pnpm 12 defaults to `strictDepBuilds: true` [V R66]. `pnpm-workspace.yaml` commits an explicit, currently empty, `onlyBuiltDependencies` allow-list, so a dependency that gains a postinstall fails loudly and is reviewed. None of the pinned packages has one today [V reviewer check].
+- **pnpm build scripts.** pnpm 12 defaults to `strictDepBuilds: true` [V R66]. `pnpm-workspace.yaml` commits an explicit `allowBuilds` map that currently allows no build script (`allowBuilds` replaced the older allow-list setting in pnpm 11; its one entry, `protobufjs: false`, denies a transitive postinstall that only prints a warning), so a dependency that gains a postinstall fails loudly and is reviewed. None of the pinned packages has one today [V reviewer check].
 
 ---
 

@@ -63,7 +63,7 @@ talking-bear/
 │   ├── research/spikes/            # throwaway planning experiments (excluded from lint/build; delete as modules land)
 │   ├── device-notes.md             # experiment results per device / Chrome version
 │   └── adr/                        # one short ADR per gated decision (VAD backend, default voice, …)
-├── package.json  pnpm-lock.yaml  pnpm-workspace.yaml (onlyBuiltDependencies allow-list)  .npmrc
+├── package.json  pnpm-lock.yaml  pnpm-workspace.yaml (saveExact, allowBuilds allow-list)
 ├── tsconfig.json                   # references: app, worklet, worker, node, test
 ├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json  tsconfig.test.json
 ├── vite.config.ts  vitest.config.ts  playwright.config.ts
