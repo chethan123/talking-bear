@@ -41,7 +41,7 @@
     "@vitest/coverage-v8": "5.0.2",
     "fast-check": "4.10.2",
     "onnxruntime-web": "1.30.0",
-    "oxlint": "1.85.0",
+    "oxlint": "1.86.0",
     "oxlint-tsgolint": "7.0.2003",
     "playwright": "1.63.0",
     "prettier": "3.9.9",
