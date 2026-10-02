@@ -3,6 +3,10 @@
 // digital silence; onset / offset use hysteresis against the floor as it was before the step. It is the M1 VAD
 // backend, the level meter, the Silero fallback and the optional pre-gate (plan §4.2.3).
 //
+// A floor that isn't restored (the first listen after wake; re-arms restore theirs, plan §4.4 point 4) starts at
+// the first hop that isn't digital silence, capped at initFloorCapDb (#146): that hop may already be speech, and a
+// floor started at speech level delays the energy onset and makes Silero's first segment fail the proximity gate.
+//
 // Pure: no DOM, no globals, no timers. `energyGateStep` and `frameDb` don't allocate, so the worker can run
 // them on every 10 ms hop.
 
@@ -31,6 +35,11 @@ export interface EnergyGateParams {
   floorInSpeechTauMs: number;
   /** Hops below this level (and non-finite levels) are digital silence: they never touch the floor. */
   ignoreBelowDb: number;
+  /**
+   * First-listen floor cap in dBFS (addition to plan §3.3, #146): the hop that initialises a floor that wasn't
+   * restored sets it to min(db, initFloorCapDb). A non-finite value (±Infinity, NaN) disables the cap.
+   */
+  initFloorCapDb: number;
   /** The hop size the time constants are applied at (addition to plan §3.3). */
   hopMs: number;
 }
@@ -43,6 +52,7 @@ export const DEFAULT_ENERGY_PARAMS: EnergyGateParams = {
   floorUpTauMs: 2500,
   floorInSpeechTauMs: 20000,
   ignoreBelowDb: -100,
+  initFloorCapDb: -40,
   hopMs: 10,
 };
 
@@ -69,7 +79,7 @@ export function initialEnergyGateState(restoreFloorDb?: number): EnergyGateState
 /**
  * Mutates and returns s (no allocation). Uses f.db only. In order:
  * 1. digital silence (db < ignoreBelowDb, or non-finite): close the gate, leave the floor;
- * 2. the first other hop initialises the floor to db and is never an onset;
+ * 2. the first other hop initialises the floor to min(db, initFloorCapDb) and is never an onset;
  * 3. hysteresis against the floor as it was before this step;
  * 4. floor += α·(db − floor), α = 1 − exp(−hopMs/τ), τ = down if db <= floor, else in-speech if the gate is
  *    open (after step 3), else up.
@@ -82,9 +92,10 @@ export function energyGateStep(s: EnergyGateState, f: FrameFeatures, p: EnergyGa
     if (s.active) s.active = false;
     return s;
   }
-  // 2. Initialisation: the initialising hop can never be an onset.
+  // 2. Initialisation, capped (#146): the initialising hop can never be an onset.
   if (!s.initialized) {
-    s.floorDb = db;
+    const cap = p.initFloorCapDb;
+    s.floorDb = Number.isFinite(cap) && db > cap ? cap : db;
     s.initialized = true;
     s.active = false;
     return s;
