@@ -3,7 +3,8 @@ import { expectMicSignal, noCspViolationsAfterEach, transitions, wake } from './
 import { micFlags } from './helpers/flags';
 
 // Plan §4.9.3 `too-short`, §7 M1: knocks start a segment that ends as a misfire, never as a take. The fixture
-// has three 40 ms bursts at 1.0, 2.5 and 4.0 s and ends at 5.04 s (scripts/gen-fixtures.ts).
+// has three 40 ms bursts at 1.0, 2.5 and 4.0 s and ends at 5.04 s (scripts/gen-fixtures.ts). Pinned to the
+// energy backend (issue #51): Silero doesn't start a segment on a knock at all, so there is no misfire to see.
 test.use({ launchOptions: { args: micFlags('e2e/fixtures/knock.wav') } });
 test.setTimeout(45_000);
 noCspViolationsAfterEach();
@@ -12,7 +13,7 @@ noCspViolationsAfterEach();
 const WINDOW_MS = 8_000;
 
 test('too-short: a knock misfires back to Listening and is never processed', async ({ page }) => {
-  const woke = await wake(page);
+  const woke = await wake(page, { vad: 'energy' });
   await expectMicSignal(page);
 
   // Wait out the whole window. It covers the whole fixture (5.04 s from the mic's start, which is before

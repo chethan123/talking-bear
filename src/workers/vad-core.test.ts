@@ -909,8 +909,8 @@ describe('VadCore energy voicing rule', () => {
 });
 
 describe('defaults', () => {
-  it("9: the engine's VAD backend is still 'energy' and the pre-gate is off", () => {
-    expect(DEFAULT_VAD_BACKEND).toBe('energy');
+  it("9: the engine's VAD backend is 'silero' (#51) and the pre-gate is off", () => {
+    expect(DEFAULT_VAD_BACKEND).toBe('silero');
     expect(PREGATE_ENABLED).toBe(false);
   });
 });
