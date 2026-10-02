@@ -13,6 +13,6 @@ export const MAX_UTTERANCE_MS = 10000;
 export const HPF_CLIP_HZ = 80;
 export const VOICING_WINDOW = 512; // gate-filtered samples per voicing score (32 ms; plan §4.2.1 step 5)
 export const PREGATE_WARMUP_FRAMES = 10; // raw frames the Silero pre-gate replays on gate-open (plan §4.2.3)
-export const DEFAULT_VAD_BACKEND: 'silero' | 'energy' = 'energy'; // engine default until #51 (M2 gate)
+export const DEFAULT_VAD_BACKEND: 'silero' | 'energy' = 'silero'; // plan §4.2.3 (#51); energy while loading
 export const PREGATE_ENABLED = false; // optional Silero pre-gate (plan §4.2.3: off in the MVP)
 export const PROXIMITY_DB = 3; // default until tuned by ADR 0001

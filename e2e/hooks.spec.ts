@@ -54,6 +54,13 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
   await page.goto('/');
   await page.waitForFunction(() => window.__bearTest !== undefined);
   expect(await state(page)).toBe('Asleep');
+  // Pinned to the energy backend before the tap arms (issue #51): Silero ends this synthetic vowel's segment
+  // after 0.3–0.6 s of its 1.5 s, and the output tap check below wants all of it.
+  await page.evaluate(() => {
+    const h = window.__bearTest;
+    if (h === undefined) throw new Error('window.__bearTest is missing');
+    h.setVadBackend('energy');
+  });
 
   // Drive one loop as the ui-placeholder smoke does: a trusted click (sticky activation for the AudioContext),
   // then Continue if the parent sheet shows.
