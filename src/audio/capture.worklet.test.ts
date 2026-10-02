@@ -632,7 +632,140 @@ describe('render-thread rules', () => {
     const r = await rig();
     const x = noise(4 * QUANTUM, 12);
     expect(() => runQuanta(r.proc, x, 0)).not.toThrow();
-    expect(() => runQuanta(r.proc, x, 0)).not.toThrow(); // overlaps the ring: the write is skipped
+    expect(() => runQuanta(r.proc, x, 0)).not.toThrow(); // behind the ring's end: these quanta continue it
     expect(() => runQuanta(r.proc, x, 0.5)).not.toThrow();
+  });
+});
+
+/** b posted the same frames as a: the same epochs and tags, then bit-identical samples. */
+function expectSameFrames(b: Rig, a: Rig): void {
+  expect(b.frames.map((f) => [f.epoch, f.firstFrame])).toEqual(a.frames.map((f) => [f.epoch, f.firstFrame]));
+  b.frames.forEach((f, i) => expect(maxAbsDiff(f.pcm16k, a.frames[i]!.pcm16k)).toBe(0));
+}
+
+/** Asks r for a take of epoch 1 over [fromFrame, toFrame), serves it with one more quantum: its samples. */
+async function takeOf(r: Rig, id: number, fromFrame: number, toFrame: number): Promise<Float32Array> {
+  r.send({ t: 'take', epoch: 1, id, fromFrame, toFrame });
+  await flushMessages();
+  r.run(new Float32Array(QUANTUM));
+  await flushMessages();
+  const chunks = chunksOf(r).filter((c) => c.id === id);
+  expectWellFormed(chunks, 1, id, 44100);
+  return concat(chunks.map((c) => c.pcm));
+}
+
+/** The tags of r's frames 20 and 40: a take range cut the way the reducer cuts one, by frame tags. */
+function cutOf(r: Rig): [number, number] {
+  return [r.frames[20]!.firstFrame, r.frames[40]!.firstFrame];
+}
+
+/**
+ * Runs 200 quanta at 44.1 kHz through r, silent but for an impulse at quantum 100 + 37, and returns how far
+ * the tag of the frame sample where it peaks lies from the impulse's ring frame, in ctx frames (the output
+ * samples are 44100 / 16000 ≈ 2.76 frames apart).
+ */
+async function impulseTagError(r: Rig): Promise<number> {
+  const x = new Float32Array(200 * QUANTUM);
+  const n0 = 100 * QUANTUM + 37;
+  x[n0] = 1;
+  const ringFrame = r.next + n0;
+  r.run(x);
+  await flushMessages();
+  let peak = 0;
+  let pos = Number.NaN;
+  for (const f of r.frames) {
+    for (let i = 0; i < f.pcm16k.length; i++) {
+      if (Math.abs(f.pcm16k[i]!) > peak) {
+        peak = Math.abs(f.pcm16k[i]!);
+        pos = f.firstFrame + (i * 44100) / VAD_RATE;
+      }
+    }
+  }
+  return Math.abs(pos - ringFrame);
+}
+
+describe('currentFrame steps other than one quantum (issue #237)', () => {
+  /** The start-up jump of the failing CI run (#237): 76 quanta, ≈ 0.22 s at 44.1 kHz. */
+  const JUMP = 76 * QUANTUM;
+
+  test('a jump ahead: the frames and a take cut by their tags equal those of the same input with the skipped frames as zeros', async () => {
+    setSampleRate(44100);
+    const x = noise(quantaLength(1.5, 44100), 21);
+    // Reference: currentFrame steps one quantum per call, and the skipped stretch is explicit silence.
+    const a = await rig();
+    a.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    a.run(new Float32Array(QUANTUM));
+    a.run(new Float32Array(JUMP));
+    a.run(x);
+    // Chrome at start-up: one silent quantum, then currentFrame jumps JUMP frames ahead.
+    const b = await rig();
+    b.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    b.run(new Float32Array(QUANTUM));
+    b.next += JUMP;
+    b.run(x);
+    expect(b.next).toBe(a.next);
+    await flushMessages();
+    expect(a.frames.length).toBeGreaterThan(50);
+    expectSameFrames(b, a);
+    // The reducer cuts takes by the worker's frame tags: a take cut by the tags of frames 20 and 40 holds the
+    // same audio in both rigs (with tags that lag the ring by JUMP, b's take would be JUMP frames early).
+    expect(maxAbsDiff(await takeOf(b, 1, ...cutOf(b)), await takeOf(a, 1, ...cutOf(a)))).toBe(0);
+  });
+
+  test('a repeated currentFrame, then a catch-up: the stale quanta continue the ring, nothing is lost or moved', async () => {
+    setSampleRate(44100);
+    const x = noise(quantaLength(1, 44100), 22);
+    const a = await rig();
+    a.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    a.run(x);
+    // Seen under load: currentFrame stuck for four quanta (99's frame), then back on time at quantum 104.
+    const b = await rig();
+    b.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    for (let q = 0; q * QUANTUM < x.length; q++) {
+      const at = q >= 100 && q <= 103 ? 99 * QUANTUM : q * QUANTUM;
+      runQuanta(b.proc, x.subarray(q * QUANTUM, (q + 1) * QUANTUM), at);
+    }
+    b.next = x.length;
+    await flushMessages();
+    expectSameFrames(b, a);
+    expect(maxAbsDiff(await takeOf(b, 1, 0, x.length), await takeOf(a, 1, 0, x.length))).toBe(0);
+  });
+
+  test.each(['before', 'after'] as const)(
+    'a jump with the arm %s it: an impulse is tagged at its ring frame',
+    async (when) => {
+      setSampleRate(44100);
+      const r = await rig();
+      if (when === 'before') {
+        r.send({ t: 'arm', epoch: 1 });
+        await flushMessages();
+      }
+      r.run(new Float32Array(QUANTUM));
+      r.next += JUMP;
+      r.run(new Float32Array(4 * QUANTUM));
+      if (when === 'after') {
+        r.send({ t: 'arm', epoch: 1 });
+        await flushMessages();
+      }
+      expect(await impulseTagError(r)).toBeLessThanOrEqual(4);
+    },
+  );
+
+  test('a 60 s jump while armed re-anchors the decimator: no frames of gap zeros, and an impulse after it is tagged at its ring frame', async () => {
+    setSampleRate(44100);
+    const r = await rig();
+    r.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    r.run(new Float32Array(QUANTUM));
+    r.next += 60 * 44100;
+    r.run(new Float32Array(4 * QUANTUM));
+    await flushMessages();
+    // Fed as zeros, the gap would post ≈ 1,900 frames in one process() call.
+    expect(r.frames).toHaveLength(0);
+    expect(await impulseTagError(r)).toBeLessThanOrEqual(4);
   });
 });
