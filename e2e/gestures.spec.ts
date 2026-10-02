@@ -1,6 +1,6 @@
 import { expect, test, type CDPSession, type Page } from '@playwright/test';
 import type { RegionId } from '../src/input/region-ids.ts';
-import { noCspViolationsAfterEach, wake, type BearTestHooks } from './helpers/app';
+import { noCspViolationsAfterEach, wake } from './helpers/app';
 import { micFlags } from './helpers/flags';
 
 // Plan §4.9.3 `gestures`, §7 M5 (issue #93): multi-touch through CDP `Input.dispatchTouchEvent`, end to end
@@ -19,12 +19,6 @@ test.use({ hasTouch: true, launchOptions: { args: micFlags('e2e/fixtures/silence
 test.setTimeout(60_000);
 noCspViolationsAfterEach();
 
-/** The interaction hooks (#93) on top of the shared ones (src/test-hooks.ts). */
-interface InteractionHooks extends BearTestHooks {
-  sfxLog: { t: number; frame: number; seq: number; id: string; endCtxTime: number }[];
-  regionCenter(id: RegionId): { x: number; y: number };
-}
-
 declare global {
   interface Window {
     /** This spec's recorder: `defaultPrevented` of every `contextmenu` that reached the window. */
@@ -40,12 +34,30 @@ interface Point {
 /** After each gesture: its reaction plays out and the (region, gesture) cooldowns pass before the next one. */
 const GAP_MS = 1_200;
 
+function isPoint(v: unknown): v is Point {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    typeof Reflect.get(v, 'x') === 'number' &&
+    typeof Reflect.get(v, 'y') === 'number'
+  );
+}
+
+/**
+ * `__bearTest.regionCenter(id)` (#93): a hit region's centre in viewport CSS px. e2e/helpers/app.ts doesn't restate
+ * this hook, so it is read through Reflect and checked, as screenshots.spec.ts and mouth-sync.spec.ts do.
+ */
 async function regionCenter(page: Page, id: RegionId): Promise<Point> {
-  return page.evaluate((r) => {
-    const h = window.__bearTest as InteractionHooks | undefined;
-    if (h === undefined) throw new Error('window.__bearTest is missing');
-    return h.regionCenter(r);
+  const p: unknown = await page.evaluate((r) => {
+    const hooks: unknown = window.__bearTest;
+    const fn: unknown =
+      typeof hooks === 'object' && hooks !== null ? Reflect.get(hooks, 'regionCenter') : null;
+    if (typeof fn !== 'function') throw new Error('window.__bearTest.regionCenter is missing');
+    const point: unknown = Reflect.apply(fn, hooks, [r]);
+    return point;
   }, id);
+  if (!isPoint(p)) throw new Error(`regionCenter(${id}) returned ${JSON.stringify(p)}`);
+  return p;
 }
 
 /** One CDP touch event; `points` are all the touch points down after it. */

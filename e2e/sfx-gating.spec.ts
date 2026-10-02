@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { RegionId } from '../src/input/region-ids.ts';
-import { noCspViolationsAfterEach, steps, wake, type BearTestHooks } from './helpers/app';
+import { noCspViolationsAfterEach, steps, wake } from './helpers/app';
 import { micFlags } from './helpers/flags';
 
 // Plan §4.9.3 `sfx-gating`, §3.4 rows 14, 32–36, §7 M5 (issue #93): a reaction sound never starts a recording.
@@ -15,12 +15,6 @@ test.use({ launchOptions: { args: micFlags('e2e/fixtures/silence_2s.wav') } });
 test.setTimeout(60_000);
 noCspViolationsAfterEach();
 
-/** The interaction hooks (#93) on top of the shared ones (src/test-hooks.ts). */
-interface InteractionHooks extends BearTestHooks {
-  sfxLog: { t: number; frame: number; seq: number; id: string; endCtxTime: number }[];
-  regionCenter(id: RegionId): { x: number; y: number };
-}
-
 /** Taps in the storm, alternating nose and belly, with this pause after each click. */
 const TAPS = 15;
 const PAUSE_MS = 300;
@@ -29,12 +23,66 @@ const COOLDOWN_S = 0.25;
 /** No Recording during the storm or this long after it. */
 const AFTER_MS = 2_000;
 
-async function regionCenter(page: Page, id: RegionId): Promise<{ x: number; y: number }> {
-  return page.evaluate((r) => {
-    const h = window.__bearTest as InteractionHooks | undefined;
-    if (h === undefined) throw new Error('window.__bearTest is missing');
-    return h.regionCenter(r);
+interface Point {
+  x: number;
+  y: number;
+}
+
+/** One `__bearTest.sfxLog` entry (src/test-hooks.ts `SfxLogEntry`): the fields this spec reads. */
+interface SfxLogEntry {
+  t: number;
+  endCtxTime: number;
+}
+
+function isPoint(v: unknown): v is Point {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    typeof Reflect.get(v, 'x') === 'number' &&
+    typeof Reflect.get(v, 'y') === 'number'
+  );
+}
+
+/**
+ * `__bearTest.regionCenter(id)` (#93): a hit region's centre in viewport CSS px. e2e/helpers/app.ts doesn't restate
+ * this hook, so it is read through Reflect and checked, as screenshots.spec.ts and mouth-sync.spec.ts do.
+ */
+async function regionCenter(page: Page, id: RegionId): Promise<Point> {
+  const p: unknown = await page.evaluate((r) => {
+    const hooks: unknown = window.__bearTest;
+    const fn: unknown =
+      typeof hooks === 'object' && hooks !== null ? Reflect.get(hooks, 'regionCenter') : null;
+    if (typeof fn !== 'function') throw new Error('window.__bearTest.regionCenter is missing');
+    const point: unknown = Reflect.apply(fn, hooks, [r]);
+    return point;
   }, id);
+  if (!isPoint(p)) throw new Error(`regionCenter(${id}) returned ${JSON.stringify(p)}`);
+  return p;
+}
+
+function isSfxLog(v: unknown): v is SfxLogEntry[] {
+  return (
+    Array.isArray(v) &&
+    v.every(
+      (x: unknown) =>
+        typeof x === 'object' &&
+        x !== null &&
+        typeof Reflect.get(x, 't') === 'number' &&
+        typeof Reflect.get(x, 'endCtxTime') === 'number',
+    )
+  );
+}
+
+/** `__bearTest.sfxLog` (#93), read through Reflect and checked like `regionCenter`. */
+async function sfxLogOf(page: Page): Promise<SfxLogEntry[]> {
+  const log: unknown = await page.evaluate(() => {
+    const hooks: unknown = window.__bearTest;
+    const entries: unknown =
+      typeof hooks === 'object' && hooks !== null ? Reflect.get(hooks, 'sfxLog') : null;
+    return entries;
+  });
+  if (!isSfxLog(log)) throw new Error(`__bearTest.sfxLog is ${JSON.stringify(log)}`);
+  return log;
 }
 
 const pageNow = (page: Page): Promise<number> => page.evaluate(() => performance.now());
@@ -69,11 +117,8 @@ test('sfx-gating: a tap storm enters SfxGated; every arm waits for the latest sf
   );
 
   const all = await steps(page);
-  const { sfxLog, rate } = await page.evaluate(() => {
-    const h = window.__bearTest as InteractionHooks | undefined;
-    if (h === undefined) throw new Error('window.__bearTest is missing');
-    return { sfxLog: h.sfxLog, rate: h.outputSampleRate() };
-  });
+  const sfxLog = await sfxLogOf(page);
+  const rate = await page.evaluate(() => window.__bearTest?.outputSampleRate() ?? Number.NaN);
 
   // 1. The storm's sounds gate the mic.
   const gated = all.filter(

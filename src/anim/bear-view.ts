@@ -555,44 +555,29 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     loop.invalidate();
   }
 
-  /** The cooldown key's region of a gesture: the region-less ones get a fixed region (`cancel` has no reaction). */
-  function regionOf(g: Gesture): RegionId {
-    switch (g.g) {
-      case 'hug':
-      case 'allOver':
-        return 'belly';
-      case 'pinch':
-        return g.regions[0];
-      case 'cancel':
-        return 'background';
-      default:
-        return g.region;
-    }
-  }
-
   /** A background tap turns the gaze to it; a background stroke's moves keep it on the finger (`onSample`). */
-  function backgroundGaze(g: Extract<Gesture, { g: 'tap' | 'stroke' }>, now: number): void {
-    if (g.g === 'tap') {
-      if (g.phase === 'down') lookAtCss(g.x, g.y, now);
-    } else if (g.phase === 'start') {
+  function backgroundGaze(ges: Extract<Gesture, { g: 'tap' | 'stroke' }>, now: number): void {
+    if (ges.g === 'tap') {
+      if (ges.phase === 'down') lookAtCss(ges.x, ges.y, now);
+    } else if (ges.phase === 'start') {
       trackId = sampleId;
       lookAtCss(T[SAMPLE_X]!, T[SAMPLE_Y]!, now);
-    } else if (g.phase === 'end') {
+    } else if (ges.phase === 'end') {
       trackId = null;
     }
   }
 
-  function onGesture(g: Gesture): void {
+  function onGesture(ges: Gesture): void {
     if (!AWAKE.has(deps.state())) return;
     const now = inputNow();
-    if ((g.g === 'tap' || g.g === 'stroke') && g.region === 'background') backgroundGaze(g, now);
-    const r = reactionFor(g);
+    if ((ges.g === 'tap' || ges.g === 'stroke') && ges.region === 'background') backgroundGaze(ges, now);
+    const r = reactionFor(ges);
     if (r !== null) {
-      const input: GestureInput = { k: 'gesture', r, region: regionOf(g), gesture: g.g, now };
-      if (g.g === 'stroke') input.dirX = Math.cos(g.dir) >= 0 ? 1 : -1;
+      const input: GestureInput = { k: 'gesture', r, region: regionOf(ges), gesture: ges.g, now };
+      if (ges.g === 'stroke') input.dirX = Math.cos(ges.dir) >= 0 ? 1 : -1;
       stepDirector(input);
-    } else if ((g.g === 'stroke' || g.g === 'longPress') && g.phase === 'end') {
-      stepDirector({ k: 'release', now, region: g.region, gesture: g.g });
+    } else if ((ges.g === 'stroke' || ges.g === 'longPress') && ges.phase === 'end') {
+      stepDirector({ k: 'release', now, region: ges.region, gesture: ges.g });
     }
   }
 
@@ -693,6 +678,24 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
       canvas.remove();
     },
   };
+}
+
+/**
+ * The region of a gesture's reaction, the director's cooldown key: the region-less gestures get a fixed one (hug
+ * and all-over: `belly`; a pinch: its first cheek; ORCH-NOTE 5955249579 item 4). `cancel` has no reaction.
+ */
+function regionOf(ges: Gesture): RegionId {
+  switch (ges.g) {
+    case 'hug':
+    case 'allOver':
+      return 'belly';
+    case 'pinch':
+      return ges.regions[0];
+    case 'cancel':
+      return 'background';
+    default:
+      return ges.region;
+  }
 }
 
 /** `x` moved toward `target` by at most `step`. */

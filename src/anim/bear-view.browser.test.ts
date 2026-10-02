@@ -260,7 +260,7 @@ function drawnFrames(h: Harness): number {
  * which CSP `style-src 'self'` doesn't govern): exactly `touch-action` and `user-select`, both `none`.
  */
 function expectOnlyAdapterStyles(canvas: HTMLCanvasElement): void {
-  expect(Array.from(canvas.style).sort()).toEqual(['touch-action', 'user-select']);
+  expect(Array.from(canvas.style).toSorted()).toEqual(['touch-action', 'user-select']);
   expect(canvas.style.getPropertyValue('touch-action')).toBe('none');
   expect(canvas.style.getPropertyValue('user-select')).toBe('none');
   expect(Array.from(root.querySelectorAll('[style]'))).toEqual([canvas]);
@@ -935,6 +935,32 @@ function awake(over: Partial<BearViewDeps> = {}, state: StateName = 'Listening')
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** The director's reaction after `g` in a fresh awake view. */
+function accepted(g: Gesture): unknown {
+  const h = awake();
+  h.view.gesture(g);
+  return h.view.director().reaction;
+}
+
+/** A headTop stroke update long enough to pet, in direction `dir` (rad). */
+function petStroke(dir: number): Gesture {
+  return { g: 'stroke', region: 'headTop', phase: 'update', pathPx: 200, dir, against: false };
+}
+
+/**
+ * A view in Attentive (every frame drawn, so two views draw the same frames) for 2 s after a left-eye tap
+ * (`blink`) or nothing: its brow and the time since.
+ */
+function browAfter(blink: boolean): { brow: number; dt: number } {
+  const h = awake({}, 'Recording');
+  h.anim({ e: 'attentive' });
+  h.run(5);
+  if (blink) h.view.gesture({ g: 'tap', phase: 'down', region: 'eyeL', x: 0, y: 0, count: 1 });
+  const t = h.clock.t;
+  h.run(120);
+  return { brow: h.view.pose()[Ch.BrowL]!, dt: (h.clock.t - t) / 1000 };
+}
+
 describe('pointer input and reactions (#93)', () => {
   let sheets: CSSStyleSheet[] = [];
   beforeEach(() => {
@@ -1033,11 +1059,6 @@ describe('pointer input and reactions (#93)', () => {
   });
 
   test('gesture fields: hug and all-over → belly, a pinch → its first cheek, a stroke → dirX', () => {
-    const accepted = (g: Gesture): unknown => {
-      const h = awake();
-      h.view.gesture(g);
-      return h.view.director().reaction;
-    };
     expect(accepted({ g: 'hug' })).toMatchObject({ r: { name: 'hug' }, region: 'belly', gesture: 'hug' });
     expect(accepted({ g: 'allOver' })).toMatchObject({
       r: { name: 'giggle' },
@@ -1049,21 +1070,13 @@ describe('pointer input and reactions (#93)', () => {
       region: 'cheekR',
       gesture: 'pinch',
     });
-    const stroke = (dir: number): Gesture => ({
-      g: 'stroke',
-      region: 'headTop',
-      phase: 'update',
-      pathPx: 200,
-      dir,
-      against: false,
-    });
-    expect(accepted(stroke(Math.PI))).toMatchObject({
+    expect(accepted(petStroke(Math.PI))).toMatchObject({
       r: { name: 'pet' },
       clip: 'petMirrored',
       region: 'headTop',
       gesture: 'stroke',
     });
-    expect(accepted(stroke(0))).toMatchObject({ r: { name: 'pet' }, clip: 'pet' });
+    expect(accepted(petStroke(0))).toMatchObject({ r: { name: 'pet' }, clip: 'pet' });
   });
 
   test('release identity: a stroke or long-press end releases its own reaction; the last pointer up, everything', () => {
@@ -1145,18 +1158,8 @@ describe('pointer input and reactions (#93)', () => {
   });
 
   test('mood outputs bump the mood layer: a hard blink leaves the brows down, decaying with τ = 8 s', () => {
-    // Attentive draws every frame, so both views draw the same frames.
-    const run = (blink: boolean): { brow: number; dt: number } => {
-      const h = awake({}, 'Recording');
-      h.anim({ e: 'attentive' });
-      h.run(5);
-      if (blink) h.view.gesture({ g: 'tap', phase: 'down', region: 'eyeL', x: 0, y: 0, count: 1 });
-      const t = h.clock.t;
-      h.run(120);
-      return { brow: h.view.pose()[Ch.BrowL]!, dt: (h.clock.t - t) / 1000 };
-    };
-    const withBlink = run(true);
-    const control = run(false);
+    const withBlink = browAfter(true);
+    const control = browAfter(false);
     const want = -0.2 * 3 * Math.exp(-withBlink.dt / 8);
     expect(Math.abs(withBlink.brow - control.brow - want)).toBeLessThan(0.02);
   });
