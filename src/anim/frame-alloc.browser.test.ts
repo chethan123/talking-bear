@@ -49,11 +49,14 @@ const ATTEMPTS = 3;
  * The bound on view − control, in bytes per frame (ORCH-ANSWERs on #214: ≈ 1.4 × the worst of 10 runs, rounded
  * up to a multiple of 8, at most 72).
  *
- * - Measured, Chromium 141 (local): 52.5 in each of 10 runs (S6 records the final head's readings here).
- *   Today's main, before #214, reads ≈ 600 (603.4, 609.7). 1.4 × 52.5 = 73.5 → 80 → capped at 72.
+ * - Readings at #214's head, local Chromium 141: 52.5 in each of 10 solo runs, and 52.5 in each of 3 full
+ *   `pnpm test:browser` runs with Vitest's results cache deleted (CI's file order). 1.4 × 52.5 = 73.5 → 80 →
+ *   capped at 72. CI (Chrome for Testing 153): recorded after the PR's first `verify` run.
+ * - Today's main, before #214, reads ≈ 600 (603.3, 603.0).
  * - The 52.5 left is boxing at call boundaries outside the modules #214 fixed: loop.ts `tick` passing `chunk` and
  *   `alpha` (≈ 25), `stepper.advance`'s returned alpha (≈ 12.6), bear-view's `logFrame` reading
- *   `mouth.clipTime` (≈ 12.2), rng.ts event calls (≈ 2). #229 removes it and brings the bound to 32.
+ *   `mouth.clipTime` (≈ 12.2), rng.ts event calls (≈ 2). Run in one Vitest process after
+ *   bear-view.browser.test.ts, the director tick adds ≈ 24 (76.5). #229 removes these and brings the bound to 32.
  * - What it catches (negative controls, B/frame): a fresh `[x, y]` per drawn part in `render` 2057.8, a fresh
  *   closure per frame passed as the mouth's `now` 100.5, one small object plus one boxed double per frame in the
  *   mouth 80.5, a private double field written per substep in gaze 76.5. So it detects ≥ 2 boxed doubles per
@@ -229,7 +232,7 @@ test(
       controlBytes.push(measure(runControl));
       viewBytes.push(measure(runView));
     }
-    // A one-off raises one window of either side and never lowers one, so each side counts its smallest window.
+    // Each side counts its smallest window: every window is at least the real allocation (see the file doc).
     const control = Math.min(...controlBytes);
     const perFrame = Math.min(...viewBytes) - control;
     // Still talking, the mouth still moving through the envelope, and every vsync drew a frame.
