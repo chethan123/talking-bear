@@ -3,13 +3,19 @@
 // SVG DOM, built from the generated parts with the rig's matrices as `transform` attributes, and by the app's
 // Canvas 2D renderer, with their max pixel difference sampled once a second. Stress mode kicks every spring
 // every 200 ms, runs the idle layers on top of the sliders' pose and renders every frame at the app stage's
-// size (DPR cap 2 or native), with frame-time statistics. Dev-only: `pnpm dev`, then /lab/rig.html
-// (docs/lab.md). No audio is involved; the log is text only. Lab pages set no CSS `style`: SVG geometry and
-// sizes are attributes.
+// size (DPR cap 2 or native), with frame-time statistics. The clip preview plays a reaction or session clip on
+// the canvas: its tracks on top of the sliders' pose, and its spring kicks through the page's own SpringBank
+// (the app's springs-map.ts constants), every spring added to its channel. Dev-only: `pnpm dev`, then
+// /lab/rig.html (docs/lab.md). No audio is involved; the log is text only. Lab pages set no CSS `style`: SVG
+// geometry and sizes are attributes.
 
 import { el, fmt, logPanel } from './common.ts';
 import type { Attrs } from './common.ts';
 import { BONES, PARTS } from '../src/art/bear-parts.gen.ts';
+import { sampleClip } from '../src/anim/clip.ts';
+import type { Clip } from '../src/anim/clip.ts';
+import { REACTION_CLIPS } from '../src/anim/clips/reactions.ts';
+import { SESSION_CLIPS } from '../src/anim/clips/session.ts';
 import {
   createBlink,
   createBreathing,
@@ -40,6 +46,17 @@ import type { View } from '../src/anim/renderer.ts';
 import { BONE_COUNT, boneMatrices, createRig, MAT, PartKind, partMatrix } from '../src/anim/rig.ts';
 import { mulberry32 } from '../src/anim/rng.ts';
 import { SpringBank } from '../src/anim/springs.ts';
+import {
+  BELLY_SPRING,
+  configureSprings,
+  HEAD_SPRING,
+  KERCHIEF_A_SPRING,
+  KERCHIEF_B_SPRING,
+  NOSE_SPRING,
+  SPRING_CHANNEL,
+  SPRING_COUNT,
+  TUFT_SPRING,
+} from '../src/anim/springs-map.ts';
 import { Stepper, SUBSTEP } from '../src/anim/stepper.ts';
 
 const DEG = Math.PI / 180;
@@ -76,6 +93,15 @@ const MISSED_FACTOR = 1.5;
 const RING = 60 * 240;
 /** While stress runs, a summary line goes to the log this often. */
 const LOG_EVERY_MS = 10_000;
+/** Clip preview: a sustained clip holds its pose this long past its duration, then is released. */
+const HOLD_S = 1;
+/** Clip preview: a released sustained clip eases back to neutral over this long (the director's 400 ms, #91). */
+const RELEASE_S = 0.4;
+/** Clip preview: after the clip's own motion, the preview runs until every spring rests, or this long at most. */
+const SETTLE_MAX_S = 3;
+/** Clip preview: a spring rests when its |position| and |velocity| are below these. */
+const REST_POS = 1e-4;
+const REST_VEL = 1e-3;
 
 // ---- channels -----------------------------------------------------------------------------------------------
 
@@ -175,22 +201,22 @@ interface LabSpring {
 
 /**
  * Every spring of the plan §4.6.5 rig (the `~` bones): the gaze layer's head-follow springs and the ear-twitch
- * layer's ear springs, with those layers' constants, plus the secondary springs no app module defines yet
- * (head wobble, tuft, kerchief tails, belly, body squash, nose sniff), with lab-only constants (f ≤ 10 Hz, stable
- * at the 1/120 s substep). The app's index allocation is `src/anim/springs-map.ts` (#81, #89).
+ * layer's ear springs, with those layers' constants, the secondary springs of the app's index allocation
+ * (`src/anim/springs-map.ts`, #81, #89: head wobble, tuft, kerchief tails, belly, nose sniff) with its constants,
+ * and a body-squash spring with lab-only constants (f ≤ 10 Hz, stable at the 1/120 s substep).
  */
 const SPRINGS: readonly LabSpring[] = [
   { name: 'headRot', ch: Ch.HeadRot, ...GAZE_SPRING, amp: 3 * DEG, layer: 'gaze' },
   { name: 'headTilt', ch: Ch.HeadTilt, ...GAZE_SPRING, amp: 3 * DEG, layer: 'gaze' },
   { name: 'earL', ch: Ch.EarRotL, ...EAR_SPRING, amp: 12 * DEG, layer: 'ears' },
   { name: 'earR', ch: Ch.EarRotR, ...EAR_SPRING, amp: 12 * DEG, layer: 'ears' },
-  { name: 'head', ch: Ch.HeadRot, freqHz: 3, zeta: 0.3, amp: 8 * DEG, layer: null },
-  { name: 'tuft', ch: Ch.TuftRot, freqHz: 4, zeta: 0.25, amp: 15 * DEG, layer: null },
-  { name: 'kerchiefA', ch: Ch.KerchiefA, freqHz: 2.5, zeta: 0.2, amp: 15 * DEG, layer: null },
-  { name: 'kerchiefB', ch: Ch.KerchiefB, freqHz: 2.8, zeta: 0.2, amp: 15 * DEG, layer: null },
-  { name: 'belly', ch: Ch.BellyJiggle, freqHz: 5, zeta: 0.3, amp: 0.04, layer: null },
+  { name: 'head', ch: Ch.HeadRot, ...HEAD_SPRING, amp: 8 * DEG, layer: null },
+  { name: 'tuft', ch: Ch.TuftRot, ...TUFT_SPRING, amp: 15 * DEG, layer: null },
+  { name: 'kerchiefA', ch: Ch.KerchiefA, ...KERCHIEF_A_SPRING, amp: 15 * DEG, layer: null },
+  { name: 'kerchiefB', ch: Ch.KerchiefB, ...KERCHIEF_B_SPRING, amp: 15 * DEG, layer: null },
+  { name: 'belly', ch: Ch.BellyJiggle, ...BELLY_SPRING, amp: 0.04, layer: null },
   { name: 'body', ch: Ch.BodySquash, freqHz: 4, zeta: 0.35, amp: 0.04, layer: null },
-  { name: 'nose', ch: Ch.NoseY, freqHz: 6, zeta: 0.4, amp: 4, layer: null },
+  { name: 'nose', ch: Ch.NoseY, ...NOSE_SPRING, amp: 4, layer: null },
 ];
 
 function springIndex(name: string): number {
@@ -433,6 +459,7 @@ const show = {
   fps: el('dd'),
   window: el('dd'),
   springs: el('dd'),
+  clip: el('dd'),
 };
 
 interface Slider {
@@ -484,8 +511,44 @@ const stressFieldset = el(
   ),
 );
 
+/** Every clip the preview offers: the reaction clips (#89), then the session clips (#77). */
+const CLIPS = new Map<string, Clip>([...Object.entries(REACTION_CLIPS), ...Object.entries(SESSION_CLIPS)]);
+
+function clipOption(name: string): HTMLOptionElement {
+  const c = CLIPS.get(name);
+  if (c === undefined) throw new Error(`lab/rig: no clip ${name}`);
+  const kicks = c.impulses?.length ?? 0;
+  const notes = [`${fmt(c.duration, 2)} s`];
+  if (c.sustained === true) notes.push('sustained');
+  if (kicks > 0) notes.push(`${kicks} spring kick${kicks === 1 ? '' : 's'}`);
+  return el('option', { value: name }, `${name} (${notes.join(', ')})`);
+}
+
+const clipSelect = el(
+  'select',
+  {},
+  el('optgroup', { label: 'Reaction clips' }, ...Object.keys(REACTION_CLIPS).map(clipOption)),
+  el('optgroup', { label: 'Session clips' }, ...Object.keys(SESSION_CLIPS).map(clipOption)),
+);
+const playButton = el('button', { type: 'button' }, 'Play');
+
+const clipFieldset = el(
+  'fieldset',
+  {},
+  el('legend', {}, 'Clip preview'),
+  el(
+    'p',
+    {},
+    'Plays a clip on the canvas on top of the sliders’ pose, with its spring kicks; a sustained clip is held ',
+    `${HOLD_S} s, then released over ${RELEASE_S * 1000} ms. The SVG view keeps the sliders’ pose.`,
+  ),
+  el('p', {}, el('label', {}, 'Clip: ', clipSelect), ' ', playButton),
+  el('dl', { class: 'lab-values' }, ...row('Clip', show.clip)),
+);
+
 root.append(
   el('fieldset', {}, el('legend', {}, 'Pose'), el('label', {}, 'Key pose: ', poseSelect), ' ', resetButton),
+  clipFieldset,
   stressFieldset,
   el('h2', {}, 'Views'),
   el('p', {}, 'Left: SVG DOM (parts and bone matrices). Right: the Canvas 2D renderer.'),
@@ -545,10 +608,10 @@ function updateSvg(pose: Pose): void {
 
 let pendingStatic = 0;
 
-/** Draws `base` in both views (once per frame at most), unless stress owns the canvas. */
+/** Draws `base` in both views (once per frame at most), unless stress or the clip preview owns the canvas. */
 function drawStatic(): void {
   pendingStatic = 0;
-  if (stress !== null) return;
+  if (stress !== null || preview !== null) return;
   render(g, rig, base, compareView);
   updateSvg(base);
 }
@@ -819,6 +882,7 @@ function showStage(): void {
 
 function startStress(): void {
   if (stress !== null) return;
+  stopPreview('stopped: stress started');
   const s = createStress();
   stress = s;
   show.diff.textContent = '(paused while stress runs)';
@@ -845,6 +909,122 @@ function stopStress(reason: string): void {
   show.diff.textContent = '';
   show.diffParts.textContent = '';
   sampledVersion = -1;
+  changed();
+}
+
+// ---- clip preview -------------------------------------------------------------------------------------------
+
+interface Preview {
+  readonly name: string;
+  readonly clip: Clip;
+  /** The page's own bank of the app's springs (springs-map.ts), from rest. */
+  readonly springs: SpringBank;
+  readonly stepper: Stepper;
+  /** The clip's sample, and the drawn pose. */
+  readonly delta: Pose;
+  readonly out: Pose;
+  /** One substep: the clip's kicks due in it, then the springs' step. Allocated once per preview. */
+  readonly substep: (dt: number) => void;
+  /** End of the clip's own motion (s): its duration, plus the hold and the release for a sustained clip. */
+  readonly end: number;
+  /** Simulated time since the start (s), advanced by the substeps. */
+  time: number;
+  raf: number;
+  /** rAF timestamp of the previous frame; −1 before the first. */
+  lastT: number;
+}
+
+let preview: Preview | null = null;
+
+function createPreview(name: string, clip: Clip): Preview {
+  const springs = new SpringBank(SPRING_COUNT);
+  configureSprings(springs);
+  const impulses = clip.impulses ?? [];
+  const p: Preview = {
+    name,
+    clip,
+    springs,
+    stepper: new Stepper(),
+    delta: createPose(),
+    out: createPose(),
+    substep(dt: number): void {
+      const t0 = p.time;
+      for (let i = 0; i < impulses.length; i++) {
+        const imp = impulses[i]!;
+        if (imp.t >= t0 && imp.t < t0 + dt) springs.impulse(imp.spring, imp.dv);
+      }
+      springs.step(dt);
+      p.time = t0 + dt;
+    },
+    end: clip.sustained === true ? clip.duration + HOLD_S + RELEASE_S : clip.duration,
+    time: 0,
+    raf: 0,
+    lastT: -1,
+  };
+  return p;
+}
+
+/** The clip's weight at time `t`: 1, except for a sustained clip after its hold, which eases out linearly. */
+function clipWeight(p: Preview, t: number): number {
+  if (p.clip.sustained !== true) return 1;
+  const release = p.clip.duration + HOLD_S;
+  return t <= release ? 1 : Math.max(0, 1 - (t - release) / RELEASE_S);
+}
+
+function springsAtRest(s: SpringBank): boolean {
+  for (let i = 0; i < SPRING_COUNT; i++) {
+    if (Math.abs(s.pos[i]!) > REST_POS || Math.abs(s.vel[i]!) > REST_VEL) return false;
+  }
+  return true;
+}
+
+/**
+ * One preview frame: the fixed-step substeps, then the sliders' pose + the clip's sample × its weight + every
+ * spring's position on its channel (`SPRING_CHANNEL`), drawn on the canvas. It ends once the clip's own motion is
+ * over and the springs rest.
+ */
+function previewFrame(t: number): void {
+  const p = preview;
+  if (p === null) return;
+  const dt = p.lastT < 0 ? 0 : (t - p.lastT) / 1000;
+  p.lastT = t;
+  p.stepper.advance(dt, p.substep);
+  const w = clipWeight(p, p.time);
+  sampleClip(p.clip, p.time, p.delta);
+  for (let ch = 0; ch < CH_COUNT; ch++) p.out[ch] = base[ch]! + w * p.delta[ch]!;
+  for (let i = 0; i < SPRING_COUNT; i++) {
+    const ch = SPRING_CHANNEL[i]!;
+    p.out[ch] = p.out[ch]! + p.springs.pos[i]!;
+  }
+  render(g, rig, p.out, compareView);
+  if (p.time >= p.end && (springsAtRest(p.springs) || p.time >= p.end + SETTLE_MAX_S)) {
+    stopPreview(`done after ${fmt(p.time, 2)} s`);
+    return;
+  }
+  p.raf = requestAnimationFrame(previewFrame);
+}
+
+function startPreview(): void {
+  const name = clipSelect.value;
+  const clip = CLIPS.get(name);
+  if (clip === undefined) return;
+  stopStress('stopped: clip preview');
+  stopPreview('stopped: another clip');
+  const p = createPreview(name, clip);
+  preview = p;
+  show.clip.textContent = `${name}: playing`;
+  const held = clip.sustained === true ? `; sustained: held ${HOLD_S} s, released over ${RELEASE_S} s` : '';
+  log(`clip ${name}: play, ${fmt(clip.duration, 2)} s, ${clip.impulses?.length ?? 0} spring kicks${held}`);
+  p.raf = requestAnimationFrame(previewFrame);
+}
+
+function stopPreview(reason: string): void {
+  const p = preview;
+  if (p === null) return;
+  preview = null;
+  cancelAnimationFrame(p.raf);
+  show.clip.textContent = `${p.name}: ${reason}`;
+  log(`clip ${p.name}: ${reason}`);
   changed();
 }
 
@@ -900,9 +1080,13 @@ window.addEventListener('resize', () => {
   showStage();
 });
 
+playButton.addEventListener('click', startPreview);
+
 // A hidden page gets no rAF: stop rather than count the gap as dropped frames.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') stopStress('page hidden');
+  if (document.visibilityState !== 'hidden') return;
+  stopStress('page hidden');
+  stopPreview('stopped: page hidden');
 });
 
 setInterval(() => {
@@ -914,6 +1098,7 @@ poseSelect.value = 'neutral';
 syncSliders();
 refreshStats();
 show.backing.textContent = '(stress off)';
+show.clip.textContent = '(none played yet)';
 changed();
 log(
   `lab/rig ready: ${PARTS.length} parts, ${BONES.length} bones, ${CH_COUNT} channels; devicePixelRatio ${window.devicePixelRatio}, viewport ${window.innerWidth} × ${window.innerHeight}; ${navigator.userAgent}`,
