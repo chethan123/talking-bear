@@ -8,7 +8,8 @@
 //                                        engine (main thread) ───── onEvent ─────→ session
 //
 // The worker also posts `vadReady` (its Silero model is loaded) and `vadStats`; both are forwarded as events,
-// which the session routes to its level listeners.
+// which the session routes to its level listeners. So is `traceBatch`, the per-frame VAD features the worker
+// streams while `setTrace(true)` is in effect (lab/vad-trace, the debug overlay).
 //
 // The graph is built on the first successful resume(). The worklet's output is connected to `destination` only
 // when `connectWorkletOutput` is set (plan §3.2: a runtime flag, off until X-R4 shows no capture gaps).
@@ -56,7 +57,8 @@ export type EngineEvent =
   | { t: 'level'; epoch: number; frame: number; db: number; floorDb: number }
   | { t: 'vadError'; message: string }
   | { t: 'vadReady'; backend: 'silero' } // the worker's Silero model is loaded (informational)
-  | { t: 'vadStats'; p95Ms: number }; // p95 Silero inference time over the last ≈ 10 s
+  | { t: 'vadStats'; p95Ms: number } // p95 Silero inference time over the last ≈ 10 s
+  | Extract<WorkerToMain, { t: 'traceBatch' }>; // the feature trace (setTrace), every 250 ms of audio
 
 export interface Engine {
   resume(): Promise<void>;
@@ -109,6 +111,17 @@ export interface OutputTapHost {
 export interface QuietHost {
   /** Quiet mode (plan §4.3.4): remembered, used when the graph is built, applied at once if the bus exists. */
   setQuiet(on: boolean): void;
+}
+
+/** The feature trace (lab/vad-trace, the debug overlay). createEngine's result has it; `Engine` doesn't. */
+export interface TraceHost {
+  /**
+   * Turns the worker's feature trace on or off: while on, `traceBatch` events arrive every 250 ms of audio
+   * (src/workers/vad-core.ts; the pre-gate is suspended, so Silero runs on every frame). Remembered: sent to
+   * the current worker at once, and to every new worker after its `init` (restartWorker, recreation after a
+   * failure, the first resume()). Turning it off flushes the partial batch.
+   */
+  setTrace(on: boolean): void;
 }
 
 type Processed = NonNullable<ReturnType<Engine['getProcessed']>>;
@@ -165,7 +178,7 @@ function concat(chunks: readonly Float32Array[], length: number): Float32Array {
 export function createEngine(opts: {
   connectWorkletOutput: boolean;
   onEvent: (e: EngineEvent) => void;
-}): Engine & OutputTapHost & QuietHost {
+}): Engine & OutputTapHost & QuietHost & TraceHost {
   const { connectWorkletOutput, onEvent } = opts;
   const emit = (e: EngineEvent): void => {
     onEvent(e);
@@ -182,6 +195,8 @@ export function createEngine(opts: {
   /** The node insertOutputTap() put between the bus and `destination`, if any. */
   let outputTap: AudioNode | null = null;
   let quietMode = true; // plan §4.3.4: on by default
+  /** The feature trace setting (setTrace); every new worker gets it after its init. */
+  let traceOn = false;
   /** Set by resume(), cleared by suspend(): the latest call wins when they race with the first build. */
   let wantRunning = false;
 
@@ -282,6 +297,19 @@ export function createEngine(opts: {
       case 'vadStats':
         emit({ t: 'vadStats', p95Ms: m.p95Ms });
         break;
+      case 'traceBatch':
+        emit({
+          t: 'traceBatch',
+          epoch: m.epoch,
+          hop0Frame: m.hop0Frame,
+          sil0Frame: m.sil0Frame,
+          rawDb: m.rawDb,
+          bandDb: m.bandDb,
+          voicing: m.voicing,
+          sileroP: m.sileroP,
+          inferMs: m.inferMs,
+        });
+        break;
     }
   }
 
@@ -308,6 +336,7 @@ export function createEngine(opts: {
     const ch = new MessageChannel();
     postToWorklet(n, { t: 'init', port: ch.port1 });
     postToWorker(w, { t: 'init', ctxRate: c.sampleRate, port: ch.port2 });
+    if (traceOn) postToWorker(w, { t: 'trace', on: true });
   }
 
   /** Terminates the worker; its listeners go first, so nothing it still has queued is forwarded. */
@@ -602,6 +631,10 @@ export function createEngine(opts: {
     setQuiet(on: boolean): void {
       quietMode = on;
       bus?.setQuiet(on);
+    },
+    setTrace(on: boolean): void {
+      traceOn = on;
+      if (worker !== null) postToWorker(worker, { t: 'trace', on });
     },
   };
 }
