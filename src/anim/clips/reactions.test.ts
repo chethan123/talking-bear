@@ -6,7 +6,7 @@ import type { Clip } from '../clip.ts';
 import { EAR_SPRING, GAZE_SPRING } from '../layers/index.ts';
 import { Ch, CH_COUNT, createPose } from '../pose.ts';
 import type { Pose } from '../pose.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from '../rig.ts';
+import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT, partIndex, partMatrix } from '../rig.ts';
 import { SpringBank } from '../springs.ts';
 import {
   BELLY_SPRING,
@@ -421,10 +421,25 @@ describe('REACTION_CLIPS: content (issue #89 "Clips")', () => {
     expect(c.duration).toBeGreaterThan(s.duration);
   });
 
-  it('noseWrinkle: NoseWrinkle → 1, both irises 6 units toward the nose, sustained', () => {
+  it('noseWrinkle: NoseWrinkle → 1, each iris 6 units toward the centre line (cross-eyed at the finger), sustained', () => {
     const c = clip('noseWrinkle');
+    expect(c.sustained).toBe(true);
     expect(at(c, c.duration, Ch.NoseWrinkle)).toBe(1);
-    expect(at(c, c.duration, Ch.IrisY)).toBe(6);
+    expect(at(c, c.duration, Ch.IrisConverge)).toBe(6);
+    // Only those two channels: no gaze offset, and no downward IrisY approximation (#222).
+    expect(channels(c).toSorted((a, b) => a - b)).toEqual([Ch.NoseWrinkle, Ch.IrisConverge]);
+    // Through the rig: at the held peak the left iris sits 6 units right of rest, the right one 6 units left.
+    const peak = sampleClip(c, c.duration, createPose());
+    boneMatrices(RIG, peak, BONE_BUF);
+    const m = new Float64Array(MAT);
+    for (const [id, dx] of [
+      ['irisL', 6],
+      ['irisR', -6],
+    ] as const) {
+      partMatrix(RIG, peak, BONE_BUF, partIndex(id), m);
+      const want = [1, 0, 0, 1, dx, 0];
+      for (let i = 0; i < MAT; i++) expect(m[i], `${id}[${i}]`).toBeCloseTo(want[i]!, 9);
+    }
   });
 
   it('tuftBoing: a tuft kick and a small head bob', () => {
