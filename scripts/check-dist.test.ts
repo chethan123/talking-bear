@@ -118,6 +118,16 @@ function ruleViolations(dir: string, mode: Mode, rule: number): string[] {
   return checkDist(dir, mode).filter((v) => v.startsWith(`rule ${rule} (`));
 }
 
+/** A complete production tree with this manifest.webmanifest text. */
+function withManifest(text: string): string {
+  return writeTree({ ...goodTree('production'), 'manifest.webmanifest': text });
+}
+
+/** Runs the script as a CLI (optionally through another path to it). */
+function run(args: readonly string[], script = SCRIPT): SpawnSyncReturns<string> {
+  return spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
+}
+
 describe('precacheUrls', () => {
   it('reads the minified vite-plugin-pwa 1.3.0 shape (unquoted url keys, renamed precache call), deduplicated', () => {
     const sw =
@@ -360,10 +370,6 @@ describe('checkDist', () => {
   });
 
   describe('rule 7: manifest', () => {
-    function withManifest(text: string): string {
-      return writeTree({ ...goodTree('production'), 'manifest.webmanifest': text });
-    }
-
     it('passes a manifest whose icons and screenshots all exist', () => {
       expect(ruleViolations(writeTree(goodTree('production')), 'production', 7)).toEqual([]);
     });
@@ -420,10 +426,6 @@ describe('checkDist', () => {
 });
 
 describe('CLI', () => {
-  function run(args: readonly string[], script = SCRIPT): SpawnSyncReturns<string> {
-    return spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
-  }
-
   it('exits 0 and prints a summary for a complete tree', () => {
     const dir = writeTree(goodTree('production'));
     const result = run([dir, 'production']);
