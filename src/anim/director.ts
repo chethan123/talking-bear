@@ -39,14 +39,16 @@
  * - **Interruption:** a reaction interrupts the active one only if its priority is ≥ the active one's;
  *   otherwise it is queued (one slot, replaced by a newer one) and dropped if it hasn't started 500 ms later.
  *   A one-shot ends at its clip end, a sustained reaction 400 ms after its release; a fresh queued reaction
- *   then starts.
+ *   then starts. This holds in Talking too: a P3+ below a carried-over reaction is queued, not announced.
  * - **Where it plays:** from Idle (Reacting/Sustained) a reaction is the base; in Attentive and Thinking it
  *   plays additively and the state stays. In Talking a P1/P2 plays a 150 ms flinch (sfx `null`); a P3+ is
  *   output with its sfx (the session stops playback) and starts when the session's `talkEnd` arrives. A
  *   sustained reaction held when Talking starts plays on additively, and its refreshes (no sfx loop, no
  *   escalation) and its release (no `sfxOnRelease`) output nothing there, so a continuing stroke doesn't stop
  *   the replay; `talkEnd` makes it Sustained again.
- * - **Release:** outputs `sfxOnRelease`, then the held reaction's clip eases out over 400 ms.
+ * - **Release:** outputs `sfxOnRelease`, then the held reaction's clip eases out over 400 ms. With a `region` and
+ *   `gesture` it ends only what that gesture started (contacts overlap: a head long-press and a belly one), and
+ *   it also drops a queued sustained reaction of that gesture.
  * - **Gentle:** gentle clips play, and an escalation target without a gentle clip is skipped.
  * Accepted reactions output `toSession` (for `session.dispatch`), `haptic` and `mood`.
  */
@@ -86,6 +88,9 @@ export interface ActiveReaction {
   sfxAt: number;
   /** When it was released (s); null while held, and always for a one-shot. */
   release: number | null;
+  /** The gesture that started it: a `release` with an identity ends only its own reaction. */
+  region: RegionId;
+  gesture: GestureKind;
 }
 
 /** The queued reaction (queue length 1). */
@@ -152,11 +157,22 @@ export interface GestureInput {
   now: number;
 }
 
+/**
+ * The end of a sustained gesture. With `region` and `gesture`: one contact's `stroke end` or `longPress end`,
+ * which ends only the reaction that gesture started. Without them: every contact is up.
+ */
+export interface ReleaseInput {
+  k: 'release';
+  now: number;
+  region?: RegionId;
+  gesture?: GestureKind;
+}
+
 export type DirInput =
   | { k: 'anim'; ev: AnimEvent; now: number }
   | { k: 'tick'; now: number }
   | GestureInput
-  | { k: 'release'; now: number }
+  | ReleaseInput
   | { k: 'setGentle'; on: boolean };
 
 /** What a step outputs: a reaction for `session.dispatch`, a haptic pattern, a mood bump. */
@@ -600,7 +616,17 @@ function start(
     ...s,
     cooldowns: announced ? s.cooldowns : withCooldown(s.cooldowns, region, gesture, r.priority, now),
     repeats: announced ? s.repeats : withRepeat(s.repeats, r, now),
-    reaction: { r, clip: clipName, start: now, last: now, runStart: now, sfxAt: now, release: null },
+    reaction: {
+      r,
+      clip: clipName,
+      start: now,
+      last: now,
+      runStart: now,
+      sfxAt: now,
+      release: null,
+      region,
+      gesture,
+    },
   };
   if (s.name === 'Attentive' || s.name === 'Thinking') return { ...next, clip };
   return enter(next, r.sustained ? 'Sustained' : 'Reacting', now, clip);
@@ -613,7 +639,8 @@ function startQueued(s: DirectorState, q: QueuedReaction, now: number, out: Out)
 
 /**
  * The active reaction is over: it and its clip are cleared, then a fresh queued reaction starts; otherwise
- * Reacting and Sustained go to Idle. While Talking, a queued (announced) reaction waits for `talkEnd`.
+ * Reacting and Sustained go to Idle. While Talking nothing starts: an announced reaction waits for `talkEnd`, and
+ * one queued behind the reaction that just ended (unannounced, the session never had it) is dropped.
  */
 function endReaction(s: DirectorState, a: ActiveReaction, now: number, out: Out): DirectorState {
   const clip = s.clip !== null && s.clip.name === a.clip ? null : s.clip;
@@ -621,7 +648,8 @@ function endReaction(s: DirectorState, a: ActiveReaction, now: number, out: Out)
   const talking = s.name === 'Talking';
   if (q !== null && !talking && now <= q.at + QUEUE_S)
     return startQueued({ ...s, reaction: null, clip }, q, now, out);
-  const cleared: DirectorState = { ...s, reaction: null, clip, queued: talking ? q : null };
+  const kept = talking && q !== null && q.announced ? q : null;
+  const cleared: DirectorState = { ...s, reaction: null, clip, queued: kept };
   return s.name === 'Reacting' || s.name === 'Sustained' ? enter(cleared, 'Idle', now, clip) : cleared;
 }
 
@@ -679,6 +707,8 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
   }
   const st = repeats === s.repeats ? s : { ...s, repeats };
   if (st.name === 'Talking') {
+    if (live !== null && r.priority >= STOPS_PLAYBACK && r.priority < live.r.priority)
+      return { ...st, queued: { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false } };
     const cooldowns = withCooldown(st.cooldowns, i.region, i.gesture, r.priority, now);
     const counted = withRepeat(st.repeats, r, now);
     if (r.priority < STOPS_PLAYBACK) {
@@ -696,14 +726,24 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
 }
 
 /**
- * The end of a sustained gesture: `sfxOnRelease` (not while Talking: it would stop the replay), then the held
- * reaction eases out over 400 ms.
+ * The end of a sustained gesture (#91 plan Decision 16): it releases the held reaction that gesture started,
+ * which outputs `sfxOnRelease` (not while Talking: it would stop the replay) and eases out over 400 ms, and it
+ * drops a queued sustained reaction that gesture started, which would otherwise start held with no release to
+ * come. A release without `region` and `gesture` (every contact up) matches any reaction.
  */
-function release(s: DirectorState, now: number, out: Out): DirectorState {
+function release(s: DirectorState, i: ReleaseInput, out: Out): DirectorState {
+  const all = i.region === undefined || i.gesture === undefined;
+  const q = s.queued;
+  const dropQ = q !== null && q.r.sustained && (all || (q.region === i.region && q.gesture === i.gesture));
   const a = s.reaction;
-  if (a === null || !a.r.sustained || a.release !== null) return s;
-  if (a.r.sfxOnRelease !== undefined && s.name !== 'Talking') toSession(out, a.r, a.r.sfxOnRelease);
-  return { ...s, reaction: { ...a, release: now } };
+  const relA =
+    a !== null &&
+    a.r.sustained &&
+    a.release === null &&
+    (all || (a.region === i.region && a.gesture === i.gesture));
+  if (!dropQ && !relA) return s;
+  if (relA && a.r.sfxOnRelease !== undefined && s.name !== 'Talking') toSession(out, a.r, a.r.sfxOnRelease);
+  return { ...s, queued: dropQ ? null : q, reaction: relA ? { ...a, release: i.now } : a };
 }
 
 /**
@@ -711,10 +751,10 @@ function release(s: DirectorState, now: number, out: Out): DirectorState {
  * dropped; a clip at or past its end is cleared; in Waking, that (or having no clip) moves to Idle. Returns
  * `s` itself, allocating nothing, when nothing is due.
  *
- * It runs once per 120 Hz substep, so it takes the input itself rather than its time, and its quiet paths (no
- * reaction, or a held or released one) pass no double to a call: V8's mid tier boxes a double passed across a
- * call (#229, the frame-allocation smoke of #214). A non-finite time changes nothing: `t − t` is 0 for every
- * finite `t` and NaN otherwise, a check that, unlike `Number.isFinite`, needs no call.
+ * It runs once per 120 Hz substep, so it takes the input itself rather than its time: the smoke's path (no
+ * reaction, no clip) passes no double across a call, which V8's mid tier would box (#229, the frame-allocation
+ * smoke of #214). A non-finite time changes nothing: `t − t` is 0 for every finite `t` and NaN otherwise, a check
+ * that, unlike `Number.isFinite`, needs no call.
  */
 function tick(s: DirectorState, i: { readonly now: number }, out: Out): DirectorState {
   const now = i.now;
@@ -747,7 +787,7 @@ function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
     case 'gesture':
       return onGesture(s, i, out);
     case 'release':
-      return release(s, i.now, out);
+      return release(s, i, out);
     case 'setGentle':
       return s.gentle === i.on ? s : { ...s, gentle: i.on };
     default:

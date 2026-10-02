@@ -1042,6 +1042,13 @@ function gest(
     : { k: 'gesture', r: reaction, region, gesture, now, dirX };
 }
 const release = (now: number): DirInput => ({ k: 'release', now });
+/** The end of one contact's sustained gesture: `stroke end` or `longPress end` (Decision 16). */
+const releaseOf = (region: RegionId, gesture: GestureKind, now: number): DirInput => ({
+  k: 'release',
+  now,
+  region,
+  gesture,
+});
 const gentle = (on: boolean): DirInput => ({ k: 'setGentle', on });
 /** A nose tap down; the recogniser's multi-poke `count` ≥ 3 makes it a big sneeze (#90). */
 const noseTap = (now: number, count = 1): DirInput =>
@@ -1883,6 +1890,151 @@ describe('#91 plan review: edge rules (M16, M19, M21) and a non-finite time', ()
   });
 });
 
+describe('#91 code review: release identity, a queued sustained reaction, Talking priority', () => {
+  it('P14: a release drops a queued sustained reaction behind a one-shot, so it never starts held', () => {
+    const r = stepAll(
+      stateIn('Idle', 0),
+      flick(6),
+      flick(7),
+      flick(8),
+      gest('pet', 'belly', 'stroke', 11.2),
+      gest('pet', 'belly', 'stroke', 11.25),
+    );
+    expect(r.s.queued).toMatchObject({ r: R('pet'), region: 'belly', gesture: 'stroke' });
+    const after = stepAll(r.s, release(11.3), tick(11.5));
+    expect(after.s).toMatchObject({ name: 'Idle', reaction: null, queued: null });
+    expect(after.out).toStrictEqual([]);
+  });
+
+  it('P15: a release drops a queued sustained reaction behind a released one', () => {
+    const r = stepAll(
+      stateIn('Idle', 0),
+      gest('hug', 'belly', 'hug', 6),
+      release(7),
+      petStroke(7.1),
+      release(7.2),
+      tick(7 + 0.4),
+    );
+    expect(r.s).toMatchObject({ name: 'Idle', reaction: null, queued: null });
+    expect(r.out).toStrictEqual([toSess('hug', 'squeal'), { k: 'mood', joy: 0.2 }]);
+  });
+
+  it('A2: in Talking a P3 below the carried-over hug is queued unannounced; a P4 still hands off', () => {
+    const talking = stepAll(
+      stateIn('Thinking'),
+      gest('hug', 'belly', 'hug', 10),
+      anim({ e: 'talk', id: 9 }, 11),
+    ).s;
+    const allOver = stepAll(talking, gest('giggle', 'belly', 'allOver', 12));
+    expect(allOver.out).toStrictEqual([]);
+    expect(allOver.s).toMatchObject({ name: 'Talking', clip: { name: 'hug', start: 10 } });
+    expect(allOver.s.queued).toMatchObject({ r: R('giggle'), announced: false });
+    const ended = directorReduce(allOver.s, anim({ e: 'talkEnd' }, 12.01));
+    expect(ended).toMatchObject({ name: 'Sustained', clip: { name: 'hug', start: 10 } });
+    expect(ended.reaction?.r).toBe(R('hug'));
+    const dizzy = stepAll(talking, flick(11.1), flick(12), flick(12.9));
+    expect(dizzy.out.at(-1)).toStrictEqual(toSess('dizzy', 'whoa'));
+    expect(dizzy.s.queued).toMatchObject({ r: R('dizzy'), announced: true });
+  });
+
+  it('in Talking, an unannounced queued reaction is dropped when the reaction it waited on ends', () => {
+    const s = stepAll(
+      stateIn('Thinking'),
+      gest('hug', 'belly', 'hug', 10),
+      anim({ e: 'talk', id: 9 }, 11),
+      gest('giggle', 'belly', 'allOver', 12),
+      releaseOf('belly', 'hug', 12.1),
+    ).s;
+    expect(s.queued).toMatchObject({ r: R('giggle'), announced: false }); // another gesture's: kept
+    expect(directorReduce(s, tick(12.1 + 0.4))).toMatchObject({
+      name: 'Talking',
+      reaction: null,
+      queued: null,
+    });
+  });
+
+  it("B2: one contact's release ends only the reaction its gesture started", () => {
+    const s = stepAll(
+      stateIn('Idle'),
+      gest('headPress', 'headTop', 'longPress', 10),
+      gest('bellyRub', 'belly', 'longPress', 10.5),
+    ).s;
+    expect(s.reaction).toMatchObject({ r: R('bellyRub'), region: 'belly', gesture: 'longPress' });
+    const head = directorStep(s, releaseOf('headTop', 'longPress', 11));
+    expect(head.state).toBe(s); // the belly is still held
+    expect(head.out).toStrictEqual([]);
+    const belly = stepAll(s, releaseOf('belly', 'longPress', 12), tick(12 + 0.4));
+    expect(belly.s).toMatchObject({ name: 'Idle', reaction: null });
+  });
+
+  it("B3: a stroke's release drops its queued pet and keeps the hug; an identity-less release then ends the hug", () => {
+    const s = stepAll(stateIn('Idle'), gest('hug', 'belly', 'hug', 10), petStroke(10.5)).s;
+    expect(s.queued).toMatchObject({ r: R('pet'), region: 'headTop', gesture: 'stroke' });
+    const stroke = stepAll(s, releaseOf('headTop', 'stroke', 11));
+    expect(stroke.out).toStrictEqual([]);
+    expect(stroke.s).toMatchObject({ name: 'Sustained', queued: null });
+    expect(stroke.s.reaction).toMatchObject({ r: R('hug'), release: null });
+    const all = stepAll(stroke.s, release(12), tick(12 + 0.4));
+    expect(all.s).toMatchObject({ name: 'Idle', reaction: null, queued: null });
+  });
+
+  it('an identity-less release releases the held reaction and drops a queued sustained one, not a one-shot', () => {
+    const sustained = stepAll(
+      stateIn('Idle'),
+      gest('hug', 'belly', 'hug', 10),
+      petStroke(10.5),
+      release(11),
+    ).s;
+    expect(sustained.reaction?.release).toBe(11);
+    expect(sustained.queued).toBeNull();
+    const oneShot = stepAll(
+      stateIn('Idle'),
+      gest('bellyRub', 'belly', 'longPress', 10),
+      noseTap(10.9),
+      release(11),
+    );
+    expect(oneShot.s.reaction?.release).toBe(11);
+    expect(oneShot.s.queued?.r).toBe(R('sneeze'));
+    expect(stepAll(oneShot.s, tick(11 + 0.4)).s).toMatchObject({
+      name: 'Reacting',
+      clip: { name: 'sneeze' },
+    });
+  });
+
+  it('M30: a released reaction still blocks a lower priority until its ease-out ends', () => {
+    const r = stepAll(stateIn('Idle'), gest('squish', 'cheekL', 'pinch', 10), release(11), noseTap(11.2));
+    expect(r.out).toStrictEqual([toSess('squish', null), toSess('squish', 'pop')]);
+    expect(r.s.queued?.r).toBe(R('sneeze'));
+    expect(directorReduce(r.s, tick(11 + 0.4)).reaction?.r).toBe(R('sneeze'));
+  });
+
+  it('N21: the same reaction after its release is a new run, not a refresh', () => {
+    const r = stepAll(stateIn('Idle'), petStroke(10), release(11), petStroke(11.1));
+    expect(r.s.reaction).toMatchObject({ start: 11.1, release: null });
+    expect(r.out.slice(-3)).toStrictEqual([
+      toSess('pet', 'purr'),
+      { k: 'haptic', pattern: [15, 35, 15, 35, 15, 35] },
+      { k: 'mood', joy: 0.2 },
+    ]);
+  });
+
+  it("N27: the release ease-out scales only the released reaction's own clip, not a flinch", () => {
+    const s = stepAll(
+      stateIn('Thinking'),
+      tickle(10),
+      anim({ e: 'talk', id: 9 }, 10.2),
+      tick(10.9),
+      release(11),
+      noseTap(11.1),
+    ).s;
+    expect(s.clip).toStrictEqual({ name: 'flinch', start: 11.1 });
+    const squash = evaluate(s, 11.15, createPose())[Ch.BodySquash]!;
+    expect(Math.abs(squash - Math.fround(BASE.talking[Ch.BodySquash]! + Math.fround(-0.03)))).toBeLessThan(
+      1e-9,
+    );
+  });
+});
+
 // ---- #91 property: random gesture, release, gentle and session sequences ------------------------------------
 describe('#91 property: random gesture and session sequences', () => {
   /** A spread of gesture inputs: taps, the big sneeze, long-presses, strokes, tickles, flicks, pinch, hug, all-over. */
@@ -1900,7 +2052,7 @@ describe('#91 property: random gesture and session sequences', () => {
     (now) => gest('hug', 'belly', 'hug', now),
     (now) => gest('giggle', 'belly', 'allOver', now),
   ];
-  type Kind = AnimKind | 'tick' | 'gesture' | 'release' | 'gentleOn' | 'gentleOff';
+  type Kind = AnimKind | 'tick' | 'gesture' | 'release' | 'releaseOf' | 'gentleOn' | 'gentleOff';
   const STEP = fc.record({
     kind: fc.constantFrom<Kind>(
       ...KINDS,
@@ -1911,6 +2063,8 @@ describe('#91 property: random gesture and session sequences', () => {
       'gesture',
       'gesture',
       'release',
+      'releaseOf',
+      'releaseOf',
       'gentleOn',
       'gentleOff',
     ),
@@ -1933,6 +2087,11 @@ describe('#91 property: random gesture and session sequences', () => {
         return GESTURES[g]!(now, dirX);
       case 'release':
         return release(now);
+      case 'releaseOf': {
+        // The end of one contact: the release of gesture `g`'s region and kind (Decision 16).
+        const gi = GESTURES[g]!(now, dirX);
+        return gi.k === 'gesture' ? releaseOf(gi.region, gi.gesture, now) : release(now);
+      }
       case 'gentleOn':
         return gentle(true);
       case 'gentleOff':
@@ -1971,7 +2130,17 @@ describe('#91 property: random gesture and session sequences', () => {
           if (r.name === 'Idle' || r.name === 'Dozing') expect(r.reaction).toBeNull();
           if (r.name === 'Talking') {
             expect(r.reaction === null || r.reaction.r.sustained).toBe(true); // a sustained one carried over
-            expect(r.queued === null || r.queued.announced).toBe(true);
+            // Announced, or queued behind a higher-priority carried-over reaction (code review finding 2).
+            expect(
+              r.queued === null ||
+                r.queued.announced ||
+                (r.reaction !== null && r.queued.r.priority < r.reaction.r.priority),
+            ).toBe(true);
+          }
+          // Every contact up: nothing sustained stays held or queued (code review findings 1 and 3).
+          if (i.k === 'release' && i.region === undefined) {
+            expect(r.reaction === null || !r.reaction.r.sustained || r.reaction.release !== null).toBe(true);
+            expect(r.queued === null || !r.queued.r.sustained).toBe(true);
           }
           // While Talking, the carried-over reaction's refreshes and release output nothing (finding 1).
           const carried = prev.name === 'Talking' ? prev.reaction : null;
