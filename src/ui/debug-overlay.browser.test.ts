@@ -1,9 +1,10 @@
 /**
  * The debug overlay's VAD section (#56) in Vitest Browser Mode: its lines with a fake engine and session that emit
  * synthetic trace batches, CSP hygiene and unmount (issue #56 Validation 1); the formatters; the backend and
- * vadReady readings; the plot's energy-gate bar and segment markers (pixels); the gate replay against a sequential
- * energy gate; the ≤ 15 fps redraw; and the allocation probes. styles.css is not imported. T70's frame-line test
- * stays in src/anim/bear-view.browser.test.ts (#81).
+ * vadReady readings; what the plot draws (pixels: p, band, floor, thresholds, the energy-gate bar, the segment
+ * markers); the gate replay against a sequential energy gate (large jumps, and levels hovering at the hysteresis
+ * thresholds); the ≤ 15 fps redraw and the 250 ms text refresh; and the allocation probes. styles.css is not
+ * imported. T70's frame-line test stays in src/anim/bear-view.browser.test.ts (#81).
  */
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
@@ -13,15 +14,19 @@ import { initialSessionState } from '../app/machine.ts';
 import type { LevelEvent, TransitionListener } from '../app/session.ts';
 import type { EngineEvent } from '../audio/engine.ts';
 import { DEFAULT_ENERGY_PARAMS, energyGateStep, initialEnergyGateState } from '../dsp/energy-gate.ts';
+import { SILERO_SEG_PARAMS } from '../dsp/segmenter.ts';
 import {
   batchBackend,
   createVadPlot,
   DEBUG_GATE_BAR_PX,
   DEBUG_PLOT_COLORS,
+  DEBUG_PLOT_DB_MAX,
+  DEBUG_PLOT_DB_MIN,
   DEBUG_PLOT_HEIGHT,
   DEBUG_PLOT_MS,
   DEBUG_PLOT_SECONDS,
   DEBUG_PLOT_WIDTH,
+  DEBUG_REFRESH_MS,
   formatAudioContext,
   formatVadBackend,
   formatVadStats,
@@ -49,8 +54,8 @@ afterEach(() => {
 
 /**
  * A synthetic trace batch of `hops` hops from ctx frame `hop0Frame` at band dB `db(i)`. With `p`, every whole
- * 512-sample frame the hops span (160 samples each) gets that Silero p and inference time `ms`; without, there
- * are none (an energy epoch).
+ * 512-sample frame the hops span (160 samples each) gets that Silero p and an inference time from `ms` (one
+ * value, or cycled through a list); without, there are none (an energy epoch).
  */
 function batch(
   epoch: number,
@@ -58,7 +63,7 @@ function batch(
   db: (i: number) => number,
   hops: number,
   p?: number,
-  ms = 1,
+  ms: number | readonly number[] = 1,
 ): TraceBatch {
   const n32 = p === undefined ? 0 : Math.floor((hops * 160) / 512);
   const bandDb = new Float32Array(hops);
@@ -72,7 +77,9 @@ function batch(
     bandDb,
     voicing: new Float32Array(hops),
     sileroP: new Float32Array(n32).fill(p ?? 0),
-    inferMs: new Float32Array(n32).fill(ms),
+    inferMs: Float32Array.from({ length: n32 }, (_, j) =>
+      typeof ms === 'number' ? ms : (ms[j % ms.length] ?? 0),
+    ),
   };
 }
 
@@ -173,9 +180,20 @@ describe('the VAD section', () => {
       for (let i = 0; i < 25; i += 3) {
         r.emit({ t: 'level', epoch: 3, frame: hop0 + i * HOP, db: -50, floorDb: -60 });
       }
-      r.emit(batch(3, hop0, () => -50, 25, 0.8, 1.1));
-      if (k === 2) r.emit({ t: 'vadStats', p95Ms: 1.25 });
-      clock.advance(250);
+      // Varying inference times: the line shows the batch's largest.
+      r.emit(batch(3, hop0, () => -50, 25, 0.8, [0.4, 1.1, 0.7]));
+      if (k === 2) {
+        // The text refreshes every DEBUG_REFRESH_MS, not on the plot's faster ticks.
+        r.emit({ t: 'vadStats', p95Ms: 1.25 });
+        clock.advance(DEBUG_PLOT_MS);
+        expect(line('infer')).toBe('infer p95 – ms · max 1.10 ms');
+        clock.advance(DEBUG_REFRESH_MS - DEBUG_PLOT_MS - 1);
+        expect(line('infer')).toBe('infer p95 – ms · max 1.10 ms');
+        clock.advance(1);
+        expect(line('infer')).toBe('infer p95 1.25 ms · max 1.10 ms');
+      } else {
+        clock.advance(DEBUG_REFRESH_MS);
+      }
     }
     expect(clock.now()).toBe(1000);
 
@@ -270,14 +288,21 @@ function pixel(c: CanvasRenderingContext2D, x: number, y: number): number[] {
   return Array.from(c.getImageData(x, y, 1, 1).data);
 }
 
+/** The plot's data area above the energy-gate bar, in CSS px (dpr 1: canvas px). */
+const PLOT_H = DEBUG_PLOT_HEIGHT - DEBUG_GATE_BAR_PX;
+/** The y of a Silero p and of a level in dBFS, as debug-overlay.ts maps them. */
+const yOfP = (p: number): number => (1 - p) * PLOT_H;
+const yOfDb = (db: number): number =>
+  ((DEBUG_PLOT_DB_MAX - db) / (DEBUG_PLOT_DB_MAX - DEBUG_PLOT_DB_MIN)) * PLOT_H;
+
 describe('the plot', () => {
-  test('the energy-gate bar and the segment markers', () => {
+  test('what it draws: p, band, floor, the thresholds, the energy-gate bar and the segment markers', () => {
     const canvas = document.createElement('canvas');
     const plot = createVadPlot(canvas, 1);
     for (let i = 0; i < 100; i += 3) plot.level(1, i * HOP, -60);
-    // Floor −60: closed at −70, opens above −50 (−40), closes below −55 (−58).
+    // Floor −60: closed at −70, opens above −50 (−40), closes below −55 (−58). Silero p 0.9 throughout.
     plot.trace(
-      batch(1, 0, (i) => (i < 40 ? -70 : i < 70 ? -40 : -58), 100),
+      batch(1, 0, (i) => (i < 40 ? -70 : i < 70 ? -40 : -58), 100, 0.9),
       RATE,
     );
     plot.seg({ kind: 'start', frame: 45 * HOP });
@@ -308,6 +333,33 @@ describe('the plot', () => {
       expect(pixel(g, col - 1, 30), `marker at hop ${hop}`).toEqual(rgba(color));
       expect(pixel(g, col, 30), `marker at hop ${hop}`).toEqual(rgba(color));
     }
+
+    // The series, on rows their 1.5 px lines cover completely and in columns where nothing else is drawn on
+    // that row: p 0.9 near hop 20, band −40 near hop 55, floor −60 near hop 20.
+    expect(yOfP(0.9)).toBeCloseTo(15.4);
+    expect(pixel(g, Math.floor(xOf(20.5 * HOP)), Math.floor(yOfP(0.9))), 'p').toEqual(
+      rgba(DEBUG_PLOT_COLORS.p),
+    );
+    expect(pixel(g, Math.floor(xOf(55.5 * HOP)), Math.floor(yOfDb(-40))), 'band').toEqual(
+      rgba(DEBUG_PLOT_COLORS.band),
+    );
+    expect(pixel(g, Math.floor(xOf(20.5 * HOP)), Math.floor(yOfDb(-60))), 'floor').toEqual(
+      rgba(DEBUG_PLOT_COLORS.floor),
+    );
+    // The dashed threshold lines (half-transparent, 1 px, so their rows are blended): ink on the rows of
+    // 0.5 and 0.35 in a column left of the data, inside a dash, and none on a row between them.
+    const col = 100; // 100 mod (4 + 3) = 2: inside a 4 px dash
+    expect(xOf(0)).toBeGreaterThan(col + 10);
+    const [tr, tg, tb] = [26, 115, 232]; // DEBUG_PLOT_COLORS.threshold
+    for (const p of [SILERO_SEG_PARAMS.posThreshold, SILERO_SEG_PARAMS.negThreshold]) {
+      const [r, gr, b, a] = pixel(g, col, Math.round(yOfP(p)));
+      expect(a, `threshold ${p}`).toBeGreaterThan(0);
+      expect(
+        Math.abs(r! - tr) + Math.abs(gr! - tg) + Math.abs(b! - tb),
+        `threshold ${p}`,
+      ).toBeLessThanOrEqual(9);
+    }
+    expect(pixel(g, col, Math.round(yOfP(0.425)))[3], 'between the thresholds').toBe(0);
   });
 
   test('the bar replays the worker’s energy gate hop by hop (sequential reference, falling floors)', () => {
@@ -343,6 +395,42 @@ describe('the plot', () => {
       );
     }
     expect(opens).toBeGreaterThanOrEqual(20);
+    const replay = refActive.map((_, i) => plot.gateOpen(N - 1 - i));
+    expect(replay).toEqual(refActive);
+  });
+
+  test('the bar replays the worker’s energy gate hop by hop (levels hovering at the hysteresis thresholds)', () => {
+    // 1000 hops whose level sits within ±3 dB of the threshold the gate tests next (floor + 10 dB to open,
+    // floor + 5 dB to close), against the reference's own floor before the hop: decisions hang on hundredths of a
+    // dB, so a floor taken one hop early (the current hop's own posted floor) or one or two hops stale (re-pinning
+    // to the newest level on every hop) shows.
+    const N = 1000;
+    const db = new Float32Array(N);
+    const plot = createVadPlot(document.createElement('canvas'), 1);
+    const ref = initialEnergyGateState();
+    const refActive: boolean[] = [];
+    let seed = 2024;
+    let opens = 0;
+    for (let k = 0; k < N / 25; k++) {
+      for (let i = k * 25; i < (k + 1) * 25; i++) {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        const jitter = (seed / 2 ** 32) * 6 - 3;
+        const margin = ref.active
+          ? DEFAULT_ENERGY_PARAMS.offsetMarginDb
+          : DEFAULT_ENERGY_PARAMS.onsetMarginDb;
+        db[i] = Math.fround(ref.initialized ? ref.floorDb + margin + jitter : -60);
+        const was = ref.active;
+        energyGateStep(ref, { frame: i * HOP, db: db[i]!, floorDb: 0 }, DEFAULT_ENERGY_PARAMS);
+        if (ref.active && !was) opens++;
+        refActive.push(ref.active);
+        if (i % 3 === 0) plot.level(1, i * HOP, ref.initialized ? ref.floorDb : Number.NaN);
+      }
+      plot.trace(
+        batch(1, k * 25 * HOP, (i) => db[k * 25 + i]!, 25),
+        RATE,
+      );
+    }
+    expect(opens).toBeGreaterThanOrEqual(50);
     const replay = refActive.map((_, i) => plot.gateOpen(N - 1 - i));
     expect(replay).toEqual(refActive);
   });
@@ -409,21 +497,64 @@ describe('allocation probes', () => {
     }
     const ROUND = 600;
     const BOUND = 4096;
-    // Until V8 has optimised a function, its lower tiers box fractional numbers. Measured on Chromium 1243:
-    // drawing is allocation-free after 2000 warm-up calls, ingesting only after about 5000.
-    const WARM_UP = 5000;
-    /** The smallest heap growth over 3 rounds of ROUND calls, each after a forced GC and with none after it, so
-     *  whatever the calls allocate shows. */
-    const minGrowth = (call: (k: number) => void): number => {
-      let min = Number.POSITIVE_INFINITY;
-      for (let round = 0; round < 3; round++) {
+    /**
+     * The heap growth of each of `rounds` rounds of ROUND calls, each round after a forced GC and with none after
+     * it, so whatever the calls allocate shows. A probe takes the smallest (an optimising compile that lands in a
+     * round adds a few KB once, and a real allocation shows in every round); a positive control takes the largest
+     * (a GC that runs inside a round can only lower that round's growth).
+     */
+    const growths = (call: (k: number) => void, rounds: number): number[] => {
+      const out: number[] = [];
+      for (let round = 0; round < rounds; round++) {
         gc();
         const before = usedJSHeapSize();
         for (let k = 0; k < ROUND; k++) call(k);
-        min = Math.min(min, usedJSHeapSize() - before);
+        out.push(usedJSHeapSize() - before);
       }
-      return min;
+      return out;
     };
+    // Until V8 has optimised a function, its lower tiers box fractional numbers, so each path is warmed up first,
+    // with every batch shape and rate the other tests use as well, so the probe doesn't depend on them running
+    // first (or not).
+    const shapes = createVadPlot(document.createElement('canvas'), 1);
+    let at = 0;
+    for (let k = 0; k < 400; k++) {
+      const rate = k % 2 === 0 ? 48_000 : 44_100;
+      const hop = rate / 100;
+      const epoch = 1 + (k % 3);
+      const hop0 = at;
+      at += 160 * hop;
+      for (let i = 0; i < 154; i += 3) shapes.level(epoch, hop0 + i * hop, i % 2 === 0 ? -60 : Number.NaN);
+      shapes.trace(
+        batch(epoch, hop0, (i) => -70 + (i % 7) * 5, 25, 0.8, [0.4, 1.1, 0.7]),
+        rate,
+      );
+      shapes.trace(
+        batch(epoch, hop0 + 25 * hop, () => -50, 25),
+        rate,
+      );
+      shapes.trace(
+        batch(epoch, hop0 + 50 * hop, () => -50, 3),
+        rate,
+      );
+      shapes.trace(
+        batch(epoch, hop0 + 53 * hop, () => -40, 1),
+        rate,
+      );
+      shapes.trace(
+        batch(epoch, hop0 + 54 * hop, (i) => -60 + (i % 3), 100, 0.3),
+        rate,
+      );
+      shapes.seg(
+        k % 3 === 0
+          ? { kind: 'start', frame: hop0 }
+          : k % 3 === 1
+            ? { kind: 'end', frame: hop0, lastSpeechFrame: hop0, reason: 'silence' }
+            : { kind: 'misfire', frame: hop0 },
+      );
+      shapes.draw(hop0 + 154 * hop + 0.5, rate);
+    }
+
     // 44.1 kHz: the Silero frames' ctx frames (1411.2 apart) are fractional.
     const rate = 44_100;
     const hop = rate / 100;
@@ -450,12 +581,12 @@ describe('allocation probes', () => {
       const end = ends[k];
       if (typeof end === 'number') plot.draw(end, rate);
     };
-    for (let k = 0; k < WARM_UP; k++) drawAt(k % ROUND);
-    const drawGrowth = minGrowth(drawAt);
-    const drawControl = minGrowth((k) => {
+    for (let k = 0; k < 5000; k++) drawAt(k % ROUND);
+    const draw = growths(drawAt, 5);
+    const drawControl = growths((k) => {
       drawAt(k);
       sink = [k];
-    });
+    }, 3);
 
     // Ingest one reused batch object and one level per call, their frames advancing like the worker's (whole ctx
     // frames, as the worker rounds them).
@@ -468,17 +599,18 @@ describe('allocation probes', () => {
       plot.level(1, next.hop0, -60.5);
       plot.trace(b, rate);
     };
-    for (let k = 0; k < WARM_UP; k++) ingest();
-    const ingestGrowth = minGrowth(ingest);
-    const ingestControl = minGrowth((k) => {
+    for (let k = 0; k < 10_000; k++) ingest();
+    const ingested = growths(ingest, 5);
+    const ingestControl = growths((k) => {
       ingest();
       sink = [k];
-    });
+    }, 3);
 
-    expect(drawGrowth, `draw: ${drawGrowth} B per ${ROUND} draws`).toBeLessThan(BOUND);
-    expect(drawControl, `draw control: ${drawControl} B`).toBeGreaterThanOrEqual(BOUND);
-    expect(ingestGrowth, `ingest: ${ingestGrowth} B per ${ROUND} batches`).toBeLessThan(BOUND);
-    expect(ingestControl, `ingest control: ${ingestControl} B`).toBeGreaterThanOrEqual(BOUND);
+    const report = `draw ${draw.join('/')}, control ${drawControl.join('/')}; ingest ${ingested.join('/')}, control ${ingestControl.join('/')} (B per ${ROUND} calls)`;
+    expect(Math.min(...draw), report).toBeLessThan(BOUND);
+    expect(Math.max(...drawControl), report).toBeGreaterThanOrEqual(BOUND);
+    expect(Math.min(...ingested), report).toBeLessThan(BOUND);
+    expect(Math.max(...ingestControl), report).toBeGreaterThanOrEqual(BOUND);
     expect(sink).not.toBeNull();
   });
 });
