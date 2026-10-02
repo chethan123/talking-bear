@@ -29,6 +29,8 @@ jobs:
       - run: pnpm verify
       - run: pnpm test:coverage
       - run: pnpm parity
+      - run: pnpm corpus --subset fast
+      - run: pnpm vad-eval --corpus fast --gate tts
       - run: pnpm test:browser
       - run: pnpm build
       - run: pnpm check:no-hooks
