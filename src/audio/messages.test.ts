@@ -41,6 +41,7 @@ const mainToWorker: Samples<MainToWorker> = {
   reset: () => ({ t: 'reset', epoch: 3, vad: 'energy', restoreFloorDb: -47, pregate: true }),
   process: () => ({ t: 'process', id: 9, pcm: ramp(480), sampleRate: 48000, preset: PRESETS.cub }),
   init: () => ({ t: 'init', ctxRate: 48000, port: port() }),
+  trace: () => ({ t: 'trace', on: true }),
 };
 const workerToMain: Samples<WorkerToMain> = {
   seg: () => ({ t: 'seg', epoch: 3, ev: { kind: 'start', frame: 52_800 } }),
@@ -48,6 +49,17 @@ const workerToMain: Samples<WorkerToMain> = {
   floorSnapshot: () => ({ t: 'floorSnapshot', epoch: 3, floorDb: -52.25 }),
   vadStats: () => ({ t: 'vadStats', p95Ms: 4.5 }),
   vadReady: () => ({ t: 'vadReady', backend: 'silero' }),
+  traceBatch: () => ({
+    t: 'traceBatch',
+    epoch: 3,
+    hop0Frame: 52_800,
+    sil0Frame: 52_800,
+    rawDb: ramp(25),
+    bandDb: ramp(25, 1),
+    voicing: ramp(25, 2),
+    sileroP: ramp(8, 3),
+    inferMs: ramp(8, 4),
+  }),
   processed: () => ({
     t: 'processed',
     id: 9,
@@ -110,6 +122,21 @@ const cases: [string, Factory][] = [
       clipped: false,
     }),
   ],
+  // No Silero values (the energy backend): two zero-length streams, transferred too, and a NaN sil0Frame.
+  [
+    'WorkerToMain traceBatch (no Silero: empty streams, NaN sil0Frame)',
+    () => ({
+      t: 'traceBatch',
+      epoch: 4,
+      hop0Frame: 96_000,
+      sil0Frame: Number.NaN,
+      rawDb: ramp(7),
+      bandDb: ramp(7, 1),
+      voicing: ramp(7, 2),
+      sileroP: new Float32Array(0),
+      inferMs: new Float32Array(0),
+    }),
+  ],
 ];
 
 /** Every ArrayBuffer (behind a typed array) and MessagePort reachable from `v`: the independent oracle. */
@@ -152,14 +179,17 @@ describe('transferList + structuredClone', () => {
       'MainToWorker reset',
       'MainToWorker process',
       'MainToWorker init',
+      'MainToWorker trace',
       'WorkerToMain seg',
       'WorkerToMain level',
       'WorkerToMain floorSnapshot',
       'WorkerToMain vadStats',
       'WorkerToMain vadReady',
+      'WorkerToMain traceBatch',
       'WorkerToMain processed',
       'WorkerToMain error',
       'WorkerToMain processed (empty envelope)',
+      'WorkerToMain traceBatch (no Silero: empty streams, NaN sil0Frame)',
     ]);
   });
 
@@ -197,6 +227,12 @@ describe('transferList + structuredClone', () => {
     expect(sizes.every((n) => n > 0)).toBe(true);
     structuredClone(msg, { transfer: transferList(msg) });
     expect(views.map((v) => v.length)).toEqual([0, 0, 0, 0, 0]);
+
+    const batch = workerToMain.traceBatch();
+    const streams = [batch.rawDb, batch.bandDb, batch.voicing, batch.sileroP, batch.inferMs];
+    expect(streams.every((v) => v.buffer.byteLength > 0)).toBe(true);
+    structuredClone(batch, { transfer: transferList(batch) });
+    expect(streams.map((v) => v.length)).toEqual([0, 0, 0, 0, 0]);
   });
 
   test('a buffer shared by several views is listed once, so the transfer succeeds', () => {
@@ -248,8 +284,8 @@ describe('dsp types', () => {
 describe('message kinds (type-level tripwire, checked by `pnpm typecheck`)', () => {
   test('WorkerToMain and MainToWorker have exactly the listed kinds', () => {
     expectTypeOf<WorkerToMain['t']>().toEqualTypeOf<
-      'seg' | 'level' | 'floorSnapshot' | 'vadStats' | 'vadReady' | 'processed' | 'error'
+      'seg' | 'level' | 'floorSnapshot' | 'vadStats' | 'vadReady' | 'traceBatch' | 'processed' | 'error'
     >();
-    expectTypeOf<MainToWorker['t']>().toEqualTypeOf<'reset' | 'process' | 'init'>();
+    expectTypeOf<MainToWorker['t']>().toEqualTypeOf<'reset' | 'process' | 'init' | 'trace'>();
   });
 });

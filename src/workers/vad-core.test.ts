@@ -26,11 +26,14 @@ import { createSilero, type SileroModel } from '../dsp/silero/model.ts';
 import { decodeWeights, type SileroWeights } from '../dsp/silero/weights.ts';
 import { PRESETS } from '../dsp/types.ts';
 import { processVoice } from '../dsp/voice.ts';
+import { createVoicing } from '../dsp/voicing.ts';
 import {
+  LEVEL_EVERY_HOPS,
   MIN_VOICED_MS,
   PREGATE_HOLD_FRAMES,
   PROXIMITY_HISTORY_HOPS,
   SILERO_NOT_READY_MESSAGE,
+  TRACE_BATCH_HOPS,
   VAD_STATS_WINDOW,
   VadCore,
   type VadCoreOptions,
@@ -1129,6 +1132,371 @@ describe('no allocation on the per-frame path', () => {
   });
 });
 
+// ---- Feature trace (setTrace) ----
+
+type TraceBatch = Extract<WorkerToMain, { t: 'traceBatch' }>;
+type TraceStream = 'rawDb' | 'bandDb' | 'voicing' | 'sileroP' | 'inferMs';
+
+function traceBatches(msgs: WorkerToMain[]): TraceBatch[] {
+  return ofType(msgs, 'traceBatch');
+}
+
+function nonTrace(msgs: WorkerToMain[]): WorkerToMain[] {
+  return msgs.filter((m) => m.t !== 'traceBatch');
+}
+
+/** One stream of every batch, joined in order. */
+function joined(batches: TraceBatch[], name: TraceStream): Float32Array {
+  const out = new Float32Array(batches.reduce((n, b) => n + b[name].length, 0));
+  let at = 0;
+  for (const b of batches) {
+    out.set(b[name], at);
+    at += b[name].length;
+  }
+  return out;
+}
+
+/** [epoch, hops, Silero values] of each batch. */
+function shapes(batches: TraceBatch[]): [number, number, number][] {
+  return batches.map((b) => [b.epoch, b.rawDb.length, b.sileroP.length]);
+}
+
+/** vowel_f0-140 (2.8 s) zero-padded to exactly 3.0 s: 94 frames, the last one partly zero. */
+function vowel3s(): Float32Array[] {
+  return frames16k(concat48(fixture('vowel_f0-140'), new Float32Array(0.2 * CTX_RATE)), 0);
+}
+
+/** A clock that advances 0.25 ms per call: every inference measures exactly 0.25 ms. */
+function steppingClock(): () => number {
+  let t = 0;
+  return () => (t += 0.25);
+}
+
+/** A core on `vad` (with `model` set, if any), the trace on from before the first frame, fed `frames`
+ *  (frame k at ctx frame k · 512 · 3), then the trace off. */
+function traced(
+  frames: Float32Array[],
+  vad: 'silero' | 'energy',
+  model: SileroModel | null,
+  pregate = false,
+  trace = true,
+): Run {
+  const run = newCore(CTX_RATE, { now: steppingClock() });
+  if (model !== null) run.core.setModel(model);
+  run.core.reset(1, vad, undefined, pregate);
+  run.core.setTrace(trace);
+  feed(run, 1, frames);
+  run.core.setTrace(false);
+  return run;
+}
+
+/** The four trace streams of `frames` (one epoch from its first frame), computed from scratch with the
+ *  production functions, as scripts/gen-vad-fingerprint.ts computes them. */
+function referenceStreams(frames: Float32Array[]): Record<Exclude<TraceStream, 'inferMs'>, Float32Array> {
+  const n = frames.length * FRAME;
+  const raw = new Float32Array(n);
+  const band = new Float32Array(n);
+  const gate = createGateFilter(16000);
+  const model = createSilero(W);
+  const sileroP = new Float32Array(frames.length);
+  frames.forEach((f, k) => {
+    raw.set(f, k * FRAME);
+    gate.process(f, band.subarray(k * FRAME, (k + 1) * FRAME));
+    sileroP[k] = model.process(f);
+  });
+  const hops = Math.floor(n / ENERGY_HOP);
+  const scorer = createVoicing(16000);
+  const win = new Float32Array(512);
+  const rawDb = new Float32Array(hops);
+  const bandDb = new Float32Array(hops);
+  const voicing = new Float32Array(hops);
+  for (let j = 0; j < hops; j++) {
+    const from = j * ENERGY_HOP;
+    const to = from + ENERGY_HOP;
+    rawDb[j] = frameDb(raw, from, to);
+    bandDb[j] = frameDb(band, from, to);
+    win.copyWithin(0, ENERGY_HOP);
+    win.set(band.subarray(from, to), win.length - ENERGY_HOP);
+    voicing[j] = scorer.score(win);
+  }
+  return { rawDb, bandDb, voicing, sileroP };
+}
+
+/** The non-trace messages of a `traced` run (a fresh SpyModel for Silero). */
+function others(
+  frames: Float32Array[],
+  vad: 'silero' | 'energy',
+  pregate: boolean,
+  trace: boolean,
+): WorkerToMain[] {
+  return nonTrace(traced(frames, vad, vad === 'silero' ? new SpyModel() : null, pregate, trace).msgs);
+}
+
+describe('VadCore feature trace (setTrace)', () => {
+  it('V1a: 3 s of vowel_f0-140 on Silero gives 12 batches of 25 hops: 300 hops and 94 Silero values', () => {
+    const frames = vowel3s();
+    expect(frames).toHaveLength(94);
+    const spy = new SpyModel();
+    const batches = traceBatches(traced(frames, 'silero', spy).msgs);
+    const hops = batches.reduce((n, b) => n + b.rawDb.length, 0);
+    expect(hops).toBe(Math.floor((frames.length * FRAME) / ENERGY_HOP));
+    expect(Math.abs(hops - 300)).toBeLessThanOrEqual(1);
+    expect(batches.reduce((n, b) => n + b.sileroP.length, 0)).toBe(94);
+    expect(spy.calls).toBe(94);
+    expect(batches.map((b) => b.rawDb.length)).toEqual(Array<number>(12).fill(TRACE_BATCH_HOPS));
+    for (const b of batches) {
+      expect(b.epoch).toBe(1);
+      expect(b.bandDb).toHaveLength(b.rawDb.length);
+      expect(b.voicing).toHaveLength(b.rawDb.length);
+      expect(b.inferMs).toHaveLength(b.sileroP.length);
+      expect(b.sileroP.length).toBeGreaterThanOrEqual(7); // 25 hops are 7.8 frames
+      expect(b.sileroP.length).toBeLessThanOrEqual(8);
+    }
+  });
+
+  it.each([
+    ['48 kHz', 48000, (k: number): number => Math.round(k * FRAME * 3)],
+    ['44.1 kHz', 44100, tag441],
+  ] as const)(
+    'V1b: at %s each batch starts where the previous one ended (hop0Frame and sil0Frame)',
+    (_name, rate, tag) => {
+      const frames = noiseLedVowelFrames();
+      const run = newCore(rate);
+      run.core.setModel(new SpyModel());
+      run.core.reset(1, 'silero');
+      run.core.setTrace(true);
+      frames.forEach((f, k) => run.core.frame(1, tag(k), f));
+      run.core.setTrace(false);
+      /** The ctx frame of hop j, as VadCore labels it: its first sample's frame plus the offset into it. */
+      const hopFrame = (j: number): number => {
+        const s = j * ENERGY_HOP;
+        return Math.round(tag(Math.floor(s / FRAME)) + ((s % FRAME) * rate) / 16000);
+      };
+      const batches = traceBatches(run.msgs);
+      expect(batches.length).toBeGreaterThan(20);
+      expect(batches[0]!.hop0Frame).toBe(tag(0));
+      expect(batches[0]!.sil0Frame).toBe(tag(0));
+      let hops = 0;
+      let sil = 0;
+      batches.forEach((b, i) => {
+        if (i < batches.length - 1) expect(b.rawDb).toHaveLength(TRACE_BATCH_HOPS);
+        expect(b.hop0Frame).toBe(hopFrame(hops));
+        if (b.sileroP.length > 0) expect(b.sil0Frame).toBe(tag(sil));
+        else expect(b.sil0Frame).toBeNaN();
+        hops += b.rawDb.length;
+        sil += b.sileroP.length;
+      });
+      expect(hops).toBe(Math.floor((frames.length * FRAME) / ENERGY_HOP));
+      expect(sil).toBe(frames.length);
+    },
+  );
+
+  it('V1c: with the trace on, pregate: true still sends every frame through the model', () => {
+    const frames = frames16k(fixture('noise_white_-60dbfs_3s'));
+    const spy = new SpyModel();
+    const run = traced(frames, 'silero', spy, true);
+    expect(spy.calls).toBe(frames.length);
+    expect(joined(traceBatches(run.msgs), 'sileroP')).toHaveLength(frames.length);
+    // Control: without the trace, the pre-gate skips ≥ 70 % of these frames (test 5a).
+    const plain = new SpyModel();
+    runSilero(frames, plain, true);
+    expect(plain.calls).toBeLessThanOrEqual(0.3 * frames.length);
+    // With the trace on, the pre-gate changes nothing: same p for every frame as without it.
+    const ungated = traceBatches(traced(frames, 'silero', new SpyModel(), false).msgs);
+    expect(joined(traceBatches(run.msgs), 'sileroP')).toEqual(joined(ungated, 'sileroP'));
+  });
+
+  it('the pre-gate skips again once the trace is off', () => {
+    const frames = frames16k(fixture('noise_white_-60dbfs_3s'));
+    const spy = new SpyModel();
+    const run = newCore();
+    run.core.setModel(spy);
+    run.core.reset(1, 'silero', undefined, true);
+    run.core.setTrace(true);
+    feed(run, 1, frames.slice(0, 47));
+    run.core.setTrace(false);
+    expect(spy.calls).toBe(47);
+    const rest = frames.slice(47);
+    feed(run, 1, rest, 47 * SILERO_GRID);
+    expect(rest.length).toBeGreaterThan(PREGATE_HOLD_FRAMES);
+    expect(spy.calls - 47).toBe(0); // the hold count ran on while tracing: skipping resumes at once
+  });
+
+  it('V1d: with the trace off, no batch is posted', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    expect(traceBatches(runFixture('vowel_f0-140').msgs)).toEqual([]);
+    expect(traceBatches(runSilero(frames, new SpyModel(), true).msgs)).toEqual([]);
+    expect(traceBatches(traced(frames, 'silero', new SpyModel(), false, false).msgs)).toEqual([]);
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    run.core.setTrace(false); // never on: nothing to flush
+    expect(run.msgs).toEqual([]);
+    run.core.setTrace(true);
+    feed(run, 1, frames.slice(0, 10));
+    run.core.setTrace(false);
+    expect(shapes(traceBatches(run.msgs))).toEqual([
+      [1, 25, 0],
+      [1, 7, 0],
+    ]);
+    feed(run, 1, frames.slice(10), 10 * SILERO_GRID);
+    run.core.setTrace(false); // already off: no-op
+    expect(traceBatches(run.msgs)).toHaveLength(2);
+  });
+
+  it("the streams are the VAD's own values: bit-exact against the production front end, level.db = bandDb", () => {
+    const frames = noiseLedVowelFrames();
+    const run = traced(frames, 'silero', new SpyModel());
+    const batches = traceBatches(run.msgs);
+    const ref = referenceStreams(frames);
+    expect(ref.rawDb.length).toBeGreaterThan(500);
+    for (const name of ['rawDb', 'bandDb', 'voicing', 'sileroP'] as const) {
+      expect(joined(batches, name), name).toEqual(ref[name]);
+    }
+    // The raw and band-limited levels differ (the band limit removes the noise's out-of-band power).
+    expect(ref.rawDb.some((db, j) => db !== ref.bandDb[j])).toBe(true);
+    // `level` carries the gate's own dB of every 3rd hop: the same value as the trace's bandDb.
+    const band = joined(batches, 'bandDb');
+    expect(levels(run.msgs).map((m) => Math.fround(m.db))).toEqual(
+      Array.from(band.filter((_, j) => j % LEVEL_EVERY_HOPS === 0)),
+    );
+    const ms = joined(batches, 'inferMs');
+    expect(ms).toHaveLength(frames.length);
+    expect(ms.every((v) => v === 0.25)).toBe(true);
+  });
+
+  it('the trace changes no other message, except that the pre-gate then runs as if it were off', () => {
+    const snr = frames16k(fixture('vowel_f0-140_pink_snr10'));
+    const energy = others(snr, 'energy', false, false);
+    expect(kinds(energy)).toEqual(['start', 'end']);
+    expect(others(snr, 'energy', false, true)).toEqual(energy);
+    const led = noiseLedVowelFrames();
+    const silero = others(led, 'silero', false, false);
+    expect(kinds(silero)).toEqual(['start', 'end']);
+    expect(others(led, 'silero', false, true)).toEqual(silero);
+    expect(others(led, 'silero', true, true)).toEqual(silero);
+  });
+
+  it('Silero absent (energy, or Silero without a model): empty Silero streams, NaN sil0Frame, every hop', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    for (const vad of ['energy', 'silero'] as const) {
+      const batches = traceBatches(traced(frames, vad, null).msgs);
+      expect(batches.length).toBeGreaterThan(10);
+      for (const b of batches) {
+        expect(b.sileroP).toHaveLength(0);
+        expect(b.inferMs).toHaveLength(0);
+        expect(b.sil0Frame).toBeNaN();
+        expect(Number.isFinite(b.hop0Frame)).toBe(true);
+      }
+      const v = joined(batches, 'voicing');
+      expect(v).toHaveLength(Math.floor((frames.length * FRAME) / ENERGY_HOP));
+      expect(Math.max(...v)).toBeGreaterThan(0.9); // the vowel is voiced on both backends' traces
+      expect(joined(batches, 'rawDb')).toEqual(referenceStreams(frames).rawDb);
+    }
+  });
+
+  it('a model that throws on its 3rd call leaves 2 Silero values in the trace, then none', () => {
+    let calls = 0;
+    const model: SileroModel = {
+      reset: () => undefined,
+      process: () => {
+        calls++;
+        if (calls === 3) throw new Error('boom');
+        return 0.125;
+      },
+    };
+    const run = traced(frames16k(fixture('vowel_f0-140')), 'silero', model);
+    const batches = traceBatches(run.msgs);
+    expect(ofType(run.msgs, 'error')).toHaveLength(1);
+    expect(joined(batches, 'sileroP')).toEqual(new Float32Array([0.125, 0.125]));
+    expect(batches[0]!.sileroP).toHaveLength(2);
+    expect(batches[0]!.sil0Frame).toBe(0);
+    expect(batches.slice(1).every((b) => b.sileroP.length === 0 && Number.isNaN(b.sil0Frame))).toBe(true);
+  });
+
+  it('reset flushes the partial batch under the old epoch, and the trace stays on in the new one', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const run = newCore();
+    run.core.setModel(new SpyModel());
+    run.core.reset(1, 'silero');
+    run.core.setTrace(true);
+    feed(run, 1, frames.slice(0, 10)); // 32 hops: a batch closes at the end of frame 7 (25.6 hops)
+    expect(shapes(traceBatches(run.msgs))).toEqual([[1, 25, 8]]);
+    run.core.reset(2, 'silero');
+    let batches = traceBatches(run.msgs);
+    expect(shapes(batches)).toEqual([
+      [1, 25, 8],
+      [1, 7, 2],
+    ]);
+    expect(batches[1]!.hop0Frame).toBe(25 * 480);
+    expect(batches[1]!.sil0Frame).toBe(8 * SILERO_GRID);
+    const offset = 1_000_000;
+    feed(run, 2, frames.slice(0, 10), offset);
+    run.core.setTrace(false);
+    batches = traceBatches(run.msgs);
+    expect(shapes(batches.slice(2))).toEqual([
+      [2, 25, 8],
+      [2, 7, 2],
+    ]);
+    expect(batches[2]!.hop0Frame).toBe(offset);
+    expect(batches[2]!.sil0Frame).toBe(offset);
+    // Nothing collected: neither a reset nor the trace going off posts anything.
+    const idle = newCore();
+    idle.core.setTrace(true);
+    idle.core.reset(1, 'energy');
+    idle.core.reset(2, 'energy');
+    idle.core.setTrace(false);
+    expect(idle.msgs).toEqual([]);
+  });
+
+  it("turned on mid-epoch and mid-hop, the trace starts at the next hop, with that hop's full raw level", () => {
+    const frames = noiseLedVowelFrames(); // −70 dBFS noise from frame 0, so every hop has a level of its own
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    feed(run, 1, frames.slice(0, 7)); // 3584 samples: 22 hops, and 64 samples of the 23rd
+    run.core.setTrace(true);
+    feed(run, 1, frames.slice(7, 20), 7 * SILERO_GRID);
+    run.core.setTrace(false);
+    const batches = traceBatches(run.msgs);
+    expect(batches[0]!.hop0Frame).toBe(22 * 480);
+    expect(batches.reduce((n, b) => n + b.rawDb.length, 0)).toBe(64 - 22);
+    const ref = referenceStreams(frames.slice(0, 20));
+    expect(Math.min(...ref.rawDb.subarray(22))).toBeGreaterThan(-100); // real levels, not digital silence
+    expect(joined(batches, 'rawDb')).toEqual(ref.rawDb.subarray(22));
+    expect(joined(batches, 'bandDb')).toEqual(ref.bandDb.subarray(22));
+    expect(joined(batches, 'voicing')).toEqual(ref.voicing.subarray(22));
+  });
+
+  it.each([
+    ['silero', true],
+    ['energy', false],
+  ] as const)(
+    'with the trace on (%s, pregate %s), the only array allocations are the five arrays of each traceBatch',
+    (vad, pregate) => {
+      const frames = noiseLedVowelFrames();
+      let batches = 0;
+      const core = new VadCore(CTX_RATE, (m) => {
+        if (m.t === 'traceBatch') batches++;
+      });
+      if (vad === 'silero') core.setModel(createSilero(W));
+      core.reset(1, vad, undefined, pregate);
+      core.setTrace(true);
+      let k = 0;
+      const step = (): void => {
+        core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
+        k++;
+      };
+      for (let i = 0; i < 60; i++) step();
+      const before = batches;
+      const allocations = countAllocations(() => {
+        for (let i = 0; i < 200; i++) step();
+      });
+      const posted = batches - before;
+      expect(posted).toBeGreaterThanOrEqual(25); // 200 frames are 640 hops
+      expect(allocations).toBe(5 * posted);
+    },
+  );
+});
+
 // ---- Worker glue (dsp.worker.ts) with a fake `self` and a fake MessagePort ----
 
 type Listener = (e: { data: unknown }) => void;
@@ -1346,6 +1714,62 @@ describe('dsp.worker glue', () => {
       proximityDb: 9,
     });
     expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true, 9);
+  });
+
+  /** Inits a VadCore on a new port, resets it to `epoch` (energy) and feeds it `frames`. */
+  function initAndFeed(epoch: number, frames: Float32Array[]): FakePort {
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    self.dispatch({ t: 'reset', epoch, vad: 'energy' });
+    frames.forEach((pcm16k, i) => port.dispatch({ t: 'frame', epoch, firstFrame: i * SILERO_GRID, pcm16k }));
+    return port;
+  }
+
+  it('trace before init is remembered; each traceBatch is posted with its five stream buffers transferred', () => {
+    self.dispatch({ t: 'trace', on: true });
+    expect(self.posted).toEqual([]);
+    initAndFeed(9, frames16k(fixture('vowel_f0-140')));
+    const posts = self.posted.filter((p) => p.msg.t === 'traceBatch');
+    expect(posts.length).toBeGreaterThan(10);
+    for (const { msg, transfer } of posts) {
+      if (msg.t !== 'traceBatch') throw new Error(`unexpected ${msg.t}`);
+      expect(msg.epoch).toBe(9);
+      expect(msg.rawDb).toHaveLength(TRACE_BATCH_HOPS);
+      const buffers = [msg.rawDb, msg.bandDb, msg.voicing, msg.sileroP, msg.inferMs].map((v) => v.buffer);
+      expect(new Set(buffers).size).toBe(5);
+      expect(transfer).toHaveLength(5);
+      for (const b of buffers) expect(transfer).toContain(b);
+    }
+  });
+
+  it('trace off flushes the partial batch; later frames post no batch', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    self.dispatch({ t: 'trace', on: true });
+    const port = initAndFeed(2, frames.slice(0, 10));
+    expect(shapes(traceBatches(sent()))).toEqual([[2, 25, 0]]);
+    self.dispatch({ t: 'trace', on: false });
+    expect(shapes(traceBatches(sent()))).toEqual([
+      [2, 25, 0],
+      [2, 7, 0],
+    ]);
+    frames
+      .slice(10)
+      .forEach((pcm16k, i) =>
+        port.dispatch({ t: 'frame', epoch: 2, firstFrame: (10 + i) * SILERO_GRID, pcm16k }),
+      );
+    expect(traceBatches(sent())).toHaveLength(2);
+  });
+
+  it('a later init keeps the trace setting for the new VadCore', () => {
+    const frames = frames16k(fixture('vowel_f0-140')).slice(0, 10);
+    self.dispatch({ t: 'trace', on: true });
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    initAndFeed(3, frames);
+    expect(shapes(traceBatches(sent()))).toEqual([[3, 25, 0]]);
+    self.dispatch({ t: 'trace', on: false });
+    self.posted.length = 0;
+    initAndFeed(4, frames);
+    expect(traceBatches(sent())).toEqual([]);
   });
 
   it('turns handler exceptions into error messages', () => {
