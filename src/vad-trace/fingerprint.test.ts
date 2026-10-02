@@ -53,7 +53,10 @@ describe('VAD front-end fingerprint', () => {
   });
 
   it("the golden is in the generator's canonical form (pnpm gen:vad-fingerprint rewrites it byte for byte)", async () => {
-    expect(await formatGolden(golden)).toBe(goldenText);
+    expect(
+      await formatGolden(golden),
+      'fingerprint.golden.json is not in canonical form: run pnpm gen:vad-fingerprint (under the same revision it keeps the values)',
+    ).toBe(goldenText);
   });
 });
 
