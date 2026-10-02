@@ -19,8 +19,12 @@ export const MAX_SUBSTEPS = 6;
 const STEP_EPS = 1e-9;
 
 export class Stepper {
-  /** Simulated time owed to the physics, in seconds; always in [0, SUBSTEP − STEP_EPS). */
-  #acc = 0;
+  /**
+   * Simulated time owed to the physics, in seconds; always in [0, SUBSTEP − STEP_EPS). A one-slot
+   * `Float64Array`, not a class field: V8's mid tier boxes a double written to a class field as a new heap number
+   * on every write (#214).
+   */
+  readonly #acc = new Float64Array(1);
 
   /**
    * Adds one frame's time and runs as many whole `SUBSTEP`s as are due, at most `MAX_SUBSTEPS`.
@@ -32,7 +36,8 @@ export class Stepper {
    * Never allocates.
    */
   advance(frameDt: number, step: (dt: number) => void): number {
-    let acc = this.#acc + (frameDt > 0 ? Math.min(frameDt, MAX_FRAME_DT) : 0);
+    // min(frameDt, MAX_FRAME_DT), written out: where V8 doesn't inline Math.min, it boxes the arguments.
+    let acc = this.#acc[0]! + (frameDt > 0 ? (frameDt < MAX_FRAME_DT ? frameDt : MAX_FRAME_DT) : 0);
     let substeps = 0;
     while (substeps < MAX_SUBSTEPS && acc >= SUBSTEP - STEP_EPS) {
       step(SUBSTEP);
@@ -41,7 +46,7 @@ export class Stepper {
     }
     // A negative residue is rounding from the tolerance; a residue of a whole substep is over budget.
     if (acc < 0 || acc >= SUBSTEP - STEP_EPS) acc = 0;
-    this.#acc = acc;
+    this.#acc[0] = acc;
     return acc / SUBSTEP;
   }
 }

@@ -4,7 +4,8 @@
  * `render` is a pure function of the pose: it walks the parts in draw order with `setTransform`, filling the
  * `Path2D` objects the rig built once, and draws the mouth and the dizzy stars parametrically on the context
  * (`moveTo`, `lineTo`, `quadraticCurveTo`, `bezierCurveTo`, `ellipse`), so no string, path or array is made per frame.
- * (`roundRect` is avoided on purpose: Chromium boxes its double arguments, i.e. it allocates per call.)
+ * (`roundRect` is avoided on purpose: Chromium boxes its double arguments, i.e. it allocates per call.) The mouth
+ * is drawn inside `render`'s parts loop, not by a helper of its own: see `render` (#214).
  * The one per-resize object is the background gradient, cached per context and rebuilt only when the backing
  * store's size changes.
  *
@@ -155,74 +156,6 @@ function setBoneTransform(g: CanvasRenderingContext2D, i: number, view: View): v
   );
 }
 
-/**
- * The mouth, in jaw-bone space at `MOUTH.x/y`. The interior is closed by two cubics: the top lip curve
- * (left corner → right corner) and the jaw curve (back). `MouthRound` pulls the corners in by up to 30 %,
- * lifts the top curve and widens the jaw curve's control points towards an ellipse. The tongue (an ellipse)
- * and the teeth (a rounded rect along the top) are clipped to the interior. Nothing shows while the mouth is
- * shut (open < 0.5 design units): the upper lip line is the closed mouth.
- */
-function drawMouth(g: CanvasRenderingContext2D, pose: Pose, view: View): void {
-  // Clamps are written out, not a helper: a call TurboFan doesn't inline boxes doubles (allocates).
-  const jawRaw = pose[Ch.Jaw]!;
-  const jaw = jawRaw < 0 ? 0 : jawRaw > 1 ? 1 : jawRaw;
-  const open = MOUTH.openRange * jaw;
-  if (open < 0.5) return;
-  const roundRaw = pose[Ch.MouthRound]!;
-  const round = roundRaw < 0 ? 0 : roundRaw > 1 ? 1 : roundRaw;
-  const wRaw = pose[Ch.MouthW]!;
-  const w = wRaw < 0 ? 0 : wRaw > 1 ? 1 : wRaw;
-  const hw = 0.5 * (MOUTH.minWidth + MOUTH.widthRange * w) * (1 - 0.3 * round);
-  const x = MOUTH.x;
-  const y = MOUTH.y;
-  const top = open * (0.16 - 0.36 * round);
-  const cx = hw * (0.55 + 0.45 * round);
-  const bottom = (4 / 3) * open;
-  setBoneTransform(g, JAW, view);
-  g.globalAlpha = 1;
-  g.beginPath();
-  g.moveTo(x - hw, y);
-  g.bezierCurveTo(x - 0.5 * hw, y + top, x + 0.5 * hw, y + top, x + hw, y);
-  g.bezierCurveTo(x + cx, y + bottom, x - cx, y + bottom, x - hw, y);
-  g.closePath();
-  g.fillStyle = MOUTH.interior;
-  g.fill();
-  const tongue = jaw > TONGUE_MIN;
-  const teeth = pose[Ch.Teeth]! > TEETH_MIN;
-  if (!tongue && !teeth) return;
-  g.save();
-  g.clip();
-  if (tongue) {
-    g.beginPath();
-    g.ellipse(x, y + 0.8 * open, 0.55 * hw, 0.34 * open, 0, 0, 2 * Math.PI);
-    g.fillStyle = MOUTH.tongue;
-    g.fill();
-  }
-  if (teeth) {
-    // A rounded rect along the top edge, its top hidden above the clip. Written out with quadraticCurveTo
-    // corners rather than a helper taking doubles (a call TurboFan doesn't inline boxes them).
-    const r = 4;
-    const tx0 = x - 0.5 * hw;
-    const tx1 = x + 0.5 * hw;
-    const ty0 = y + 0.75 * top - 10;
-    const ty1 = ty0 + 14 + 0.12 * open;
-    g.beginPath();
-    g.moveTo(tx0 + r, ty0);
-    g.lineTo(tx1 - r, ty0);
-    g.quadraticCurveTo(tx1, ty0, tx1, ty0 + r);
-    g.lineTo(tx1, ty1 - r);
-    g.quadraticCurveTo(tx1, ty1, tx1 - r, ty1);
-    g.lineTo(tx0 + r, ty1);
-    g.quadraticCurveTo(tx0, ty1, tx0, ty1 - r);
-    g.lineTo(tx0, ty0 + r);
-    g.quadraticCurveTo(tx0, ty0, tx0 + r, ty0);
-    g.closePath();
-    g.fillStyle = MOUTH.teeth;
-    g.fill();
-  }
-  g.restore();
-}
-
 /** 3 stars on a circle of radius 320 about the head centre, at phase `Stars·2π`, each spun by the phase. */
 function drawStars(g: CanvasRenderingContext2D, pose: Pose, view: View): void {
   const phase = pose[Ch.Stars]! * 2 * Math.PI;
@@ -253,6 +186,12 @@ function drawStars(g: CanvasRenderingContext2D, pose: Pose, view: View): void {
  * Draws `pose`: the background, every part in draw order (`setTransform(view × bone [× part] [× mirror])`,
  * `fillStyle`, `globalAlpha`, `fill(path)`), the eyes' sclera clip, the mouth and the stars. Never allocates
  * after the first frame at a given canvas size.
+ *
+ * The mouth is drawn inside the parts loop, at `rig.mouthSlot` (the extra pass `i === PARTS.length` when it
+ * comes after every part), rather than by a helper: V8 compiles this loop with its optimising tier within the
+ * first few thousand frames, and its canvas calls then pass doubles without allocating, while a loop-free helper
+ * called once per frame stays for the first ~10 000–20 000 frames in V8's mid tier, which boxes every double it
+ * passes to a canvas method as a new heap number (#214).
  */
 export function render(g: CanvasRenderingContext2D, rig: Rig, pose: Pose, view: View): void {
   const width = g.canvas.width;
@@ -264,14 +203,90 @@ export function render(g: CanvasRenderingContext2D, rig: Rig, pose: Pose, view: 
 
   boneMatrices(rig, pose, BONE_BUF);
   const s = view.scale;
+  const count = PARTS.length;
   let clipped = false;
-  for (let i = 0; i < PARTS.length; i++) {
-    const kind = rig.kind[i]!;
+  // i === count is the mouth's slot when it draws after every part.
+  for (let i = 0; i <= count; i++) {
+    const kind = i < count ? rig.kind[i]! : PartKind.plain;
     if (clipped && kind !== PartKind.gaze) {
       g.restore();
       clipped = false;
     }
-    if (i === rig.mouthSlot) drawMouth(g, pose, view);
+    if (i === rig.mouthSlot) {
+      // The mouth, in jaw-bone space at `MOUTH.x/y`. The interior is closed by two cubics: the top lip curve
+      // (left corner → right corner) and the jaw curve (back). `MouthRound` pulls the corners in by up to 30 %,
+      // lifts the top curve and widens the jaw curve's control points towards an ellipse. The tongue (an
+      // ellipse) and the teeth (a rounded rect along the top) are clipped to the interior. Nothing shows while
+      // the mouth is shut (open < 0.5 design units): the upper lip line is the closed mouth.
+      // Clamps are written out, not a helper: a call V8 doesn't inline boxes doubles (allocates).
+      const jawRaw = pose[Ch.Jaw]!;
+      const jaw = jawRaw < 0 ? 0 : jawRaw > 1 ? 1 : jawRaw;
+      const open = MOUTH.openRange * jaw;
+      if (!(open < 0.5)) {
+        const roundRaw = pose[Ch.MouthRound]!;
+        const round = roundRaw < 0 ? 0 : roundRaw > 1 ? 1 : roundRaw;
+        const wRaw = pose[Ch.MouthW]!;
+        const w = wRaw < 0 ? 0 : wRaw > 1 ? 1 : wRaw;
+        const hw = 0.5 * (MOUTH.minWidth + MOUTH.widthRange * w) * (1 - 0.3 * round);
+        const x = MOUTH.x;
+        const y = MOUTH.y;
+        const top = open * (0.16 - 0.36 * round);
+        const cx = hw * (0.55 + 0.45 * round);
+        const bottom = (4 / 3) * open;
+        const o = JAW * MAT;
+        g.setTransform(
+          s * BONE_BUF[o]!,
+          s * BONE_BUF[o + 1]!,
+          s * BONE_BUF[o + 2]!,
+          s * BONE_BUF[o + 3]!,
+          s * BONE_BUF[o + 4]! + view.ox,
+          s * BONE_BUF[o + 5]! + view.oy,
+        );
+        g.globalAlpha = 1;
+        g.beginPath();
+        g.moveTo(x - hw, y);
+        g.bezierCurveTo(x - 0.5 * hw, y + top, x + 0.5 * hw, y + top, x + hw, y);
+        g.bezierCurveTo(x + cx, y + bottom, x - cx, y + bottom, x - hw, y);
+        g.closePath();
+        g.fillStyle = MOUTH.interior;
+        g.fill();
+        const tongue = jaw > TONGUE_MIN;
+        const teeth = pose[Ch.Teeth]! > TEETH_MIN;
+        if (tongue || teeth) {
+          g.save();
+          g.clip();
+          if (tongue) {
+            g.beginPath();
+            g.ellipse(x, y + 0.8 * open, 0.55 * hw, 0.34 * open, 0, 0, 2 * Math.PI);
+            g.fillStyle = MOUTH.tongue;
+            g.fill();
+          }
+          if (teeth) {
+            // A rounded rect along the top edge, its top hidden above the clip, with quadraticCurveTo corners.
+            const r = 4;
+            const tx0 = x - 0.5 * hw;
+            const tx1 = x + 0.5 * hw;
+            const ty0 = y + 0.75 * top - 10;
+            const ty1 = ty0 + 14 + 0.12 * open;
+            g.beginPath();
+            g.moveTo(tx0 + r, ty0);
+            g.lineTo(tx1 - r, ty0);
+            g.quadraticCurveTo(tx1, ty0, tx1, ty0 + r);
+            g.lineTo(tx1, ty1 - r);
+            g.quadraticCurveTo(tx1, ty1, tx1 - r, ty1);
+            g.lineTo(tx0 + r, ty1);
+            g.quadraticCurveTo(tx0, ty1, tx0, ty1 - r);
+            g.lineTo(tx0, ty0 + r);
+            g.quadraticCurveTo(tx0, ty0, tx0 + r, ty0);
+            g.closePath();
+            g.fillStyle = MOUTH.teeth;
+            g.fill();
+          }
+          g.restore();
+        }
+      }
+    }
+    if (i === count) break;
     const part = PARTS[i]!;
     let alpha = part.opacity;
     if (kind === PartKind.blush) {
@@ -294,8 +309,6 @@ export function render(g: CanvasRenderingContext2D, rig: Rig, pose: Pose, view: 
       clipped = true;
     }
   }
-  if (clipped) g.restore();
-  if (rig.mouthSlot === PARTS.length) drawMouth(g, pose, view);
   if (pose[Ch.Stars]! > 0) drawStars(g, pose, view);
   g.globalAlpha = 1;
 }
