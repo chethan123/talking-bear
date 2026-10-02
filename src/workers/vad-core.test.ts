@@ -1023,28 +1023,67 @@ function stepper(frames: Float32Array[], vad: 'silero' | 'energy', pregate: bool
   return step;
 }
 
-/** Runs of 1000 frames of noise_white_-60dbfs_3s on Silero with `model`, after 400 warm-up frames. */
-function heapRunner(model: SileroModel, pregate: boolean): () => void {
+/** A core on Silero with `model` (floor restored to −75 dBFS), and a function that feeds it the next n frames
+ *  of noise_white_-60dbfs_3s. */
+function heapRunner(model: SileroModel, pregate: boolean): (n: number) => void {
   const frames = frames16k(fixture('noise_white_-60dbfs_3s'), 0);
   const core = new VadCore(CTX_RATE, NOOP_POST);
   core.setModel(model);
   core.reset(1, 'silero', -75, pregate);
   let k = 0;
-  const run = (n: number): void => {
+  return (n) => {
     for (let i = 0; i < n; i++, k++) core.frame(1, k * SILERO_GRID, frames[k % frames.length]!);
   };
-  run(400);
-  return () => run(1000);
 }
 
-/** The smallest finite growth over up to 20 runs, stopping early once `done(best)`. */
-function bestGrowth(run: () => void, done: (best: number) => boolean = () => false): number {
+/** The smallest finite growth over up to `runs` runs, stopping early once `done(best)`. */
+function bestGrowth(run: () => void, done: (best: number) => boolean = () => false, runs = 20): number {
   let best = Number.POSITIVE_INFINITY;
-  for (let trial = 0; trial < 20 && !(Number.isFinite(best) && done(best)); trial++) {
+  for (let trial = 0; trial < runs && !(Number.isFinite(best) && done(best)); trial++) {
     best = Math.min(best, heapGrowth(run));
   }
   expect(Number.isFinite(best)).toBe(true);
   return best;
+}
+
+/** The lower quartile of the finite growths over `runs` runs: a rare reading far below the rest (seen
+ *  under v8 coverage with the path already optimised) can't become the baseline. */
+function lowGrowth(run: () => void, runs = 20): number {
+  const finite: number[] = [];
+  for (let trial = 0; trial < runs; trial++) {
+    const g = heapGrowth(run);
+    if (Number.isFinite(g)) finite.push(g);
+  }
+  expect(finite.length).toBeGreaterThanOrEqual(10);
+  finite.sort((a, b) => a - b);
+  return finite[Math.floor(finite.length / 4)]!;
+}
+
+/**
+ * How much more the heap grows over 1000 frames of `model` than over 1000 frames of a zero model, on the
+ * Silero path with the given pre-gate, once V8 has optimised that path: `model`'s best growth over up to 5
+ * runs (they stop once `done(excess)`) minus the lower quartile of the zero model's 20 readings.
+ *
+ * Both cores share VadCore's per-frame path. It runs once per frame, so V8 needs about 11 000 frames to
+ * optimise it with TurboFan, with or without coverage; below TurboFan it boxes doubles, about 200 B per frame
+ * of a real model more than an optimised zero model. A path optimised on the zero model alone is deoptimised
+ * once `model` and its non-zero p reach it, and re-tiers only after another 11 000 frames of `model`: about
+ * 2 minutes under v8 coverage. So `model` runs first, and its own loops tier up meanwhile; then the cheap
+ * zero model takes the shared path to TurboFan with both models in its feedback, and every measured run
+ * starts in that steady state.
+ */
+function growthOverZero(model: SileroModel, pregate: boolean, done: (excess: number) => boolean): number {
+  const real = heapRunner(model, pregate);
+  const zero = heapRunner(zeroModel(), pregate);
+  real(400);
+  zero(50_000); // about 1.5 s, 3.5 s under coverage: well past the 11 000 frames TurboFan needs
+  const base = lowGrowth(() => zero(1000));
+  const best = bestGrowth(
+    () => real(1000),
+    (b) => done(b - base),
+    5,
+  );
+  return best - base;
 }
 
 describe('no allocation on the per-frame path', () => {
@@ -1071,9 +1110,7 @@ describe('no allocation on the per-frame path', () => {
     'the Silero path (pregate %s) grows the heap < 64 KB per 1000 frames more than a zero model',
     { timeout: 120_000 },
     (pregate) => {
-      const zero = bestGrowth(heapRunner(zeroModel(), pregate));
-      const real = bestGrowth(heapRunner(createSilero(W), pregate), (b) => b - zero < LIMIT);
-      expect(real - zero).toBeLessThan(LIMIT);
+      expect(growthOverZero(createSilero(W), pregate, (excess) => excess < LIMIT)).toBeLessThan(LIMIT);
     },
   );
 
@@ -1085,11 +1122,10 @@ describe('no allocation on the per-frame path', () => {
     leaky.onProcess = (x) => {
       kept[leaky.calls % 1000] = x.subarray(1);
     };
-    const zero = bestGrowth(heapRunner(zeroModel(), false));
     // Retry until a run is GC-free: +Infinity alone would pass the bound without proving anything.
-    const leak = bestGrowth(heapRunner(leaky, false), () => true);
+    const leak = growthOverZero(leaky, false, () => true);
     expect(kept.every((v) => v !== undefined)).toBe(true);
-    expect(leak - zero).toBeGreaterThanOrEqual(LIMIT);
+    expect(leak).toBeGreaterThanOrEqual(LIMIT);
   });
 });
 
