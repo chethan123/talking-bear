@@ -4,22 +4,9 @@ import { yinF0 } from '../src/dsp/yin.ts';
 import { expectNoEnforcedViolations, installCspRecorder } from './helpers/csp';
 import { micFlags } from './helpers/flags';
 
-// The e2e test hooks, window.__bearTest (src/test-hooks.ts, plan §4.9.3), which only the e2e build has. This spec
-// type-checks without the app's modules, so it restates the part of the hooks' shape it uses, as a local type
-// that page functions cast `window` to (no global `Window` declaration, so other e2e files can declare their own).
-interface BearTestHooks {
-  log: { t: number; frame: number; from: string; to: string; event: string; effects: string[] }[];
-  events: { t: number; e: { t: string } }[];
-  state(): string;
-  setVisibility(v: 'visible' | 'hidden'): void;
-  maxLevelDb(sinceMs: number): number;
-  outputSamples(): number[];
-  outputSampleRate(): number;
-}
-
-interface HookWindow {
-  __bearTest?: BearTestHooks;
-}
+// The e2e test hooks, window.__bearTest (src/test-hooks.ts, plan §4.9.3), which only the e2e build has, are typed
+// by the global `Window` declaration in helpers/app.ts: this TypeScript project (tsconfig.node.json) includes every
+// e2e file, so the declaration applies here without an import.
 
 // Launch flags are worker-scoped: one fixture per spec file (plan §4.9.3).
 test.use({ launchOptions: { args: micFlags('e2e/fixtures/vowel_f0-140.wav') } });
@@ -48,7 +35,7 @@ const SPEECH_SEC = speechSeconds(new URL('./fixtures/vowel_f0-140.json', import.
 
 async function state(page: Page): Promise<string> {
   return page.evaluate(() => {
-    const h = (window as unknown as HookWindow).__bearTest;
+    const h = window.__bearTest;
     if (h === undefined) throw new Error('window.__bearTest is missing');
     return h.state();
   });
@@ -65,7 +52,7 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
 
   await installCspRecorder(page);
   await page.goto('/');
-  await page.waitForFunction(() => (window as unknown as HookWindow).__bearTest !== undefined);
+  await page.waitForFunction(() => window.__bearTest !== undefined);
   expect(await state(page)).toBe('Asleep');
 
   // Drive one loop as the ui-placeholder smoke does: a trusted click (sticky activation for the AudioContext),
@@ -76,22 +63,16 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
 
   // Every audio spec first proves that the input isn't silent (plan §4.9.3). The fixture starts with 1 s of zeros.
   await expect
-    .poll(
-      () =>
-        page.evaluate(
-          () => (window as unknown as HookWindow).__bearTest?.maxLevelDb(60_000) ?? Number.NEGATIVE_INFINITY,
-        ),
-      {
-        message: 'fake mic silent: check WAV path/format',
-        timeout: 5_000,
-      },
-    )
+    .poll(() => page.evaluate(() => window.__bearTest?.maxLevelDb(60_000) ?? Number.NEGATIVE_INFINITY), {
+      message: 'fake mic silent: check WAV path/format',
+      timeout: 5_000,
+    })
     .toBeGreaterThan(-50);
 
   // The loop is over once the bear listens again after its replay's cooldown.
   await page.waitForFunction(
     () => {
-      const log = (window as unknown as HookWindow).__bearTest?.log ?? [];
+      const log = window.__bearTest?.log ?? [];
       const played = log.findIndex((x) => x.to === 'Playing');
       return played >= 0 && log.slice(played).some((x) => x.from === 'Cooldown' && x.to === 'Listening');
     },
@@ -100,7 +81,7 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
   );
 
   const { log, events, samples, rate } = await page.evaluate(() => {
-    const h = (window as unknown as HookWindow).__bearTest;
+    const h = window.__bearTest;
     if (h === undefined) throw new Error('window.__bearTest is missing');
     return { log: h.log, events: h.events, samples: h.outputSamples(), rate: h.outputSampleRate() };
   });
@@ -148,13 +129,13 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
 
   // setVisibility drives the app's visibility source: hidden → Paused; visible → awake again, which resumes the
   // context a second time without a second output tap (the hooks insert it on the first ctxRunning only).
-  await page.evaluate(() => (window as unknown as HookWindow).__bearTest?.setVisibility('hidden'));
+  await page.evaluate(() => window.__bearTest?.setVisibility('hidden'));
   await expect.poll(() => state(page)).toBe('Paused');
   // maxLevelDb covers exactly the last sinceMs: Paused posts no level events, so 1.5 s later the last second has
   // none, the last 3 s still reach back into Listening, and the vowel is within the last minute.
   await page.waitForTimeout(1500);
   const levels = await page.evaluate(() => {
-    const h = (window as unknown as HookWindow).__bearTest;
+    const h = window.__bearTest;
     if (h === undefined) throw new Error('window.__bearTest is missing');
     return [h.maxLevelDb(1000), h.maxLevelDb(3000), h.maxLevelDb(60_000)];
   });
@@ -166,11 +147,10 @@ test('the test hooks log one loop, and the output tap hears the replay at 140 ×
     Number.NEGATIVE_INFINITY,
   );
   expect(levels[2], `maxLevelDb(1000/3000/60000) = ${levels.join(', ')}`).toBeGreaterThan(-50);
-  await page.evaluate(() => (window as unknown as HookWindow).__bearTest?.setVisibility('visible'));
+  await page.evaluate(() => window.__bearTest?.setVisibility('visible'));
   await expect.poll(() => state(page), { timeout: 10_000 }).toBe('Listening');
   const ctxRunnings = await page.evaluate(
-    () =>
-      (window as unknown as HookWindow).__bearTest?.events.filter((x) => x.e.t === 'ctxRunning').length ?? 0,
+    () => window.__bearTest?.events.filter((x) => x.e.t === 'ctxRunning').length ?? 0,
   );
   expect(ctxRunnings).toBe(2);
 
