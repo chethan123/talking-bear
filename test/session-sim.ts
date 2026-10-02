@@ -17,7 +17,10 @@ import {
   type TimerName,
 } from '../src/app/events.ts';
 import { initialSessionState, reduce } from '../src/app/machine.ts';
+import { CUSTOM_PITCH_MAX, CUSTOM_PITCH_MIN, parseSettings, presetFor } from '../src/app/settings.ts';
 import type { SegEvent } from '../src/dsp/segmenter.ts';
+import { PRESETS, type VoicePreset } from '../src/dsp/types.ts';
+import { CUSTOM_PITCH_STEP } from '../src/ui/settings-sheet.ts';
 
 /** A source of uniform numbers in [0, 1). The property tests feed it from fast-check values. */
 export type SimRng = () => number;
@@ -85,10 +88,7 @@ interface Pending {
   readonly event: SessionEvent;
 }
 
-/**
- * Every event type the random pool injects. Mic results come only from `openMic`; timers and the at-speaker
- * events only from the sim. A new `SessionEvent` type is not injected until it is listed here.
- */
+/** Every event type the random pool injects (current or stale). The rest are in `SIM_ONLY_KINDS`. */
 export const POOL_KINDS = [
   'tapBear',
   'parentContinue',
@@ -115,8 +115,31 @@ export const POOL_KINDS = [
   'freeze',
   'visible',
   'updateReady',
+  'settingsChanged',
 ] as const satisfies readonly EventType[];
 export type PoolKind = (typeof POOL_KINDS)[number];
+
+/**
+ * The event types the pool never injects, because the sim schedules them itself: the mic results answer
+ * an `openMic`, `timer` fires a pending named timer, and the at-speaker events follow `play` and `sfx`.
+ * Injected at random, they would model an impossible world (an sfx that ended while still audible).
+ */
+export const SIM_ONLY_KINDS = [
+  'micGranted',
+  'micDenied',
+  'noDevice',
+  'timer',
+  'playbackAtSpeakerEnded',
+  'sfxAtSpeakerEnded',
+] as const satisfies readonly EventType[];
+export type SimOnlyKind = (typeof SIM_ONLY_KINDS)[number];
+
+/** Compiles only if `T` is `never`; otherwise tsc names the offending kinds. */
+type MustBeNever<T extends never> = T;
+// tsc fails here on an unlisted SessionEvent type: add it to POOL_KINDS (and `make`) or to SIM_ONLY_KINDS.
+export type UnclassifiedKind = MustBeNever<Exclude<EventType, PoolKind | SimOnlyKind>>;
+// tsc fails here on a type listed in both: keep it in one.
+export type DoublyClassifiedKind = MustBeNever<Extract<PoolKind, SimOnlyKind>>;
 
 /** The pool kinds that carry an epoch or a take id: the liveness phase injects only their stale variants. */
 export const STALE_KINDS = [
@@ -134,6 +157,17 @@ const PRIORITIES: readonly Priority[] = [1, 2, 3, 4];
 const REACTION_NAMES: readonly string[] = ['tap', 'poke', 'tickle', 'hug'];
 const SFX_IDS: readonly SfxId[] = ['boing', 'sneeze', 'giggle', 'hm', 'pop', 'purr'];
 const SEG_KINDS: readonly SegEvent['kind'][] = ['start', 'end', 'misfire'];
+/** The named presets: the shared `PRESETS` entries, which `presetFor` returns for a named voice. */
+const NAMED_PRESETS: readonly VoicePreset[] = Object.values(PRESETS);
+/**
+ * The custom pitch slider's values (settings sheet): `CUSTOM_PITCH_MIN` to `CUSTOM_PITCH_MAX` in steps of
+ * `CUSTOM_PITCH_STEP`, that is 0.7, 0.75, …, 2.2. Each is the double nearest its decimal, as the app reads
+ * `Number(slider.value)`, not the sum `0.7 + 2 · 0.05 = 0.7999999999999999`.
+ */
+const CUSTOM_PITCH_GRID: readonly number[] = Array.from(
+  { length: Math.round((CUSTOM_PITCH_MAX - CUSTOM_PITCH_MIN) / CUSTOM_PITCH_STEP) + 1 },
+  (_, i) => Number((CUSTOM_PITCH_MIN + i * CUSTOM_PITCH_STEP).toPrecision(12)),
+);
 /** The worker blocks onsets this long after arm, so a plausible onset is at least this far after it. */
 const ONSET_AFTER_ARM_MS = 100;
 const MAX_ONSET_AGE_MS = 100;
@@ -536,6 +570,8 @@ export class SessionSim {
       }
       case 'fxError':
         return { t: kind, id: stale ? older(s.takeId) : s.takeId };
+      case 'settingsChanged':
+        return { t: kind, preset: settingsPreset(rng) };
       default:
         return { t: kind };
     }
@@ -582,6 +618,15 @@ export class SessionSim {
         return { t: 'seg', epoch, ev: { kind, frame: now } };
     }
   }
+}
+
+/**
+ * The preset of a random `settingsChanged`: half the time a named preset, otherwise Custom at a slider value,
+ * built as the app builds it (the store validates the setting, then `presetFor` turns it into a preset).
+ */
+function settingsPreset(rng: SimRng): VoicePreset {
+  if (rng() < 0.5) return pick(rng, NAMED_PRESETS);
+  return presetFor(parseSettings({ voice: 'custom', customPitch: pick(rng, CUSTOM_PITCH_GRID) }));
 }
 
 function formatEvent(e: SessionEvent): string {
