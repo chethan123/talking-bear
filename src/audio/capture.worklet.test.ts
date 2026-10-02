@@ -768,4 +768,92 @@ describe('currentFrame steps other than one quantum (issue #237)', () => {
     expect(r.frames).toHaveLength(0);
     expect(await impulseTagError(r)).toBeLessThanOrEqual(4);
   });
+
+  test.each([
+    [22050, true],
+    [22051, false],
+  ])('a %i-frame jump while armed at 44.1 kHz: gap zeros fed = %s (the cap is 0.5 s)', async (gap, fed) => {
+    setSampleRate(44100);
+    const r = await rig();
+    r.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    r.run(new Float32Array(QUANTUM));
+    r.next += gap;
+    r.run(new Float32Array(QUANTUM));
+    await flushMessages();
+    expect(r.frames.length > 0).toBe(fed);
+    expect(await impulseTagError(r)).toBeLessThanOrEqual(4);
+  });
+
+  test('a jump that is not a whole number of quanta: the frames equal those of the same input with the skipped frames as zeros', async () => {
+    setSampleRate(44100);
+    const x = noise(quantaLength(1, 44100), 7);
+    const J = 76 * QUANTUM + 37;
+    const ref = new Float32Array(J + x.length);
+    ref.set(x, J);
+    const a = await rig();
+    a.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    a.run(new Float32Array(QUANTUM));
+    a.run(ref.subarray(0, Math.floor(ref.length / QUANTUM) * QUANTUM));
+    const b = await rig();
+    b.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    b.run(new Float32Array(QUANTUM));
+    b.next += J;
+    b.run(x);
+    await flushMessages();
+    expect(b.frames.length).toBe(a.frames.length);
+    expectSameFrames(b, a);
+  });
+
+  test('an arm on the jump quantum or on a stale quantum: armFrame is the placed frame, and so are the frame tags', async () => {
+    setSampleRate(44100);
+    const a = await rig();
+    a.run(new Float32Array(QUANTUM));
+    a.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    a.next += 76 * QUANTUM;
+    a.run(new Float32Array(QUANTUM));
+    await flushMessages();
+    expect(a.main.find((m) => m.t === 'armed')).toMatchObject({ armFrame: 77 * QUANTUM });
+    a.run(new Float32Array(20 * QUANTUM));
+    await flushMessages();
+    expect(a.frames[0]!.firstFrame - 77 * QUANTUM).toBeGreaterThanOrEqual(0);
+    expect(a.frames[0]!.firstFrame - 77 * QUANTUM).toBeLessThan(3);
+    const b = await rig();
+    b.run(new Float32Array(4 * QUANTUM));
+    b.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    runQuanta(b.proc, new Float32Array(QUANTUM), 3 * QUANTUM); // a repeated currentFrame
+    await flushMessages();
+    expect(b.main.find((m) => m.t === 'armed')).toMatchObject({ armFrame: 4 * QUANTUM });
+    runQuanta(b.proc, new Float32Array(20 * QUANTUM), 5 * QUANTUM);
+    await flushMessages();
+    expect(b.frames[0]!.firstFrame - 4 * QUANTUM).toBeGreaterThanOrEqual(0);
+    expect(b.frames[0]!.firstFrame - 4 * QUANTUM).toBeLessThan(3);
+  });
+
+  test('a re-anchor mid-frame drops the partial frame: the next frame is tagged at the jump frame', async () => {
+    setSampleRate(44100);
+    const r = await rig();
+    r.send({ t: 'arm', epoch: 1 });
+    await flushMessages();
+    r.run(noise(3 * QUANTUM, 5));
+    const at = r.next + 2 * 44100;
+    r.next = at;
+    r.run(noise(40 * QUANTUM, 6));
+    await flushMessages();
+    expect(r.frames.length).toBeGreaterThan(0);
+    expect(r.frames[0]!.firstFrame).toBe(at);
+  });
+
+  test('a currentFrame within one quantum of Number.MAX_SAFE_INTEGER: process() drops the quantum and does not throw', async () => {
+    const r = await rig();
+    r.run(new Float32Array(4 * QUANTUM));
+    const x = new Float32Array(QUANTUM);
+    expect(() => runQuanta(r.proc, x, Number.MAX_SAFE_INTEGER - 64)).not.toThrow();
+    const empty = await rig();
+    expect(() => runQuanta(empty.proc, x, Number.MAX_SAFE_INTEGER - 64)).not.toThrow();
+  });
 });

@@ -90,7 +90,7 @@ class CaptureProcessor extends AudioWorkletProcessor implements AudioWorkletProc
    * the ring's frames, zero-filled gaps included, so its output j sits at ring frame streamBase + j / ratio.
    */
   #streamBase = Number.NaN;
-  /** The longest currentFrame gap fed to the decimator as zeros: 1 s of frames. Longer ones re-anchor it. */
+  /** The longest currentFrame gap fed to the decimator as zeros (0.5 s of frames); longer ones re-anchor. */
   readonly #maxZeroFeed: number;
 
   #worker: MessagePort | null = null;
@@ -118,7 +118,7 @@ class CaptureProcessor extends AudioWorkletProcessor implements AudioWorkletProc
     this.#hpf = butterworthHighpass(sampleRate, HPF_CLIP_HZ);
     this.#ring = new RingBuffer(Math.ceil(this.#ringFrames));
     this.#dec = createResampler(sampleRate, VAD_RATE);
-    this.#maxZeroFeed = Math.round(sampleRate);
+    this.#maxZeroFeed = Math.round(sampleRate / 2);
     this.#decOut = new Float32Array(Math.ceil(QUANTUM * this.#dec.ratio) + 2);
     for (let i = 0; i < TAKE_QUEUE; i++) {
       this.#takes.push({ epoch: 0, id: 0, fromFrame: 0, toFrame: 0, sent: 0, seq: 0 });
@@ -144,14 +144,15 @@ class CaptureProcessor extends AudioWorkletProcessor implements AudioWorkletProc
     // can jump ahead (at start-up, by up to 4,480 frames in local runs and ≈ 9,800 in the failing CI run),
     // and it can repeat, then catch up. A jump leaves a gap that the ring zero-fills, and the decimator is
     // fed the same zeros: otherwise its tags, counted from streamBase, fall behind the ring by the gap, and a
-    // take cut by them misses the gap's length of its tail. A gap over 1 s re-anchors the decimator instead,
-    // so a huge jump costs no more than a small one. A currentFrame at or behind the ring's end (the normal
-    // step, a repeat, or not a safe integer) continues the ring. With an empty ring, a quantum without a
-    // valid currentFrame is dropped.
+    // take cut by them misses the gap's length of its tail. A gap over 0.5 s re-anchors the decimator
+    // instead, so a huge jump costs no more than a small one. A currentFrame at or behind the ring's end (the
+    // normal step, a repeat, or not a safe integer) continues the ring. With an empty ring, a quantum without
+    // a valid currentFrame is dropped, and so is any quantum whose last frame isn't a safe integer (the ring
+    // would throw).
     const ring = this.#ring;
     const cf = currentFrame;
     const frame = ring.isEmpty ? cf : Number.isSafeInteger(cf) && cf > ring.endFrame ? cf : ring.endFrame;
-    if (Number.isSafeInteger(frame)) {
+    if (Number.isSafeInteger(frame) && Number.isSafeInteger(frame + QUANTUM)) {
       this.#downmix(inputs[0] ?? NO_CHANNELS);
       this.#hpf.process(this.#mono, this.#hp);
       const gap = ring.isEmpty ? 0 : frame - ring.endFrame;
