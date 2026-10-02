@@ -40,6 +40,12 @@ export interface SessionDeps {
   clock: Clock;
   cfg?: SessionConfig;
   onAnim?(ev: AnimEvent): void;
+  /**
+   * A `play{id}` effect started replay `id`, whose first sample is scheduled at context time `startCtxTime` (the
+   * player's `PlayHandle.startCtxTime`). Called synchronously inside that effect, so before the `anim talk{id}`
+   * that follows it in the same transition; the bear's mouth (#81) samples the envelope against it.
+   */
+  onPlayStarted?(id: number, startCtxTime: number): void;
   onUi?(o: Overlay): void;
   onApplyUpdate?(): void;
   onTransition?(from: StateName, to: StateName, e: SessionEvent, effects: Effect[]): void;
