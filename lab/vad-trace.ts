@@ -201,8 +201,8 @@ interface Recording {
   inferMsMax: number;
   /** Hold-to-talk marks, in ctx frames. */
   readonly labels: Array<{ press: number; release: number }>;
-  /** The hold in progress: its press (ctx frame) and what started it. */
-  hold: { readonly press: number; readonly source: HoldSource } | null;
+  /** The hold in progress: its press (ctx frame), what started it, and whether it cancelled a countdown. */
+  hold: { readonly press: number; readonly source: HoldSource; readonly early: boolean } | null;
   /** Index of the phrase shown (short-phrase scripts); PHRASES_PER_SCRIPT once the script is done. */
   phrase: number;
   /** performance.now() at which the next phrase appears (the countdown after a release), or null. */
@@ -268,6 +268,8 @@ const stopButton = el('button', { type: 'button', id: 'stop' }, 'Stop');
 const exportButton = el('button', { type: 'button', id: 'export' }, 'Export');
 const discardButton = el('button', { type: 'button', id: 'discard' }, 'Discard');
 const statusText = el('strong', {}, 'Choose the setup, then press Start.');
+/** Next to Export while a trace is held: whether the run completed its script (a stray Stop is flagged). */
+const completenessText = el('strong', { id: 'completeness' });
 const holdCanvas = el('canvas', { width: '300', height: '300' });
 const holdButton = el('button', { type: 'button', id: 'hold', 'aria-label': 'Hold to talk' }, holdCanvas);
 const plotCanvas = el('canvas', { class: 'lab-spectrum', id: 'plot' });
@@ -300,7 +302,7 @@ root.append(
     el('p', {}, 'Chrome ', chromeValue),
     field('Notes (optional, read at Export)', notesInput),
   ),
-  el('p', {}, startButton, stopButton, exportButton, discardButton),
+  el('p', {}, startButton, stopButton, exportButton, discardButton, completenessText),
   el('p', { id: 'status' }, statusText),
   el('p', {}, holdButton),
   el(
@@ -670,6 +672,7 @@ function onCaptureStarted(r: Recording): void {
 function finish(r: Recording): void {
   if (r.phase !== 'capturing') return;
   dropHold(r, 'stop');
+  if (r.countdownEnd !== null) r.phrase++; // the phrase was said and released; only its countdown was left
   r.countdownEnd = null;
   const lastRelease = r.labels.at(-1)?.release ?? 0;
   r.endFrame = Math.max(nowFrame(r), lastRelease) + Math.round(TAIL_SECONDS * r.ctxRate);
@@ -704,8 +707,31 @@ function stopCapture(r: Recording, why: string): void {
     `stopped (${why}): n10 ${n10} (${fmt(n10 / HOPS_PER_SECOND, 2)} s), n32 ${n32}, ${r.labels.length} labels; ` +
       `Silero inference mean ${fmt(meanMs, 2)} ms, max ${fmt(r.inferMsMax, 2)} ms`,
   );
+  log(completeness(r));
   setStatus(`Stopped: ${fmt(n10 / HOPS_PER_SECOND, 2)} s, ${r.labels.length} labels. Export the trace.`);
   refresh();
+}
+
+function plural(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/**
+ * Whether a stopped run is a complete protocol trace (plan §7 M2: 30 phrases per cell, 15 min of noise only).
+ * An early Stop still exports (the counts are in the meta for the checks downstream), but is flagged here.
+ */
+function completeness(r: Recording): string {
+  const labels = plural(r.labels.length, 'label', 'labels');
+  if (r.setup.scriptId === NOISE_SCRIPT_ID) {
+    const total = minutes(NOISE_ONLY_SECONDS);
+    return r.rawDb.length >= NOISE_HOPS
+      ? `Complete: ${total} of noise, ${labels}.`
+      : `Stopped early: ${minutes(r.rawDb.length / HOPS_PER_SECOND)} of ${total} of noise (incomplete: not a protocol trace).`;
+  }
+  const done = Math.min(r.phrase, PHRASES_PER_SCRIPT);
+  return done >= PHRASES_PER_SCRIPT
+    ? `Complete: ${PHRASES_PER_SCRIPT} of ${PHRASES_PER_SCRIPT} phrases, ${labels}.`
+    : `Stopped early: ${done} of ${PHRASES_PER_SCRIPT} phrases, ${labels} (incomplete: not a protocol trace).`;
 }
 
 /** Ends a recording that is starting, capturing or finishing with an error; its data is wiped. */
@@ -781,13 +807,14 @@ function press(source: HoldSource): boolean {
   const r = rec;
   if (r === null || r.phase !== 'capturing' || r.hold !== null) return false;
   const frame = nowFrame(r);
-  if (r.countdownEnd !== null) {
+  const early = r.countdownEnd !== null;
+  if (early) {
     const last = r.labels.at(-1);
     const gapMs = last === undefined ? Number.NaN : ((frame - last.release) / r.ctxRate) * 1000;
     log(`early press: gap ${fmt(gapMs, 0)} ms < ${NEXT_PHRASE_DELAY_MS}`);
     r.countdownEnd = null;
   }
-  r.hold = { press: frame, source };
+  r.hold = { press: frame, source, early };
   drawHold();
   drawPlot();
   return true;
@@ -802,6 +829,7 @@ function release(source: HoldSource): void {
   const r = rec;
   if (r === null || r.hold === null || !sameSource(r.hold.source, source)) return;
   const pressFrame = r.hold.press;
+  const early = r.hold.early;
   r.hold = null;
   if (resizePending) sizeHold();
   if (r.phase !== 'capturing') return;
@@ -811,10 +839,15 @@ function release(source: HoldSource): void {
     log(`short hold (${fmt(seconds * 1000, 0)} ms): dropped; check the page-turner holds`);
   } else {
     r.labels.push({ press: pressFrame, release: frame });
-    const phrase = phraseOf(r);
+    // An early press is an extra utterance, not the shown phrase (that one was already said).
+    const phrase = early ? '' : phraseOf(r);
     log(
       `label ${r.labels.length}: press ${pressFrame}, release ${frame} (${fmt(seconds, 2)} s)` +
-        (phrase === '' ? '' : `, phrase ${r.phrase + 1}: "${phrase}"`),
+        (early
+          ? ', extra label (early press)'
+          : phrase === ''
+            ? ''
+            : `, phrase ${r.phrase + 1}: "${phrase}"`),
     );
     if (seconds > LONG_HOLD_SECONDS) log(`long hold: ${fmt(seconds, 2)} s > ${LONG_HOLD_SECONDS} s`);
     if (r.setup.scriptId !== NOISE_SCRIPT_ID && r.phrase < PHRASES_PER_SCRIPT) {
@@ -1120,7 +1153,14 @@ async function exportTrace(): Promise<void> {
       `exported ${base}.json (${jsonBlob.size} bytes) and ${base}.bin (${binBlob.size} bytes): script ` +
         `${s.scriptId}, n10 ${n10}, n32 ${n32}, ${labels.length} labels, frontEndHash ${hash}`,
     );
-    setStatus(EXPORT_HINT);
+    const dropped = r.labels.length - labels.length;
+    if (dropped === 0) {
+      setStatus(EXPORT_HINT);
+    } else {
+      const what = `${plural(dropped, 'label', 'labels')} fell outside the trace and ${dropped === 1 ? 'was' : 'were'} dropped`;
+      log(`export: ${what}`);
+      setStatus(`Exported, but ${what} (see the log); report this.`);
+    }
   } catch (err) {
     log(`export failed: ${describe(err)}`);
     setStatus(`Export failed: ${describe(err)}`);
@@ -1196,6 +1236,7 @@ function refresh(): void {
   exportButton.disabled = !held || r.exporting;
   discardButton.disabled = r === null || active;
   holdButton.disabled = r === null || r.phase !== 'capturing';
+  completenessText.textContent = held ? completeness(r) : '';
   showValues();
   drawHold();
   drawPlot();
@@ -1212,6 +1253,7 @@ function preselectScript(): void {
   if (scriptSelect.value === id) return;
   scriptSelect.value = id;
   log(`script ${id} preselected for ${c} × ${p}`);
+  refresh(); // the generic change listener ran before this, with the script still blank
 }
 
 /** The `Google Chrome` (else `Chromium`) version in a `fullVersionList`, if any. */
@@ -1315,6 +1357,16 @@ window.addEventListener('keyup', (e) => {
   if (!holdKeyEvent(e)) return;
   e.preventDefault();
   release(keySource(e));
+});
+
+// A key whose keyup never comes (a page-turner reconnecting, focus moving to the system UI) would leave a stuck
+// hold, and its next release would make one bogus long label: a blur drops a key hold.
+window.addEventListener('blur', () => {
+  const r = rec;
+  if (r !== null && r.hold !== null && r.hold.source.kind === 'key') {
+    dropHold(r, 'window lost focus');
+    refresh();
+  }
 });
 
 window.addEventListener('resize', () => {
