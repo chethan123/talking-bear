@@ -34,7 +34,7 @@ export interface Track {
 }
 
 /**
- * A keyframed clip. Later tasks may add optional fields (#89 adds `sustained?: boolean` for reactions).
+ * A keyframed clip. Later tasks may add optional fields.
  */
 export interface Clip {
   name: string;
@@ -46,6 +46,13 @@ export interface Clip {
    * owns the SpringBank applies them; `sampleClip` ignores them.
    */
   impulses?: readonly { t: number; spring: number; dv: number }[];
+  /**
+   * A reaction held for as long as its gesture lasts (#89; a long-press, pinch, hug or pet). Its tracks ease
+   * into the held pose and end there instead of at 0, and the sampler's clamp holds that pose from `duration`
+   * on, so the clip doesn't return to neutral by itself: its player eases it out after the release (#91).
+   * Absent or false: the clip starts and ends at neutral.
+   */
+  sustained?: boolean;
 }
 
 /** Eased progress through a segment, for `u` in [0, 1]; every ease maps 0 to 0 and 1 to 1. */
