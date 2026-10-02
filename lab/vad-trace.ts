@@ -27,9 +27,11 @@ import {
 import { el, fmt, logPanel } from './common.ts';
 import {
   CELL_SCRIPTS,
+  NEXT_PHRASE_DELAY_MS,
   NOISE_ONLY_SECONDS,
   NOISE_SCRIPT_ID,
   PHRASE_SCRIPT_IDS,
+  PHRASE_SCRIPTS,
   PHRASES_PER_SCRIPT,
   type ScriptId,
 } from './vad-scripts.ts';
@@ -58,6 +60,38 @@ const INITIAL_CAPACITY = 6000;
 const HOPS_PER_SECOND = 100;
 /** The noise-only recording ends when it holds this many hops (a whole number of 25-hop batches). */
 const NOISE_HOPS = NOISE_ONLY_SECONDS * HOPS_PER_SECOND;
+/** A hold shorter than this is dropped (a tap, or a page-turner that sends key-up at once). */
+const MIN_HOLD_SECONDS = 0.05;
+/** A hold longer than this is logged: the short-phrase metrics assume phrases under 3 s (plan §7 M2). */
+const LONG_HOLD_SECONDS = 3;
+/**
+ * The hold button's canvas: this share of the viewport's height (the button must be at least 40 % of it), and
+ * the page's width less the button's padding, border and margin. lab.css has no class that tall and lab pages
+ * set no style attributes, so the canvas is sized by its width and height attributes, in CSS px.
+ */
+const HOLD_HEIGHT_SHARE = 0.45;
+const HOLD_SIDE_PX = 48;
+const HOLD_MIN_WIDTH = 200;
+/** The live plot shows the last PLOT_SECONDS; bandDb is drawn over [PLOT_DB_MIN, PLOT_DB_MAX] dBFS. */
+const PLOT_SECONDS = 10;
+const PLOT_DB_MIN = -90;
+const PLOT_DB_MAX = 0;
+/** Length of a Silero frame (512 samples at 16 kHz). */
+const SILERO_FRAME_SECONDS = 0.032;
+/** Hold-to-talk keys, matched by KeyboardEvent.code or .key (a Bluetooth page-turner sends one of them). */
+const HOLD_CODES: ReadonlySet<string> = new Set(['Space', 'PageDown', 'PageUp', 'ArrowRight', 'Enter']);
+const HOLD_KEYS: ReadonlySet<string> = new Set([' ', 'PageDown', 'PageUp', 'ArrowRight', 'Enter']);
+const COLORS = {
+  idle: '#5f6368',
+  prompt: '#1a73e8',
+  holding: '#d93025',
+  countdown: '#b06000',
+  done: '#188038',
+  text: '#ffffff',
+  sileroP: '#1a73e8',
+  bandDb: '#e8710a',
+  label: 'rgba(52, 168, 83, 0.3)',
+} as const;
 
 const SESSIONS: readonly TraceMeta['session'][] = ['A', 'B', 'other'];
 const CONDITIONS: readonly TraceMeta['condition'][] = ['quiet', 'fan', 'tv', 'music'];
@@ -99,6 +133,10 @@ interface Setup {
  * failed: ended by an error (or a cancelled start), nothing to export.
  */
 type Phase = 'starting' | 'capturing' | 'finishing' | 'stopped' | 'failed';
+
+/** What started a hold: a pointer (its pointerId) or a key (its code); only the same source ends it. */
+type HoldSource =
+  { readonly kind: 'pointer'; readonly id: number } | { readonly kind: 'key'; readonly id: string };
 
 /** A growable Float32Array: values are only appended; capacity doubles. */
 class Floats {
@@ -163,6 +201,12 @@ interface Recording {
   inferMsMax: number;
   /** Hold-to-talk marks, in ctx frames. */
   readonly labels: Array<{ press: number; release: number }>;
+  /** The hold in progress: its press (ctx frame) and what started it. */
+  hold: { readonly press: number; readonly source: HoldSource } | null;
+  /** Index of the phrase shown (short-phrase scripts); PHRASES_PER_SCRIPT once the script is done. */
+  phrase: number;
+  /** performance.now() at which the next phrase appears (the countdown after a release), or null. */
+  countdownEnd: number | null;
   /** performance.now() of the latest accepted batch (the stall watchdog). */
   lastBatchAt: number;
   /** While finishing: the trace ends once its hops reach this ctx frame. */
@@ -175,8 +219,9 @@ interface Recording {
 
 // ---- page ---------------------------------------------------------------------------------------------------
 
-const root = document.getElementById('lab');
-if (!(root instanceof HTMLElement)) throw new Error('lab/vad-trace: missing #lab');
+const found = document.getElementById('lab');
+if (!(found instanceof HTMLElement)) throw new Error('lab/vad-trace: missing #lab');
+const root: HTMLElement = found;
 
 function selectOf(id: string, values: readonly string[], text?: (v: string) => string): HTMLSelectElement {
   return el(
@@ -223,6 +268,9 @@ const stopButton = el('button', { type: 'button', id: 'stop' }, 'Stop');
 const exportButton = el('button', { type: 'button', id: 'export' }, 'Export');
 const discardButton = el('button', { type: 'button', id: 'discard' }, 'Discard');
 const statusText = el('strong', {}, 'Choose the setup, then press Start.');
+const holdCanvas = el('canvas', { width: '300', height: '300' });
+const holdButton = el('button', { type: 'button', id: 'hold', 'aria-label': 'Hold to talk' }, holdCanvas);
+const plotCanvas = el('canvas', { class: 'lab-spectrum', id: 'plot' });
 
 const rateValue = el('dd', { id: 'rate' }, '–');
 const backendValue = el('dd', { id: 'backend' }, '–');
@@ -254,6 +302,7 @@ root.append(
   ),
   el('p', {}, startButton, stopButton, exportButton, discardButton),
   el('p', { id: 'status' }, statusText),
+  el('p', {}, holdButton),
   el(
     'dl',
     { class: 'lab-values' },
@@ -276,6 +325,8 @@ root.append(
     el('dt', {}, 'Silero inference'),
     inferValue,
   ),
+  el('h2', {}, 'Last 10 s'),
+  plotCanvas,
 );
 const log = logPanel(root);
 
@@ -480,6 +531,9 @@ async function start(): Promise<void> {
     inferMsSum: 0,
     inferMsMax: 0,
     labels: [],
+    hold: null,
+    phrase: 0,
+    countdownEnd: null,
     lastBatchAt: 0,
     endFrame: null,
     exported: false,
@@ -597,17 +651,25 @@ function onTraceBatch(e: TraceBatch): void {
     stopCapture(r, `${TAIL_SECONDS} s tail recorded`);
   }
   showValues();
+  drawPlot();
 }
 
-/** Capture has started: the first batch passed its check. */
+/** Capture has started: the first batch passed its check, so holds are accepted from now on. */
 function onCaptureStarted(r: Recording): void {
-  setStatus(r.setup.scriptId === NOISE_SCRIPT_ID ? 'Recording noise only.' : 'Recording.');
+  setStatus(
+    r.setup.scriptId === NOISE_SCRIPT_ID
+      ? 'Recording noise only: stay quiet, and hold the button if anyone speaks.'
+      : 'Recording: hold the button while you say each phrase.',
+  );
   refresh();
+  holdButton.focus();
 }
 
 /** Stop pressed while capturing: record TAIL_SECONDS past the later of now and the last release, then stop. */
 function finish(r: Recording): void {
   if (r.phase !== 'capturing') return;
+  dropHold(r, 'stop');
+  r.countdownEnd = null;
   const lastRelease = r.labels.at(-1)?.release ?? 0;
   r.endFrame = Math.max(nowFrame(r), lastRelease) + Math.round(TAIL_SECONDS * r.ctxRate);
   r.phase = 'finishing';
@@ -618,6 +680,8 @@ function finish(r: Recording): void {
 
 /** Stops the engine's part of a recording: no trace, no arm, no mic, context suspended, no wake lock. */
 function teardown(r: Recording): void {
+  dropHold(r, 'end of the recording');
+  r.countdownEnd = null;
   engine.setTrace(false); // its flush of the partial batch is ignored: the phase is no longer active
   engine.disarm(r.epoch);
   engine.closeMic();
@@ -683,6 +747,285 @@ function stop(): void {
   } else if (r.phase === 'capturing') {
     finish(r);
   }
+}
+
+// ---- hold-to-talk ---------------------------------------------------------------------------------------------
+
+/** The phrase shown (short-phrase scripts), or '' (noise-only, or the script is done). */
+function phraseOf(r: Recording): string {
+  const id = r.setup.scriptId;
+  return id === NOISE_SCRIPT_ID ? '' : (PHRASE_SCRIPTS[id][r.phrase] ?? '');
+}
+
+function sameSource(a: HoldSource, b: HoldSource): boolean {
+  return a.kind === b.kind && a.id === b.id;
+}
+
+/** Drops a hold still in progress (Stop, the end of a recording): it has no release, so it is no label. */
+function dropHold(r: Recording, why: string): void {
+  if (r.hold === null) return;
+  log(`${why}: the press at ctx frame ${r.hold.press} is still held, dropped`);
+  r.hold = null;
+  drawHold();
+}
+
+/**
+ * A press, while capturing only (so every label starts inside the trace): press = Math.round(ctx.currentTime ·
+ * ctx.sampleRate). One hold at a time. A press during the countdown is still recorded (labels are the ground
+ * truth of when someone spoke) and cancels the countdown; its release starts a new one. Returns whether the
+ * press started a hold.
+ */
+function press(source: HoldSource): boolean {
+  const r = rec;
+  if (r === null || r.phase !== 'capturing' || r.hold !== null) return false;
+  const frame = nowFrame(r);
+  if (r.countdownEnd !== null) {
+    const last = r.labels.at(-1);
+    const gapMs = last === undefined ? Number.NaN : ((frame - last.release) / r.ctxRate) * 1000;
+    log(`early press: gap ${fmt(gapMs, 0)} ms < ${NEXT_PHRASE_DELAY_MS}`);
+    r.countdownEnd = null;
+  }
+  r.hold = { press: frame, source };
+  drawHold();
+  drawPlot();
+  return true;
+}
+
+/**
+ * The release of the hold `source` started: release = Math.round(ctx.currentTime · ctx.sampleRate). A hold
+ * shorter than MIN_HOLD_SECONDS is dropped; otherwise it becomes a label, and in a short-phrase script the next
+ * phrase appears NEXT_PHRASE_DELAY_MS later.
+ */
+function release(source: HoldSource): void {
+  const r = rec;
+  if (r === null || r.hold === null || !sameSource(r.hold.source, source)) return;
+  const pressFrame = r.hold.press;
+  r.hold = null;
+  if (resizePending) sizeHold();
+  if (r.phase !== 'capturing') return;
+  const frame = nowFrame(r);
+  const seconds = (frame - pressFrame) / r.ctxRate;
+  if (frame - pressFrame < Math.round(MIN_HOLD_SECONDS * r.ctxRate)) {
+    log(`short hold (${fmt(seconds * 1000, 0)} ms): dropped; check the page-turner holds`);
+  } else {
+    r.labels.push({ press: pressFrame, release: frame });
+    const phrase = phraseOf(r);
+    log(
+      `label ${r.labels.length}: press ${pressFrame}, release ${frame} (${fmt(seconds, 2)} s)` +
+        (phrase === '' ? '' : `, phrase ${r.phrase + 1}: "${phrase}"`),
+    );
+    if (seconds > LONG_HOLD_SECONDS) log(`long hold: ${fmt(seconds, 2)} s > ${LONG_HOLD_SECONDS} s`);
+    if (r.setup.scriptId !== NOISE_SCRIPT_ID && r.phrase < PHRASES_PER_SCRIPT) {
+      r.countdownEnd = performance.now() + NEXT_PHRASE_DELAY_MS;
+    }
+  }
+  showValues();
+  drawHold();
+  drawPlot();
+}
+
+function isHoldKey(e: KeyboardEvent): boolean {
+  return HOLD_CODES.has(e.code) || HOLD_KEYS.has(e.key);
+}
+
+function keySource(e: KeyboardEvent): HoldSource {
+  return { kind: 'key', id: e.code === '' ? e.key : e.code };
+}
+
+/** A key event for the hold: only while capturing or finishing, and not while typing in a text field. */
+function holdKeyEvent(e: KeyboardEvent): boolean {
+  const r = rec;
+  if (r === null || (r.phase !== 'capturing' && r.phase !== 'finishing') || !isHoldKey(e)) return false;
+  const t = e.target;
+  return !(
+    t instanceof HTMLInputElement ||
+    t instanceof HTMLSelectElement ||
+    t instanceof HTMLTextAreaElement
+  );
+}
+
+// ---- drawing ------------------------------------------------------------------------------------------------
+
+/** A window resize that came during a hold; applied at the release, so the button never moves under a finger. */
+let resizePending = false;
+
+function sizeHold(): void {
+  resizePending = false;
+  const w = Math.max(HOLD_MIN_WIDTH, Math.floor(root.clientWidth) - HOLD_SIDE_PX);
+  const h = Math.round(HOLD_HEIGHT_SHARE * window.innerHeight);
+  if (holdCanvas.width !== w) holdCanvas.width = w;
+  if (holdCanvas.height !== h) holdCanvas.height = h;
+  drawHold();
+}
+
+/** What the hold button shows: its colour, a large title (wrapped) and a one-line detail. */
+function holdView(): { color: string; title: string; detail: string } {
+  const r = rec;
+  if (r === null || r.phase === 'stopped' || r.phase === 'failed') {
+    return { color: COLORS.idle, title: 'Hold to talk', detail: 'Press Start first' };
+  }
+  if (r.phase === 'starting')
+    return { color: COLORS.idle, title: 'Starting…', detail: 'Wait for the prompt' };
+  if (r.phase === 'finishing') {
+    return { color: COLORS.idle, title: 'Finishing…', detail: `Recording ${TAIL_SECONDS} s more` };
+  }
+  const noise = r.setup.scriptId === NOISE_SCRIPT_ID;
+  if (r.hold !== null) {
+    return {
+      color: COLORS.holding,
+      title: noise ? 'Holding' : phraseOf(r) || 'Holding',
+      detail: 'Let go just after the speech ends',
+    };
+  }
+  if (noise) {
+    const left = Math.max(0, NOISE_ONLY_SECONDS - r.rawDb.length / HOPS_PER_SECOND);
+    return {
+      color: COLORS.done,
+      title: 'Noise only: stay quiet',
+      detail: `${minutes(left)} left; hold the button if anyone speaks`,
+    };
+  }
+  if (r.phrase >= PHRASES_PER_SCRIPT) {
+    return { color: COLORS.done, title: 'Script done: press Stop', detail: `${r.labels.length} labels` };
+  }
+  if (r.countdownEnd !== null) {
+    const s = Math.max(0, r.countdownEnd - performance.now()) / 1000;
+    return {
+      color: COLORS.countdown,
+      title: `Next phrase in ${fmt(s, 1)} s`,
+      detail: `Phrase ${r.phrase + 2} of ${PHRASES_PER_SCRIPT} comes next`,
+    };
+  }
+  return {
+    color: COLORS.prompt,
+    title: phraseOf(r),
+    detail: `Phrase ${r.phrase + 1} of ${PHRASES_PER_SCRIPT}: hold the button while you say it`,
+  };
+}
+
+/** `text` split at spaces into lines no wider than `maxWidth` in g's current font. */
+function wrapLines(g: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  let line = '';
+  for (const word of text.split(' ')) {
+    const next = line === '' ? word : `${line} ${word}`;
+    if (line !== '' && g.measureText(next).width > maxWidth) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line !== '') lines.push(line);
+  return lines;
+}
+
+function drawHold(): void {
+  const g = holdCanvas.getContext('2d');
+  if (g === null) return;
+  const w = holdCanvas.width;
+  const h = holdCanvas.height;
+  const v = holdView();
+  g.fillStyle = v.color;
+  g.fillRect(0, 0, w, h);
+  g.fillStyle = COLORS.text;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  const big = Math.max(18, Math.round(h * 0.1));
+  g.font = `600 ${big}px system-ui, sans-serif`;
+  const lines = wrapLines(g, v.title, w * 0.9);
+  const lineHeight = big * 1.25;
+  const top = h * 0.42 - ((lines.length - 1) * lineHeight) / 2;
+  for (let i = 0; i < lines.length; i++) g.fillText(lines[i] ?? '', w / 2, top + i * lineHeight, w * 0.95);
+  g.font = `${Math.max(12, Math.round(h * 0.045))}px system-ui, sans-serif`;
+  g.fillText(v.detail, w / 2, h * 0.85, w * 0.95);
+}
+
+/** The plot's CSS colour, for the axis line and the legend (read live, so it follows the colour scheme). */
+const plotStyle = getComputedStyle(plotCanvas);
+
+/** The last PLOT_SECONDS of sileroP (0–1) and bandDb, the labels shaded; redrawn per batch and per hold. */
+function drawPlot(): void {
+  const g = plotCanvas.getContext('2d');
+  if (g === null) return;
+  const dpr = window.devicePixelRatio;
+  const w = Math.max(1, Math.round(plotCanvas.clientWidth * dpr));
+  const h = Math.max(1, Math.round(plotCanvas.clientHeight * dpr));
+  if (plotCanvas.width !== w) plotCanvas.width = w;
+  if (plotCanvas.height !== h) plotCanvas.height = h;
+  g.clearRect(0, 0, w, h);
+  const ink = plotStyle.color;
+  g.strokeStyle = ink;
+  g.globalAlpha = 0.4;
+  g.lineWidth = dpr;
+  g.setLineDash([4 * dpr, 4 * dpr]);
+  g.beginPath();
+  g.moveTo(0, h / 2); // p = 0.5, and −45 dBFS
+  g.lineTo(w, h / 2);
+  g.stroke();
+  g.setLineDash([]);
+  g.globalAlpha = 1;
+  const r = rec;
+  if (r !== null && r.firstFrame !== null && r.ctxRate > 0) {
+    const n10 = r.bandDb.length;
+    const n32 = r.sileroP.length;
+    // Seconds since firstFrame at the right edge, and px per second.
+    const tEnd = Math.max(PLOT_SECONDS, n10 / HOPS_PER_SECOND);
+    const t0 = tEnd - PLOT_SECONDS;
+    const scale = w / PLOT_SECONDS;
+    const f0 = r.firstFrame;
+    const rate = r.ctxRate;
+    g.fillStyle = COLORS.label;
+    for (let k = r.labels.length - 1; k >= 0; k--) {
+      const l = r.labels[k];
+      if (l === undefined) continue;
+      const b = (l.release - f0) / rate;
+      if (b < t0) break;
+      const a = (l.press - f0) / rate;
+      g.fillRect((a - t0) * scale, 0, (b - a) * scale, h);
+    }
+    if (r.hold !== null) {
+      const a = (r.hold.press - f0) / rate;
+      g.fillRect((a - t0) * scale, 0, w - (a - t0) * scale, h);
+    }
+    g.lineWidth = 1.5 * dpr;
+    g.strokeStyle = COLORS.bandDb;
+    g.beginPath();
+    const i0 = Math.max(0, n10 - PLOT_SECONDS * HOPS_PER_SECOND);
+    for (let i = i0; i < n10; i++) {
+      const db = Math.min(PLOT_DB_MAX, Math.max(PLOT_DB_MIN, r.bandDb.at(i)));
+      const x = (i / HOPS_PER_SECOND - t0) * scale;
+      const y = h * (1 - (db - PLOT_DB_MIN) / (PLOT_DB_MAX - PLOT_DB_MIN));
+      if (i === i0) g.moveTo(x, y);
+      else g.lineTo(x, y);
+    }
+    g.stroke();
+    g.strokeStyle = COLORS.sileroP;
+    g.beginPath();
+    const j0 = Math.max(0, n32 - Math.ceil(PLOT_SECONDS / SILERO_FRAME_SECONDS) - 1);
+    for (let j = j0; j < n32; j++) {
+      const p = Math.min(1, Math.max(0, r.sileroP.at(j)));
+      const x = (j * SILERO_FRAME_SECONDS - t0) * scale;
+      const y = h * (1 - p);
+      if (j === j0) g.moveTo(x, y);
+      else g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+  g.font = `${12 * dpr}px system-ui, sans-serif`;
+  g.textAlign = 'left';
+  g.textBaseline = 'top';
+  g.fillStyle = COLORS.sileroP;
+  g.fillText('Silero p (0 to 1)', 6 * dpr, 4 * dpr);
+  g.fillStyle = COLORS.bandDb;
+  g.fillText(`band dB (${PLOT_DB_MIN} to ${PLOT_DB_MAX} dBFS)`, 6 * dpr, 20 * dpr);
+  g.fillStyle = ink;
+  g.fillText('shaded: labels', 6 * dpr, 36 * dpr);
+}
+
+/** `m:ss` of a duration in seconds. */
+function minutes(seconds: number): string {
+  return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
 }
 
 // ---- export ---------------------------------------------------------------------------------------------------
@@ -827,9 +1170,9 @@ function showValues(): void {
     scriptValue.textContent = '–';
   } else if (r.setup.scriptId === NOISE_SCRIPT_ID) {
     const left = Math.max(0, NOISE_ONLY_SECONDS - n10 / HOPS_PER_SECOND);
-    scriptValue.textContent = `noise only: ${Math.floor(left / 60)}:${String(Math.floor(left % 60)).padStart(2, '0')} left`;
+    scriptValue.textContent = `noise only, ${minutes(left)} left`;
   } else {
-    scriptValue.textContent = `${r.setup.scriptId}, ${PHRASES_PER_SCRIPT} phrases`;
+    scriptValue.textContent = `${r.setup.scriptId}: ${Math.min(r.phrase, PHRASES_PER_SCRIPT)} of ${PHRASES_PER_SCRIPT} phrases done`;
   }
 }
 
@@ -845,7 +1188,10 @@ function refresh(): void {
   stopButton.disabled = r === null || (r.phase !== 'starting' && r.phase !== 'capturing');
   exportButton.disabled = !held || r.exporting;
   discardButton.disabled = r === null || active;
+  holdButton.disabled = r === null || r.phase !== 'capturing';
   showValues();
+  drawHold();
+  drawPlot();
 }
 
 // ---- setup form ---------------------------------------------------------------------------------------------------
@@ -933,6 +1279,47 @@ exportButton.addEventListener('click', () => {
 });
 discardButton.addEventListener('click', discard);
 
+// The hold button: pointer capture keeps the release on it; touch and contextmenu defaults are prevented, so a
+// finger that moves a little doesn't pan the page (which would cancel the pointer) and a long press opens no menu
+// (the no-CSS equivalent of touch-action: none).
+holdButton.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  if (!press({ kind: 'pointer', id: e.pointerId })) return;
+  try {
+    holdButton.setPointerCapture(e.pointerId);
+  } catch {
+    // The pointer is already gone; its pointerup or pointercancel still ends the hold.
+  }
+});
+holdButton.addEventListener('pointerup', (e) => release({ kind: 'pointer', id: e.pointerId }));
+holdButton.addEventListener('pointercancel', (e) => release({ kind: 'pointer', id: e.pointerId }));
+holdButton.addEventListener('contextmenu', (e) => e.preventDefault());
+holdButton.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+holdButton.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+
+// Keys (a Bluetooth page-turner): key repeat is ignored, and the default (scrolling, activating a focused
+// button) is prevented while capturing or finishing.
+window.addEventListener('keydown', (e) => {
+  if (!holdKeyEvent(e)) return;
+  e.preventDefault();
+  if (!e.repeat) press(keySource(e));
+});
+window.addEventListener('keyup', (e) => {
+  if (!holdKeyEvent(e)) return;
+  e.preventDefault();
+  release(keySource(e));
+});
+
+window.addEventListener('resize', () => {
+  const r = rec;
+  if (r !== null && r.hold !== null) {
+    resizePending = true;
+    return;
+  }
+  sizeHold();
+  drawPlot();
+});
+
 // A trace that isn't exported yet lives only in this page: leaving asks first.
 window.addEventListener('beforeunload', (e) => {
   const r = rec;
@@ -949,8 +1336,20 @@ function tick(): void {
   const now = performance.now();
   if (r.phase === 'starting' && r.armedAt !== null && now - r.armedAt > SETUP_TIMEOUT_MS) {
     fail(r, `no trace batch within ${SETUP_TIMEOUT_MS} ms of the arm`);
-  } else if ((r.phase === 'capturing' || r.phase === 'finishing') && now - r.lastBatchAt > STALL_MS) {
+    return;
+  }
+  if ((r.phase === 'capturing' || r.phase === 'finishing') && now - r.lastBatchAt > STALL_MS) {
     fail(r, `trace stalled: no batch for ${fmt(now - r.lastBatchAt, 0)} ms`);
+    return;
+  }
+  if (r.phase === 'capturing' && r.countdownEnd !== null) {
+    if (now >= r.countdownEnd) {
+      r.countdownEnd = null;
+      r.phrase++;
+      if (r.phrase >= PHRASES_PER_SCRIPT) log(`script ${r.setup.scriptId} done: press Stop`);
+      showValues();
+    }
+    drawHold();
   }
 }
 setInterval(tick, UI_TICK_MS);
@@ -968,6 +1367,7 @@ detectClient()
     refresh();
   });
 
+sizeHold();
 refresh();
 log(
   `lab/vad-trace ready: VAD backend ${backendValue.textContent}, DEFAULT_VAD_BACKEND ${DEFAULT_VAD_BACKEND}; ` +
