@@ -60,25 +60,33 @@ function checkIndex(i: number, name: string): void {
   if (!Number.isInteger(i) || i < 0) throw new RangeError(`${name} must be an integer >= 0`);
 }
 
+// The doubles kept between updates live in a `Float64Array`, one slot each: V8's mid tier boxes a double written to
+// a class field as a new heap number on every write (#214).
+/** Seconds until the next saccade. */
+const WAIT = 0;
+/** Seconds since the latest saccade's scheduled time. */
+const SINCE = 1;
+/** Target of the latest random saccade. */
+const TX = 2;
+const TY = 3;
+/** Current iris offset. */
+const IX = 4;
+const IY = 5;
+
 class Gaze implements GazeLayer {
   readonly #rot: number;
   readonly #tilt: number;
   #primed = false;
-  /** Seconds until the next saccade. */
-  #wait = 0;
-  #since = Number.POSITIVE_INFINITY;
+  /** The doubles kept between updates, by slot. */
+  readonly #s = new Float64Array(6);
   #count = 0;
-  /** Target of the latest random saccade. */
-  #tx = 0;
-  #ty = 0;
-  #ix = 0;
-  #iy = 0;
 
   constructor(springs: GazeSprings) {
     checkIndex(springs.headRot, 'headRot');
     checkIndex(springs.headTilt, 'headTilt');
     this.#rot = springs.headRot;
     this.#tilt = springs.headTilt;
+    this.#s[SINCE] = Number.POSITIVE_INFINITY;
   }
 
   get count(): number {
@@ -86,62 +94,71 @@ class Gaze implements GazeLayer {
   }
 
   get sinceSaccade(): number {
-    return this.#since;
+    return this.#s[SINCE]!;
   }
 
   get irisX(): number {
-    return this.#ix;
+    return this.#s[IX]!;
   }
 
   get irisY(): number {
-    return this.#iy;
+    return this.#s[IY]!;
   }
 
   update(dt: number, pose: Pose, ctx: AnimContext): void {
     const rng = ctx.rng;
     const springs = ctx.springs;
+    const st = this.#s;
     if (this.#rot >= springs.pos.length || this.#tilt >= springs.pos.length) {
       throw new RangeError('gaze spring index out of range');
     }
     if (!this.#primed) {
       this.#primed = true;
-      this.#wait = uniform(rng, SACCADE_MIN, SACCADE_MAX);
+      st[WAIT] = uniform(rng, SACCADE_MIN, SACCADE_MAX);
     }
-    this.#since += dt;
-    this.#wait -= dt;
-    if (this.#wait <= 0) {
-      this.#since = -this.#wait;
+    st[SINCE] = st[SINCE]! + dt;
+    st[WAIT] = st[WAIT]! - dt;
+    if (st[WAIT] <= 0) {
+      st[SINCE] = -st[WAIT];
       this.#count++;
-      this.#wait += uniform(rng, SACCADE_MIN, SACCADE_MAX);
+      st[WAIT] = st[WAIT] + uniform(rng, SACCADE_MIN, SACCADE_MAX);
       // Uniform over the disc of radius GAZE_MAX (u < 1, so the magnitude stays below it).
       const r = GAZE_MAX * Math.sqrt(rng());
       const a = 2 * Math.PI * rng();
-      this.#tx = r * Math.cos(a);
-      this.#ty = r * Math.sin(a);
+      st[TX] = r * Math.cos(a);
+      st[TY] = r * Math.sin(a);
     }
-    let tx = this.#tx;
-    let ty = this.#ty;
+    let tx = st[TX]!;
+    let ty = st[TY]!;
     const look = ctx.lookAt;
     // A point with a non-finite coordinate (e.g. from a zero-size layout) counts as unset, so it can never
-    // poison the iris or the springs.
-    if (look != null && Number.isFinite(look.x) && Number.isFinite(look.y)) {
-      // Toward the point: full offset at LOOK_SATURATE or farther, proportional closer in.
-      const dx = look.x - EYES_CENTER.x;
-      const dy = look.y - EYES_CENTER.y;
-      const d = Math.sqrt(dx * dx + dy * dy);
-      const s = d > 0 ? (GAZE_MAX * Math.min(1, d / LOOK_SATURATE)) / d : 0;
-      tx = dx * s;
-      ty = dy * s;
+    // poison the iris or the springs. Finite is tested as `v − v === 0` (NaN and ±∞ give NaN) and the
+    // `min(1, …)` is written out: V8's mid tier calls Number.isFinite and Math.min with boxed arguments.
+    if (look != null) {
+      const lx = look.x;
+      const ly = look.y;
+      if (lx - lx === 0 && ly - ly === 0) {
+        // Toward the point: full offset at LOOK_SATURATE or farther, proportional closer in.
+        const dx = lx - EYES_CENTER.x;
+        const dy = ly - EYES_CENTER.y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        const near = d / LOOK_SATURATE;
+        const s = d > 0 ? (GAZE_MAX * (near < 1 ? near : 1)) / d : 0;
+        tx = dx * s;
+        ty = dy * s;
+      }
     }
     // A convex step toward the target: the iris stays inside the disc.
     const k = 1 - Math.exp(-dt / IRIS_TAU);
-    this.#ix += (tx - this.#ix) * k;
-    this.#iy += (ty - this.#iy) * k;
-    springs.target[this.#rot] = HEAD_FOLLOW * (this.#ix / GAZE_MAX) * HEAD_FULL_ANGLE;
-    springs.target[this.#tilt] = HEAD_FOLLOW * (this.#iy / GAZE_MAX) * HEAD_FULL_ANGLE;
+    st[IX] = st[IX]! + (tx - st[IX]!) * k;
+    st[IY] = st[IY]! + (ty - st[IY]!) * k;
+    const ix = st[IX];
+    const iy = st[IY];
+    springs.target[this.#rot] = HEAD_FOLLOW * (ix / GAZE_MAX) * HEAD_FULL_ANGLE;
+    springs.target[this.#tilt] = HEAD_FOLLOW * (iy / GAZE_MAX) * HEAD_FULL_ANGLE;
     const w = ctx.weights.gaze;
-    pose[Ch.IrisX] = pose[Ch.IrisX]! + w * this.#ix;
-    pose[Ch.IrisY] = pose[Ch.IrisY]! + w * this.#iy;
+    pose[Ch.IrisX] = pose[Ch.IrisX]! + w * ix;
+    pose[Ch.IrisY] = pose[Ch.IrisY]! + w * iy;
     pose[Ch.HeadRot] = pose[Ch.HeadRot]! + w * springs.pos[this.#rot]!;
     pose[Ch.HeadTilt] = pose[Ch.HeadTilt]! + w * springs.pos[this.#tilt]!;
   }
