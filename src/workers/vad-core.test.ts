@@ -1716,6 +1716,62 @@ describe('dsp.worker glue', () => {
     expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true, 9);
   });
 
+  /** Inits a VadCore on a new port, resets it to `epoch` (energy) and feeds it `frames`. */
+  function initAndFeed(epoch: number, frames: Float32Array[]): FakePort {
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    self.dispatch({ t: 'reset', epoch, vad: 'energy' });
+    frames.forEach((pcm16k, i) => port.dispatch({ t: 'frame', epoch, firstFrame: i * SILERO_GRID, pcm16k }));
+    return port;
+  }
+
+  it('trace before init is remembered; each traceBatch is posted with its five stream buffers transferred', () => {
+    self.dispatch({ t: 'trace', on: true });
+    expect(self.posted).toEqual([]);
+    initAndFeed(9, frames16k(fixture('vowel_f0-140')));
+    const posts = self.posted.filter((p) => p.msg.t === 'traceBatch');
+    expect(posts.length).toBeGreaterThan(10);
+    for (const { msg, transfer } of posts) {
+      if (msg.t !== 'traceBatch') throw new Error(`unexpected ${msg.t}`);
+      expect(msg.epoch).toBe(9);
+      expect(msg.rawDb).toHaveLength(TRACE_BATCH_HOPS);
+      const buffers = [msg.rawDb, msg.bandDb, msg.voicing, msg.sileroP, msg.inferMs].map((v) => v.buffer);
+      expect(new Set(buffers).size).toBe(5);
+      expect(transfer).toHaveLength(5);
+      for (const b of buffers) expect(transfer).toContain(b);
+    }
+  });
+
+  it('trace off flushes the partial batch; later frames post no batch', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    self.dispatch({ t: 'trace', on: true });
+    const port = initAndFeed(2, frames.slice(0, 10));
+    expect(shapes(traceBatches(sent()))).toEqual([[2, 25, 0]]);
+    self.dispatch({ t: 'trace', on: false });
+    expect(shapes(traceBatches(sent()))).toEqual([
+      [2, 25, 0],
+      [2, 7, 0],
+    ]);
+    frames
+      .slice(10)
+      .forEach((pcm16k, i) =>
+        port.dispatch({ t: 'frame', epoch: 2, firstFrame: (10 + i) * SILERO_GRID, pcm16k }),
+      );
+    expect(traceBatches(sent())).toHaveLength(2);
+  });
+
+  it('a later init keeps the trace setting for the new VadCore', () => {
+    const frames = frames16k(fixture('vowel_f0-140')).slice(0, 10);
+    self.dispatch({ t: 'trace', on: true });
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    initAndFeed(3, frames);
+    expect(shapes(traceBatches(sent()))).toEqual([[3, 25, 0]]);
+    self.dispatch({ t: 'trace', on: false });
+    self.posted.length = 0;
+    initAndFeed(4, frames);
+    expect(traceBatches(sent())).toEqual([]);
+  });
+
   it('turns handler exceptions into error messages', () => {
     self.dispatch({ t: 'reset', epoch: 1, vad: 'energy' });
     self.dispatch({ t: 'init', ctxRate: Number.NaN, port: new FakePort() });
