@@ -4,7 +4,8 @@
 // - real-voice feature traces (test/traces/<session>/trace.{json,bin}) replayed through energyGateStep /
 //   segmenterStep and the proximity gate (scripts/trace-replay.ts).
 // It prints a table per scene and a pooled table (scripts/vad-metrics.ts), and with --gate tts enforces the CI TTS
-// regression gate.
+// regression gate. The espeak-ng whisper renders (UNGATED_VOICES) are reported in their own column and row, never
+// gated (#53 Q1, answer A).
 //
 // Usage:
 //   node scripts/vad-eval.ts [--corpus fast|full] [--traces <dir>] [--backend silero|energy] [--gate tts]
@@ -47,12 +48,18 @@ import {
   type GateResult,
   type Metrics,
   type Segment,
+  type ShortCounts,
 } from './vad-metrics.ts';
 
 /** Synthetic context rate of the corpus scenes (the common Android rate). */
 export const EVAL_CTX_RATE = 48000;
 /** Re-arm delay after an end or misfire: the session cooldown (plan §3.4). */
 export const REARM_MS = DEFAULT_CONFIG.cooldownMs;
+/**
+ * Voices whose short phrases are reported but never gated: Silero v6 scores most espeak-ng whisper renders below
+ * 0.5 even clean (#53 Q1, answer A). They stay truth for false triggers and truncation.
+ */
+export const UNGATED_VOICES: readonly string[] = ['en-us+whisper'];
 const WEIGHTS_BIN = join(REPO_ROOT, 'src', 'dsp', 'silero', 'weights.bin');
 
 export type Backend = 'silero' | 'energy';
@@ -183,6 +190,16 @@ function corpusEntries(): ReturnType<typeof parseManifest> {
   return parseManifest(JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')));
 }
 
+/** Whether an utterance's short phrases are gated: false for UNGATED_VOICES; throws for an unknown id. */
+export function gatedByVoice(entries: ReturnType<typeof parseManifest>): (id: string) => boolean {
+  const voiceOf = new Map(entries.map((e) => [e.id, e.voice]));
+  return (id) => {
+    const voice = voiceOf.get(id);
+    if (voice === undefined) throw new Error(`unknown utterance ${id}`);
+    return !UNGATED_VOICES.includes(voice);
+  };
+}
+
 /** A scene's samples and sidecar from .cache/corpus/, checked against its plan. */
 function loadScene(plan: ScenePlan): { audio: Float32Array; meta: SceneLabels } {
   const f32 = join(CORPUS_DIR, `${plan.name}.f32`);
@@ -234,7 +251,13 @@ const COLUMNS = [
   'FT/min',
   'EoS p50',
   'EoS p90',
+  'whisper h/m/s',
 ] as const;
+
+/** The ungated (whisper) counts as hits/misses/splits, or '-' when there are none. */
+function ungatedCell(u: ShortCounts): string {
+  return u.shortPhrases === 0 ? '-' : `${u.hits}/${u.misses}/${u.splits}`;
+}
 
 function row(name: string, m: Metrics): string[] {
   return [
@@ -251,7 +274,19 @@ function row(name: string, m: Metrics): string[] {
     fmt(m.falseTriggersPerMin, 3),
     fmt(m.eosP50Ms),
     fmt(m.eosP90Ms),
+    ungatedCell(m.ungated),
   ];
+}
+
+/** A row of ungated short-phrase counts only: N, hit, miss and split; '-' elsewhere. */
+function ungatedRow(name: string, u: ShortCounts): string[] {
+  const cells = COLUMNS.map((): string => '-');
+  cells[0] = name;
+  cells[2] = String(u.shortPhrases);
+  cells[3] = String(u.hits);
+  cells[4] = String(u.misses);
+  cells[5] = String(u.splits);
+  return cells;
 }
 
 function table(rows: string[][]): string {
@@ -353,13 +388,15 @@ async function main(argv: readonly string[]): Promise<number> {
   const scenes: SceneRow[] = [];
   if (args.corpus !== null) {
     const subset = args.corpus;
-    for (const plan of planCorpus(subset, corpusEntries()).filter((p) => p.group === subset)) {
+    const entries = corpusEntries();
+    const isGated = gatedByVoice(entries);
+    for (const plan of planCorpus(subset, entries).filter((p) => p.group === subset)) {
       const { audio, meta } = loadScene(plan);
       const { segments, durationFrames } = runVadCore(audio, args.backend, model);
       const metrics = evaluateScene({
         ctxRate: EVAL_CTX_RATE,
         durationFrames,
-        truth: corpusTruth(meta, EVAL_CTX_RATE),
+        truth: corpusTruth(meta, EVAL_CTX_RATE, isGated),
         segments,
       });
       scenes.push({
@@ -402,7 +439,12 @@ async function main(argv: readonly string[]): Promise<number> {
     console.log(`\nCorpus ${args.corpus}: per scene`);
     console.log(table(scenes.map((s) => row(s.name, s.metrics))));
     console.log(`\nCorpus ${args.corpus}: pooled`);
-    console.log(table(pooled.map((p) => row(p.name, p.metrics))));
+    const gatePool = pooled.find((p) => p.name === 'snr20+10+5');
+    const rows = pooled.map((p) => row(p.name, p.metrics));
+    if (gatePool !== undefined) {
+      rows.push(ungatedRow('whisper snr20+10+5 (not gated)', gatePool.metrics.ungated));
+    }
+    console.log(table(rows));
   }
   if (args.traces !== null) {
     console.log(`\nTraces under ${args.traces}: ${traces.length}`);
@@ -422,6 +464,11 @@ async function main(argv: readonly string[]): Promise<number> {
     for (const c of gate.checks) {
       console.log(`${c.pass ? 'PASS' : 'FAIL'} ${c.name}: ${c.value} ≤ ${c.limit} (${c.scenes.join(', ')})`);
     }
+    const u = gate.ungated;
+    console.log(
+      `INFO whisper (not gated, SNR 20/10/5): N ${u.shortPhrases}, hit ${u.hits}, miss ${u.misses}, ` +
+        `split ${u.splits}`,
+    );
     console.log(`gate tts: ${gate.pass ? 'PASS' : 'FAIL'}`);
   }
   console.log(`\nvad-eval: ${scenes.length} scenes, ${traces.length} traces in ${elapsed} s`);
@@ -433,6 +480,7 @@ async function main(argv: readonly string[]): Promise<number> {
       proximityDb: PROXIMITY_DB,
       ctxRate: EVAL_CTX_RATE,
       rearmMs: REARM_MS,
+      ungatedVoices: UNGATED_VOICES,
       corpus: args.corpus,
       scenes,
       pooled,

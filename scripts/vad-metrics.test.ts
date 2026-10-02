@@ -24,6 +24,7 @@ const MIN = 60_000; // one minute of frames
 const short = (id: string, start: number, end: number): TruthSpan => ({
   id,
   kind: 'short',
+  gated: true,
   start,
   end,
   offset: end,
@@ -31,9 +32,15 @@ const short = (id: string, start: number, end: number): TruthSpan => ({
 const passage = (id: string, start: number, end: number): TruthSpan => ({
   id,
   kind: 'passage',
+  gated: true,
   start,
   end,
   offset: end,
+});
+/** An ungated short phrase (a whisper render): reported, never gated. */
+const whisper = (id: string, start: number, end: number): TruthSpan => ({
+  ...short(id, start, end),
+  gated: false,
 });
 const seg = (
   startFrame: number,
@@ -222,7 +229,7 @@ describe('evaluateScene', () => {
     const m = evaluateScene({
       ctxRate: 48_000,
       durationFrames: 48_000 * 30,
-      truth: [{ id: 'a', kind: 'short', start: 48_000, end: 96_000, offset: 96_000 }],
+      truth: [{ id: 'a', kind: 'short', gated: true, start: 48_000, end: 96_000, offset: 96_000 }],
       segments: [seg(48_000, 96_000 + 28_800, 96_000 - 1536)],
     });
     expect(m.eosMs).toEqual([600]);
@@ -232,7 +239,7 @@ describe('evaluateScene', () => {
       evaluateScene({
         ctxRate: 48_000,
         durationFrames: 48_000 * 30,
-        truth: [{ id: 'a', kind: 'short', start: 48_000, end: 96_000, offset: 96_000 }],
+        truth: [{ id: 'a', kind: 'short', gated: true, start: 48_000, end: 96_000, offset: 96_000 }],
         segments: [seg(48_000, 100_000, last)],
       }).truncations;
     expect(at(96_000 - 14_401)).toBe(1);
@@ -259,8 +266,9 @@ describe('corpusTruth', () => {
         ids: ['s1', 's1'],
       },
       48_000,
+      () => true,
     );
-    expect(t).toEqual([{ id: 's1', kind: 'short', start: 300, end: 1350, offset: 1350 }]);
+    expect(t).toEqual([{ id: 's1', kind: 'short', gated: true, start: 300, end: 1350, offset: 1350 }]);
   });
 
   it('maps words and sentences to short phrases and passages to passages, one per id run', () => {
@@ -278,15 +286,60 @@ describe('corpusTruth', () => {
         ids: ['w', 's', 'p', 'p', 'w'],
       },
       16_000,
+      (id) => id !== 's',
     );
     expect(t).toEqual([
-      { id: 'w', kind: 'short', start: 0, end: 10, offset: 10 },
-      { id: 's', kind: 'short', start: 20, end: 30, offset: 30 },
-      { id: 'p', kind: 'passage', start: 40, end: 70, offset: 70 },
+      { id: 'w', kind: 'short', gated: true, start: 0, end: 10, offset: 10 },
+      // isGated decides per utterance (vad-eval: by the manifest voice).
+      { id: 's', kind: 'short', gated: false, start: 20, end: 30, offset: 30 },
+      { id: 'p', kind: 'passage', gated: true, start: 40, end: 70, offset: 70 },
       // The same id again after another utterance is a new utterance.
-      { id: 'w', kind: 'short', start: 80, end: 90, offset: 90 },
+      { id: 'w', kind: 'short', gated: true, start: 80, end: 90, offset: 90 },
     ]);
-    expect(corpusTruth({ sampleRate: 16_000, spans: [], kinds: [], ids: [] }, 48_000)).toEqual([]);
+    expect(corpusTruth({ sampleRate: 16_000, spans: [], kinds: [], ids: [] }, 48_000, () => true)).toEqual(
+      [],
+    );
+  });
+});
+
+describe('ungated short phrases (whisper renders: reported, not gated)', () => {
+  it('are truth for false triggers and truncation, but never in N, hit, miss, split or EoS', () => {
+    const m = evaluate(
+      [short('a', 1000, 2000), whisper('w', 5000, 6000), whisper('x', 9000, 10_000)],
+      [seg(1000, 2600, 1990), seg(5000, 5800, 5100)],
+    );
+    expect(m).toMatchObject({
+      shortPhrases: 1,
+      hits: 1,
+      misses: 0,
+      splits: 0,
+      eosMs: [600],
+      falseTriggers: 0, // the segment on w overlaps a truth span
+      truncChecked: 2, // a and w
+      truncations: 1, // w: 5100 + 150 < 6000 − 150
+      ungated: { shortPhrases: 2, hits: 1, misses: 1, splits: 0 },
+    });
+  });
+
+  it('count their own hits, misses and splits, pooled like the gated ones', () => {
+    const a = evaluate(
+      [whisper('h', 1000, 2000), whisper('m', 5000, 6000), whisper('s', 9000, 11_000)],
+      [seg(1000, 2600, 1990), seg(9000, 9800, 9200), seg(10_000, 11_700, 10_990)],
+    );
+    expect(a).toMatchObject({
+      shortPhrases: 0,
+      hits: 0,
+      misses: 0,
+      splits: 0,
+      eosMs: [],
+      ungated: { shortPhrases: 3, hits: 1, misses: 1, splits: 1 },
+    });
+    const b = evaluate([whisper('m2', 1000, 2000), short('g', 5000, 6000)], []);
+    expect(poolMetrics([a, b])).toMatchObject({
+      shortPhrases: 1,
+      misses: 1,
+      ungated: { shortPhrases: 4, hits: 1, misses: 2, splits: 1 },
+    });
   });
 });
 
@@ -365,8 +418,8 @@ describe('ttsGate', () => {
     const r = ttsGate(base());
     expect(r.pass).toBe(true);
     expect(r.checks.map((c) => c.name)).toEqual([
-      'misses (SNR 20/10/5, N = 180)',
-      'splits (SNR 20/10/5, N = 180)',
+      'misses (SNR 20/10/5, gated N = 180)',
+      'splits (SNR 20/10/5, gated N = 180)',
       'false triggers/min, fan noise-only (0 in 15.0 min)',
       'false triggers/min, fan SNR ≥ 10 (0 in 1.5 min)',
       'false triggers/min, music noise-only (0 in 15.0 min)',
@@ -411,6 +464,24 @@ describe('ttsGate', () => {
     // 1 false trigger in 3.0 min of fan SNR ≥ 10 scenes: 0.333/min.
     expect(check(ttsGate(s), 'false triggers/min, fan SNR')).toMatchObject({ value: 0.333, pass: false });
     expect(ttsGate(s).pass).toBe(false);
+  });
+
+  it('never gates ungated short phrases, and reports them', () => {
+    const s = base();
+    s[0]!.metrics = metrics({
+      shortPhrases: 60,
+      hits: 60,
+      minutes: 1.5,
+      ungated: { shortPhrases: 12, hits: 2, misses: 10, splits: 0 },
+    });
+    const r = ttsGate(s);
+    expect(r.pass).toBe(true);
+    expect(check(r, 'misses')).toMatchObject({
+      name: 'misses (SNR 20/10/5, gated N = 180)',
+      value: 0,
+      limit: 3,
+    });
+    expect(r.ungated).toEqual({ shortPhrases: 12, hits: 2, misses: 10, splits: 0 });
   });
 
   it('allows 0 errors when N < 60 (the fast subset may have floor 0)', () => {

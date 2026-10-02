@@ -70,8 +70,22 @@ describe('traceTruth', () => {
       ],
     });
     expect(traceTruth(m)).toEqual([
-      { id: 'label-1', kind: 'short', start: 96_000 - 7200, end: 239_999 + 7200, offset: 239_999 },
-      { id: 'label-0', kind: 'passage', start: 480_000 - 7200, end: 624_000 + 7200, offset: 624_000 },
+      {
+        id: 'label-1',
+        kind: 'short',
+        gated: true,
+        start: 96_000 - 7200,
+        end: 239_999 + 7200,
+        offset: 239_999,
+      },
+      {
+        id: 'label-0',
+        kind: 'passage',
+        gated: true,
+        start: 480_000 - 7200,
+        end: 624_000 + 7200,
+        offset: 624_000,
+      },
     ]);
   });
 });

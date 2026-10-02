@@ -23,6 +23,11 @@
 //   false trigger a segment that overlaps no span; reported per minute of evaluated audio
 //   cap ends      segments that ended at the maximum utterance length (`maxLength`)
 // Passages are used only for truncation and cap ends (plan §7 M2).
+//
+// Gated and ungated short phrases (#53 Q1, answer A): a short phrase with `gated: false` (the corpus's espeak-ng
+// whisper renders, which Silero v6 mostly scores below 0.5 even clean) is still truth for false triggers and
+// truncation, but its hit/miss/split goes to `ungated` instead of N, hit, miss, split and EoS latency, so the
+// gates never count it and the reports show it in a row of its own.
 
 /** Why a segment ended: the segmenter's end reasons, `misfire`, or `open` (still in speech when the input ended). */
 export type SegmentReason = 'silence' | 'maxLength' | 'misfire' | 'open';
@@ -44,6 +49,8 @@ export type TruthKind = 'short' | 'passage';
 export interface TruthSpan {
   id: string;
   kind: TruthKind;
+  /** False: a short phrase reported in `ungated`, never in the gated counts (only matters for short phrases). */
+  gated: boolean;
   /** Half-open [start, end): the hull of the utterance's spans (traces: press − 150 ms, release + 150 ms). */
   start: number;
   end: number;
@@ -59,8 +66,16 @@ export interface SceneInput {
   segments: readonly Segment[];
 }
 
+/** Hit, miss and split counts of a set of short phrases. */
+export interface ShortCounts {
+  shortPhrases: number;
+  hits: number;
+  misses: number;
+  splits: number;
+}
+
 export interface Metrics {
-  /** N: short-phrase spans evaluated (hits + misses + splits). */
+  /** N: gated short-phrase spans evaluated (hits + misses + splits). */
   shortPhrases: number;
   hits: number;
   misses: number;
@@ -81,6 +96,8 @@ export interface Metrics {
   /** Nearest-rank percentiles of eosMs; null when it is empty. */
   eosP50Ms: number | null;
   eosP90Ms: number | null;
+  /** The ungated short phrases (gated: false): reported, never gated. */
+  ungated: ShortCounts;
 }
 
 /** The truncation margin on both sides of the comparison, in ms (issue #53; TAIL_MS is the take's tail). */
@@ -135,6 +152,7 @@ export function evaluateScene(input: SceneInput): Metrics {
     eosMs: [],
     eosP50Ms: null,
     eosP90Ms: null,
+    ungated: { shortPhrases: 0, hits: 0, misses: 0, splits: 0 },
   };
   for (const t of truth) {
     const over = counted.filter((s) => overlaps(s.startFrame, s.endFrame, t.start, t.end));
@@ -147,6 +165,14 @@ export function evaluateScene(input: SceneInput): Metrics {
       if (last + margin < t.end - margin) m.truncations++;
     }
     if (t.kind !== 'short') continue;
+    if (!t.gated) {
+      const u = m.ungated;
+      u.shortPhrases++;
+      if (over.length === 0) u.misses++;
+      else if (over.length === 1) u.hits++;
+      else u.splits++;
+      continue;
+    }
     m.shortPhrases++;
     if (over.length === 0) {
       m.misses++;
@@ -169,8 +195,9 @@ export function evaluateScene(input: SceneInput): Metrics {
 
 /** Pools scene metrics: counts and minutes add up, the rate is recomputed, latencies are concatenated. */
 export function poolMetrics(list: readonly Metrics[]): Metrics {
-  const sum = (key: Exclude<keyof Metrics, 'eosMs' | 'eosP50Ms' | 'eosP90Ms'>): number =>
+  const sum = (key: Exclude<keyof Metrics, 'eosMs' | 'eosP50Ms' | 'eosP90Ms' | 'ungated'>): number =>
     list.reduce((acc, m) => acc + m[key], 0);
+  const sumUngated = (key: keyof ShortCounts): number => list.reduce((acc, m) => acc + m.ungated[key], 0);
   const eosMs = list.flatMap((m) => m.eosMs);
   const minutes = sum('minutes');
   const falseTriggers = sum('falseTriggers');
@@ -190,6 +217,12 @@ export function poolMetrics(list: readonly Metrics[]): Metrics {
     eosMs,
     eosP50Ms: percentile(eosMs, 50),
     eosP90Ms: percentile(eosMs, 90),
+    ungated: {
+      shortPhrases: sumUngated('shortPhrases'),
+      hits: sumUngated('hits'),
+      misses: sumUngated('misses'),
+      splits: sumUngated('splits'),
+    },
   };
 }
 
@@ -210,9 +243,13 @@ export interface CorpusLabels {
 /**
  * The truth spans of a corpus scene in ctx frames: one per utterance, i.e. per run of consecutive spans with the
  * same id, from its first span's start to its last span's end (the true offset). Words and sentences are short
- * phrases, passages passages.
+ * phrases, passages passages; `isGated(id)` decides whether a short phrase counts for the gates.
  */
-export function corpusTruth(labels: CorpusLabels, ctxRate: number): TruthSpan[] {
+export function corpusTruth(
+  labels: CorpusLabels,
+  ctxRate: number,
+  isGated: (id: string) => boolean,
+): TruthSpan[] {
   const scale = ctxRate / labels.sampleRate;
   const out: TruthSpan[] = [];
   for (let i = 0; i < labels.spans.length; i++) {
@@ -227,6 +264,7 @@ export function corpusTruth(labels: CorpusLabels, ctxRate: number): TruthSpan[] 
     out.push({
       id,
       kind: labels.kinds[i] === 'passage' ? 'passage' : 'short',
+      gated: isGated(id),
       start: start * scale,
       end: end * scale,
       offset: end * scale,
@@ -267,12 +305,14 @@ export interface GateCheck {
 export interface GateResult {
   pass: boolean;
   checks: GateCheck[];
+  /** The ungated short phrases of the miss/split pool: reported, not gated. */
+  ungated: ShortCounts;
 }
 
 /**
  * The TTS gate over a corpus group's scenes:
  * - misses ≤ floor(3·N/180) and splits ≤ floor(3·N/180), pooled over the SNR scenes at 20, 10 and 5 dB (N = their
- *   short phrases); it fails when there is no such scene;
+ *   gated short phrases; the ungated ones are only reported, in `ungated`); it fails when there is no such scene;
  * - for fan and for music, each present population on its own: the noise-only stream(s), and the scenes at
  *   ≥ 10 dB SNR (the SNR scenes and the passages scene), pooled: false triggers ≤ 0.13/min.
  */
@@ -287,7 +327,7 @@ export function ttsGate(scenes: readonly GateScene[]): GateResult {
     ['splits', pooled.splits],
   ] as const) {
     checks.push({
-      name: `${what} (SNR ${TTS_GATE_SNRS.join('/')}, N = ${pooled.shortPhrases})`,
+      name: `${what} (SNR ${TTS_GATE_SNRS.join('/')}, gated N = ${pooled.shortPhrases})`,
       value,
       limit: allowed,
       pass: pool.length > 0 && value <= allowed,
@@ -321,5 +361,5 @@ export function ttsGate(scenes: readonly GateScene[]): GateResult {
       });
     }
   }
-  return { pass: checks.every((c) => c.pass), checks };
+  return { pass: checks.every((c) => c.pass), checks, ungated: pooled.ungated };
 }

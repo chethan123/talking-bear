@@ -67,7 +67,7 @@ export function loadTrace(dir: string): { meta: TraceMeta; streams: TraceStreams
 
 /**
  * The truth spans of a trace: one per hold-to-talk label, in press order, [press − 150 ms, release + 150 ms) with
- * the release as the true offset; short when release − press < 3 s, else a passage.
+ * the release as the true offset; short when release − press < 3 s, else a passage; all gated.
  */
 export function traceTruth(meta: TraceMeta): TruthSpan[] {
   const pad = (TRACE_SPAN_PAD_MS * meta.ctxRate) / 1000;
@@ -77,6 +77,7 @@ export function traceTruth(meta: TraceMeta): TruthSpan[] {
     .map(({ press, release, i }) => ({
       id: `label-${i}`,
       kind: ((release - press) * 1000) / meta.ctxRate < SHORT_PHRASE_MAX_MS ? 'short' : 'passage',
+      gated: true,
       start: press - pad,
       end: release + pad,
       offset: release,
