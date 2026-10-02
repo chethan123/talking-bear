@@ -11,13 +11,16 @@
 //   are never stored or downloaded (plan Q2), only handed to the spec that asks for them.
 // - The bear (#81): `showPose` renders one key pose for the full-app screenshots, and `frameLog` returns the
 //   bear's X-A2 frame log (rAF time, mouth clip time, envelope index per drawn frame).
+// - The VAD backend (#51): `setVadBackend` pins the backend of every later arm (specs whose synthetic fixtures
+//   Silero doesn't treat as speech pin 'energy'), and `workerEvents` records the worker's VAD status events.
 
 import type { BearView, FrameLogEntry } from './anim/bear-view.ts';
 import { POSES, type PoseName } from './anim/poses.ts';
 import type { Effect, SessionEvent, StateName } from './app/events.ts';
-import type { Session } from './app/session.ts';
+import type { LevelEvent, Session } from './app/session.ts';
 import tapUrl from './audio/test-tap.worklet.ts?worker&url';
-import type { Engine, OutputTapHost } from './audio/engine.ts';
+import { DEFAULT_VAD_BACKEND } from './audio/constants.ts';
+import type { Engine, OutputTapHost, VadBackend, VadBackendHost } from './audio/engine.ts';
 import type { Visibility } from './platform/visibility.ts';
 
 export interface TransitionLogEntry {
@@ -36,6 +39,16 @@ export interface EventLogEntry {
   t: number;
   /** The event as dispatched, payload included (the same object, not a copy). */
   e: SessionEvent;
+}
+
+/** The worker's VAD status events, which reach the session's level listeners (not the reducer). */
+export type WorkerEvent = Extract<LevelEvent, { t: 'vadReady' | 'vadStats' | 'vadError' }>;
+
+export interface WorkerEventLogEntry {
+  /** performance.now() when the level listener got the event, in ms (the clock of `log` and `events`). */
+  t: number;
+  /** The event as the engine emitted it (the same object, not a copy). */
+  e: WorkerEvent;
 }
 
 export interface BearTestApi {
@@ -60,6 +73,12 @@ export interface BearTestApi {
   showPose(name: string, opts?: { cssWidth?: number; cssHeight?: number }): void;
   /** The bear's last 600 drawn frames, oldest first; [] before the bear is mounted. */
   frameLog(): FrameLogEntry[];
+  /** Pins the VAD backend that every later arm asks the worker for (engine.setVadBackend). */
+  setVadBackend(b: VadBackend): void;
+  /** The backend every arm asks the worker for: the last setVadBackend's, else DEFAULT_VAD_BACKEND. */
+  vadBackend(): VadBackend;
+  /** Every `vadReady`, `vadStats` and `vadError` the session's level listeners got, oldest first. */
+  workerEvents: WorkerEventLogEntry[];
 }
 
 declare global {
@@ -70,7 +89,7 @@ declare global {
 
 export interface TestHookDeps {
   session: Session;
-  engine: Pick<Engine, 'context'> & OutputTapHost;
+  engine: Pick<Engine, 'context'> & OutputTapHost & VadBackendHost;
   visibility: Visibility;
   /** The bear, once main.ts has mounted it (after the hooks are installed). */
   bear: () => Pick<BearView, 'showPose' | 'frameLog'> | null;
@@ -130,6 +149,9 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
   const { session, engine, visibility } = deps;
   const log: TransitionLogEntry[] = [];
   const events: EventLogEntry[] = [];
+  const workerEvents: WorkerEventLogEntry[] = [];
+  /** What setVadBackend last pinned (the engine's own value is private), so specs can see what arms ask for. */
+  let backend: VadBackend = DEFAULT_VAD_BACKEND;
 
   const frameNow = (): number => {
     const ctx = engine.context();
@@ -146,6 +168,13 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
     levelT[i] = performance.now();
     levelDb[i] = e.db;
     levelCount++;
+  });
+
+  // ---- the worker's VAD status: model loaded, inference timing, fallback errors ----------------------------
+  session.subscribeLevel((e) => {
+    if (e.t === 'vadReady' || e.t === 'vadStats' || e.t === 'vadError') {
+      workerEvents.push({ t: performance.now(), e });
+    }
   });
 
   // ---- output tap --------------------------------------------------------------------------------------------
@@ -203,6 +232,14 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
       bear.showPose(POSES[name], opts?.cssWidth ?? POSE_CSS_WIDTH, opts?.cssHeight ?? POSE_CSS_HEIGHT);
     },
     frameLog: () => deps.bear()?.frameLog() ?? [],
+    setVadBackend(b) {
+      // The engine has the method in every build that has these hooks (both need VITE_BEAR_TEST_HOOKS=1).
+      if (engine.setVadBackend === undefined) throw new Error('setVadBackend: the engine has no such method');
+      engine.setVadBackend(b);
+      backend = b;
+    },
+    vadBackend: () => backend,
+    workerEvents,
   };
   window.__bearTest = api;
   return api;
