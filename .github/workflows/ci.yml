@@ -33,6 +33,7 @@ jobs:
       - run: pnpm test:browser
       - run: pnpm build
       - run: pnpm check:dist
+      - run: pnpm size-limit
 
   coverage:
     runs-on: ubuntu-24.04
