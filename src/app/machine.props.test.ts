@@ -186,6 +186,11 @@ describe('session reducer properties (plan §4.9.1)', () => {
         if (sim.now - t0 > LIVENESS_BOUND_MS) {
           fail(sim, `P4: reached ${sim.state.name} after ${sim.now - t0} ms (bound ${LIVENESS_BOUND_MS} ms)`);
         }
+        // Nothing current is injected, so nothing can hide the page: a phase that didn't start Paused must end
+        // Asleep (stricter than the issue's "Asleep or Paused", which it implies; D20).
+        if (from !== 'Paused' && sim.state.name !== 'Asleep') {
+          fail(sim, `P4: the liveness phase began in ${from} but ended in ${sim.state.name}, not Asleep`);
+        }
       }),
       { numRuns: RUNS },
     );
@@ -286,8 +291,10 @@ describe('session reducer properties (plan §4.9.1)', () => {
         }
         if (sim.micOpen && !MIC_OPEN.has(s.name)) fail(sim, `P8: mic open in ${s.name}`);
         if (sim.openWhileOpen > 0) fail(sim, `P8: openMic while the stream was still open`);
-        if (MIC_OPEN.has(s.name) && s.name !== 'Waking' && s.micGranted && !sim.micOpen) {
-          fail(sim, `P8: ${s.name} with micGranted but the mic is closed`);
+        // Stronger than the issue's `MIC_OPEN∖{Waking} ∧ micGranted ⇒ micOpen`: past Waking the stream must be
+        // open whatever the reducer's own `micGranted` says (review thread on #199, D19).
+        if (MIC_OPEN.has(s.name) && s.name !== 'Waking' && !sim.micOpen) {
+          fail(sim, `P8: ${s.name} (micGranted ${s.micGranted}) but the mic is closed`);
         }
       });
     });
