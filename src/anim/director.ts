@@ -723,10 +723,12 @@ function tick(s: DirectorState, now: number, out: Out): DirectorState {
 
 /**
  * One step of the director. Pure: it never mutates `s`, and returns `s` itself when nothing changes. A tick,
- * gesture or release at a non-finite time changes nothing (a NaN release would otherwise never end).
+ * gesture or release at a non-finite time changes nothing (a NaN release would otherwise never end): `t − t` is 0
+ * for every finite `t` and NaN otherwise, a check that, unlike `Number.isFinite`, makes no call on the per-substep
+ * tick path (call arguments box doubles in V8's mid tier, #229).
  */
 function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
-  if ((i.k === 'tick' || i.k === 'gesture' || i.k === 'release') && !Number.isFinite(i.now)) return s;
+  if ((i.k === 'tick' || i.k === 'gesture' || i.k === 'release') && i.now - i.now !== 0) return s;
   switch (i.k) {
     case 'tick':
       return tick(s, i.now, out);
