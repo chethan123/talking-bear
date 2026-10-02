@@ -51,7 +51,8 @@ const ATTEMPTS = 3;
  *
  * - Readings at #214's head, local Chromium 141: 52.5 in each of 10 solo runs, and 52.5 in each of 3 full
  *   `pnpm test:browser` runs with Vitest's results cache deleted (CI's file order). 1.4 × 52.5 = 73.5 → 80 →
- *   capped at 72. CI (Chrome for Testing 153): recorded after the PR's first `verify` run.
+ *   capped at 72. CI (`verify`, Chrome for Testing 153, PR #235 at 0038e97): 39.2 (view 68.4, 67.2, 70.8, 74.2,
+ *   69.0; control 30.5, 28.0, 28.0, 28.0, 28.0; positive control 271.1).
  * - Today's main, before #214, reads ≈ 600 (603.3, 603.0).
  * - The 52.5 left is boxing at call boundaries outside the modules #214 fixed: loop.ts `tick` passing `chunk` and
  *   `alpha` (≈ 25), `stepper.advance`'s returned alpha (≈ 12.6), bear-view's `logFrame` reading
@@ -60,7 +61,7 @@ const ATTEMPTS = 3;
  * - What it catches (negative controls, B/frame): a fresh `[x, y]` per drawn part in `render` 2057.8, a fresh
  *   closure per frame passed as the mouth's `now` 100.5, one small object plus one boxed double per frame in the
  *   mouth 80.5, a private double field written per substep in gaze 76.5. So it detects ≥ 2 boxed doubles per
- *   frame; one (+12 B) passes.
+ *   frame locally; one (+12 B) passes. On CI, which reads lower (39.2), it takes ≥ 3 (+36 B).
  */
 const BOUND = 72;
 
