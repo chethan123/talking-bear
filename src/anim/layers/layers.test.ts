@@ -280,11 +280,24 @@ function runBlink(
   return { events, lidL, lidR, skipped };
 }
 
+/** What `blinkStats` reports for one seed. */
+interface BlinkStats {
+  /** Seconds from the first to the last onset. */
+  span: number;
+  /** Blink events; a double counts once. */
+  n: number;
+  /** How many of them were doubles. */
+  doubles: number;
+}
+
 /**
  * A lean 10 000 s blink run at `DT` (no lid arrays): the span from the first to the last onset, the number
- * of events and of doubles.
+ * of events and of doubles. It steps the layer exactly as `runBlink` does and computes each onset the same
+ * way, so its numbers are bit-identical to `runBlink`'s (pinned for seed 0x7467 below). Nothing reads the
+ * pose here, so it is not cleared between updates (the layer only adds to it): that saves ≈ 11 % per step
+ * under coverage (#258).
  */
-function blinkStats(seed: number): { span: number; n: number; doubles: number } {
+function blinkStats(seed: number): BlinkStats {
   const layer = createBlink();
   const ctx: AnimContext = { rng: mulberry32(seed), weights: FULL, lookAt: null, springs: new SpringBank(0) };
   const pose = createPose();
@@ -292,7 +305,6 @@ function blinkStats(seed: number): { span: number; n: number; doubles: number } 
   let first = 0;
   let last = 0;
   for (let i = 0; i < 600_000; i++) {
-    pose.fill(0);
     layer.update(DT, pose, ctx);
     if (layer.count !== count) {
       count = layer.count;
@@ -327,6 +339,14 @@ describe('blink', () => {
       expect(
         Math.abs(intervals.filter((x) => x < 3.5).length / intervals.length - 0.632),
       ).toBeLessThanOrEqual(0.03);
+    });
+
+    it('agrees exactly with blinkStats, the lean run behind the 100-seed test: span, events and doubles', () => {
+      expect(blinkStats(SEED)).toEqual({
+        span: events[events.length - 1]!.onset - events[0]!.onset,
+        n: events.length,
+        doubles: events.filter((e) => e.double).length,
+      });
     });
 
     it('makes 15 % ± 1.5 of the blinks doubles', () => {
