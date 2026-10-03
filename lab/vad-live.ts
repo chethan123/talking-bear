@@ -12,10 +12,16 @@
 // The debug overlay turns the worker's feature trace on while it is mounted, and the trace suspends the Silero
 // pre-gate's skipping: Silero runs on every frame (src/workers/vad-core.ts). The status line and the summary
 // report the overlay as it actually is (boot's `onDebugOverlay`: mounted, or failed to load or mount), not as the
-// URL asked for it. Nothing is tallied while the overlay is still loading (the marks are disabled and transitions
-// are ignored): a run's counts all share one trace state, so the summary's single `pregate` label is true for every
-// count. `?debug=0` boots the app without the overlay (never loading), to measure the pre-gate once it is enabled
+// URL asked for it. `?debug=0` boots the app without the overlay, to measure the pre-gate once it is enabled
 // (PREGATE_ENABLED).
+//
+// One arming rule (D15) keeps every count true to the labels: the page tallies only while `tallying()`, i.e. the app
+// has booted (`app` 'ok': `boot` resolved, the whole pipeline wired) and the overlay is settled (off, on or failed,
+// never loading). A take is armed at its Listening → Recording if `tallying()` holds then, and its later transitions
+// count only while it is armed; it is disarmed when the take ends (into Listening, Asleep, Paused or Error). So a
+// phrase that started while the overlay was loading is never counted, even in part, and every count of a run shares
+// one trace state. The marks are enabled only while `tallying()`. A failed boot is terminal: nothing is tallied, the
+// status line says so, and the summary carries `app: "failed"`.
 //
 // Layout: all of the app's layers are position: fixed, so the app root gets a height and `contain: strict`, which
 // makes it their containing block, and the tally panel follows it. The rules come from a constructed stylesheet
@@ -41,6 +47,7 @@ type Auto = (typeof AUTOS)[number];
 type Counter = Mark | Auto;
 type Counts = Record<Counter, number>;
 type OverlayState = 'off' | 'loading' | 'on' | 'failed';
+type AppState = 'booting' | 'ok' | 'failed';
 /** A table row: a counter, or `phrases` (derived: hits + misses + splits). */
 type Row = 'phrases' | Counter;
 const ROWS: readonly Row[] = ['phrases', ...MARKS, ...AUTOS];
@@ -105,10 +112,23 @@ let lastMark: { condition: Condition; mark: Mark } | null = null;
 const debug = new URLSearchParams(location.search).get('debug') !== '0';
 /**
  * The debug overlay as it actually is: off (`?debug=0`), loading, on (mounted: the feature trace is on), or failed
- * (it didn't load or mount, or the app didn't boot: the trace is off). Set by boot's `onDebugOverlay`. Nothing is
- * tallied while it is loading.
+ * (it didn't load or mount: the trace is off). Set by boot's `onDebugOverlay`; it stays loading if the app never
+ * gets that far.
  */
 let overlay: OverlayState = debug ? 'loading' : 'off';
+/** The app: booting until `boot` resolves (session, engine and UI all wired), then ok; failed (terminal) if it rejects. */
+let app: AppState = 'booting';
+/** Why the boot failed, for the status line. */
+let bootError = '';
+/** The current take is tallied: `tallying()` held at its Listening → Recording, and it hasn't ended yet. */
+let takeArmed = false;
+/** The states that end a take (a misfire ends in Listening, after it is counted). */
+const TAKE_ENDS: ReadonlySet<StateName> = new Set<StateName>(['Listening', 'Asleep', 'Paused', 'Error']);
+
+/** D15: marks and new takes are tallied only once the app has booted and the overlay's trace state is settled. */
+function tallying(): boolean {
+  return app === 'ok' && overlay !== 'loading';
+}
 
 /** The pre-gate as this run has it: off in the build, on, or on but suspended by the overlay's feature trace. */
 function pregate(): 'off' | 'on' | 'suspended' {
@@ -116,12 +136,15 @@ function pregate(): 'off' | 'on' | 'suspended' {
   return overlay === 'on' ? 'suspended' : 'on';
 }
 
-/** The status line: what the overlay and the feature trace are doing to the pre-gate. */
+/** The status line: the app's boot first, then what the overlay and the feature trace are doing to the pre-gate. */
 function statusText(): string {
+  if (app === 'failed')
+    return `The app failed to boot (${bootError}): nothing is tallied. Reload to try again.`;
+  if (app === 'booting') return 'Starting the app: nothing is tallied until it is up.';
   const built = `Pre-gate in this build: ${PREGATE_ENABLED ? 'on' : 'off'}.`;
   const text: Readonly<Record<OverlayState, string>> = {
     on: `Debug overlay on: the worker's feature trace is on, so the Silero pre-gate never skips (Silero runs on every frame). ${built} Open ?debug=0 to run without the overlay.`,
-    loading: `Debug overlay loading: nothing is tallied until it is up (the feature trace is still off). ${built}`,
+    loading: `Debug overlay loading: nothing is tallied until it is up (the feature trace is still off), not even a phrase that ends after. ${built}`,
     failed: `The debug overlay failed to load or mount (see the console): the feature trace is off and the pre-gate runs as built. ${built} Reload to try again.`,
     off: `Debug overlay off (?debug=0): no feature trace, so the pre-gate runs as built. ${built}`,
   };
@@ -138,6 +161,7 @@ function summary(): string {
   return JSON.stringify(
     {
       page: 'lab/vad-live',
+      app,
       overlay,
       pregate: pregate(),
       userAgent: navigator.userAgent,
@@ -158,7 +182,6 @@ layout.replaceSync(`#vad-live-app { height: ${APP_HEIGHT}; contain: strict; } bo
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, layout];
 
 const statusLine = el('p', {});
-const bootLine = el('p', { hidden: '' });
 
 const conditionBox = el('fieldset', {}, el('legend', {}, 'Condition'));
 for (const c of CONDITIONS) {
@@ -180,7 +203,7 @@ for (const m of MARKS) {
   const b = el('button', { type: 'button' }, MARK_LABELS[m]);
   markButtons.push(b);
   b.addEventListener('click', () => {
-    if (overlay === 'loading') return;
+    if (!tallying()) return;
     counts[condition][m]++;
     lastMark = { condition, mark: m };
     lastLine.textContent = `Marked ${MARK_LABELS[m]} (${condition}).`;
@@ -189,7 +212,7 @@ for (const m of MARKS) {
   markRow.append(b);
 }
 undo.addEventListener('click', () => {
-  if (lastMark === null) return;
+  if (lastMark === null || !tallying()) return;
   const { condition: c, mark: m } = lastMark;
   counts[c][m]--;
   lastMark = null;
@@ -236,7 +259,7 @@ copy.addEventListener('click', () => {
     );
 });
 
-panel.append(statusLine, bootLine, conditionBox, markRow, lastLine, table, el('p', {}, copy, copyLine), json);
+panel.append(statusLine, conditionBox, markRow, lastLine, table, el('p', {}, copy, copyLine), json);
 
 function render(): void {
   statusLine.textContent = statusText();
@@ -249,8 +272,8 @@ function render(): void {
       if (td !== undefined) td.textContent = String(values[r]);
     }
   });
-  undo.disabled = lastMark === null;
-  for (const b of markButtons) b.disabled = overlay === 'loading';
+  undo.disabled = lastMark === null || !tallying();
+  for (const b of markButtons) b.disabled = !tallying();
   json.textContent = summary();
 }
 render();
@@ -261,22 +284,29 @@ boot(appRoot, {
   debug,
   onSession: (s) => {
     s.addTransitionListener((from, to, e) => {
+      if (from === 'Listening' && to === 'Recording') takeArmed = tallying();
       const k = autoCounter(from, to, e);
-      if (k === null || overlay === 'loading') return;
-      counts[condition][k]++;
-      render();
+      if (k !== null && takeArmed) {
+        counts[condition][k]++;
+        render();
+      }
+      if (TAKE_ENDS.has(to)) takeArmed = false;
     });
   },
   onDebugOverlay: (mounted) => {
     overlay = mounted ? 'on' : 'failed';
     render();
   },
-}).catch((err: unknown) => {
-  bootLine.hidden = false;
-  bootLine.textContent = `The app failed to boot: ${String(err)}`;
-  // A boot that failed before reaching the overlay's mount never reports: show it as failed, not loading. One that
-  // failed later still reports, and its `onDebugOverlay` wins.
-  if (overlay === 'loading') overlay = 'failed';
-  render();
-  console.error('vad-live: boot failed', err);
-});
+}).then(
+  () => {
+    app = 'ok';
+    render();
+  },
+  (err: unknown) => {
+    app = 'failed';
+    bootError = String(err);
+    takeArmed = false;
+    render();
+    console.error('vad-live: boot failed', err);
+  },
+);
