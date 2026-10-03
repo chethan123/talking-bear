@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lab: VAD live (the production pipeline with a tally)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./lab.css" />
+    <script type="module" src="./vad-live.ts"></script>
+  </head>
+  <body>
+    <div id="vad-live-app"></div>
+    <h1>VAD live: the production pipeline with a tally</h1>
+    <section id="tally" aria-label="Tally"></section>
+    <p><a href="./">All labs</a></p>
+    <h2>What this page is</h2>
+    <p>
+      Plan §7 M2: the live end-to-end check on D1 that covers what feature traces can't, such as the LSTM
+      reset at every re-arm and the pre-gate warm-up. The bear above is the app itself, booted by
+      <code>src/main.ts</code> with the debug overlay: the same engine, worker, VAD, voice chain and session,
+      nothing copied. Only aggregate counts are kept.
+    </p>
+    <h2>How to run the check</h2>
+    <p>
+      Tap the bear to wake it and allow the microphone. Choose the condition (quiet, fan or TV noise), then
+      say short phrases (under 3 s, with at least 2 s between them) and wait for each replay. After each
+      phrase press exactly one of Hit (the bear replayed the whole phrase, once), Miss (no replay) or Split
+      (the phrase came back in two or more replays). Press Truncated as well when a replay cut off the start
+      or the end of the phrase, and False trigger whenever the bear recorded with nobody speaking. Undo takes
+      back the last mark. Phrases spoken is hits + misses + splits.
+    </p>
+    <p>
+      The auto counters come from the session's transitions: recordings (Listening → Recording), completed
+      (Processing → Playing), misfires (a segment too short to keep: Recording → Listening) and maxLength ends
+      (a segment cut at the 10 s cap: Recording → Processing). Each count goes to the condition selected when
+      it happens. Check the two rare counters once on the device: in quiet, knock on the table (if the VAD
+      starts on the knock at all, it ends as a misfire, with no replay), then speak for more than 10 s without
+      a pause (a maxLength end, then the replay). The M2 exit criterion: at most 1 miss or split in 30 phrases
+      in each of quiet, fan and TV, with the frozen parameters. At the end press Copy summary and paste the
+      JSON into <code>docs/device-notes.md</code>, with the phone model and the Android and Chrome versions.
+    </p>
+    <p>
+      The debug overlay turns the worker's feature trace on while it is shown, and while the trace is on the
+      Silero pre-gate never skips a frame (Silero runs on every frame). The line at the top of the tally says
+      whether that applies. To measure the pre-gate's skipping and warm-up once it is enabled, open this page
+      as <code>vad-live.html?debug=0</code>, which boots the app without the overlay.
+    </p>
+    <h2>Privacy</h2>
+    <p>
+      Plan Q2: only aggregate counts are kept, as integers in this page's memory. The page keeps no audio, no
+      times and no record of single phrases, stores nothing in the browser and sends nothing anywhere: Copy
+      summary puts the counts on the clipboard, and leaving or reloading the page resets them. The app itself
+      never stores audio: each take lives in memory only until its replay ends.
+    </p>
+  </body>
+</html>
