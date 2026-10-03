@@ -49,6 +49,11 @@ export interface BootOptions {
   debug?: boolean;
   /** Called with the session as soon as it exists, before its first event (lab/vad-live's tally). */
   onSession?(s: Session): void;
+  /**
+   * With the overlay: called once it is up (`true`: it has turned the worker's feature trace on) or has failed to
+   * load or mount (`false`: the trace is off), so a caller reports what actually ran (lab/vad-live's pre-gate).
+   */
+  onDebugOverlay?(mounted: boolean): void;
 }
 
 /** Boots the app into `app`, its root element (index.html: main#app), which gets `data-state`. */
@@ -193,8 +198,9 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
   // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted). It is loaded on
   // demand and nothing waits for it (#57): its code, and the energy gate it replays, stay out of the initial bundle.
   void overlayModule
-    ?.then((m) =>
-      m?.mountDebugOverlay(app, {
+    ?.then((m) => {
+      if (m === null) return false;
+      m.mountDebugOverlay(app, {
         frameStats: (out) => view.frameStats(out),
         clock,
         storage,
@@ -206,9 +212,15 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
           now: () => clock.now(),
         },
         vad: { engine, session: s },
-      }),
-    )
-    .catch((err: unknown) => console.error('debug overlay failed to mount', err));
+      });
+      return true;
+    })
+    .catch((err: unknown) => {
+      console.error('debug overlay failed to mount', err);
+      engine.setTrace(false); // a mount that threw after turning the trace on: nothing reads the trace
+      return false;
+    })
+    .then((mounted) => opts.onDebugOverlay?.(mounted));
 
   let shown: StateName | null = null;
   const render = (st: SessionState): void => {

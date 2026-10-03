@@ -10,8 +10,10 @@
 // its replay ends.
 //
 // The debug overlay turns the worker's feature trace on while it is mounted, and the trace suspends the Silero
-// pre-gate's skipping: Silero runs on every frame (src/workers/vad-core.ts). The status line says so, and
-// `?debug=0` boots the app without the overlay, to measure the pre-gate once it is enabled (PREGATE_ENABLED).
+// pre-gate's skipping: Silero runs on every frame (src/workers/vad-core.ts). The status line and the summary
+// report the overlay as it actually is (boot's `onDebugOverlay`: mounted, or failed to load or mount), not as the
+// URL asked for it, and `?debug=0` boots the app without the overlay, to measure the pre-gate once it is enabled
+// (PREGATE_ENABLED).
 //
 // Layout: all of the app's layers are position: fixed, so the app root gets a height and `contain: strict`, which
 // makes it their containing block, and the tally panel follows it. The rules come from a constructed stylesheet
@@ -36,6 +38,7 @@ const AUTOS = ['recordings', 'completed', 'misfires', 'maxLength'] as const;
 type Auto = (typeof AUTOS)[number];
 type Counter = Mark | Auto;
 type Counts = Record<Counter, number>;
+type OverlayState = 'off' | 'loading' | 'on' | 'failed';
 /** A table row: a counter, or `phrases` (derived: hits + misses + splits). */
 type Row = 'phrases' | Counter;
 const ROWS: readonly Row[] = ['phrases', ...MARKS, ...AUTOS];
@@ -98,11 +101,28 @@ let condition: Condition = 'quiet';
 let lastMark: { condition: Condition; mark: Mark } | null = null;
 /** `?debug=0` boots the app without the debug overlay (and so without the feature trace). */
 const debug = new URLSearchParams(location.search).get('debug') !== '0';
+/**
+ * The debug overlay as it actually is: off (`?debug=0`), loading, on (mounted: the feature trace is on), or failed
+ * (it didn't load or mount: the trace is off). Set by boot's `onDebugOverlay`.
+ */
+let overlay: OverlayState = debug ? 'loading' : 'off';
 
 /** The pre-gate as this run has it: off in the build, on, or on but suspended by the overlay's feature trace. */
 function pregate(): 'off' | 'on' | 'suspended' {
   if (!PREGATE_ENABLED) return 'off';
-  return debug ? 'suspended' : 'on';
+  return overlay === 'on' ? 'suspended' : 'on';
+}
+
+/** The status line: what the overlay and the feature trace are doing to the pre-gate. */
+function statusText(): string {
+  const built = `Pre-gate in this build: ${PREGATE_ENABLED ? 'on' : 'off'}.`;
+  const text: Readonly<Record<OverlayState, string>> = {
+    on: `Debug overlay on: the worker's feature trace is on, so the Silero pre-gate never skips (Silero runs on every frame). ${built} Open ?debug=0 to run without the overlay.`,
+    loading: `Debug overlay loading: until it is up, the feature trace is off and the pre-gate runs as built. ${built}`,
+    failed: `The debug overlay failed to load or mount (see the console): the feature trace is off and the pre-gate runs as built. ${built} Reload to try again.`,
+    off: `Debug overlay off (?debug=0): no feature trace, so the pre-gate runs as built. ${built}`,
+  };
+  return text[overlay];
 }
 
 /** The Copy summary JSON: the counts per condition and how the run was set up; no times, no per-phrase data. */
@@ -115,7 +135,7 @@ function summary(): string {
   return JSON.stringify(
     {
       page: 'lab/vad-live',
-      overlay: debug,
+      overlay,
       pregate: pregate(),
       userAgent: navigator.userAgent,
       counts: perCondition,
@@ -134,13 +154,7 @@ const layout = new CSSStyleSheet();
 layout.replaceSync(`#vad-live-app { height: ${APP_HEIGHT}; contain: strict; } body { margin: 0 auto; }`);
 document.adoptedStyleSheets = [...document.adoptedStyleSheets, layout];
 
-const statusLine = el(
-  'p',
-  {},
-  debug
-    ? `Debug overlay on: the worker's feature trace is on, so the Silero pre-gate never skips (Silero runs on every frame). Pre-gate in this build: ${PREGATE_ENABLED ? 'on' : 'off'}. Open ?debug=0 to run without the overlay.`
-    : `Debug overlay off (?debug=0): no feature trace, so the pre-gate runs as built: ${PREGATE_ENABLED ? 'on' : 'off'}.`,
-);
+const statusLine = el('p', {});
 const bootLine = el('p', { hidden: '' });
 
 const conditionBox = el('fieldset', {}, el('legend', {}, 'Condition'));
@@ -219,6 +233,7 @@ copy.addEventListener('click', () => {
 panel.append(statusLine, bootLine, conditionBox, markRow, lastLine, table, el('p', {}, copy, copyLine), json);
 
 function render(): void {
+  statusLine.textContent = statusText();
   CONDITIONS.forEach((c, i) => {
     const th = headCells[i];
     if (th !== undefined) th.textContent = c === condition ? `${c} *` : c;
@@ -244,6 +259,10 @@ boot(appRoot, {
       counts[condition][k]++;
       render();
     });
+  },
+  onDebugOverlay: (mounted) => {
+    overlay = mounted ? 'on' : 'failed';
+    render();
   },
 }).catch((err: unknown) => {
   bootLine.hidden = false;
