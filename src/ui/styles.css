@@ -234,6 +234,23 @@ body {
   font: inherit;
 }
 
+/* "For parents" (#114): the sheet's last section, set off by a rule; its buttons are .sheet-button (48 px). */
+.settings-parents {
+  margin-top: 16px;
+  padding-top: 8px;
+  border-top: 1px solid #dfe6e4;
+}
+
+.settings-parents h3 {
+  margin: 8px 0;
+  font-size: 1.125rem;
+}
+
+.settings-parents p {
+  margin: 8px 0;
+  line-height: 1.4;
+}
+
 /* The licences screen (licences-screen.ts, #114): a full-screen, opaque modal over the settings sheet. Only an open
    one is a flex column, so the UA's display: none still hides it when closed. The header stays put and the text
    scrolls inside the <pre>; pre-wrap and overflow-wrap wrap the long SHA-256 and URL lines at phone width. */

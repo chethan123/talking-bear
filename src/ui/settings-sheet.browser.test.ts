@@ -1,13 +1,29 @@
 // Browser Mode tests for the settings sheet (settings-sheet.ts): M3 (issue #66), its M6 Install and restart
-// buttons (issue #98) and M8 (issue #113): the gear's 1 s press guard and progress ring, every control, and the
-// focus-trapped dialog. styles.css is imported, so the gear's size, corner and ring are the real ones; the store is
-// the real one (in memory) with `set` spied on. Presses use an injected clock, except the real-time 300 / 1100 ms
-// case; pointer and key events are dispatched on the gear, and Tab / Escape go through the real keyboard.
+// buttons (issue #98), M8 (issue #113): the gear's 1 s press guard and progress ring, every control, and the
+// focus-trapped dialog, and M8's "For parents" section (issue #114): the mic retry and help, the privacy note, the
+// licences view, and no outbound links with every UI module mounted. styles.css is imported, so the gear's size,
+// corner and ring are the real ones; the store is the real one (in memory) with `set` spied on. Presses use an
+// injected clock, except the real-time 300 / 1100 ms case; pointer and key events are dispatched on the gear, and
+// Tab / Escape go through the real keyboard. The licences view gets the shipped public/licenses.txt through a mocked
+// fetch.
 
-import { afterEach, beforeEach, describe, expect, test, vi, type Mock, type MockInstance } from 'vitest';
-import { userEvent } from 'vitest/browser';
-import type { StateName } from '../app/events.ts';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+  type Mock,
+  type MockInstance,
+} from 'vitest';
+import { commands, page, userEvent } from 'vitest/browser';
+import { realClock } from '../app/clock.ts';
+import type { Overlay, SessionEvent, StateName } from '../app/events.ts';
 import { createSettingsStore, DEFAULT_SETTINGS, type SettingsStore } from '../app/settings.ts';
+import { mountDebugOverlay } from './debug-overlay.ts';
+import { mountOverlay } from './overlay.ts';
 import {
   GEAR_HOLD_MS,
   GEAR_PRESSING_CLASS,
@@ -50,6 +66,8 @@ interface Harness {
   store: SettingsStore;
   set: MockInstance<SettingsStore['set']>;
   setQuiet: Mock<(on: boolean) => void>;
+  /** The session's dispatch (the mic retry). */
+  dispatch: Mock<(e: SessionEvent) => void>;
   state: { name: StateName };
   /** The sheet's clock (ms); a press advances it. */
   clock: { t: number };
@@ -60,15 +78,17 @@ function harness(): Harness {
   const store = createSettingsStore(null);
   const set = vi.spyOn(store, 'set');
   const setQuiet = vi.fn<(on: boolean) => void>();
+  const dispatch = vi.fn<(e: SessionEvent) => void>();
   const state: { name: StateName } = { name: 'Listening' };
   const clock = { t: 1000 };
   return {
     store,
     set,
     setQuiet,
+    dispatch,
     state,
     clock,
-    deps: { store, bus: { setQuiet }, state: () => state.name, now: () => clock.t },
+    deps: { store, bus: { setQuiet }, state: () => state.name, dispatch, now: () => clock.t },
   };
 }
 
@@ -91,7 +111,7 @@ function arc(): SVGCircleElement {
 }
 
 function dialog(): HTMLDialogElement {
-  const d = root.querySelector('dialog');
+  const d = root.querySelector<HTMLDialogElement>('dialog.settings-sheet');
   if (d === null) throw new Error('no dialog');
   return d;
 }
@@ -758,5 +778,283 @@ describe('M6 Install and restart (#98)', () => {
     expect(button(SETTINGS_TEXT.install).hidden).toBe(false);
     expect(button(SETTINGS_TEXT.restart).disabled).toBe(false);
     expect(root.querySelectorAll('[style]').length).toBe(0);
+  });
+});
+
+// ---- For parents (#114) ----
+
+/** The shipped licences file (public/licenses.txt; the path is relative to the project root). */
+let FILE = '';
+
+beforeAll(async () => {
+  FILE = await commands.readFile('public/licenses.txt');
+});
+
+/** #114's wording, written out here rather than read from SETTINGS_TEXT. */
+const MIC_HELP_114 =
+  "If the microphone is blocked: open Chrome's menu → Settings → Site settings → Microphone, and allow this site.";
+const PRIVACY_114 =
+  'Talking Bear works entirely on this device. It has no accounts, analytics or tracking, and never sends audio anywhere. What Juni hears stays in memory only until the replay finishes. Settings are stored on this device.';
+
+/** A fetch that answers with the shipped licences file. */
+function licencesFetch() {
+  return vi.fn<(url: string) => Promise<Response>>(async () => new Response(FILE));
+}
+
+function parentsSection(): HTMLElement {
+  const s = dialog().querySelector<HTMLElement>('section.settings-parents');
+  if (s === null) throw new Error('no For parents section');
+  return s;
+}
+
+function licencesView(): HTMLDialogElement {
+  const d = root.querySelector<HTMLDialogElement>('dialog.licences-screen');
+  if (d === null) throw new Error('no licences view');
+  return d;
+}
+
+/** Every `a` / `area` href under the document that does not resolve to this origin. */
+function offOriginHrefs(): string[] {
+  return Array.from(
+    document.querySelectorAll('a[href], area[href]'),
+    (a) => a.getAttribute('href') ?? '',
+  ).filter((href) => new URL(href, document.baseURI).origin !== location.origin);
+}
+
+describe('For parents (#114)', () => {
+  test('the texts are the specified ones; Install keeps its M6 label', () => {
+    expect(SETTINGS_TEXT).toMatchObject({
+      forParents: 'For parents',
+      micRetry: 'Try the microphone again',
+      micHelp: MIC_HELP_114,
+      privacy: PRIVACY_114,
+      licences: 'Open-source licences',
+      install: 'Install',
+      restart: 'New version – restart',
+    });
+  });
+
+  test('the section sits between Sleep after and Close: heading, retry, help, Install, restart, privacy, licences', () => {
+    const f = fakePwa();
+    f.flags.install = true;
+    const sheet = mountSettingsSheet(root, { ...harness().deps, pwa: f.pwa });
+    sheet.open();
+    const section = parentsSection();
+    expect(Array.from(section.children, (el) => [el.tagName, el.textContent])).toEqual([
+      ['H3', 'For parents'],
+      ['BUTTON', 'Try the microphone again'],
+      ['P', MIC_HELP_114],
+      ['BUTTON', 'Install'],
+      ['BUTTON', 'New version – restart'],
+      ['P', PRIVACY_114],
+      ['BUTTON', 'Open-source licences'],
+    ]);
+    const heading = section.querySelector('h3');
+    expect(heading?.id).not.toBe('');
+    expect(section.getAttribute('aria-labelledby')).toBe(heading?.id);
+    expect(section.previousElementSibling?.querySelector('select')).toBe(sleepSelect());
+    expect(section.nextElementSibling).toBe(closeButton());
+    expect(dialog().lastElementChild).toBe(closeButton());
+    for (const b of section.querySelectorAll('button')) {
+      expect(b.type, b.textContent ?? '').toBe('button');
+      expect(b.getBoundingClientRect().height, b.textContent ?? '').toBeGreaterThanOrEqual(48);
+    }
+  });
+
+  test('without the PWA side the section has the heading, retry, help, privacy and licences only', () => {
+    const sheet = mountSettingsSheet(root, harness().deps);
+    sheet.open();
+    expect(Array.from(parentsSection().children, (el) => el.textContent)).toEqual([
+      'For parents',
+      'Try the microphone again',
+      MIC_HELP_114,
+      PRIVACY_114,
+      'Open-source licences',
+    ]);
+  });
+
+  test('"Try the microphone again" closes the sheet, then dispatches settingsRetry exactly once', () => {
+    const h = harness();
+    const openAtDispatch: boolean[] = [];
+    h.dispatch.mockImplementation(() => {
+      openAtDispatch.push(dialog().open);
+    });
+    mountSettingsSheet(root, h.deps);
+    h.state.name = 'MicDenied';
+    press(h, GEAR_HOLD_MS);
+    expect(dialog().open).toBe(true);
+    button(SETTINGS_TEXT.micRetry).click();
+    expect(h.dispatch.mock.calls).toEqual([[{ t: 'settingsRetry' }]]);
+    expect(openAtDispatch).toEqual([false]);
+    expect(dialog().open).toBe(false);
+  });
+
+  test('the retry dispatches settingsRetry in every state: the session decides (it acts only in MicDenied)', () => {
+    for (const name of STATES) {
+      const h = harness();
+      const sheet = mountSettingsSheet(root, h.deps);
+      sheet.open(); // in Listening; the bear keeps running while the sheet is open
+      h.state.name = name;
+      button(SETTINGS_TEXT.micRetry).click();
+      expect(h.dispatch.mock.calls, name).toEqual([[{ t: 'settingsRetry' }]]);
+      root.replaceChildren();
+    }
+  });
+
+  test('the help and the privacy note are plain text, worded exactly as #114; the sheet has no links', () => {
+    const sheet = mountSettingsSheet(root, harness().deps);
+    sheet.open();
+    const ps = Array.from(parentsSection().querySelectorAll('p'));
+    expect(ps.map((p) => p.textContent)).toEqual([MIC_HELP_114, PRIVACY_114]);
+    for (const p of ps) expect(p.children).toHaveLength(0);
+    expect(maybeButton('Try the microphone again')?.textContent).toBe('Try the microphone again');
+    expect(maybeButton('Open-source licences')?.textContent).toBe('Open-source licences');
+    expect(root.querySelector('a')).toBeNull();
+  });
+
+  test('"Open-source licences" opens the full-screen licences view over the sheet; Close returns to the sheet', async () => {
+    const fetchMock = licencesFetch();
+    const sheet = mountSettingsSheet(root, { ...harness().deps, fetch: fetchMock });
+    sheet.open();
+    const opener = button(SETTINGS_TEXT.licences);
+    await userEvent.click(opener);
+    const view = licencesView();
+    expect(view.open).toBe(true);
+    expect(view.matches(':modal')).toBe(true);
+    expect(dialog().open).toBe(true);
+    await vi.waitFor(() => {
+      expect(view.querySelector('pre')?.textContent).toBe(FILE);
+    });
+    expect(fetchMock.mock.calls).toEqual([['/licenses.txt']]);
+    expect(document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2)?.closest('dialog')).toBe(
+      view,
+    );
+    const close = Array.from(view.querySelectorAll('button')).find((b) => b.textContent === 'Close');
+    close?.click();
+    expect(view.open).toBe(false);
+    expect(dialog().open).toBe(true);
+    expect(document.activeElement).toBe(opener);
+  });
+
+  test('after a real tap on "Open-source licences", Escape closes only the licences view; a second Escape closes the sheet', async () => {
+    const sheet = mountSettingsSheet(root, { ...harness().deps, fetch: licencesFetch() });
+    sheet.open();
+    const opener = button(SETTINGS_TEXT.licences);
+    await userEvent.click(opener);
+    expect(licencesView().open).toBe(true);
+    await userEvent.keyboard('{Escape}');
+    expect(licencesView().open).toBe(false);
+    expect(dialog().open).toBe(true);
+    expect(document.activeElement).toBe(opener);
+    await userEvent.keyboard('{Escape}');
+    expect(dialog().open).toBe(false);
+  });
+
+  test('in MicDenied with the mic help shown, the gear is on top, a 1 s press opens the sheet, and the retry dispatches', async () => {
+    try {
+      for (const [width, height] of [
+        [414, 896],
+        [320, 568],
+      ] as const) {
+        await page.viewport(width, height);
+        const at = `${width} × ${height}`;
+        const h = harness();
+        h.state.name = 'MicDenied';
+        const show = mountOverlay(root, vi.fn()); // mounted before the sheet, as in main.ts
+        show('micHelp');
+        mountSettingsSheet(root, h.deps);
+        const help = Array.from(root.querySelectorAll<HTMLElement>('.overlay section')).find(
+          (x) => !x.hidden,
+        );
+        expect(help?.checkVisibility(), at).toBe(true);
+        const r = gear().getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        expect(hit !== null && gear().contains(hit), at).toBe(true);
+        press(h, GEAR_HOLD_MS);
+        expect(dialog().open, at).toBe(true);
+        button(SETTINGS_TEXT.micRetry).click();
+        expect(h.dispatch.mock.calls, at).toEqual([[{ t: 'settingsRetry' }]]);
+        root.replaceChildren();
+      }
+    } finally {
+      await page.viewport(414, 896); // the default tester viewport
+    }
+  });
+
+  test('no outbound links: with every UI module mounted and every view shown, nothing links off the origin', async () => {
+    const openSpy = vi.spyOn(window, 'open');
+    const h = harness();
+    const f = fakePwa();
+    f.flags.install = true;
+    f.flags.ready = true;
+    const showOverlay = mountOverlay(root, h.dispatch);
+    const sheet = mountSettingsSheet(root, { ...h.deps, pwa: f.pwa, fetch: licencesFetch() });
+    const debug = mountDebugOverlay(root, { frameStats: (out) => out, clock: realClock });
+    try {
+      sheet.open();
+      expect(button(SETTINGS_TEXT.install).hidden).toBe(false);
+      expect(button(SETTINGS_TEXT.restart).disabled).toBe(false);
+      button(SETTINGS_TEXT.install).click();
+      button(SETTINGS_TEXT.restart).click();
+      await userEvent.click(button(SETTINGS_TEXT.licences));
+      await vi.waitFor(() => {
+        expect(licencesView().querySelector('pre')?.textContent).toBe(FILE);
+      });
+      expect(FILE).toContain('https://'); // the file's URLs are on screen, as text
+      const overlays: Overlay[] = [
+        'tapToWake',
+        'parentPermission',
+        'micHelp',
+        'micMuted',
+        'tooNoisy',
+        'error',
+        null,
+      ];
+      for (const o of overlays) {
+        showOverlay(o);
+        expect(document.querySelectorAll('a[href^="http"]').length, String(o)).toBe(0);
+        expect(document.querySelectorAll('[href^="//"]').length, String(o)).toBe(0);
+        expect(document.querySelectorAll('[href^="mailto:"]').length, String(o)).toBe(0);
+        expect(offOriginHrefs(), String(o)).toEqual([]);
+      }
+      expect(root.querySelector('a')).toBeNull();
+      licencesView().close();
+      button(SETTINGS_TEXT.micRetry).click();
+      showOverlay('parentPermission');
+      for (const b of root.querySelectorAll<HTMLButtonElement>('.overlay button')) b.click();
+      expect(openSpy).not.toHaveBeenCalled();
+    } finally {
+      debug.dispose();
+      openSpy.mockRestore();
+    }
+  });
+
+  test('at 414 × 896 the sheet opens at the top, voices first, with focus on Close; the rest scrolls', async () => {
+    await page.viewport(414, 896);
+    const h = harness();
+    const f = fakePwa();
+    f.flags.install = true;
+    f.flags.ready = true;
+    const sheet = mountSettingsSheet(root, { ...h.deps, pwa: f.pwa });
+    press(h, GEAR_HOLD_MS);
+    const d = dialog();
+    expect(document.activeElement).toBe(closeButton());
+    expect(d.scrollTop).toBe(0);
+    const box = d.getBoundingClientRect();
+    const legend = d.querySelector('legend');
+    if (legend === null) throw new Error('no Voice legend');
+    expect(legend.textContent).toBe(SETTINGS_TEXT.voice);
+    const r = legend.getBoundingClientRect();
+    expect(r.top).toBeGreaterThanOrEqual(box.top);
+    expect(r.bottom).toBeLessThanOrEqual(box.bottom);
+    expect(d.scrollHeight).toBeGreaterThan(d.clientHeight);
+    expect(getComputedStyle(d).overflowY).toBe('auto');
+    // Reopened after scrolling down, it starts at the top again.
+    d.scrollTop = d.scrollHeight;
+    expect(d.scrollTop).toBeGreaterThan(0);
+    sheet.close();
+    sheet.open();
+    expect(d.scrollTop).toBe(0);
+    expect(document.activeElement).toBe(closeButton());
   });
 });
