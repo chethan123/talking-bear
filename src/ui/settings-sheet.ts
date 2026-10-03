@@ -25,7 +25,7 @@
 //   Playing, like the gear);
 // - the privacy note (plan §2 "Privacy posture");
 // - "Open-source licences", which opens the full-screen licences view (licences-screen.ts) over the sheet.
-// Nothing in the sheet links anywhere: no `<a href>`, nothing opens a window.
+// Nothing in the sheet links anywhere: it has no anchors, and nothing opens a window.
 //
 // CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement(NS)/textContent only,
 // never HTML strings, and nothing sets a `style` attribute; styles.css styles it, including the ring's fill.
