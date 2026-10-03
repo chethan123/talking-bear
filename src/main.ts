@@ -2,7 +2,8 @@
 // audio engine, the service worker and install prompt (pwa/register.ts), the session store, the haptics, the bear
 // (BearView: Juni on the canvas stage, driven by the session's `anim` effects and the replay's processed envelope,
 // and touched through the pointer input: adapter → recogniser → reactions table → director → session), the M1 text
-// overlays and the M3 settings sheet, with `data-state` on main#app for hook-free smoke tests (plan §4.9.3).
+// overlays and the settings sheet (M3, M8: behind a 1 s press of the gear), with `data-state` on main#app for
+// hook-free smoke tests (plan §4.9.3).
 import './ui/styles.css';
 import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
 import type { Overlay, SessionState, StateName } from './app/events.ts';
@@ -110,6 +111,8 @@ async function boot(): Promise<void> {
     clock,
     onAnim: (ev) => bear?.onAnim(ev),
     onPlayStarted: (id, startCtxTime) => bear?.onPlayStarted(id, startCtxTime),
+    // M8 (#113): read at every dispatch: the sleep timeout (next timer start) and noisy-room NS (next mic open).
+    settings: () => settings.get(),
     onUi: (o) => showOverlay(o),
     // Row 38: on a hide that leaves the session Asleep or Paused with an update ready, activate it synchronously.
     onApplyUpdate: () => pwa.applyUpdate(),
@@ -150,9 +153,10 @@ async function boot(): Promise<void> {
   applyMotion();
   motion.addEventListener('change', applyMotion);
 
-  // Settings (plan §7 M3): the voice preset goes to the reducer now and on every change, Quiet mode to the
+  // Settings (plan §7 M3, M8): the voice preset goes to the reducer now and on every change, Quiet mode to the
   // engine and Gentle mode to the bear on every change. The sheet writes the store and also sets Quiet itself;
-  // a repeated setQuiet is idempotent.
+  // a repeated setQuiet is idempotent. Haptics, the sleep timeout and noisy-room NS are read where they are used
+  // (createHaptics above, the session's `settings`).
   s.dispatch({ t: 'settingsChanged', preset: presetFor(settings.get()) });
   settings.subscribe((st) => {
     s.dispatch({ t: 'settingsChanged', preset: presetFor(st) });
@@ -165,6 +169,7 @@ async function boot(): Promise<void> {
     store: settings,
     bus: { setQuiet: (on) => engine.setQuiet(on) },
     state: () => s.state().name,
+    now: () => clock.now(),
     pwa: {
       installAvailable: () => installAvailable,
       promptInstall: () => pwa.promptInstall(),

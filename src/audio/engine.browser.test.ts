@@ -1,6 +1,6 @@
 // The engine in a real Chromium (Vitest Browser Mode): real AudioContext, capture worklet (loaded from the Vite
 // dev server), DSP worker and the fake microphone (--use-fake-device-for-media-stream: a 400 Hz beep every
-// 500 ms). One engine is shared by tests 1–15, which run in order; tests 16–20 use fresh engines.
+// 500 ms). One engine is shared by tests 1–15, which run in order; tests 2b and 16–20 use fresh engines.
 //
 // Test-only patches on this page, installed before the engines exist and removed in afterAll: `Worker` records
 // every instance and terminate() call (and can be told to fail its next construction), `getUserMedia` records
@@ -259,6 +259,19 @@ describe('engine (Browser Mode, fake media)', () => {
     const track = streams.at(-1)?.getAudioTracks()[0];
     if (track === undefined) throw new Error('no audio track was recorded');
     expect(log[index + 1]).toStrictEqual({ t: track.muted ? 'trackMuted' : 'trackUnmuted' });
+  }, 10_000);
+
+  test('2b: openMic(1, { noiseSuppression: true }) asks getUserMedia for NS on top of the §4.1.1 constraints (a fresh engine)', async () => {
+    const b = freshEngine();
+    b.engine.openMic(1, { noiseSuppression: true });
+    await b.waitFor('micGranted', 0, 5000, (e) => e.req === 1);
+    expect(gumConstraints.at(-1)).toStrictEqual({
+      audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false },
+    });
+    const stream = streams.at(-1);
+    if (stream === undefined) throw new Error('no stream was recorded');
+    b.engine.closeMic(); // test 12 expects every recorded stream ended
+    for (const t of stream.getTracks()) expect(t.readyState).toBe('ended');
   }, 10_000);
 
   test('3: arm(1) posts reset to the worker before arm to the worklet, emits armed{1, …}, and level events arrive within 1500 ms', async () => {

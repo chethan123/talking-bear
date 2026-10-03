@@ -120,7 +120,8 @@ body {
   color: #5f6368;
 }
 
-/* M3 settings (settings-sheet.ts): the gear in the top-right corner and its modal sheet. */
+/* Settings (settings-sheet.ts, M3 and M8): the gear in the top-right corner and its modal sheet. The gear opens the
+   sheet only after a 1 s press; X-A5: no context menu, selection or browser gesture on that long-press. */
 .settings-gear {
   position: fixed;
   top: 8px;
@@ -136,6 +137,41 @@ body {
   font: inherit;
   font-size: 1.75rem;
   line-height: 48px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* The press's progress ring (#113): hidden at rest; while pressing, it fills in 1 s (settings-sheet.ts GEAR_HOLD_MS). */
+.settings-gear-ring {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.settings-gear-ring circle {
+  fill: none;
+  stroke: #2f7a6d;
+  stroke-width: 4;
+  stroke-dasharray: 100;
+  stroke-dashoffset: 100;
+}
+
+.settings-gear--pressing .settings-gear-ring {
+  opacity: 1;
+}
+
+.settings-gear--pressing .settings-gear-ring circle {
+  animation: settings-gear-fill 1s linear forwards;
+}
+
+@keyframes settings-gear-fill {
+  to {
+    stroke-dashoffset: 0;
+  }
 }
 
 .settings-sheet {
@@ -189,6 +225,13 @@ body {
   flex: 1;
   min-height: 48px;
   margin: 0;
+}
+
+/* "Sleep after" (#113): a 48 px target like the other rows. */
+.settings-select {
+  min-height: 48px;
+  margin-left: auto;
+  font: inherit;
 }
 
 /* Developer overlay, ?debug=1 (debug-overlay.ts): top-left text that never takes pointer events. */

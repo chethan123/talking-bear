@@ -2,6 +2,9 @@
 // sfx scheduler, the wake lock, the injected clock and the UI callbacks. The session (session.ts) owns the loop and
 // calls `run` for each effect in order; events an effect produces go back through `io.dispatch`, which queues them
 // while a dispatch is running. Named timers use the injected `Clock` only, never the global timers.
+//
+// Noisy room (plan §4.1.1, §7 M8, #113): each `openMic` reads the settings, and with `noisyRoomNs` on passes
+// `NOISY_ROOM_CONSTRAINTS` as the engine's `extra`, so a change applies at the next mic open.
 
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
 import type { Player, SessionDeps, Sfx, SfxScheduled } from './session.ts';
@@ -18,7 +21,13 @@ export type EffectDeps = Pick<
   | 'onPlayStarted'
   | 'onUi'
   | 'onApplyUpdate'
+  | 'settings'
 >;
+
+/** The noisy-room toggle's `extra` for `engine.openMic`: software NS only, nothing else changes (plan §4.1.1). */
+export const NOISY_ROOM_CONSTRAINTS: Readonly<MediaTrackConstraints> = Object.freeze({
+  noiseSuppression: true,
+});
 
 /** How effects talk back to the session. */
 export interface EffectIo {
@@ -208,7 +217,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
   function exec(fx: Effect): void {
     switch (fx.k) {
       case 'openMic':
-        engine.openMic(fx.req);
+        if (deps.settings?.().noisyRoomNs === true) engine.openMic(fx.req, NOISY_ROOM_CONSTRAINTS);
+        else engine.openMic(fx.req);
         return;
       case 'closeMic':
         engine.closeMic();
