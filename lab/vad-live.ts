@@ -15,13 +15,16 @@
 // URL asked for it. `?debug=0` boots the app without the overlay, to measure the pre-gate once it is enabled
 // (PREGATE_ENABLED).
 //
-// One arming rule (D15) keeps every count true to the labels: the page tallies only while `tallying()`, i.e. the app
-// has booted (`app` 'ok': `boot` resolved, the whole pipeline wired) and the overlay is settled (off, on or failed,
-// never loading). A take is armed at its Listening → Recording if `tallying()` holds then, and its later transitions
-// count only while it is armed; it is disarmed when the take ends (into Listening, Asleep, Paused or Error). So a
-// phrase that started while the overlay was loading is never counted, even in part, and every count of a run shares
-// one trace state. The marks are enabled only while `tallying()`. A failed boot is terminal: nothing is tallied, the
-// status line says so, and the summary carries `app: "failed"`.
+// One arming rule (D15, D16) keeps every count true to the labels: the page tallies only while `tallying()`, i.e. the
+// app has booted (`app` 'ok': `boot` resolved, the whole pipeline wired) and the overlay is settled (off, on or
+// failed, never loading). A listen is clean if the session's `arm` effect for it (the worker's `reset`) came while
+// `tallying()` held: `setTrace(true)` is posted before the overlay reports, and the worker handles its messages in
+// order, so a clean listen, its LSTM and pre-gate warm-up included, runs under the final trace setting. A take is
+// armed at its Listening → Recording only in a clean listen; its later transitions count only while it is armed,
+// into the condition selected when it started; it is disarmed when it ends. So a phrase whose listen began before
+// the tally was live is never counted, even in part. The marks open at the first clean listen and close while an
+// unarmed take is the latest phrase. A failed boot is terminal: nothing is tallied, the status line says so, and the
+// summary carries `app: "failed"`.
 //
 // Layout: all of the app's layers are position: fixed, so the app root gets a height and `contain: strict`, which
 // makes it their containing block, and the tally panel follows it. The rules come from a constructed stylesheet
@@ -120,14 +123,31 @@ let overlay: OverlayState = debug ? 'loading' : 'off';
 let app: AppState = 'booting';
 /** Why the boot failed, for the status line. */
 let bootError = '';
-/** The current take is tallied: `tallying()` held at its Listening → Recording, and it hasn't ended yet. */
+/** The current listen is clean: the session's `arm` effect for it came while `tallying()` held (D16). */
+let cleanArm = false;
+/** A clean listen has been seen: the marks can open. */
+let cleanEpochSeen = false;
+/** The current take is tallied: it started (Listening → Recording) in a clean listen, and it hasn't ended yet. */
 let takeArmed = false;
-/** The states that end a take (a misfire ends in Listening, after it is counted). */
+/** The latest take was not armed: neither it nor a mark for it is counted until the next armed take starts. */
+let marksBlocked = false;
+/** The condition selected when the current take started: all of its counts go there. */
+let takeCondition: Condition = 'quiet';
+/**
+ * The states that end a take (a misfire ends in Listening, after it is counted). Recording → Cooldown (rows 45/46)
+ * and Recording → Waking (row 40) end one too; most of this set is defensive, since every counted transition follows
+ * its own Listening → Recording.
+ */
 const TAKE_ENDS: ReadonlySet<StateName> = new Set<StateName>(['Listening', 'Asleep', 'Paused', 'Error']);
 
 /** D15: marks and new takes are tallied only once the app has booted and the overlay's trace state is settled. */
 function tallying(): boolean {
   return app === 'ok' && overlay !== 'loading';
+}
+
+/** D16: the marks are open once a clean listen has been seen, and not while an unarmed take is the latest phrase. */
+function marksOpen(): boolean {
+  return tallying() && cleanEpochSeen && !marksBlocked;
 }
 
 /** The pre-gate as this run has it: off in the build, on, or on but suspended by the overlay's feature trace. */
@@ -148,7 +168,11 @@ function statusText(): string {
     failed: `The debug overlay failed to load or mount (see the console): the feature trace is off and the pre-gate runs as built. ${built} Reload to try again.`,
     off: `Debug overlay off (?debug=0): no feature trace, so the pre-gate runs as built. ${built}`,
   };
-  return text[overlay];
+  if (overlay === 'loading') return text.loading;
+  if (marksBlocked) {
+    return `${text[overlay]} A phrase was in flight when the tally started: it isn't counted or marked. Counting starts with the next listen.`;
+  }
+  return cleanEpochSeen ? text[overlay] : `${text[overlay]} Counting starts when the bear next listens.`;
 }
 
 /** The Copy summary JSON: the counts per condition and how the run was set up; no times, no per-phrase data. */
@@ -203,7 +227,7 @@ for (const m of MARKS) {
   const b = el('button', { type: 'button' }, MARK_LABELS[m]);
   markButtons.push(b);
   b.addEventListener('click', () => {
-    if (!tallying()) return;
+    if (!marksOpen()) return;
     counts[condition][m]++;
     lastMark = { condition, mark: m };
     lastLine.textContent = `Marked ${MARK_LABELS[m]} (${condition}).`;
@@ -212,7 +236,7 @@ for (const m of MARKS) {
   markRow.append(b);
 }
 undo.addEventListener('click', () => {
-  if (lastMark === null || !tallying()) return;
+  if (lastMark === null || !marksOpen()) return;
   const { condition: c, mark: m } = lastMark;
   counts[c][m]--;
   lastMark = null;
@@ -272,8 +296,8 @@ function render(): void {
       if (td !== undefined) td.textContent = String(values[r]);
     }
   });
-  undo.disabled = lastMark === null || !tallying();
-  for (const b of markButtons) b.disabled = !tallying();
+  undo.disabled = lastMark === null || !marksOpen();
+  for (const b of markButtons) b.disabled = !marksOpen();
   json.textContent = summary();
 }
 render();
@@ -283,14 +307,30 @@ render();
 boot(appRoot, {
   debug,
   onSession: (s) => {
-    s.addTransitionListener((from, to, e) => {
-      if (from === 'Listening' && to === 'Recording') takeArmed = tallying();
+    s.addTransitionListener((from, to, e, effects) => {
+      let changed = false;
+      if (from === 'Listening' && to === 'Recording') {
+        takeArmed = cleanArm && tallying();
+        takeCondition = condition;
+        marksBlocked = !takeArmed;
+        changed = true;
+      }
       const k = autoCounter(from, to, e);
       if (k !== null && takeArmed) {
-        counts[condition][k]++;
-        render();
+        counts[takeCondition][k]++;
+        changed = true;
       }
       if (TAKE_ENDS.has(to)) takeArmed = false;
+      // The `arm` effect (the worker's `reset`) starts a listen; a Listening → Listening stay has none.
+      for (const fx of effects) {
+        if (fx.k !== 'arm') continue;
+        cleanArm = tallying();
+        if (cleanArm && !cleanEpochSeen) {
+          cleanEpochSeen = true;
+          changed = true;
+        }
+      }
+      if (changed) render();
     });
   },
   onDebugOverlay: (mounted) => {
