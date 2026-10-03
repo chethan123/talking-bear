@@ -392,6 +392,7 @@ describe('the 1 s press guard (#113)', () => {
     expect(dialog().open).toBe(false);
     pointer('pointerdown');
     await sleep(1100);
+    expect(dialog().open).toBe(false); // D1: opens at release, never while held
     pointer('pointerup');
     expect(dialog().open).toBe(true);
   });
@@ -548,13 +549,28 @@ describe('the 1 s press guard (#113)', () => {
   });
 
   test('X-A5: the gear prevents the context menu and takes no touch gestures or selection', () => {
-    mountSettingsSheet(root, harness().deps);
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
     const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
     gear().dispatchEvent(e);
     expect(e.defaultPrevented).toBe(true);
     const cs = getComputedStyle(gear());
     expect(cs.touchAction).toBe('none');
     expect(cs.userSelect).toBe('none');
+    // Android's long-press contextmenu (≈ 500 ms) neither opens the sheet nor ends a parent's press.
+    const contextmenu = (): void => {
+      gear().dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    };
+    pointer('pointerdown');
+    h.clock.t += 500;
+    contextmenu();
+    expect(dialog().open).toBe(false);
+    expect(gear().classList.contains(GEAR_PRESSING_CLASS)).toBe(true);
+    h.clock.t += 600;
+    contextmenu();
+    expect(dialog().open).toBe(false);
+    pointer('pointerup');
+    expect(dialog().open).toBe(true);
   });
 });
 
