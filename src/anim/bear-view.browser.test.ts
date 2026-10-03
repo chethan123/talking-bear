@@ -43,6 +43,7 @@ import { POSES } from './poses.ts';
 import { createContext, fitView, MAX_DPR, render } from './renderer.ts';
 import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { SpringBank } from './springs.ts';
+import { MAX_FRAME_DT, Stepper } from './stepper.ts';
 import { configureSprings, SPRING, SPRING_COUNT, SPRING_PARAMS } from './springs-map.ts';
 
 const DEG = Math.PI / 180;
@@ -1162,18 +1163,84 @@ describe('reaction clips in the frame (#221)', () => {
     const a = awake();
     const b = awake();
     a.view.gesture(TUFT_TAP);
+    // Only vsyncs where `a` drew on this one and the previous one count: truly at full rate, not throttled out of
+    // phase with the control.
     let fullRate = 0;
+    let prevDrew = false;
     for (let k = 0; k < 120; k++) {
       const na = drawnFrames(a);
       const nb = drawnFrames(b);
       a.run(1);
       b.run(1);
+      const drew = drawnFrames(a) > na;
       const ringing = delta(a, b, Ch.TuftRot) !== 0;
-      if (a.view.director().clip === null && drawnFrames(a) > na && drawnFrames(b) === nb && ringing)
-        fullRate++;
+      if (a.view.director().clip === null && drew && prevDrew && drawnFrames(b) === nb && ringing) fullRate++;
+      prevDrew = drew;
     }
     expect(a.view.director().name).toBe('Idle');
-    expect(fullRate, 'vsyncs the ringing tuft alone kept drawn').toBeGreaterThanOrEqual(5);
+    expect(fullRate, 'consecutive vsyncs the ringing tuft alone kept drawn').toBeGreaterThanOrEqual(5);
+  });
+
+  test('after a kicked clip has ended, the next clip gets its kicks', () => {
+    const impulse = vi.spyOn(SpringBank.prototype, 'impulse');
+    const h = awake();
+    h.view.gesture(TUFT_TAP);
+    h.run(60); // 1 s at 60 Hz: tuftBoing (0.8 s) has ended, its kick applied
+    expect(h.view.director().clip).toBeNull();
+    impulse.mockClear();
+    h.view.gesture(BELLY_TAP);
+    expect(h.view.director().clip?.name).toBe('bellyBoing');
+    h.run(1);
+    expect(impulse.mock.calls.filter(([i]) => i === SPRING.belly)).toStrictEqual([
+      [SPRING.belly, REACTION_CLIPS.bellyBoing.impulses![0]!.dv],
+    ]);
+  });
+
+  test('a secondary spring is drawn at the frame alpha between its last two substeps, like the layers (90 Hz)', () => {
+    const P90 = 1000 / 90;
+    // Attentive before the first frame: every frame is drawn, so each frame's time since the last one is known.
+    const h = harness();
+    h.session.state = 'Listening';
+    toIdle(h);
+    h.anim({ e: 'attentive' });
+    // The reference: the app's springs, stepped by a stepper fed the same frame times as the view's loop.
+    const bank = new SpringBank(SPRING_COUNT);
+    configureSprings(bank);
+    const prev = new Float32Array(SPRING_COUNT);
+    const stepper = new Stepper();
+    const kick = REACTION_CLIPS.tuftBoing.impulses![0]!;
+    let kickDue = false;
+    const substep = (dt: number): void => {
+      if (kickDue) bank.impulse(kick.spring, kick.dv);
+      kickDue = false;
+      prev.set(bank.pos);
+      bank.step(dt);
+    };
+    let last = -1;
+    let between = 0;
+    for (let k = 0; k < 150; k++) {
+      if (k === 30) {
+        h.view.gesture(TUFT_TAP);
+        expect(h.view.director().clip?.name).toBe('tuftBoing');
+        kickDue = true; // the view applies it in the first substep after the tap
+      }
+      const t = h.clock.t + P90;
+      const drawn = drawnFrames(h);
+      h.stepTo(t);
+      expect(drawnFrames(h) - drawn, `frame ${k} is drawn`).toBe(1);
+      // As loop.ts feeds its stepper: nothing on the first frame, then the time since the last drawn frame.
+      const owed = last >= 0 ? (t - last) / 1000 : 0;
+      last = t;
+      const alpha = stepper.advance(owed < MAX_FRAME_DT ? owed : MAX_FRAME_DT, substep);
+      const a = prev[SPRING.tuft]!;
+      const cur = bank.pos[SPRING.tuft]!;
+      const want = a + (cur - a) * alpha;
+      expect(Math.abs(h.view.pose()[Ch.TuftRot]! - want), `frame ${k}, alpha ${alpha}`).toBeLessThanOrEqual(
+        1e-6,
+      );
+      if (Math.abs(cur - want) > 1e-3) between++;
+    }
+    expect(between, 'frames drawn visibly between the last two substeps').toBeGreaterThanOrEqual(20);
   });
 });
 
