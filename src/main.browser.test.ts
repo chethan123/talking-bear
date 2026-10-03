@@ -1,8 +1,10 @@
 // `boot(root, { debug, onDebugOverlay })` (#57, PR #260 review): the overlay's report says what actually ran, so
-// lab/vad-live labels its pre-gate by the real feature-trace state, not by the URL. The overlay module is mocked:
-// it turns the trace on through its deps, as the real one does, and then mounts or throws.
+// lab/vad-live labels its pre-gate by the real feature-trace state, not by the URL. `boot` is tested with the
+// overlay module mocked (it turns the trace on through its deps, as the real one does, and then mounts or throws);
+// a module that fails to load can't be mocked in Browser Mode (a throwing factory fails the run), so that path is
+// tested on `mountDebugOverlayWhenLoaded`, which `boot` hands the import to.
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { boot } from './main.ts';
+import { boot, mountDebugOverlayWhenLoaded } from './main.ts';
 import type { Pwa } from './pwa/register.ts';
 import type { DebugOverlayDeps } from './ui/debug-overlay.ts';
 
@@ -38,27 +40,33 @@ vi.mock('./ui/debug-overlay.ts', () => ({
 
 const roots: HTMLElement[] = [];
 
-/** Boots into a fresh root; resolves with `onDebugOverlay`'s argument, or 'none' if it isn't called in time. */
-async function bootReport(debug: boolean, waitMs = 3000): Promise<boolean | 'none'> {
-  const root = document.createElement('div');
-  document.body.append(root);
-  roots.push(root);
-  const reported = new Promise<boolean>((resolve) => {
-    void boot(root, { debug, onDebugOverlay: resolve });
-  });
+/** Resolves with the first report, or 'none' if there is none within `waitMs`. */
+function firstReport(
+  start: (report: (mounted: boolean) => void) => void,
+  waitMs = 3000,
+): Promise<boolean | 'none'> {
+  const reported = new Promise<boolean>((resolve) => start(resolve));
   const timeout = new Promise<'none'>((resolve) => setTimeout(() => resolve('none'), waitMs));
   return Promise.race([reported, timeout]);
 }
 
-describe('boot: onDebugOverlay', () => {
-  afterEach(() => {
-    h.mode = 'mount';
-    h.mounts = 0;
-    h.trace.length = 0;
-    for (const r of roots.splice(0)) r.remove();
-    vi.restoreAllMocks();
-  });
+/** Boots into a fresh root; resolves with `onDebugOverlay`'s argument, or 'none' if it isn't called in time. */
+function bootReport(debug: boolean, waitMs = 3000): Promise<boolean | 'none'> {
+  const root = document.createElement('div');
+  document.body.append(root);
+  roots.push(root);
+  return firstReport((report) => void boot(root, { debug, onDebugOverlay: report }), waitMs);
+}
 
+afterEach(() => {
+  h.mode = 'mount';
+  h.mounts = 0;
+  h.trace.length = 0;
+  for (const r of roots.splice(0)) r.remove();
+  vi.restoreAllMocks();
+});
+
+describe('boot: onDebugOverlay', () => {
   test('a mounted overlay reports true, with the feature trace on', async () => {
     expect(await bootReport(true)).toBe(true);
     expect(h.mounts).toBe(1);
@@ -78,5 +86,33 @@ describe('boot: onDebugOverlay', () => {
     expect(await bootReport(false, 500)).toBe('none');
     expect(h.mounts).toBe(0);
     expect(h.trace).toEqual([]);
+  });
+});
+
+describe('mountDebugOverlayWhenLoaded', () => {
+  test('a module that failed to load (null) reports false, never mounts and leaves the trace alone', async () => {
+    const mount = vi.fn();
+    const trace = { setTrace: vi.fn() };
+    const report = await firstReport((r) =>
+      mountDebugOverlayWhenLoaded(Promise.resolve(null), mount, trace, r),
+    );
+    expect(report).toBe(false);
+    expect(mount).not.toHaveBeenCalled();
+    expect(trace.setTrace).not.toHaveBeenCalled();
+  });
+
+  test('a report that throws is logged, not left as an unhandled rejection', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const trace = { setTrace: vi.fn() };
+    mountDebugOverlayWhenLoaded(
+      Promise.resolve({}),
+      () => {},
+      trace,
+      () => {
+        throw new Error('test: report threw');
+      },
+    );
+    await vi.waitFor(() => expect(error).toHaveBeenCalledWith('onDebugOverlay threw', expect.any(Error)));
+    expect(trace.setTrace).not.toHaveBeenCalled();
   });
 });

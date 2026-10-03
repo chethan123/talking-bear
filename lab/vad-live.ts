@@ -12,7 +12,9 @@
 // The debug overlay turns the worker's feature trace on while it is mounted, and the trace suspends the Silero
 // pre-gate's skipping: Silero runs on every frame (src/workers/vad-core.ts). The status line and the summary
 // report the overlay as it actually is (boot's `onDebugOverlay`: mounted, or failed to load or mount), not as the
-// URL asked for it, and `?debug=0` boots the app without the overlay, to measure the pre-gate once it is enabled
+// URL asked for it. Nothing is tallied while the overlay is still loading (the marks are disabled and transitions
+// are ignored): a run's counts all share one trace state, so the summary's single `pregate` label is true for every
+// count. `?debug=0` boots the app without the overlay (never loading), to measure the pre-gate once it is enabled
 // (PREGATE_ENABLED).
 //
 // Layout: all of the app's layers are position: fixed, so the app root gets a height and `contain: strict`, which
@@ -103,7 +105,8 @@ let lastMark: { condition: Condition; mark: Mark } | null = null;
 const debug = new URLSearchParams(location.search).get('debug') !== '0';
 /**
  * The debug overlay as it actually is: off (`?debug=0`), loading, on (mounted: the feature trace is on), or failed
- * (it didn't load or mount: the trace is off). Set by boot's `onDebugOverlay`.
+ * (it didn't load or mount, or the app didn't boot: the trace is off). Set by boot's `onDebugOverlay`. Nothing is
+ * tallied while it is loading.
  */
 let overlay: OverlayState = debug ? 'loading' : 'off';
 
@@ -118,7 +121,7 @@ function statusText(): string {
   const built = `Pre-gate in this build: ${PREGATE_ENABLED ? 'on' : 'off'}.`;
   const text: Readonly<Record<OverlayState, string>> = {
     on: `Debug overlay on: the worker's feature trace is on, so the Silero pre-gate never skips (Silero runs on every frame). ${built} Open ?debug=0 to run without the overlay.`,
-    loading: `Debug overlay loading: until it is up, the feature trace is off and the pre-gate runs as built. ${built}`,
+    loading: `Debug overlay loading: nothing is tallied until it is up (the feature trace is still off). ${built}`,
     failed: `The debug overlay failed to load or mount (see the console): the feature trace is off and the pre-gate runs as built. ${built} Reload to try again.`,
     off: `Debug overlay off (?debug=0): no feature trace, so the pre-gate runs as built. ${built}`,
   };
@@ -172,9 +175,12 @@ for (const c of CONDITIONS) {
 const lastLine = el('p', {}, 'No mark yet.');
 const undo = el('button', { type: 'button' }, 'Undo last mark');
 const markRow = el('p', {});
+const markButtons: HTMLButtonElement[] = [];
 for (const m of MARKS) {
   const b = el('button', { type: 'button' }, MARK_LABELS[m]);
+  markButtons.push(b);
   b.addEventListener('click', () => {
+    if (overlay === 'loading') return;
     counts[condition][m]++;
     lastMark = { condition, mark: m };
     lastLine.textContent = `Marked ${MARK_LABELS[m]} (${condition}).`;
@@ -244,6 +250,7 @@ function render(): void {
     }
   });
   undo.disabled = lastMark === null;
+  for (const b of markButtons) b.disabled = overlay === 'loading';
   json.textContent = summary();
 }
 render();
@@ -255,7 +262,7 @@ boot(appRoot, {
   onSession: (s) => {
     s.addTransitionListener((from, to, e) => {
       const k = autoCounter(from, to, e);
-      if (k === null) return;
+      if (k === null || overlay === 'loading') return;
       counts[condition][k]++;
       render();
     });
@@ -267,5 +274,9 @@ boot(appRoot, {
 }).catch((err: unknown) => {
   bootLine.hidden = false;
   bootLine.textContent = `The app failed to boot: ${String(err)}`;
+  // A boot that failed before reaching the overlay's mount never reports: show it as failed, not loading. One that
+  // failed later still reports, and its `onDebugOverlay` wins.
+  if (overlay === 'loading') overlay = 'failed';
+  render();
   console.error('vad-live: boot failed', err);
 });

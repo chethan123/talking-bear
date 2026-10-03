@@ -56,6 +56,33 @@ export interface BootOptions {
   onDebugOverlay?(mounted: boolean): void;
 }
 
+/**
+ * Mounts the developer overlay once its module has loaded (#57) and reports whether it is up: `true` once `mount`
+ * has returned (the overlay has turned the worker's feature trace on), `false` if the module failed to load
+ * (`null`) or `mount` threw. A mount that threw after turning the trace on has it turned off again, so `false` always
+ * means the trace is off. Nothing waits for it, and a `report` that throws is logged.
+ */
+export function mountDebugOverlayWhenLoaded<M>(
+  module: Promise<M | null>,
+  mount: (m: M) => void,
+  trace: { setTrace(on: boolean): void },
+  report: (mounted: boolean) => void,
+): void {
+  void module
+    .then((m) => {
+      if (m === null) return false;
+      mount(m);
+      return true;
+    })
+    .catch((err: unknown) => {
+      console.error('debug overlay failed to mount', err);
+      trace.setTrace(false); // a mount that threw after turning the trace on: nothing reads the trace
+      return false;
+    })
+    .then(report)
+    .catch((err: unknown) => console.error('onDebugOverlay threw', err));
+}
+
 /** Boots the app into `app`, its root element (index.html: main#app), which gets `data-state`. */
 export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<void> {
   // The developer overlay (mounted below) is loaded on demand (#57), its fetch started here. A failed load is
@@ -197,30 +224,27 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
   // usage, the device lines (#93: the latest vibrate result, ctx.state, the mic track's events, the audio inputs),
   // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted). It is loaded on
   // demand and nothing waits for it (#57): its code, and the energy gate it replays, stay out of the initial bundle.
-  void overlayModule
-    ?.then((m) => {
-      if (m === null) return false;
-      m.mountDebugOverlay(app, {
-        frameStats: (out) => view.frameStats(out),
-        clock,
-        storage,
-        device: {
-          lastVibrate: () => lastVibrate,
-          engine,
-          session: s,
-          mediaDevices: 'mediaDevices' in navigator ? navigator.mediaDevices : null,
-          now: () => clock.now(),
-        },
-        vad: { engine, session: s },
-      });
-      return true;
-    })
-    .catch((err: unknown) => {
-      console.error('debug overlay failed to mount', err);
-      engine.setTrace(false); // a mount that threw after turning the trace on: nothing reads the trace
-      return false;
-    })
-    .then((mounted) => opts.onDebugOverlay?.(mounted));
+  if (overlayModule !== null) {
+    mountDebugOverlayWhenLoaded(
+      overlayModule,
+      (m) =>
+        m.mountDebugOverlay(app, {
+          frameStats: (out) => view.frameStats(out),
+          clock,
+          storage,
+          device: {
+            lastVibrate: () => lastVibrate,
+            engine,
+            session: s,
+            mediaDevices: 'mediaDevices' in navigator ? navigator.mediaDevices : null,
+            now: () => clock.now(),
+          },
+          vad: { engine, session: s },
+        }),
+      engine,
+      (mounted) => opts.onDebugOverlay?.(mounted),
+    );
+  }
 
   let shown: StateName | null = null;
   const render = (st: SessionState): void => {
