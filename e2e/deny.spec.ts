@@ -11,5 +11,6 @@ test('deny: a denied mic shows the MicDenied help', async ({ page }) => {
   await openApp(page);
   await tapToWake(page);
   await expect(page.locator('main#app')).toHaveAttribute('data-state', 'MicDenied', { timeout: 5_000 });
-  await expect(page.getByText('Microphone is blocked')).toBeVisible();
+  await expect(page.locator('.overlay').getByText('Microphone is blocked')).toBeVisible();
+  await expect(page.locator('.overlay').getByRole('button')).toHaveCount(0);
 });

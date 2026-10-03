@@ -1,6 +1,7 @@
 // The M1 text overlays (plan §7 M1 UI, §4.5 parent sheet): tap-to-wake, the parent-permission sheet, the
 // mic-denied help, the mic-muted and too-noisy badges, and the error hint. Development text only: M8 replaces it
-// with the kid-first, text-free UI.
+// with the kid-first, text-free UI. The mic-denied help has no button: a child's tap never retries the mic, and
+// retrying lives behind the settings long-press, in the sheet's "For parents" section (plan §4.5, #114).
 //
 // CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/textContent only,
 // never HTML strings, and nothing sets a `style` attribute. Every variant is built once at mount and toggled
@@ -15,7 +16,6 @@ export const OVERLAY_TEXT = {
   parentMicOff: 'The microphone switches off when Juni falls asleep.',
   parentContinue: 'Continue',
   micHelp: "Microphone is blocked. To fix it, allow the microphone for this site in Chrome's site settings.",
-  micHelpRetry: 'Try again',
   micMuted: 'Mic muted',
   tooNoisy: 'Too noisy',
   error: 'Something went wrong. Tap to try again.',
@@ -43,7 +43,8 @@ function button(text: string, onClick: () => void): HTMLButtonElement {
 
 /**
  * Mounts every overlay variant (all hidden) into `root` and returns `show`: `show(o)` makes variant `o` the only
- * visible one, and `show(null)` hides them all. The sheets' buttons dispatch `parentContinue` and `settingsRetry`.
+ * visible one, and `show(null)` hides them all. The parent sheet's Continue dispatches `parentContinue`; nothing
+ * here dispatches `settingsRetry` (the settings sheet does, #114).
  * The non-interactive variants let pointer events through to the canvas below (styles.css), so "Tap Juni…" and
  * "Tap to try again" reach it.
  */
@@ -59,10 +60,7 @@ export function mountOverlay(root: HTMLElement, dispatch: (e: SessionEvent) => v
   );
 
   const micHelp = element('section', 'sheet');
-  micHelp.append(
-    element('p', null, OVERLAY_TEXT.micHelp),
-    button(OVERLAY_TEXT.micHelpRetry, () => dispatch({ t: 'settingsRetry' })),
-  );
+  micHelp.append(element('p', null, OVERLAY_TEXT.micHelp));
 
   const views: Record<View, HTMLElement> = {
     tapToWake: element('p', 'overlay-hint', OVERLAY_TEXT.tapToWake),

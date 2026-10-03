@@ -216,6 +216,8 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     store: settings,
     bus: { setQuiet: (on) => engine.setQuiet(on) },
     state: () => s.state().name,
+    // #114: "Try the microphone again" (For parents) dispatches `settingsRetry`; the sheet mounts the licences view.
+    dispatch: (e) => s.dispatch(e),
     now: () => clock.now(),
     pwa: {
       installAvailable: () => installAvailable,
