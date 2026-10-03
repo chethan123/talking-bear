@@ -1,8 +1,9 @@
 /**
  * BearView in Vitest Browser Mode (issue #81): the canvas stage, the director fed by session `anim` events, the
  * mouth fed by the processed envelope, the frame loop (fixed step, idle and asleep throttling, hidden-page pause),
- * reduced motion, `showPose`, the pointer input and its reactions (#93), the frame stats with the debug overlay,
- * and the allocation smoke.
+ * reduced motion, the reaction clips in the frame (#221: spring kicks, secondary springs, the clip's mouth),
+ * `showPose`, the pointer input and its reactions (#93), the frame stats with the debug overlay, and the allocation
+ * smoke.
  *
  * Every test drives the loop with a fake frame scheduler and a fake clock: `step(t)` runs the pending rAF
  * callbacks like one vsync at `t` ms, and the app clock (`now`) reads the same `t`. styles.css is not imported, so
