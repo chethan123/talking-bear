@@ -7,7 +7,9 @@
 // Silero (plan §4.2.3): the first successful `init` starts loading the shipped weights (weights.bin, which Vite
 // emits as a hashed asset next to this chunk). Once decoded, the model is handed to the current VadCore and
 // `vadReady` is posted; a later `init` reuses it. Until then, and if loading fails, epochs that ask for Silero
-// run on the energy backend.
+// run on the energy backend. A failed load is retried by the next `reset` that asks for Silero while no model
+// is set (#251), and by the next `init`: no timer, at most one attempt per Silero re-arm, and never a second
+// fetch while one is in flight.
 //
 // Feature trace (`trace`): the setting is kept here and handed to every VadCore, so it survives a later
 // `init`; the VadCore posts the `traceBatch` messages, whose five stream buffers are transferred.
@@ -55,7 +57,8 @@ function attachModel(c: VadCore, m: SileroModel): void {
   post({ t: 'vadReady', backend: 'silero' });
 }
 
-/** Fetches and decodes the weights once; a failure is reported, and the next `init` tries again. */
+/** Fetches and decodes the weights unless the model is set or a load is in flight, so at most one fetch is ever
+ *  in flight. A failure is reported; the next Silero `reset` (or `init`) tries again. */
 function loadModel(): void {
   if (loading || model !== null) return;
   loading = true;
@@ -122,6 +125,9 @@ function onMainMessage(e: MessageEvent<MainToWorker>): void {
       try {
         if (core === null) throw new Error('reset before init');
         core.reset(msg.epoch, msg.vad, msg.restoreFloorDb, msg.pregate, msg.proximityDb);
+        // A Silero epoch without a model runs on energy: retry a failed load (#251). Once it lands, setModel
+        // switches this epoch to Silero if its segmenter is still idle.
+        if (msg.vad === 'silero') loadModel();
       } catch (err) {
         postError('vad', err);
       }
