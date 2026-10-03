@@ -266,6 +266,7 @@ function wakeByPermission(s: SessionState, cfg: SessionConfig, p: Partial<Sessio
       return transitionTo(s, 'MicDenied', cfg, [{ k: 'resumeCtx' }, anim({ e: 'wake' })], p);
   }
 }
+/** Rows 1–3 (Asleep + tapBear), row 39 (Paused + visible), and Asleep + settingsRetry (#266): wake by permission. */
 const onWakeTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out => wakeByPermission(s, cfg);
 /** Row 42: tap to retry from Error starts a fresh wake, as row 1 does (approved deviations D4, D25). */
 const onErrorTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out =>
@@ -495,7 +496,7 @@ export const TABLE: { readonly [S in StateName]: Row } = {
   Asleep: {
     tapBear: onWakeTap, // rows 1–3
     parentContinue: 'ignore',
-    settingsRetry: 'ignore',
+    settingsRetry: onWakeTap, // #266: the parent's retry wakes exactly as the tap does (rows 1–3)
     permissionChanged: onPermissionChanged,
     micGranted: 'ignore',
     micDenied: 'ignore',
