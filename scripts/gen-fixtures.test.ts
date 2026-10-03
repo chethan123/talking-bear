@@ -33,7 +33,7 @@ const BOTH = ['test', 'e2e'];
 
 // The fixture table of #16 in samples (ORCH-PLAN v4): lead 48 000 + sound + tail = total.
 const EXPECTED: ExpectedFixture[] = [
-  { name: 'silence_2s', targets: TEST, sound: 96_000, tail: 14_400, total: 158_400 },
+  { name: 'silence_2s', targets: BOTH, sound: 96_000, tail: 14_400, total: 158_400 },
   { name: 'noise_white_-60dbfs_3s', targets: TEST, sound: 144_000, tail: 14_400, total: 206_400 },
   { name: 'noise_pink_-40dbfs_5s', targets: TEST, sound: 240_000, tail: 14_400, total: 302_400 },
   { name: 'sine_1k_-20dbfs_1s', targets: TEST, sound: 48_000, tail: 14_400, total: 110_400 },

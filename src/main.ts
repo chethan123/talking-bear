@@ -1,6 +1,7 @@
-// Bootstrap and wiring (plan §3.3, §7 M1, §7 M3, §7 M4, §7 M6): platform services, the settings store, the audio
-// engine, the service worker and install prompt (pwa/register.ts), the session store, the bear (BearView: Juni on
-// the canvas stage, driven by the session's `anim` effects and the replay's processed envelope), the M1 text
+// Bootstrap and wiring (plan §3.3, §7 M1, §7 M3, §7 M4, §7 M5, §7 M6): platform services, the settings store, the
+// audio engine, the service worker and install prompt (pwa/register.ts), the session store, the haptics, the bear
+// (BearView: Juni on the canvas stage, driven by the session's `anim` effects and the replay's processed envelope,
+// and touched through the pointer input: adapter → recogniser → reactions table → director → session), the M1 text
 // overlays and the M3 settings sheet, with `data-state` on main#app for hook-free smoke tests (plan §4.9.3).
 import './ui/styles.css';
 import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
@@ -11,7 +12,9 @@ import { createSession, type Session } from './app/session.ts';
 import { createSettingsStore, presetFor } from './app/settings.ts';
 import { createEngine } from './audio/engine.ts';
 import { createPlayer } from './audio/player.ts';
-import { createSfx, M1_SYNTHS } from './audio/sfx.ts';
+import { createSfx } from './audio/sfx.ts';
+import { SYNTHS } from './audio/sfx-synths.ts';
+import { createHaptics } from './platform/haptics.ts';
 import { createMicPermission } from './platform/permissions.ts';
 import { createStorage } from './platform/storage.ts';
 import { createVisibility } from './platform/visibility.ts';
@@ -51,6 +54,16 @@ async function boot(): Promise<void> {
   const permission = createMicPermission(navigator, visibility);
   const settings = createSettingsStore(settingsStorage());
   const storage = createStorage(navigator);
+  // Haptics (plan §4.6.3): the reactions' patterns, gated by the setting and by sticky activation. The latest
+  // `vibrate` log line (X-A6) is kept for the debug overlay.
+  let lastVibrate: string | null = null;
+  const haptics = createHaptics(
+    navigator,
+    () => settings.get().haptics,
+    (m) => {
+      lastVibrate = m;
+    },
+  );
 
   // createEngine takes its event sink before the session exists; the engine emits nothing until an effect has
   // called it, so relaying through `session` loses nothing (Session.onEngineEvent).
@@ -89,7 +102,8 @@ async function boot(): Promise<void> {
   session = createSession(initialSessionState(permission0), {
     engine,
     makePlayer: createPlayer,
-    makeSfx: (ctx, bus) => createSfx(ctx, bus, M1_SYNTHS),
+    // Every reaction sound of plan §4.6.4 (#88), synthesised.
+    makeSfx: (ctx, bus) => createSfx(ctx, bus, SYNTHS),
     wakeLock,
     visibility,
     permission,
@@ -111,19 +125,26 @@ async function boot(): Promise<void> {
   }
 
   const s = session;
-  // The bear (plan §7 M4) is the stage: mounted first, so the overlays and the sheet sit above it. Its pointer
-  // input keeps the M1 tap behaviour. `?L=<ms>` overrides the display-latency constant for X-A2.
+  // The bear (plan §7 M4) is the stage: mounted first, so the overlays and the sheet sit above it. `?L=<ms>`
+  // overrides the display-latency constant for X-A2. Its pointer input (plan §7 M5, #93) routes by the session
+  // state: in Asleep, Error and Paused a tap anywhere dispatches `tapBear`; while awake (MicDenied included) the
+  // gestures go to the director, whose `toSession` reactions come back through `dispatch` (session.dispatch),
+  // `haptic` patterns go to `haptics.play` and `mood` to its mood layer; the last pointer up and a stroke or
+  // long-press end release the director; background touches move the gaze; pointerdown / pointerup note the
+  // haptics' activation (bear-view.ts).
   const view = mountBearView(app, {
     visibility,
     now: () => clock.now(),
     state: () => s.state().name,
     dispatch: (e) => s.dispatch(e),
     engine,
+    haptics,
     seed: Math.floor(Math.random() * 2 ** 32),
     latencyMs: latencyFromQuery(location.search),
   });
   bear = view;
-  // Reduced motion (plan §4.6.6): the OS setting or the parent's Gentle mode.
+  // Reduced motion (plan §4.6.6): the OS setting or the parent's Gentle mode; it also sets the director's gentle
+  // flag (gentle clips, no P4 escalation without one: plan §4.6.4).
   const motion = matchMedia('(prefers-reduced-motion: reduce)');
   const applyMotion = (): void => view.setReducedMotion(motion.matches || settings.get().gentleMode);
   applyMotion();
@@ -152,13 +173,21 @@ async function boot(): Promise<void> {
     },
   });
 
-  // Developer overlay (plan §7 M2, M4, M6): the frame loop's p95 frame time and fps, storage persistence and
-  // usage, and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted).
+  // Developer overlay (plan §7 M2, M4, M5, M6): the frame loop's p95 frame time and fps, storage persistence and
+  // usage, the device lines (#93: the latest vibrate result, ctx.state, the mic track's events, the audio inputs),
+  // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted).
   if (new URLSearchParams(location.search).get('debug') === '1') {
     mountDebugOverlay(app, {
       frameStats: (out) => view.frameStats(out),
       clock,
       storage,
+      device: {
+        lastVibrate: () => lastVibrate,
+        engine,
+        session: s,
+        mediaDevices: 'mediaDevices' in navigator ? navigator.mediaDevices : null,
+        now: () => clock.now(),
+      },
       vad: { engine, session: s },
     });
   }

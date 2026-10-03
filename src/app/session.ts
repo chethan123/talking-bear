@@ -5,6 +5,9 @@
 // Dispatch loop: events go into a FIFO queue. A dispatch made while one is running (from an effect or a
 // listener) is only queued; otherwise the queue is drained, and for each event: reduce → store the new state →
 // run its effects in order → onTransition (then the addTransitionListener listeners) → subscribers.
+//
+// Each `sfx` effect the runner schedules is reported to the `addSfxListener` listeners while it runs (so before
+// that step's transition listeners), with the context time its sound ends (#93: the e2e `sfxLog`).
 
 import type { Engine, EngineEvent } from '../audio/engine.ts';
 import type { createPlayer } from '../audio/player.ts';
@@ -21,6 +24,7 @@ import {
   type SessionConfig,
   type SessionEvent,
   type SessionState,
+  type SfxId,
   type StateName,
 } from './events.ts';
 import { reduce } from './machine.ts';
@@ -58,12 +62,21 @@ export type LevelEvent = Extract<
 >;
 export type TransitionListener = (from: StateName, to: StateName, e: SessionEvent, effects: Effect[]) => void;
 
+/** An `sfx` effect the runner scheduled: `sfx.play(id)` returned `endCtxTime`, the context time its sound ends. */
+export interface SfxScheduled {
+  seq: number;
+  id: SfxId;
+  endCtxTime: number;
+}
+
 export interface Session {
   dispatch(e: SessionEvent): void;
   state(): SessionState;
   subscribe(cb: (s: SessionState) => void): () => void;
   /** Multi-listener version of onTransition (UI, test hooks). */
   addTransitionListener(cb: TransitionListener): () => void;
+  /** Every `sfx` effect once scheduled, with its end on the context clock (test hooks: `sfxLog`). */
+  addSfxListener(cb: (e: SfxScheduled) => void): () => void;
   /** Engine `level`, `vadError`, `vadReady`, `vadStats` and `traceBatch` events (not dispatched to the reducer). */
   subscribeLevel(cb: (e: LevelEvent) => void): () => void;
   /**
@@ -127,10 +140,15 @@ export function createSession(initial: SessionState, deps: SessionDeps): Session
   const transitionListeners = listenerSet<Parameters<TransitionListener>>('transition listener');
   const subscribers = listenerSet<[SessionState]>('subscriber');
   const levelListeners = listenerSet<[LevelEvent]>('level listener');
+  const sfxListeners = listenerSet<[SfxScheduled]>('sfx listener');
   /** Bumped by every visibility change: a `visible` whose permission re-query settles later is dropped. */
   let visibleToken = 0;
 
-  const runner = createEffectRunner(deps, { dispatch, state: () => current });
+  const runner = createEffectRunner(deps, {
+    dispatch,
+    state: () => current,
+    sfxScheduled: (e) => sfxListeners.notify(e),
+  });
 
   function step(e: SessionEvent): void {
     const from = current.name;
@@ -213,6 +231,7 @@ export function createSession(initial: SessionState, deps: SessionDeps): Session
     state: () => current,
     subscribe: (cb) => subscribers.add(cb),
     addTransitionListener: (cb) => transitionListeners.add(cb),
+    addSfxListener: (cb) => sfxListeners.add(cb),
     subscribeLevel: (cb) => levelListeners.add(cb),
     onEngineEvent(e) {
       if (

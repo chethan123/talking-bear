@@ -12,7 +12,14 @@
  *   then reduced motion, then `render`.
  *
  * **Director ← session.** `onAnim(ev)` reduces the director at the app clock's time (`deps.now()`). The director
- * clock is seconds on the `performance.now()` timebase, which rAF timestamps share; it never steps back.
+ * clock is seconds on the `performance.now()` timebase, which rAF timestamps share; it never steps back. `anim`
+ * inputs output nothing, so `onAnim` keeps `directorReduce`.
+ *
+ * **Director → session** (#93). Every other director input goes through `directorStep`: the 120 Hz tick in
+ * `substep` (a queued reaction starts on a tick), and the gestures and releases of the pointer input below. The
+ * step's new state is stored first, then its outputs are routed: `toSession` → `deps.dispatch`
+ * (`session.dispatch`), `haptic` → `deps.haptics.play`, `mood` → the mood layer's `bump`. `session.dispatch` can
+ * feed `anim` effects (`talkEnd`) straight back into the director, which must see the new state.
  *
  * **Mouth ← processed envelope.** The effect runner reports each replay's scheduled start through
  * `onPlayStarted(id, startCtxTime)` (the player's `PlayHandle.startCtxTime`), right before the session's
@@ -30,26 +37,45 @@
  * squash, sway and wobble channels (`BodySquash`, `BodyLean`, `HeadSquishX/Y`, `TuftRot`, `KerchiefA/B`, and the
  * clip's part of `HeadRot`) × 0.3, every spring ζ ≥ 0.9; blinks, mouth and gaze are kept.
  *
- * **Input.** The canvas keeps the M1 tap behaviour (M5 replaces it with the recogniser): `tapBear` while Asleep
- * or Error, otherwise in an awake state a `poke` test-beep reaction, or `poke2` for a second tap within 300 ms
- * and 100 px.
+ * **Input** (#93): the pointer adapter (#87) on the canvas, with `hit` = `hitTest` (#85) over the bone matrices
+ * of the last drawn pose and the view in **CSS px** (`fitView` of the canvas's CSS size: the adapter's points
+ * are CSS px relative to the canvas, never backing-store px). `adapter.tick()` runs in every drawn frame, so a
+ * long-press fires without movement. Routing, by the session state (`deps.state()`):
+ * - **Asleep, Error, Paused:** every `pointerdown` dispatches `tapBear` ("a tap anywhere").
+ * - **Awake** (MicDenied included): a background `tap down` turns the gaze to the point for `LOOK_HOLD_S`, and a
+ *   background stroke's moves keep it on the finger. A gesture with a reaction (`reactionFor`, #90) goes to the
+ *   director as `{k:'gesture'}` at the director clock; its region is the cooldown key (hug and all-over:
+ *   `belly`; a pinch: its first cheek), and a stroke carries `dirX`. A `stroke end` or `longPress end` releases
+ *   what that contact started (`{k:'release', region, gesture}`).
+ * - **Every state:** the last pointer up (`onRawUp` with `active === 0`, a `pointercancel` included) releases
+ *   everything (`{k:'release'}`): pinch, hug, tickle and all-over have no end gesture. `pointerdown` notes the
+ *   `down` activation and a `pointerup` the `up` one for the haptics (never a cancel: it grants no activation).
+ * Reduced motion also sets the director's `gentle` (gentle clips, no P4 escalation without one).
  *
  * **Allocation.** This module's own code allocates nothing per frame: every buffer is preallocated, the loop's
- * callbacks are created once, and the doubles kept between frames live in a `Float64Array`. Director transitions
- * (events, a clip's end) allocate a new director state; that is per event, not per frame. The upstream modules a
- * frame calls (renderer, mouth layer, layers) still box a few transient doubles per frame (≈ 0.6 KB, nothing
- * retained): follow-up #214.
+ * callbacks are created once, and the doubles kept between frames live in a `Float64Array`. A quiet director tick
+ * returns `directorStep`'s shared frozen result (no outputs, nothing to route); `adapter.tick()` returns at once
+ * with no pointer down; the hit-test bone matrices are only marked stale per frame and recomputed on the next
+ * pointer sample. Director transitions (events, gestures, a clip's end) allocate a new director state and their
+ * outputs; that is per event, not per frame. Not free yet: once a reaction has bumped the mood, `mood.ts` boxes
+ * ≈ 48 B per frame until it decays, which #229 fixes (`mood.ts` is outside #93).
  */
 import type { AnimEvent, SessionEvent, StateName } from '../app/events.ts';
 import { AWAKE } from '../app/machine.ts';
 import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
+import { attachPointerAdapter } from '../input/pointer-adapter.ts';
+import type { Gesture, PointerSample } from '../input/recognizer.ts';
+import type { RegionId } from '../input/region-ids.ts';
+import { hitTest, REGIONS } from '../input/regions.ts';
+import type { Haptics } from '../platform/haptics.ts';
 import type { Visibility } from '../platform/visibility.ts';
+import { reactionFor } from '../reactions/table.ts';
 import { DISPLAY_LATENCY_MS } from './constants.ts';
-import { directorReduce, evaluate, initialDirector, mouthCloseScale } from './director.ts';
-import type { DirectorState, DirInput } from './director.ts';
+import { directorReduce, directorStep, evaluate, initialDirector, mouthCloseScale } from './director.ts';
+import type { DirectorState, DirInput, DirOut, GestureInput } from './director.ts';
 import { createBlink, createBreathing, createEarTwitch, createGaze, createMood } from './layers/index.ts';
-import type { AnimContext, LayerWeights } from './layers/index.ts';
+import type { AnimContext, LayerWeights, LookAt } from './layers/index.ts';
 import { MouthLayer } from './layers/mouth.ts';
 import { ASLEEP_FPS, createFrameLoop, IDLE_FPS } from './loop.ts';
 import type { FrameStats } from './loop.ts';
@@ -57,7 +83,7 @@ import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
 import { createContext, fitView, render, resizeCanvas } from './renderer.ts';
 import type { View } from './renderer.ts';
-import { createRig } from './rig.ts';
+import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { mulberry32 } from './rng.ts';
 import { SpringBank } from './springs.ts';
 import { configureSprings, SPRING, SPRING_COUNT } from './springs-map.ts';
@@ -79,9 +105,8 @@ const BASE_FADE_S = 0.15;
 export const WEIGHT_RAMP_S = 0.15;
 /** Frames `frameLog()` keeps (X-A2 logging). */
 export const FRAME_LOG_SIZE = 600;
-/** A second pointerdown within this time and distance of a poke is a double tap (poke2). */
-export const DOUBLE_TAP_MS = 300;
-export const DOUBLE_TAP_PX = 100;
+/** How long the gaze holds a background touch's point (s): a tap's, or a background stroke's latest move (#93). */
+export const LOOK_HOLD_S = 2;
 /** The X-A2 override `?L=<ms>` is clamped to this range. */
 export const LATENCY_OVERRIDE_MAX_MS = 200;
 /** Default seed of the layers' RNG; main.ts passes a random one. */
@@ -141,11 +166,14 @@ export interface FrameLogEntry {
 
 export interface BearViewDeps {
   visibility: Pick<Visibility, 'current' | 'subscribe'>;
-  /** Monotonic milliseconds on the `performance.now()` timebase (the app clock): director time for events, double taps. */
+  /** Monotonic milliseconds on the `performance.now()` timebase (the app clock): director time for events and input. */
   now(): number;
-  /** The session's current state, for the pointer input. */
+  /** The session's current state: routes the pointer input (wake taps; gestures only while awake). */
   state(): StateName;
+  /** `session.dispatch`: wake taps (`tapBear`) and the director's `toSession` reactions. */
   dispatch(e: SessionEvent): void;
+  /** The haptics (`createHaptics`): the director's `haptic` patterns and the pointer activations; none without. */
+  haptics?: Pick<Haptics, 'play' | 'noteActivation'>;
   /** The audio engine's parts the mouth reads (`Engine` satisfies it). */
   engine: {
     /** The processed result of replay `id` while it is stored (`Engine.getProcessed`). */
@@ -178,6 +206,19 @@ export interface BearView {
   readonly reducedMotion: boolean;
   /** The director's current state. */
   director(): Readonly<DirectorState>;
+  /**
+   * A recognised gesture, as the pointer adapter hands it over (exposed for tests). While the session is awake, a
+   * background tap or stroke moves the gaze, a gesture with a reaction goes to the director, and a stroke or
+   * long-press end releases what its contact started.
+   */
+  gesture(g: Gesture): void;
+  /**
+   * The centre of region `id`'s first `REGIONS` entry in viewport CSS px, from the bone matrices of the last drawn
+   * pose (e2e: `__bearTest.regionCenter`). Throws a RangeError for an id without a region (`background`).
+   */
+  regionCenter(id: RegionId): { x: number; y: number };
+  /** The point the gaze holds after a background touch (design units), or null. */
+  lookAt(): Readonly<LookAt> | null;
   /** The pose of the last drawn frame (the live buffer: read it, never write it). */
   pose(): Readonly<Pose>;
   /** The loop's frame-time p95 and fps over its last 120 drawn frames, into `out` (a new object by default). */
@@ -186,10 +227,10 @@ export interface BearView {
   frameLog(): FrameLogEntry[];
   /**
    * E2E screenshots: stops the frame loop for good, sizes the canvas to `cssWidth × cssHeight` CSS px at DPR 1
-   * (class `stage--fixed`, no style attribute), fits the design box and renders `pose` once.
+   * (class `stage--fixed`, no inline size), fits the design box and renders `pose` once.
    */
   showPose(pose: Pose, cssWidth: number, cssHeight: number): void;
-  /** Stops the loop, removes the listeners and the canvas. */
+  /** Stops the loop, detaches the pointer adapter, removes the listeners and the canvas. */
   dispose(): void;
 }
 
@@ -202,10 +243,13 @@ const FRAME_T = 1;
 const PLAY_START = 2;
 /** The last frame's alpha, for a redraw outside the loop (resize). */
 const ALPHA = 3;
-/** Time of the last poke, ms; and its position. */
-const POKE_T = 4;
-const POKE_X = 5;
-const POKE_Y = 6;
+/** Director time (s) at which the background gaze lets go. */
+const LOOK_UNTIL = 4;
+/** The latest pointer sample's position, CSS px relative to the canvas. */
+const SAMPLE_X = 5;
+const SAMPLE_Y = 6;
+/** The session states in which any `pointerdown` wakes the bear (Paused never sees one while visible). */
+const TAP_TO_WAKE: ReadonlySet<StateName> = new Set<StateName>(['Asleep', 'Error', 'Paused']);
 
 export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const { engine } = deps;
@@ -217,10 +261,11 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const g = createContext(canvas);
   const rig = createRig();
   const view: View = { scale: 0, ox: 0, oy: 0 };
+  /** `view` in CSS px of the canvas: hit tests, `regionCenter` and the gaze map pointer points through it. */
+  const cssView: View = { scale: 1, ox: 0, oy: 0 };
 
   const T = new Float64Array(7);
   T[NOW] = deps.now() / 1000;
-  T[POKE_T] = Number.NEGATIVE_INFINITY;
 
   // ---- director, layers, springs, mouth ------------------------------------------------------------------
   let dir: DirectorState = initialDirector(T[NOW]);
@@ -327,7 +372,11 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   // ---- the frame -------------------------------------------------------------------------------------------
   function substep(dt: number): void {
     tickIn.now = T[NOW]!;
-    dir = directorReduce(dir, tickIn);
+    // A queued reaction starts on a tick, which outputs it like a gesture (#93). A quiet tick returns the shared
+    // frozen result, with nothing to route.
+    const r = directorStep(dir, tickIn);
+    dir = r.state;
+    if (r.out.length !== 0) route(r.out);
     springs.step(dt);
     rampWeights(dt);
     prevLayers.set(curLayers);
@@ -387,11 +436,14 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
       beginFrame(t) {
         T[FRAME_T] = t;
         advanceNow(t / 1000);
+        if (ctx.lookAt !== null && T[NOW]! >= T[LOOK_UNTIL]!) ctx.lookAt = null;
+        adapter.tick();
       },
       substep,
       draw(t, alpha) {
         T[ALPHA] = alpha;
         compose(T[NOW]!, alpha);
+        bonesStale = true;
         render(g, rig, pose, view);
         logFrame(t);
       },
@@ -424,6 +476,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     const t = deps.now();
     T[FRAME_T] = t;
     compose(advanceNow(t / 1000), T[ALPHA]!);
+    bonesStale = true;
     render(g, rig, pose, view);
   }
 
@@ -434,33 +487,132 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     const cssH = Math.max(1, canvas.clientHeight);
     resizeCanvas(canvas, cssW, cssH, dpr());
     fitView(canvas.width, canvas.height, view);
+    fitView(cssW, cssH, cssView);
     redraw();
   }
 
-  // ---- input (the M1 tap behaviour) ------------------------------------------------------------------------
-  function onPointerDown(e: PointerEvent): void {
-    const s = deps.state();
-    if (s === 'Asleep' || s === 'Error') {
-      deps.dispatch({ t: 'tapBear' });
-      return;
+  // ---- input (#93): pointer adapter → recogniser → reactions table → director → session ------------------------
+  /** The bone matrices of the last drawn pose for hit tests; stale once a frame is drawn, recomputed on demand. */
+  const hitBones = new Float32Array(BONE_COUNT * MAT);
+  let bonesStale = true;
+  /** The gaze target of a background touch (design units), `ctx.lookAt` while held. */
+  const look: LookAt = { x: 0, y: 0 };
+  /** The pointer id of the latest sample; the background stroke's pointer the gaze follows (null: none). */
+  let sampleId = 0;
+  let trackId: number | null = null;
+
+  function bones(): Float32Array {
+    if (bonesStale) {
+      boneMatrices(rig, pose, hitBones);
+      bonesStale = false;
     }
-    if (!AWAKE.has(s)) return;
-    const t = deps.now();
-    if (
-      t - T[POKE_T]! <= DOUBLE_TAP_MS &&
-      Math.hypot(e.clientX - T[POKE_X]!, e.clientY - T[POKE_Y]!) <= DOUBLE_TAP_PX
-    ) {
-      T[POKE_T] = Number.NEGATIVE_INFINITY; // the pair is complete: a third quick tap is a new poke
-      deps.dispatch({ t: 'reaction', name: 'poke2', priority: 3, sfx: 'testBeep' });
-      return;
-    }
-    T[POKE_T] = t;
-    T[POKE_X] = e.clientX;
-    T[POKE_Y] = e.clientY;
-    deps.dispatch({ t: 'reaction', name: 'poke', priority: 2, sfx: 'testBeep' });
+    return hitBones;
   }
 
-  canvas.addEventListener('pointerdown', onPointerDown);
+  /** The region under a point in CSS px relative to the canvas, as the adapter's samples are. */
+  function hit(x: number, y: number): RegionId {
+    return hitTest(x, y, bones(), cssView);
+  }
+
+  /** The director clock for a pointer input (s): the app clock, never stepping back. */
+  function inputNow(): number {
+    return advanceNow(deps.now() / 1000);
+  }
+
+  /** The gaze looks at a canvas point (CSS px) until `LOOK_HOLD_S` after `now`. */
+  function lookAtCss(x: number, y: number, now: number): void {
+    look.x = (x - cssView.ox) / cssView.scale;
+    look.y = (y - cssView.oy) / cssView.scale;
+    ctx.lookAt = look;
+    T[LOOK_UNTIL] = now + LOOK_HOLD_S;
+    loop.invalidate();
+  }
+
+  /** Routes a director step's outputs, in order, without keeping `out`. */
+  function route(out: readonly DirOut[]): void {
+    for (let i = 0; i < out.length; i++) {
+      const o = out[i]!;
+      switch (o.k) {
+        case 'toSession':
+          deps.dispatch(o.ev);
+          break;
+        case 'haptic':
+          deps.haptics?.play(o.pattern);
+          break;
+        case 'mood':
+          if (o.joy !== undefined) mood.bump('joy', o.joy);
+          if (o.annoy !== undefined) mood.bump('annoy', o.annoy);
+          break;
+      }
+    }
+  }
+
+  /** A pointer input's director step: the new state is stored before its outputs are routed. */
+  function stepDirector(input: DirInput): void {
+    const r = directorStep(dir, input);
+    dir = r.state;
+    route(r.out);
+    loop.invalidate();
+  }
+
+  /** A background tap turns the gaze to it; a background stroke's moves keep it on the finger (`onSample`). */
+  function backgroundGaze(ges: Extract<Gesture, { g: 'tap' | 'stroke' }>, now: number): void {
+    if (ges.g === 'tap') {
+      if (ges.phase === 'down') lookAtCss(ges.x, ges.y, now);
+    } else if (ges.phase === 'start') {
+      trackId = sampleId;
+      lookAtCss(T[SAMPLE_X]!, T[SAMPLE_Y]!, now);
+    } else if (ges.phase === 'end') {
+      trackId = null;
+    }
+  }
+
+  function onGesture(ges: Gesture): void {
+    if (!AWAKE.has(deps.state())) return;
+    const now = inputNow();
+    if ((ges.g === 'tap' || ges.g === 'stroke') && ges.region === 'background') backgroundGaze(ges, now);
+    const r = reactionFor(ges);
+    if (r !== null) {
+      const input: GestureInput = { k: 'gesture', r, region: regionOf(ges), gesture: ges.g, now };
+      if (ges.g === 'stroke') input.dirX = Math.cos(ges.dir) >= 0 ? 1 : -1;
+      stepDirector(input);
+    } else if ((ges.g === 'stroke' || ges.g === 'longPress') && ges.phase === 'end') {
+      stepDirector({ k: 'release', now, region: ges.region, gesture: ges.g });
+    }
+  }
+
+  const adapter = attachPointerAdapter(canvas, {
+    hit,
+    onGesture,
+    onRawDown() {
+      deps.haptics?.noteActivation('down');
+      if (TAP_TO_WAKE.has(deps.state())) deps.dispatch({ t: 'tapBear' });
+    },
+    onRawUp(e) {
+      if (!e.cancel) deps.haptics?.noteActivation('up');
+      if (e.active === 0) stepDirector({ k: 'release', now: inputNow() });
+    },
+    onSample(smp: PointerSample) {
+      sampleId = smp.id;
+      T[SAMPLE_X] = smp.x;
+      T[SAMPLE_Y] = smp.y;
+      if (smp.id !== trackId) return;
+      if (smp.type === 'move') lookAtCss(smp.x, smp.y, inputNow());
+      else if (smp.type === 'up' || smp.type === 'cancel') trackId = null;
+    },
+  });
+
+  function regionCenter(id: RegionId): { x: number; y: number } {
+    const r = REGIONS.find((d) => d.id === id);
+    if (r === undefined) throw new RangeError(`regionCenter: no hit region ${id}`);
+    const m = bones();
+    const o = boneIndex(r.bone) * MAT;
+    const x = m[o]! * r.cx + m[o + 2]! * r.cy + m[o + 4]!;
+    const y = m[o + 1]! * r.cx + m[o + 3]! * r.cy + m[o + 5]!;
+    const rect = canvas.getBoundingClientRect();
+    return { x: rect.left + cssView.ox + cssView.scale * x, y: rect.top + cssView.oy + cssView.scale * y };
+  }
+
   window.addEventListener('resize', resize);
   resize();
   loop.start();
@@ -482,12 +634,16 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     setReducedMotion(on) {
       reduced = on;
       configureSprings(springs, on ? REDUCED_MOTION_MIN_ZETA : 0);
+      dir = directorReduce(dir, { k: 'setGentle', on });
       loop.invalidate();
     },
     get reducedMotion() {
       return reduced;
     },
     director: () => dir,
+    gesture: onGesture,
+    regionCenter,
+    lookAt: () => ctx.lookAt ?? null,
     pose: () => pose,
     frameStats(out = { p95Ms: Number.NaN, fps: Number.NaN, frames: 0 }) {
       return loop.stats(out);
@@ -512,15 +668,34 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
       canvas.classList.add('stage--fixed');
       resizeCanvas(canvas, cssWidth, cssHeight, 1);
       fitView(canvas.width, canvas.height, view);
+      fitView(cssWidth, cssHeight, cssView);
       render(g, rig, p, view);
     },
     dispose() {
       loop.dispose();
+      adapter.detach();
       window.removeEventListener('resize', resize);
-      canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.remove();
     },
   };
+}
+
+/**
+ * The region of a gesture's reaction, the director's cooldown key: the region-less gestures get a fixed one (hug
+ * and all-over: `belly`; a pinch: its first cheek; ORCH-NOTE 5955249579 item 4). `cancel` has no reaction.
+ */
+function regionOf(ges: Gesture): RegionId {
+  switch (ges.g) {
+    case 'hug':
+    case 'allOver':
+      return 'belly';
+    case 'pinch':
+      return ges.regions[0];
+    case 'cancel':
+      return 'background';
+    default:
+      return ges.region;
+  }
 }
 
 /** `x` moved toward `target` by at most `step`. */

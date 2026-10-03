@@ -3,8 +3,9 @@
  * synthetic trace batches, CSP hygiene and unmount (issue #56 Validation 1); the formatters; the backend and
  * vadReady readings; what the plot draws (pixels: p, band, floor, thresholds, the energy-gate bar, the segment
  * markers); the gate replay against a sequential energy gate (large jumps, and levels hovering at the hysteresis
- * thresholds); the ≤ 15 fps redraw and the 250 ms text refresh; and the allocation probes. styles.css is not
- * imported. T70's frame-line test stays in src/anim/bear-view.browser.test.ts (#81).
+ * thresholds); the ≤ 15 fps redraw and the 250 ms text refresh; and the allocation probes. Then the device lines
+ * (#93): the vibrate line, the context state on `statechange`, the mic-track events and the audio inputs. styles.css
+ * is not imported. T70's frame-line test stays in src/anim/bear-view.browser.test.ts (#81).
  */
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
@@ -27,11 +28,17 @@ import {
   DEBUG_PLOT_SECONDS,
   DEBUG_PLOT_WIDTH,
   DEBUG_REFRESH_MS,
+  DEBUG_TRACK_EVENTS,
   formatAudioContext,
+  formatCtxState,
+  formatInputs,
+  formatTrackEvents,
   formatVadBackend,
   formatVadStats,
   formatVadState,
+  formatVibrate,
   mountDebugOverlay,
+  type DebugDeviceDeps,
   type DebugVadDeps,
   type TraceBatch,
 } from './debug-overlay.ts';
@@ -612,5 +619,276 @@ describe('allocation probes', () => {
     expect(Math.min(...ingested), report).toBeLessThan(BOUND);
     expect(Math.max(...ingestControl), report).toBeGreaterThanOrEqual(BOUND);
     expect(sink).not.toBeNull();
+  });
+});
+
+// ---- the device lines (#93) ---------------------------------------------------------------------------------
+
+/** An event target whose listener count is visible: a fake AudioContext or MediaDevices. */
+function counted<T extends object>(
+  extra: T,
+): T & {
+  addEventListener(type: string, cb: () => void): void;
+  removeEventListener(type: string, cb: () => void): void;
+  fire(type: string): void;
+  listeners(): number;
+} {
+  const target = new EventTarget();
+  let n = 0;
+  return Object.assign(extra, {
+    addEventListener(type: string, cb: () => void): void {
+      n++;
+      target.addEventListener(type, cb);
+    },
+    removeEventListener(type: string, cb: () => void): void {
+      n--;
+      target.removeEventListener(type, cb);
+    },
+    fire(type: string): void {
+      target.dispatchEvent(new Event(type));
+    },
+    listeners: () => n,
+  });
+}
+
+function device(kind: MediaDeviceKind, label: string): MediaDeviceInfo {
+  return { deviceId: label, groupId: '', kind, label, toJSON: () => ({}) };
+}
+
+/** Lets the pending promise callbacks (an enumeration) run. */
+const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+interface DeviceRig {
+  deps: DebugDeviceDeps;
+  /** The haptics log's latest line. */
+  vibrate: { line: string | null };
+  /** The engine's context (null: none yet). */
+  engine: { ctx: ReturnType<typeof fakeContext> | null };
+  media: ReturnType<typeof fakeMedia>;
+  transitionListeners: Set<TransitionListener>;
+  transition(e: SessionEvent): void;
+}
+
+function fakeContext(state: AudioContextState) {
+  return counted({ state });
+}
+
+function fakeMedia(list: () => MediaDeviceInfo[] | Error) {
+  const enumerateDevices = vi.fn((): Promise<MediaDeviceInfo[]> => {
+    const l = list();
+    return l instanceof Error ? Promise.reject(l) : Promise.resolve(l);
+  });
+  return counted({ enumerateDevices });
+}
+
+function deviceRig(clock: FakeClock, list: () => MediaDeviceInfo[] | Error = () => []): DeviceRig {
+  const vibrate = { line: null as string | null };
+  const engine: DeviceRig['engine'] = { ctx: null };
+  const media = fakeMedia(list);
+  const transitionListeners = new Set<TransitionListener>();
+  const state = initialSessionState('granted');
+  return {
+    deps: {
+      lastVibrate: () => vibrate.line,
+      engine: { context: () => engine.ctx },
+      session: {
+        addTransitionListener(cb) {
+          transitionListeners.add(cb);
+          return () => {
+            transitionListeners.delete(cb);
+          };
+        },
+      },
+      mediaDevices: media,
+      now: () => clock.now(),
+    },
+    vibrate,
+    engine,
+    media,
+    transitionListeners,
+    transition(e) {
+      for (const cb of transitionListeners) cb(state.name, state.name, e, []);
+    },
+  };
+}
+
+describe('the device lines (#93)', () => {
+  test('formatters', () => {
+    expect(formatVibrate(null)).toBe('vibrate –');
+    const logged = 'vibrate([12]) = true; immediate; last activation: down; userActivation: n/a';
+    expect(formatVibrate(logged)).toBe(logged);
+    expect(formatCtxState(null)).toBe('ctx state –');
+    expect(formatCtxState('running')).toBe('ctx state running');
+    expect(formatTrackEvents([])).toBe('track –');
+    expect(
+      formatTrackEvents([
+        { kind: 'mute', t: 12_340 },
+        { kind: 'unmute', t: 15_000 },
+        { kind: 'ended', t: 61_960 },
+      ]),
+    ).toBe('track mute 12.3 s · unmute 15.0 s · ended 62.0 s');
+    expect(formatInputs(null)).toBe('inputs –');
+    expect(formatInputs([])).toBe('inputs (none)');
+    expect(formatInputs(['Speakerphone', '', 'Headset earpiece'])).toBe(
+      'inputs Speakerphone · (no label) · Headset earpiece',
+    );
+  });
+
+  test('the vibrate line shows the haptics log’s latest line at the next 250 ms tick', () => {
+    const clock = new FakeClock();
+    const r = deviceRig(clock);
+    const overlay = mountDebugOverlay(root, { frameStats: (out) => out, clock, device: r.deps });
+    expect(line('vibrate')).toBe('vibrate –');
+    r.vibrate.line = 'vibrate([12]) = true; deferred to up; last activation: up; userActivation: n/a';
+    clock.advance(DEBUG_REFRESH_MS - 1);
+    expect(line('vibrate')).toBe('vibrate –');
+    clock.advance(1);
+    expect(line('vibrate')).toBe(r.vibrate.line);
+    overlay.dispose();
+  });
+
+  test('ctx state: found at the next tick once it exists, then rewritten on every statechange', () => {
+    const clock = new FakeClock();
+    const r = deviceRig(clock);
+    const overlay = mountDebugOverlay(root, { frameStats: (out) => out, clock, device: r.deps });
+    expect(line('ctxState')).toBe('ctx state –');
+    const first = fakeContext('suspended');
+    r.engine.ctx = first;
+    expect(line('ctxState')).toBe('ctx state –');
+    clock.advance(DEBUG_REFRESH_MS);
+    expect(line('ctxState')).toBe('ctx state suspended');
+    expect(first.listeners()).toBe(1);
+    // A statechange rewrites it at once: no tick.
+    first.state = 'running';
+    first.fire('statechange');
+    expect(line('ctxState')).toBe('ctx state running');
+    // A new context takes over at the next tick; the old one no longer writes.
+    const second = fakeContext('suspended');
+    r.engine.ctx = second;
+    clock.advance(DEBUG_REFRESH_MS);
+    expect(line('ctxState')).toBe('ctx state suspended');
+    expect([first.listeners(), second.listeners()]).toEqual([0, 1]);
+    first.state = 'closed';
+    first.fire('statechange');
+    expect(line('ctxState')).toBe('ctx state suspended');
+    second.state = 'running';
+    second.fire('statechange');
+    expect(line('ctxState')).toBe('ctx state running');
+    overlay.dispose();
+    expect(second.listeners()).toBe(0);
+  });
+
+  test('track: the mic track’s mute, unmute and ended events with their page times, the newest four', () => {
+    const clock = new FakeClock(10_000);
+    const r = deviceRig(clock);
+    const overlay = mountDebugOverlay(root, { frameStats: (out) => out, clock, device: r.deps });
+    expect(line('track')).toBe('track –');
+    r.transition({ t: 'trackMuted' });
+    expect(line('track')).toBe('track mute 10.0 s');
+    const events: SessionEvent[] = [
+      { t: 'trackUnmuted' },
+      { t: 'trackMuted' },
+      { t: 'tapBear' }, // not a track event
+      { t: 'trackUnmuted' },
+      { t: 'trackEnded' },
+    ];
+    for (const e of events) {
+      clock.advance(1_250);
+      r.transition(e);
+    }
+    expect(DEBUG_TRACK_EVENTS).toBe(4);
+    // 10.0 s mute, then 11.25 unmute, 12.5 mute, (13.75 tapBear), 15.0 unmute, 16.25 ended: the newest four.
+    expect(line('track')).toBe('track unmute 11.3 s · mute 12.5 s · unmute 15.0 s · ended 16.3 s');
+    overlay.dispose();
+  });
+
+  test('inputs: the audioinput labels at mount, again on devicechange and on micGranted; a rejection or no mediaDevices → –', async () => {
+    const clock = new FakeClock();
+    let list: MediaDeviceInfo[] | Error = [
+      device('audioinput', 'Speakerphone'),
+      device('audiooutput', 'Speaker'),
+      device('audioinput', ''),
+      device('videoinput', 'Camera'),
+    ];
+    const r = deviceRig(clock, () => list);
+    const overlay = mountDebugOverlay(root, { frameStats: (out) => out, clock, device: r.deps });
+    expect(line('inputs')).toBe('inputs –');
+    await settle();
+    expect(line('inputs')).toBe('inputs Speakerphone · (no label)');
+    expect(r.media.enumerateDevices).toHaveBeenCalledTimes(1);
+    list = [device('audioinput', 'Speakerphone'), device('audioinput', 'Headset earpiece')];
+    r.media.fire('devicechange');
+    await settle();
+    expect(line('inputs')).toBe('inputs Speakerphone · Headset earpiece');
+    list = [device('audioinput', 'Bluetooth headset')];
+    r.transition({ t: 'micGranted', req: 1 });
+    await settle();
+    expect(line('inputs')).toBe('inputs Bluetooth headset');
+    expect(r.media.enumerateDevices).toHaveBeenCalledTimes(3);
+    list = new Error('enumerateDevices failed');
+    r.media.fire('devicechange');
+    await settle();
+    expect(line('inputs')).toBe('inputs –');
+    overlay.dispose();
+
+    root.replaceChildren();
+    const none = deviceRig(clock);
+    const noMedia = mountDebugOverlay(root, {
+      frameStats: (out) => out,
+      clock,
+      device: { ...none.deps, mediaDevices: null },
+    });
+    await settle();
+    expect(line('inputs')).toBe('inputs –');
+    noMedia.dispose();
+  });
+
+  test('inputs: an older enumeration that settles after a newer one never overwrites it', async () => {
+    const clock = new FakeClock();
+    const pending: ((list: MediaDeviceInfo[]) => void)[] = [];
+    const media = counted({
+      enumerateDevices: vi.fn(
+        (): Promise<MediaDeviceInfo[]> =>
+          new Promise((resolve) => {
+            pending.push(resolve);
+          }),
+      ),
+    });
+    const r = deviceRig(clock);
+    const overlay = mountDebugOverlay(root, {
+      frameStats: (out) => out,
+      clock,
+      device: { ...r.deps, mediaDevices: media },
+    });
+    // The mount's enumeration, then two devicechanges: three pending, settled newest first.
+    media.fire('devicechange');
+    media.fire('devicechange');
+    expect(pending).toHaveLength(3);
+    pending[2]!([device('audioinput', 'Newest')]);
+    await settle();
+    expect(line('inputs')).toBe('inputs Newest');
+    pending[1]!([device('audioinput', 'Older')]);
+    pending[0]!([device('audioinput', 'Oldest')]);
+    await settle();
+    expect(line('inputs')).toBe('inputs Newest');
+    overlay.dispose();
+  });
+
+  test('sets no style attribute; dispose removes every listener and timer', async () => {
+    const clock = new FakeClock();
+    const r = deviceRig(clock, () => [device('audioinput', 'Speakerphone')]);
+    const overlay = mountDebugOverlay(root, { frameStats: (out) => out, clock, device: r.deps });
+    const ctx = fakeContext('running');
+    r.engine.ctx = ctx;
+    clock.advance(DEBUG_REFRESH_MS);
+    await settle();
+    expect(line('ctxState')).toBe('ctx state running');
+    expect(line('inputs')).toBe('inputs Speakerphone');
+    expect(root.querySelectorAll('[style]').length).toBe(0);
+    expect([ctx.listeners(), r.media.listeners(), r.transitionListeners.size]).toEqual([1, 1, 1]);
+    overlay.dispose();
+    expect(root.querySelector('.debug-overlay')).toBeNull();
+    expect([ctx.listeners(), r.media.listeners(), r.transitionListeners.size]).toEqual([0, 0, 0]);
+    expect(clock.pending()).toBe(0);
   });
 });
