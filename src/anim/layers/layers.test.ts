@@ -315,6 +315,12 @@ function blinkStats(seed: number): BlinkStats {
   return { span: last - first, n: count, doubles: layer.doubles };
 }
 
+/**
+ * Seeds per `it` of the 100-seed statistics test (#258): 10 seeds take ≈ 1 s under an idle `pnpm
+ * test:coverage` (≈ 0.3 s without) and at most ≈ 8.5 s in a loaded coverage suite.
+ */
+const STATS_BATCH = 10;
+
 describe('blink', () => {
   it('uses the spec constants: mean 3.5 s, 15 % doubles, 60/40/80 ms close/hold/open', () => {
     expect(BLINK_MEAN_INTERVAL).toBe(3.5);
@@ -431,27 +437,48 @@ describe('blink', () => {
     expect(events[0]!.onset).toBeCloseTo(exponential(mulberry32(SEED), 3.5), 9);
   });
 
-  it('keeps its statistics over seeds 1–100 × 10 000 s: pooled mean 3.5 s ± 0.03, doubles 15 % ± 0.5, and ≥ 70 % of the seeds pass the single-run checks', () => {
-    let span = 0;
-    let intervals = 0;
-    let n = 0;
-    let doubles = 0;
-    let pass = 0;
-    for (let seed = 1; seed <= 100; seed++) {
-      const r = blinkStats(seed);
-      span += r.span;
-      intervals += r.n - 1;
-      n += r.n;
-      doubles += r.doubles;
-      if (Math.abs(r.span / (r.n - 1) - 3.5) <= 0.1 && Math.abs(r.doubles / r.n - 0.15) <= 0.015) pass++;
-    }
-    // Pooled standard errors ≈ 0.0066 s and 0.0007; the no-overlap floor adds ≈ +0.007 s to the mean.
-    expect(Math.abs(span / intervals - 3.5)).toBeLessThanOrEqual(0.03);
-    expect(Math.abs(doubles / n - 0.15)).toBeLessThanOrEqual(0.005);
-    // About 83 % of seeds pass both of the issue's single-run tolerances.
-    expect(pass).toBeGreaterThanOrEqual(70);
-    // 100 × 600 000 updates take ≈ 3 s alone; allow for a loaded CI runner.
-  }, 30_000);
+  describe(
+    'keeps its statistics over seeds 1–100 × 10 000 s: pooled mean 3.5 s ± 0.03, doubles 15 % ± 0.5, and ≥ 70 % of the seeds pass the single-run checks',
+    { concurrent: false, shuffle: false },
+    () => {
+      // As one `it`, the 100 seeds took 11–12 s under `--coverage` and over 30 s under load (#258), ≈ 78 % of
+      // it in the layer's own update, which must stay at dt = 1/60 for the onsets to stay exact. So the seeds
+      // run in batches of STATS_BATCH, each its own `it` and budget, and one final `it` pools all 100. The
+      // batches must run in order, one at a time, before `pools` (hence `concurrent: false, shuffle: false`),
+      // so that each `it`'s 30 s budget covers only its own seeds.
+      /** `blinkStats(seed)` at index `seed − 1`, filled in by the batches. */
+      const stats: (BlinkStats | undefined)[] = [];
+      for (let lo = 1; lo <= 100; lo += STATS_BATCH) {
+        const hi = Math.min(lo + STATS_BATCH - 1, 100);
+        it(`runs seeds ${lo}–${hi}`, () => {
+          for (let seed = lo; seed <= hi; seed++) stats[seed - 1] = blinkStats(seed);
+        }, 30_000);
+      }
+
+      it('pools seeds 1–100', () => {
+        let span = 0;
+        let intervals = 0;
+        let n = 0;
+        let doubles = 0;
+        let pass = 0;
+        for (let seed = 1; seed <= 100; seed++) {
+          // A batch left out of this run (`-t`) is run here, so the assertions always cover all 100 seeds.
+          const r = stats[seed - 1] ?? blinkStats(seed);
+          span += r.span;
+          intervals += r.n - 1;
+          n += r.n;
+          doubles += r.doubles;
+          if (Math.abs(r.span / (r.n - 1) - 3.5) <= 0.1 && Math.abs(r.doubles / r.n - 0.15) <= 0.015) pass++;
+        }
+        // Pooled standard errors ≈ 0.0066 s and 0.0007; the no-overlap floor adds ≈ +0.007 s to the mean.
+        expect(Math.abs(span / intervals - 3.5)).toBeLessThanOrEqual(0.03);
+        expect(Math.abs(doubles / n - 0.15)).toBeLessThanOrEqual(0.005);
+        // About 83 % of seeds pass both of the issue's single-run tolerances.
+        expect(pass).toBeGreaterThanOrEqual(70);
+        // Only a run that filtered out the batches computes seeds here; allow for that on a loaded runner.
+      }, 30_000);
+    },
+  );
 });
 
 /** Direct DFT bin k of x: Σ x[n]·e^(−i·2π·k·n/N), as [re, im]. */
