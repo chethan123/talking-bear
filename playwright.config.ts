@@ -32,5 +32,14 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       timeout: 30_000,
     },
+    {
+      // The update spec's one-origin server (issue #101): builds the v1 and v2 variants of the e2e build
+      // (dist-e2e-v1/, dist-e2e-v2/), then serves the active one on port 4174 and flips it on /__switch.
+      // The timeout covers the two builds.
+      command: 'node scripts/build-update-variants.mjs && node e2e/update-proxy.mjs --port 4174',
+      url: 'http://localhost:4174',
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
   ],
 });
