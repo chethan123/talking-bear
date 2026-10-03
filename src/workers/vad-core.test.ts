@@ -1769,6 +1769,12 @@ class FakePort extends FakeTarget {
   }
 }
 
+/** The weights-load failures among `msgs`. */
+const loadFailures = (msgs: WorkerToMain[]): Extract<WorkerToMain, { t: 'error' }>[] =>
+  ofType(msgs, 'error').filter((m) => m.message.startsWith('silero weights failed to load: '));
+/** Resolves after the pending microtasks: a load that settled has posted its result by then. */
+const nextTask = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
 describe('dsp.worker glue', () => {
   let self: FakeSelf;
   /** The worker's `fetch` (of weights.bin): by default it never settles, so no load result arrives. */
@@ -1886,7 +1892,7 @@ describe('dsp.worker glue', () => {
     ['a rejected fetch', (): Promise<Response> => Promise.reject(new TypeError('network down'))],
     ['an HTTP 404', (): Promise<Response> => Promise.resolve(new Response(null, { status: 404 }))],
   ])(
-    '%s posts error{vad} and no vadReady; Silero epochs run on energy; the next init retries',
+    '%s posts error{vad} and no vadReady; Silero epochs run on energy; the next init and Silero re-arm retry',
     async (_name, impl) => {
       fetchStub.mockImplementation(impl);
       self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
@@ -1901,12 +1907,15 @@ describe('dsp.worker glue', () => {
       expect(fetchStub).toHaveBeenCalledTimes(2);
       await vi.waitFor(() => expect(ofType(sent(), 'error')).toHaveLength(1));
       self.posted.length = 0;
-      self.dispatch({ t: 'reset', epoch: 3, vad: 'silero' });
+      self.dispatch({ t: 'reset', epoch: 3, vad: 'silero' }); // retries the load too (#251)
+      expect(fetchStub).toHaveBeenCalledTimes(3);
       expect(sent()).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
       frames16k(fixture('vowel_f0-140')).forEach((pcm16k, i) =>
         port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
       );
       expect(segs(sent())).toEqual(segs(runFixture('vowel_f0-140').msgs));
+      await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(1));
+      expect(ofType(sent(), 'vadReady')).toEqual([]);
     },
   );
 
@@ -1935,6 +1944,141 @@ describe('dsp.worker glue', () => {
     expect(evs.map((e) => e.kind)).toEqual(['start', 'end']);
     for (const e of evs) expect(e.frame % SILERO_GRID).toBe(0);
     expect(ofType(sent(), 'error')).toHaveLength(1); // only the not-ready one
+  });
+
+  // #251: a failed load is retried by the next epoch that asks for Silero while no model is set.
+  it('a failed first load (HTTP 500) is retried by the next Silero re-arm: vadReady once, the next epoch on Silero', async () => {
+    fetchStub
+      .mockImplementationOnce(() => Promise.resolve(new Response(null, { status: 500 })))
+      .mockImplementation(() => Promise.resolve(new Response(weightsBuffer())));
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(1));
+    expect(loadFailures(sent())[0]).toEqual({
+      t: 'error',
+      where: 'vad',
+      message: 'silero weights failed to load: HTTP 500',
+    });
+    await nextTask();
+    expect(fetchStub).toHaveBeenCalledTimes(1); // the failure alone never retries
+    let mark = self.posted.length;
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', pregate: false });
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(sent().slice(mark)).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    expect(ofType(sent(), 'vadReady')).toEqual([{ t: 'vadReady', backend: 'silero' }]);
+    mark = self.posted.length;
+    self.dispatch({ t: 'reset', epoch: 3, vad: 'silero', pregate: false });
+    const frames = frames16k(fixture('vowel_f0-140'));
+    frames.forEach((pcm16k, i) =>
+      port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
+    );
+    const run = sent().slice(mark);
+    expect(ofType(run, 'error')).toEqual([]); // no SILERO_NOT_READY_MESSAGE: the epoch asked for Silero and got it
+    const silero = segs(runSilero(frames, createSilero(W)).msgs);
+    expect(silero).not.toEqual(segs(runFixture('vowel_f0-140').msgs)); // the check tells the backends apart
+    expect(segs(run)).toEqual(silero);
+    await nextTask();
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(ofType(sent(), 'vadReady')).toHaveLength(1);
+  });
+
+  it('repeated failures never put two fetches in flight; only a Silero re-arm retries', async () => {
+    /** Settles every fetch, in call order: with a response, or rejected with an error. */
+    const settles: ((outcome: Response | Error) => void)[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    fetchStub.mockImplementation(() => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise<Response>((resolve, reject) => {
+        settles.push((outcome) => {
+          inFlight--;
+          if (outcome instanceof Error) reject(outcome);
+          else resolve(outcome);
+        });
+      });
+    });
+    /** Fails fetch k, and waits until its failure is posted and every microtask after it has run. */
+    const fail = async (k: number, outcome: Response | Error): Promise<void> => {
+      settles[k]!(outcome);
+      await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(k + 1));
+      await nextTask();
+    };
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() }); // fetch 1
+    self.dispatch({ t: 'reset', epoch: 1, vad: 'silero' });
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero' });
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    await fail(0, new Response(null, { status: 500 }));
+    expect(fetchStub).toHaveBeenCalledTimes(1); // the failure alone never retries
+    self.dispatch({ t: 'reset', epoch: 3, vad: 'energy' }); // an energy listen doesn't want the model
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    self.dispatch({ t: 'reset', epoch: 4, vad: 'silero' }); // fetch 2
+    self.dispatch({ t: 'reset', epoch: 5, vad: 'silero' });
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    await fail(1, new TypeError('network down'));
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    self.dispatch({ t: 'reset', epoch: 6, vad: 'silero' }); // fetch 3
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+    await fail(2, new Response(null, { status: 500 }));
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+    expect(maxInFlight).toBe(1);
+    expect(loadFailures(sent()).map((m) => m.message)).toEqual([
+      'silero weights failed to load: HTTP 500',
+      'silero weights failed to load: network down',
+      'silero weights failed to load: HTTP 500',
+    ]);
+    expect(ofType(sent(), 'error').filter((m) => m.message === SILERO_NOT_READY_MESSAGE)).toHaveLength(5);
+    expect(ofType(sent(), 'vadReady')).toEqual([]);
+  });
+
+  it('a successful first load is never fetched again: Silero and energy re-arms and a later init reuse it', async () => {
+    fetchStub.mockImplementation(() => Promise.resolve(new Response(weightsBuffer())));
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    for (let epoch = 1; epoch <= 4; epoch++) {
+      self.dispatch({ t: 'reset', epoch, vad: epoch % 2 === 1 ? 'silero' : 'energy' });
+    }
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    self.dispatch({ t: 'reset', epoch: 5, vad: 'silero' });
+    await nextTask();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(ofType(sent(), 'error')).toEqual([]);
+    expect(ofType(sent(), 'vadReady')).toHaveLength(2); // the load's, and the later init's attach
+  });
+
+  it('a retry still in flight when a later init arrives attaches to the new core, not the old one', async () => {
+    let settle: ((r: Response) => void) | undefined;
+    fetchStub
+      .mockImplementationOnce(() => Promise.resolve(new Response(null, { status: 500 })))
+      .mockImplementation(
+        () =>
+          new Promise<Response>((r) => {
+            settle = r;
+          }),
+      );
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(1));
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', pregate: false }); // the retry: fetch 2, pending
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port }); // a load is in flight: no third fetch
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(ofType(sent(), 'vadReady')).toEqual([]);
+    if (settle === undefined) throw new Error('the retry did not fetch');
+    settle(new Response(weightsBuffer()));
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    const mark = self.posted.length;
+    self.dispatch({ t: 'reset', epoch: 3, vad: 'silero', pregate: false });
+    const frames = frames16k(fixture('vowel_f0-140'));
+    frames.forEach((pcm16k, i) =>
+      port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
+    );
+    const run = sent().slice(mark);
+    expect(ofType(run, 'error')).toEqual([]); // the new core has the model
+    expect(segs(run)).toEqual(segs(runSilero(frames, createSilero(W)).msgs));
+    expect(fetchStub).toHaveBeenCalledTimes(2);
   });
 
   it('reset forwards restoreFloorDb, pregate and proximityDb to the VadCore', async () => {
