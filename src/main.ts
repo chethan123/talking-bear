@@ -21,7 +21,6 @@ import { createStorage } from './platform/storage.ts';
 import { createVisibility } from './platform/visibility.ts';
 import { createWakeLock } from './platform/wake-lock.ts';
 import { setupPwa } from './pwa/register.ts';
-import { mountDebugOverlay } from './ui/debug-overlay.ts';
 import { mountOverlay } from './ui/overlay.ts';
 import { mountSettingsSheet, type SettingsSheet } from './ui/settings-sheet.ts';
 
@@ -45,10 +44,57 @@ function settingsStorage(): Storage | null {
   }
 }
 
-async function boot(): Promise<void> {
-  const app = document.querySelector<HTMLElement>('main#app');
-  if (app === null) throw new Error('boot: main#app is missing');
+/** What `boot` takes besides its root (#57). */
+export interface BootOptions {
+  /** Mounts the developer overlay. Default: the `?debug=1` query. */
+  debug?: boolean;
+  /** Called with the session as soon as it exists, before its first event (lab/vad-live's tally). */
+  onSession?(s: Session): void;
+  /**
+   * With the overlay: called once it is up (`true`: it has turned the worker's feature trace on) or has failed to
+   * load or mount (`false`: the trace is off), so a caller reports what actually ran (lab/vad-live's pre-gate).
+   */
+  onDebugOverlay?(mounted: boolean): void;
+}
 
+/**
+ * Mounts the developer overlay once its module has loaded (#57) and reports whether it is up: `true` once `mount`
+ * has returned (the overlay has turned the worker's feature trace on), `false` if the module failed to load
+ * (`null`) or `mount` threw. A mount that threw after turning the trace on has it turned off again, so `false` always
+ * means the trace is off. Nothing waits for it, and a `report` that throws is logged.
+ */
+export function mountDebugOverlayWhenLoaded<M>(
+  module: Promise<M | null>,
+  mount: (m: M) => void,
+  trace: { setTrace(on: boolean): void },
+  report: (mounted: boolean) => void,
+): void {
+  void module
+    .then((m) => {
+      if (m === null) return false;
+      mount(m);
+      return true;
+    })
+    .catch((err: unknown) => {
+      console.error('debug overlay failed to mount', err);
+      trace.setTrace(false); // a mount that threw after turning the trace on: nothing reads the trace
+      return false;
+    })
+    .then(report)
+    .catch((err: unknown) => console.error('onDebugOverlay threw', err));
+}
+
+/** Boots the app into `app`, its root element (index.html: main#app), which gets `data-state`. */
+export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<void> {
+  // The developer overlay (mounted below) is loaded on demand (#57), its fetch started here. A failed load is
+  // handled here, at once: the mount below is reached only after `await`s.
+  const wantDebug = opts.debug ?? new URLSearchParams(location.search).get('debug') === '1';
+  const overlayModule = wantDebug
+    ? import('./ui/debug-overlay.ts').catch((err: unknown) => {
+        console.error('debug overlay failed to load', err);
+        return null;
+      })
+    : null;
   const clock = realClock;
   const visibility = createVisibility();
   const wakeLock = createWakeLock(navigator, visibility);
@@ -117,6 +163,7 @@ async function boot(): Promise<void> {
     // Row 38: on a hide that leaves the session Asleep or Paused with an update ready, activate it synchronously.
     onApplyUpdate: () => pwa.applyUpdate(),
   });
+  opts.onSession?.(session);
   // An update found before the session existed (its relayed dispatch was dropped).
   if (pwa.updateReady()) session.dispatch({ t: 'updateReady' });
 
@@ -180,21 +227,28 @@ async function boot(): Promise<void> {
 
   // Developer overlay (plan §7 M2, M4, M5, M6): the frame loop's p95 frame time and fps, storage persistence and
   // usage, the device lines (#93: the latest vibrate result, ctx.state, the mic track's events, the audio inputs),
-  // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted).
-  if (new URLSearchParams(location.search).get('debug') === '1') {
-    mountDebugOverlay(app, {
-      frameStats: (out) => view.frameStats(out),
-      clock,
-      storage,
-      device: {
-        lastVibrate: () => lastVibrate,
-        engine,
-        session: s,
-        mediaDevices: 'mediaDevices' in navigator ? navigator.mediaDevices : null,
-        now: () => clock.now(),
-      },
-      vad: { engine, session: s },
-    });
+  // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted). It is loaded on
+  // demand and nothing waits for it (#57): its code, and the energy gate it replays, stay out of the initial bundle.
+  if (overlayModule !== null) {
+    mountDebugOverlayWhenLoaded(
+      overlayModule,
+      (m) =>
+        m.mountDebugOverlay(app, {
+          frameStats: (out) => view.frameStats(out),
+          clock,
+          storage,
+          device: {
+            lastVibrate: () => lastVibrate,
+            engine,
+            session: s,
+            mediaDevices: 'mediaDevices' in navigator ? navigator.mediaDevices : null,
+            now: () => clock.now(),
+          },
+          vad: { engine, session: s },
+        }),
+      engine,
+      (mounted) => opts.onDebugOverlay?.(mounted),
+    );
   }
 
   let shown: StateName | null = null;
@@ -209,4 +263,6 @@ async function boot(): Promise<void> {
   s.subscribe(render);
 }
 
-void boot();
+// index.html's entry. lab/vad-live has no main#app: it imports `boot` and calls it on its own root.
+const appRoot = document.querySelector<HTMLElement>('main#app');
+if (appRoot !== null) void boot(appRoot);
