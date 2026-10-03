@@ -106,10 +106,11 @@ test('update: a new version found while Recording waits for the loop, then is ap
     await page.goto(`${ORIGIN}/`);
     await page.waitForFunction(() => window.__bearTest !== undefined);
     await expect(app).toHaveAttribute('data-state', 'Asleep');
-    await page.evaluate(async () => {
-      await navigator.serviceWorker.ready;
-    });
-    await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
+    await page
+      .waitForFunction(() => navigator.serviceWorker.controller !== null, undefined, { timeout: 15_000 })
+      .catch((err: unknown) => {
+        throw new Error('step 1: the service worker did not control the page within 15 s', { cause: err });
+      });
     expect(await build(page), 'step 1: the first visit runs v1').toBe('v1');
     await page.evaluate(() => {
       const h = window.__bearTest;
@@ -145,8 +146,12 @@ test('update: a new version found while Recording waits for the loop, then is ap
       return i < 0 ? null : { index: i, state: all[i]!.from };
     });
     // Recording, so step 4 covers the whole rest of the loop.
-    if (found !== 'reloaded')
-      expect(found.state, 'step 3: the update was ready while Recording').toBe('Recording');
+    if (found !== 'reloaded') {
+      expect(
+        found.state,
+        `step 3: the update was ready while Recording (seen ${Date.now() - switchedAt} ms after the switch)`,
+      ).toBe('Recording');
+    }
     return found;
   });
   const readyAfterMs = Date.now() - switchedAt;
@@ -215,7 +220,7 @@ test('update: a new version found while Recording waits for the loop, then is ap
       const took = Date.now() - start;
       // The new page boots, and nothing reloads it again.
       await expect(app).toHaveAttribute('data-state', 'Asleep');
-      await page.waitForLoadState('networkidle');
+      await page.waitForLoadState('networkidle', { timeout: 10_000 });
       expect(navigations, 'step 5: exactly one reload').toHaveLength(1);
       return took;
     });

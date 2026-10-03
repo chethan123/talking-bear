@@ -10,8 +10,9 @@
 //   /index.html; exact lookup: no directory index, no SPA fallback. No ETag, 304, ranges or precompressed variants:
 //   the update spec needs none of them, and the Go server's tests cover them.
 // - Test-only endpoints, which exist only in this proxy: `GET /__switch?to=v1|v2` makes that directory the active
-//   one (204), and `GET /__404s` returns every 404 so far as a JSON array of "<METHOD> <path> (<active id>)".
-//   Both are `no-store`, like the 404s and 405s (errorCacheControl).
+//   one (204; any other method gets 405, so a HEAD never switches), and `GET /__404s` returns every 404 so far as a
+//   JSON array of "<METHOD> <raw path> (<active id>)", the path as requested, without its query. Both are
+//   `no-store`, like the 404s and 405s (errorCacheControl).
 // Plain Node ESM with no dependencies.
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -98,12 +99,12 @@ const server = createServer((req, res) => {
     res.writeHead(status).end(req.method === 'HEAD' ? undefined : `${body}\n`);
   };
 
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.setHeader('Allow', 'GET, HEAD');
-    error(405, 'Method Not Allowed');
-    return;
-  }
   if (url.pathname === '/__switch') {
+    if (req.method !== 'GET') {
+      res.setHeader('Allow', 'GET'); // only a GET switches; a HEAD must be safe
+      error(405, 'Method Not Allowed');
+      return;
+    }
     const to = url.searchParams.get('to');
     if (to !== 'v1' && to !== 'v2') {
       error(400, 'to must be v1 or v2');
@@ -113,6 +114,11 @@ const server = createServer((req, res) => {
     console.log(`update-proxy: active ${active}`);
     res.setHeader('Cache-Control', HEADERS.errorCacheControl);
     res.writeHead(204).end();
+    return;
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.setHeader('Allow', 'GET, HEAD');
+    error(405, 'Method Not Allowed');
     return;
   }
   if (url.pathname === '/__404s') {
@@ -131,8 +137,17 @@ const server = createServer((req, res) => {
   if (path === '/') path = '/index.html';
   const file = fileFor(path);
   if (file === null) {
-    notFound.push(`${req.method} ${url.pathname} (${active})`);
-    console.log(`update-proxy: 404 ${req.method} ${url.pathname} (${active})`);
+    const rawPath = (req.url ?? '/').split('?')[0];
+    notFound.push(`${req.method} ${rawPath} (${active})`);
+    console.log(`update-proxy: 404 ${req.method} ${rawPath} (${active})`);
+    error(404, 'Not Found');
+    return;
+  }
+  let body;
+  try {
+    body = readFileSync(file);
+  } catch {
+    // The file went away between the lookup and the read (e.g. the variants were rebuilt under a running proxy).
     error(404, 'Not Found');
     return;
   }
@@ -140,7 +155,6 @@ const server = createServer((req, res) => {
   if (contentType.split(';')[0]?.trim().toLowerCase() === 'text/html') {
     for (const [name, value] of Object.entries(HEADERS.htmlOnly)) res.appendHeader(name, value);
   }
-  const body = readFileSync(file);
   res.setHeader('Content-Type', contentType);
   res.setHeader('Cache-Control', cacheControlFor(path));
   res.setHeader('Content-Length', body.length);
