@@ -189,7 +189,11 @@ function countAllocations(fn: () => void): number {
 /** The `gc` function, exposed once at runtime with Node built-ins only (no `--expose-gc` flag needed). */
 let exposedGc: (() => void) | undefined;
 
-/** Runs a full garbage collection. */
+/**
+ * Runs two full garbage collections. After one, V8 can still be freeing what it found, concurrently: after a reading
+ * with GCs, heapUsed then fell by up to 225 KB during the next reading, with no GC (#246). The second one finds almost
+ * nothing to free.
+ */
 function forceGc(): void {
   if (exposedGc === undefined) {
     setFlagsFromString('--expose-gc');
@@ -200,20 +204,187 @@ function forceGc(): void {
     };
   }
   exposedGc();
+  exposedGc();
 }
 
+/** `%GetOptimizationStatus`, exposed once at runtime the same way as `gc` (no `--allow-natives-syntax` flag needed). */
+let exposedStatus: ((fn: unknown) => number) | undefined;
+
 /**
- * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
- * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ * V8's optimisation status bits of `model`'s process() closure (`%GetOptimizationStatus`; the bits are V8's
+ * `OptimizationStatus`, src/runtime/runtime.h, checked on Node 24.21 and V8 13.6).
  */
-function heapGrowth(fn: () => void): number {
-  forceGc();
+function processStatus(model: SileroModel): number {
+  if (exposedStatus === undefined) {
+    setFlagsFromString('--allow-natives-syntax');
+    const status: unknown = runInNewContext('(fn) => %GetOptimizationStatus(fn)');
+    if (typeof status !== 'function') throw new Error('%GetOptimizationStatus is not available');
+    exposedStatus = (fn: unknown): number => {
+      const bits: unknown = status(fn);
+      if (typeof bits !== 'number') throw new Error('%GetOptimizationStatus returned no number');
+      return bits;
+    };
+  }
+  // The closure itself, unbound: %GetOptimizationStatus reads its code and never calls it.
+  return exposedStatus(Reflect.get(model, 'process'));
+}
+
+/** `OptimizationStatus` bits: the function runs TurboFan, Maglev, Sparkplug or Ignition code; a job is compiling it. */
+const TURBOFANNED = 1 << 6;
+const MAGLEVVED = 1 << 5;
+const BASELINE = 1 << 15;
+const INTERPRETED = 1 << 7;
+const OPTIMIZING_CONCURRENTLY = 1 << 10;
+
+/**
+ * The tier of a function with optimisation status `bits`, as a report shows it. `status N` also appears for a function
+ * whose only optimised code is OSR code.
+ */
+function tierName(bits: number): string {
+  const tier =
+    bits & TURBOFANNED
+      ? 'TurboFan'
+      : bits & MAGLEVVED
+        ? 'Maglev'
+        : bits & BASELINE
+          ? 'Sparkplug'
+          : bits & INTERPRETED
+            ? 'Ignition'
+            : `status ${bits}`;
+  return bits & OPTIMIZING_CONCURRENTLY ? `${tier}, optimising concurrently` : tier;
+}
+
+/** `heapUsed` growth in bytes over `fn`, and whether any GC ran during it (a scavenge frees garbage it should count). */
+function heapUsedOver(fn: () => void): { bytes: number; gc: boolean } {
   const profiler = new GCProfiler();
   profiler.start();
   const before = process.memoryUsage().heapUsed;
   fn();
-  const growth = process.memoryUsage().heapUsed - before;
-  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+  const bytes = process.memoryUsage().heapUsed - before;
+  return { bytes, gc: profiler.stop().statistics.length > 0 };
+}
+
+/** Frames per warm-up chunk. */
+const WARM_UP_CHUNK = 50;
+/**
+ * A warm-up chunk that grows the heap by less than this per frame with no GC shows process(), and the conv1d it calls
+ * (which this file can't reach), running optimised code: TurboFan's steady state is about 20 B per frame, while below
+ * TurboFan the loops box doubles, kilobytes per frame or more (#246).
+ */
+const STEADY_BYTES_PER_FRAME = 1024;
+/**
+ * The longest the warm-up waits for the steady state; idle, V8 reaches it within 150 frames. The bound plus one reading
+ * of 1000 frames takes at most about 12 s idle and 23 s under v8 coverage (11.1 s and 21.8 s measured with the budget
+ * forced to run out), under half the 60 s timeout. If the state isn't reached within the bound, the loop of up to 20
+ * readings continues, as before #246: a late pass can take up to the timeout, and a failure takes about 55 s idle and
+ * several minutes under coverage, and reports its assertion and readings.
+ */
+const WARM_UP_BUDGET_MS = 10_000;
+
+/** What the warm-up did: frames run, time taken, whether it reached the optimised state, and the last chunk. */
+interface WarmUp {
+  frames: number;
+  ms: number;
+  optimised: boolean;
+  last: string;
+}
+
+/**
+ * Runs `model` in chunks of WARM_UP_CHUNK frames until V8 has optimised it: process() is TurboFan code and a chunk
+ * grew the heap by less than STEADY_BYTES_PER_FRAME per frame with no GC, and heapUsed didn't fall. It stops after
+ * WARM_UP_BUDGET_MS anyway. Under CPU load, V8's background compilers can take seconds longer to deliver TurboFan
+ * code (#246), so a fixed warm-up can leave every reading below TurboFan, where each one has a GC.
+ */
+function warmUp(model: SileroModel): WarmUp {
+  const start = performance.now();
+  for (let frames = WARM_UP_CHUNK; ; frames += WARM_UP_CHUNK) {
+    const { bytes, gc } = heapUsedOver(() => {
+      for (let i = frames - WARM_UP_CHUNK; i < frames; i++) model.process(frameAt(i));
+    });
+    const bits = processStatus(model);
+    const optimised =
+      (bits & TURBOFANNED) !== 0 && !gc && bytes >= 0 && bytes < WARM_UP_CHUNK * STEADY_BYTES_PER_FRAME;
+    const ms = Math.round(performance.now() - start);
+    if (optimised || ms >= WARM_UP_BUDGET_MS) {
+      return {
+        frames,
+        ms,
+        optimised,
+        last: `process() ${tierName(bits)}; last chunk ${bytes} B${gc ? ' (GC)' : ''}`,
+      };
+    }
+  }
+}
+
+/** One 1000-frame reading: the `heapUsed` growth in bytes, whether a GC ran, and process()'s tier after it. */
+interface HeapReading {
+  bytes: number;
+  gc: boolean;
+  tier: string;
+}
+
+/**
+ * A reading counts only if no GC ran during it, and heapUsed didn't fall: process() never frees memory, so a fall
+ * means heapUsed moved for a reason outside the run (seen on #246 right after readings with GCs).
+ */
+function qualifies(r: HeapReading): boolean {
+  return !r.gc && r.bytes >= 0;
+}
+
+/** The smallest qualifying reading's bytes, or +Infinity if none qualified. */
+function bestQualifying(readings: HeapReading[]): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (const r of readings) if (qualifies(r)) best = Math.min(best, r.bytes);
+  return best;
+}
+
+/** The steady state the warm-up waits for, as the report names it. */
+const STEADY = `process() TurboFan and a GC-free chunk under ${STEADY_BYTES_PER_FRAME} B per frame`;
+
+/** The report of a measurement: the warm-up, every reading, and the outcome (bestQualifying of the readings). */
+function heapReport(warm: WarmUp, readings: HeapReading[]): string {
+  const best = bestQualifying(readings);
+  const lines = [
+    warm.optimised
+      ? `warm-up: ${warm.frames} frames, ${warm.ms} ms, until steady: ${STEADY} (${warm.last})`
+      : `warm-up: ${warm.frames} frames, ${warm.ms} ms, stopped at the ${WARM_UP_BUDGET_MS} ms budget before a steady chunk (${STEADY}) (${warm.last})`,
+    ...readings.map(
+      (r, i) =>
+        `reading ${i + 1}: ${r.bytes} B${r.gc ? ' (GC)' : ''}, process() ${r.tier}${!r.gc && r.bytes < 0 ? '; heapUsed fell without a GC' : ''}`,
+    ),
+  ];
+  if (Number.isFinite(best)) {
+    lines.push(`best qualifying reading: ${best} B per 1000 frames`);
+  } else {
+    const gcs = readings.filter((r) => r.gc).length;
+    lines.push(
+      `no reading qualified: ${gcs} of ${readings.length} had a GC, ${readings.length - gcs} showed heapUsed falling without one`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/** The smallest qualifying reading (+Infinity if none), and the report. */
+interface Measurement {
+  best: number;
+  report: string;
+}
+
+/**
+ * Warms `model` up, then takes up to 20 readings of `run` (1000 frames each), each from a freshly collected heap,
+ * until `done(best)`, where `best` is the smallest qualifying reading so far (+Infinity before the first).
+ */
+function measure(model: SileroModel, run: () => void, done: (best: number) => boolean): Measurement {
+  const warm = warmUp(model);
+  const readings: HeapReading[] = [];
+  let best = Number.POSITIVE_INFINITY;
+  while (readings.length < 20 && !done(best)) {
+    forceGc();
+    const { bytes, gc } = heapUsedOver(run);
+    readings.push({ bytes, gc, tier: tierName(processStatus(model)) });
+    best = bestQualifying(readings);
+  }
+  return { best, report: heapReport(warm, readings) };
 }
 
 describe('process() allocates nothing', () => {
@@ -234,15 +405,10 @@ describe('process() allocates nothing', () => {
     const run = (): void => {
       for (let i = 0; i < 1000; i++) model.process(frameAt(i));
     };
-    // Warm up so V8's optimising compilers take over (until then every double is boxed). The floor of about
-    // 20 B per frame is the HeapNumber that boxes the returned p, inherent to process(): number; one
-    // subarray per frame adds about 130 B per frame. As in clip.test.ts, take the best of up to 20 runs, each
-    // from a freshly collected heap; a run during which any GC ran counts as +Infinity.
-    forceGc();
-    for (let i = 0; i < 300; i++) model.process(frameAt(i));
-    let best = heapGrowth(run);
-    for (let trial = 1; trial < 20 && best >= LIMIT; trial++) best = Math.min(best, heapGrowth(run));
-    expect(best).toBeLessThan(LIMIT);
+    // The floor of about 20 B per frame is the HeapNumber that boxes the returned p, inherent to process(): number;
+    // one subarray per frame adds about 130 B per frame. As in clip.test.ts, take the best of up to 20 readings.
+    const { best, report } = measure(model, run, (b) => b < LIMIT);
+    expect(best, report).toBeLessThan(LIMIT);
   });
 
   it('both meters have teeth (positive controls)', { timeout: 60_000 }, () => {
@@ -256,12 +422,50 @@ describe('process() allocates nothing', () => {
         kept[i] = frameAt(i).subarray(1);
       }
     };
-    for (let i = 0; i < 300; i++) model.process(frameAt(i));
-    // Retry until a run is GC-free: +Infinity alone would pass the bound without proving anything.
-    let growth = heapGrowth(run);
-    for (let trial = 1; trial < 20 && !Number.isFinite(growth); trial++) growth = heapGrowth(run);
+    // Read until a reading qualifies: +Infinity alone would pass the bound without proving anything.
+    const leak = measure(model, run, (b) => Number.isFinite(b));
     expect(kept.every((v) => v !== undefined)).toBe(true);
-    expect(Number.isFinite(growth)).toBe(true);
-    expect(growth).toBeGreaterThanOrEqual(LIMIT);
+    expect(Number.isFinite(leak.best), leak.report).toBe(true);
+    expect(leak.best, leak.report).toBeGreaterThanOrEqual(LIMIT);
+  });
+
+  it('lists the warm-up, every reading and why none qualified in its heap report', () => {
+    // Readings recorded on #246: TurboFan disabled in the worker (the failure's shape), and a compile delay on main.
+    const stalled: WarmUp = {
+      frames: 3600,
+      ms: 10_064,
+      optimised: false,
+      last: 'process() Maglev; last chunk -4547360 B (GC)',
+    };
+    const maglev: HeapReading[] = [
+      { bytes: 2_317_208, gc: true, tier: 'Maglev' },
+      { bytes: 2_315_696, gc: true, tier: 'Maglev' },
+    ];
+    expect(bestQualifying(maglev)).toBe(Number.POSITIVE_INFINITY);
+    expect(heapReport(stalled, maglev).split('\n')).toEqual([
+      'warm-up: 3600 frames, 10064 ms, stopped at the 10000 ms budget before a steady chunk (process() TurboFan and a GC-free chunk under 1024 B per frame) (process() Maglev; last chunk -4547360 B (GC))',
+      'reading 1: 2317208 B (GC), process() Maglev',
+      'reading 2: 2315696 B (GC), process() Maglev',
+      'no reading qualified: 2 of 2 had a GC, 0 showed heapUsed falling without one',
+    ]);
+    const warm: WarmUp = {
+      frames: 100,
+      ms: 110,
+      optimised: true,
+      last: 'process() TurboFan; last chunk 1040 B',
+    };
+    const fell: HeapReading = { bytes: -104_480, gc: false, tier: 'TurboFan' };
+    const steady: HeapReading = { bytes: 29_488, gc: false, tier: 'TurboFan' };
+    expect(qualifies(fell)).toBe(false);
+    expect(bestQualifying([fell, steady])).toBe(29_488);
+    expect(heapReport(warm, [fell]).split('\n').at(-1)).toBe(
+      'no reading qualified: 0 of 1 had a GC, 1 showed heapUsed falling without one',
+    );
+    expect(heapReport(warm, [fell, steady]).split('\n')).toEqual([
+      'warm-up: 100 frames, 110 ms, until steady: process() TurboFan and a GC-free chunk under 1024 B per frame (process() TurboFan; last chunk 1040 B)',
+      'reading 1: -104480 B, process() TurboFan; heapUsed fell without a GC',
+      'reading 2: 29488 B, process() TurboFan',
+      'best qualifying reading: 29488 B per 1000 frames',
+    ]);
   });
 });
