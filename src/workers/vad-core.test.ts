@@ -1999,6 +1999,39 @@ describe('VadCore capture gaps (#244)', () => {
     const post = Math.floor(((frames.length - cut) * FRAME) / ENERGY_HOP);
     expect(linearHopFrames(batches)).toEqual(hopGrid(50, gapEnd, post));
   });
+
+  it('the voicing window restarts from zeros at the gap: the trace voicing equals a reference zeroed there', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 55; // mid-vowel, and exactly 176 hops before it: no partial hop is dropped
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    run.core.setTrace(true);
+    feedWithGap(run, 1, frames, cut);
+    run.core.setTrace(false);
+    // The reference, as referenceStreams computes it: the gate filter runs on across the gap (it carries on),
+    // and the 512-sample voicing window is zeroed just before hop 176, the first after the gap.
+    const firstAfter = (cut * FRAME) / ENERGY_HOP;
+    expect(firstAfter).toBe(176);
+    const band = new Float32Array(frames.length * FRAME);
+    const gate = createGateFilter(16000);
+    frames.forEach((f, k) => gate.process(f, band.subarray(k * FRAME, (k + 1) * FRAME)));
+    const voicingWith = (zeroAt: number): Float32Array => {
+      const scorer = createVoicing(16000);
+      const win = new Float32Array(512);
+      const out = new Float32Array(Math.floor(band.length / ENERGY_HOP));
+      for (let j = 0; j < out.length; j++) {
+        if (j === zeroAt) win.fill(0);
+        win.copyWithin(0, ENERGY_HOP);
+        win.set(band.subarray(j * ENERGY_HOP, (j + 1) * ENERGY_HOP), win.length - ENERGY_HOP);
+        out[j] = scorer.score(win);
+      }
+      return out;
+    };
+    const reference = voicingWith(firstAfter);
+    // The reset shows here: a window carried over the gap scores the first hop after it differently.
+    expect(voicingWith(-1)[firstAfter]).not.toBe(reference[firstAfter]);
+    expect(joined(traceBatches(run.msgs), 'voicing')).toEqual(reference);
+  });
 });
 
 // ---- Worker glue (dsp.worker.ts) with a fake `self` and a fake MessagePort ----
