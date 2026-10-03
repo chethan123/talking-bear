@@ -281,6 +281,14 @@ const STEADY_BYTES_PER_FRAME = 1024;
  */
 const WARM_UP_BUDGET_MS = 10_000;
 
+/**
+ * Whether a warm-up chunk shows the steady state: process() is TurboFan code (status `bits`), and the chunk grew the
+ * heap by `bytes`, less than STEADY_BYTES_PER_FRAME per frame, with no GC and no fall.
+ */
+function steadyChunk(bits: number, bytes: number, gc: boolean): boolean {
+  return (bits & TURBOFANNED) !== 0 && !gc && bytes >= 0 && bytes < WARM_UP_CHUNK * STEADY_BYTES_PER_FRAME;
+}
+
 /** What the warm-up did: frames run, time taken, whether it reached the optimised state, and the last chunk. */
 interface WarmUp {
   frames: number;
@@ -302,8 +310,7 @@ function warmUp(model: SileroModel): WarmUp {
       for (let i = frames - WARM_UP_CHUNK; i < frames; i++) model.process(frameAt(i));
     });
     const bits = processStatus(model);
-    const optimised =
-      (bits & TURBOFANNED) !== 0 && !gc && bytes >= 0 && bytes < WARM_UP_CHUNK * STEADY_BYTES_PER_FRAME;
+    const optimised = steadyChunk(bits, bytes, gc);
     const ms = Math.round(performance.now() - start);
     if (optimised || ms >= WARM_UP_BUDGET_MS) {
       return {
@@ -456,6 +463,8 @@ describe('process() allocates nothing', () => {
     };
     const fell: HeapReading = { bytes: -104_480, gc: false, tier: 'TurboFan' };
     const steady: HeapReading = { bytes: 29_488, gc: false, tier: 'TurboFan' };
+    const larger: HeapReading = { bytes: 31_000, gc: false, tier: 'TurboFan' };
+    expect(bestQualifying([fell, larger, steady])).toBe(29_488);
     expect(qualifies(fell)).toBe(false);
     expect(bestQualifying([fell, steady])).toBe(29_488);
     expect(heapReport(warm, [fell]).split('\n').at(-1)).toBe(
@@ -467,5 +476,11 @@ describe('process() allocates nothing', () => {
       'reading 2: 29488 B, process() TurboFan',
       'best qualifying reading: 29488 B per 1000 frames',
     ]);
+    // The warm-up's exit test: status 81 is TurboFan, 49 Maglev (Node 24.21); 51 200 B is 1024 B × 50 frames.
+    expect(steadyChunk(81, 1040, false)).toBe(true);
+    expect(steadyChunk(49, 1040, false)).toBe(false);
+    expect(steadyChunk(81, 1040, true)).toBe(false);
+    expect(steadyChunk(81, -1, false)).toBe(false);
+    expect(steadyChunk(81, 51_200, false)).toBe(false);
   });
 });
