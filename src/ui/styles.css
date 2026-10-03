@@ -234,6 +234,69 @@ body {
   font: inherit;
 }
 
+/* The licences screen (licences-screen.ts, #114): a full-screen, opaque modal over the settings sheet. Only an open
+   one is a flex column, so the UA's display: none still hides it when closed. The header stays put and the text
+   scrolls inside the <pre>; pre-wrap and overflow-wrap wrap the long SHA-256 and URL lines at phone width. */
+.licences-screen {
+  position: fixed;
+  inset: 0;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: #fff;
+  color: #202124;
+}
+
+.licences-screen[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.licences-screen::backdrop {
+  background: #fff;
+}
+
+.licences-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #dfe6e4;
+}
+
+.licences-header h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.licences-header .licences-close {
+  width: auto;
+  margin: 0;
+  padding: 0 16px;
+}
+
+.licences-status {
+  margin: 16px;
+}
+
+.licences-text {
+  flex: 1;
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font:
+    0.8125rem/1.45 ui-monospace,
+    monospace;
+}
+
 /* Developer overlay, ?debug=1 (debug-overlay.ts): top-left text that never takes pointer events. */
 .debug-overlay {
   position: fixed;
