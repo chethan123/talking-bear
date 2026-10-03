@@ -53,9 +53,15 @@ export interface BootOptions {
 
 /** Boots the app into `app`, its root element (index.html: main#app), which gets `data-state`. */
 export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<void> {
-  // The developer overlay (mounted below) is loaded on demand (#57), its fetch started here.
+  // The developer overlay (mounted below) is loaded on demand (#57), its fetch started here. A failed load is
+  // handled here, at once: the mount below is reached only after `await`s.
   const wantDebug = opts.debug ?? new URLSearchParams(location.search).get('debug') === '1';
-  const overlayModule = wantDebug ? import('./ui/debug-overlay.ts') : null;
+  const overlayModule = wantDebug
+    ? import('./ui/debug-overlay.ts').catch((err: unknown) => {
+        console.error('debug overlay failed to load', err);
+        return null;
+      })
+    : null;
   const clock = realClock;
   const visibility = createVisibility();
   const wakeLock = createWakeLock(navigator, visibility);
@@ -187,8 +193,8 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
   // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted). It is loaded on
   // demand and nothing waits for it (#57): its code, and the energy gate it replays, stay out of the initial bundle.
   void overlayModule
-    ?.then(({ mountDebugOverlay }) =>
-      mountDebugOverlay(app, {
+    ?.then((m) =>
+      m?.mountDebugOverlay(app, {
         frameStats: (out) => view.frameStats(out),
         clock,
         storage,
@@ -202,7 +208,7 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
         vad: { engine, session: s },
       }),
     )
-    .catch((err: unknown) => console.error('debug overlay failed to load', err));
+    .catch((err: unknown) => console.error('debug overlay failed to mount', err));
 
   let shown: StateName | null = null;
   const render = (st: SessionState): void => {
