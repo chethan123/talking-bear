@@ -1,8 +1,8 @@
 // VadCore driven by the synthetic fixtures: the energy backend (M1) and its voicing rule, the Silero backend on
 // the shipped weights (fallback, late model, failures, pre-gate, LSTM reset, vadStats), the allocation meters,
-// and a smoke test of the worker glue. Fixtures are 48 kHz; like the capture worklet, the test decimates them
-// to 16 kHz and feeds 512-sample frames tagged with the ctx frame of their first sample (ctxRate 48000, so
-// frame i starts at i·512·3).
+// capture gaps (#244), and a smoke test of the worker glue. Fixtures are 48 kHz; like the capture worklet, the
+// test decimates them to 16 kHz and feeds 512-sample frames tagged with the ctx frame of their first sample
+// (ctxRate 48000, so frame i starts at i·512·3).
 
 import { readFileSync } from 'node:fs';
 import { GCProfiler, setFlagsFromString } from 'node:v8';
@@ -15,7 +15,9 @@ import {
   ENERGY_HOP,
   PREGATE_ENABLED,
   PREGATE_WARMUP_FRAMES,
+  PREROLL_MS,
   PROXIMITY_DB,
+  TAIL_MS,
 } from '../audio/constants.ts';
 import type { WorkerToMain } from '../audio/messages.ts';
 import { DEFAULT_ENERGY_PARAMS, createGateFilter, frameDb } from '../dsp/energy-gate.ts';
@@ -28,6 +30,7 @@ import { PRESETS } from '../dsp/types.ts';
 import { processVoice } from '../dsp/voice.ts';
 import { createVoicing } from '../dsp/voicing.ts';
 import {
+  CAPTURE_GAP_SLACK,
   LEVEL_EVERY_HOPS,
   MIN_VOICED_MS,
   PREGATE_HOLD_FRAMES,
@@ -1731,6 +1734,271 @@ describe('VadCore feature trace (setTrace)', () => {
       expect(allocations).toBe(5 * posted);
     },
   );
+});
+
+// ---- Capture gaps (#244) ----
+
+/** The re-anchor of the tests: a 2 s audio-thread stall, in ctx frames. */
+const GAP = 2 * CTX_RATE;
+/** Ctx frames per 10 ms hop. */
+const HOP_CTX = ENERGY_HOP * 3;
+/** The session's pre-roll and tail in ctx frames (machine.ts `endOfSpeech`). */
+const PREROLL_CTX = (PREROLL_MS / 1000) * CTX_RATE;
+const TAIL_CTX = (TAIL_MS / 1000) * CTX_RATE;
+
+/**
+ * Feeds `frames` as the worklet tags them across a re-anchor: frame k at k·512·3 before frame `cut`, and `jump`
+ * ctx frames later from frame `cut` on.
+ */
+function feedWithGap(run: Run, epoch: number, frames: Float32Array[], cut: number, jump = GAP): void {
+  frames.forEach((f, k) => run.core.frame(epoch, k * SILERO_GRID + (k < cut ? 0 : jump), f));
+}
+
+/** The [fromFrame, toFrame] the session would take for each start → end pair of `evs` (machine.ts
+ *  `endOfSpeech`: PREROLL_CTX before the onset, clamped to the epoch's first frame 0, to TAIL_CTX after
+ *  lastSpeechFrame). */
+function takesOf(evs: SegEvent[]): [number, number][] {
+  const out: [number, number][] = [];
+  let onset: number | null = null;
+  for (const ev of evs) {
+    if (ev.kind === 'start') {
+      onset = ev.frame;
+      continue;
+    }
+    if (ev.kind === 'end' && onset !== null) {
+      out.push([Math.max(0, onset - PREROLL_CTX), ev.lastSpeechFrame + TAIL_CTX]);
+    }
+    onset = null;
+  }
+  return out;
+}
+
+/** Index in `msgs` of the first `level` at or after ctx frame `frame`: the first message about audio there. */
+function firstLevelAt(msgs: WorkerToMain[], frame: number): number {
+  return msgs.findIndex((m) => m.t === 'level' && m.frame >= frame);
+}
+
+/** Index in `msgs` of the n-th `seg` message (n = 0: the first). */
+function segIndex(msgs: WorkerToMain[], n: number): number {
+  const at = msgs.flatMap((m, i) => (m.t === 'seg' ? [i] : []));
+  return at[n] ?? -1;
+}
+
+/** Each batch's hops mapped linearly from its hop0Frame (480 frames apart), all batches joined. */
+function linearHopFrames(batches: TraceBatch[]): number[] {
+  return batches.flatMap((b) => Array.from(b.rawDb, (_, i) => b.hop0Frame + i * HOP_CTX));
+}
+
+/** Hop frames h·480 for h in [0, pre), then gapEnd + m·480 for m in [0, post). */
+function hopGrid(pre: number, gapEnd: number, post: number): number[] {
+  return [
+    ...Array.from({ length: pre }, (_, h) => h * HOP_CTX),
+    ...Array.from({ length: post }, (_, m) => gapEnd + m * HOP_CTX),
+  ];
+}
+
+describe('VadCore capture gaps (#244)', () => {
+  it('energy: a 2 s re-anchor mid-vowel ends the segment at the gap, and no take spans the gap', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 55; // frame 55 starts at 1.76 s, mid-vowel (1.0–2.5 s): exactly 176 hops before it
+    const gapStart = cut * SILERO_GRID; // the first ctx frame the stall swallowed
+    const gapEnd = gapStart + GAP; // the re-anchor: the frames resume here
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    feedWithGap(run, 1, frames, cut);
+    const evs = segs(run.msgs);
+    // No take reaches across the gap: each lies before it (its tail may reach TAIL_CTX into it) or after it
+    // (its pre-roll may reach PREROLL_CTX back into it).
+    const takes = takesOf(evs);
+    expect(takes.length).toBeGreaterThan(0);
+    for (const [from, to] of takes) {
+      expect(to <= gapStart + TAIL_CTX || from >= gapEnd - PREROLL_CTX, `take [${from}, ${to}]`).toBe(true);
+    }
+    // The segment ends at its last hop before the gap, before any message about the audio after it.
+    const lastHop = (176 - 1) * HOP_CTX;
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'end', 'start', 'end']);
+    expect(evs[1]).toEqual({ kind: 'end', frame: lastHop, lastSpeechFrame: lastHop, reason: 'silence' });
+    expect(segIndex(run.msgs, 1)).toBeLessThan(firstLevelAt(run.msgs, gapEnd));
+    expect(takes[0]![1]).toBe(lastHop + TAIL_CTX);
+    // The vowel after the gap is a segment of its own, from the re-anchor on.
+    expect(evs[2]!.frame).toBeGreaterThanOrEqual(gapEnd);
+    expect(takes[1]![0]).toBeGreaterThanOrEqual(gapEnd - PREROLL_CTX);
+  });
+
+  it('Silero: the segment ends at its last frame before the gap, after the proximity gate', () => {
+    const cut = LEAD + 15;
+    const frames = burstFrames(74, -50, 12, LEAD, BURST, TAIL);
+    const run = (x: number): Run => {
+      const r = newCore();
+      r.core.setModel(burstModel(LEAD, LEAD + BURST));
+      r.core.reset(1, 'silero', undefined, false, x);
+      feedWithGap(r, 1, frames, cut);
+      return r;
+    };
+    const pass = run(6);
+    const evs = segs(pass.msgs);
+    const lastBefore = (cut - 1) * SILERO_GRID;
+    expect(evs).toEqual([
+      { kind: 'start', frame: LEAD * SILERO_GRID },
+      { kind: 'end', frame: lastBefore, lastSpeechFrame: lastBefore, reason: 'silence' },
+      { kind: 'start', frame: cut * SILERO_GRID + GAP },
+      {
+        kind: 'end',
+        frame: evs[3]?.frame,
+        lastSpeechFrame: (LEAD + BURST - 1) * SILERO_GRID + GAP,
+        reason: 'silence',
+      },
+    ]);
+    expect(segIndex(pass.msgs, 1)).toBeLessThan(firstLevelAt(pass.msgs, cut * SILERO_GRID + GAP));
+    // X = 15 (the burst is 12 dB above the floor): the same messages, with both ends misfires at their frames.
+    const fail = run(15);
+    expect(fail.msgs).toEqual(
+      pass.msgs.map((m) =>
+        m.t === 'seg' && m.ev.kind === 'end'
+          ? { t: 'seg', epoch: 1, ev: { kind: 'misfire', frame: m.ev.frame } }
+          : m,
+      ),
+    );
+  });
+
+  it('a segment cut short by the gap is a misfire: under the minimum speech (Silero), or unvoiced (energy)', () => {
+    // Silero: the burst starts 2 frames (64 ms < 150 ms) before the gap.
+    const cut = LEAD + 2;
+    const silero = newCore();
+    silero.core.setModel(burstModel(LEAD, LEAD + BURST));
+    silero.core.reset(1, 'silero', undefined, false, 6);
+    feedWithGap(silero, 1, burstFrames(75, -50, 12, LEAD, BURST, TAIL), cut);
+    expect(segs(silero.msgs).slice(0, 3)).toEqual([
+      { kind: 'start', frame: LEAD * SILERO_GRID },
+      { kind: 'misfire', frame: (cut - 1) * SILERO_GRID },
+      { kind: 'start', frame: cut * SILERO_GRID + GAP },
+    ]);
+    // Energy: a 600 ms white-noise burst at −20 dBFS (never voiced), cut 300 ms in.
+    const x = concat48(whiteNoise48(41, 1.0, -70), whiteNoise48(42, 0.6, -20), whiteNoise48(43, 1.0, -70));
+    const energy = newCore();
+    energy.core.reset(1, 'energy');
+    const noiseCut = Math.round((1.3 * 16000) / FRAME);
+    feedWithGap(energy, 1, frames16k(x), noiseCut);
+    const evs = segs(energy.msgs);
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'misfire', 'start', 'misfire']);
+    expect(evs[1]!.frame).toBeLessThan(noiseCut * SILERO_GRID);
+    expect(evs[2]!.frame).toBeGreaterThanOrEqual(noiseCut * SILERO_GRID + GAP);
+  });
+
+  it('a gap while idle posts nothing: the events after it are the gapless run’s, shifted by the gap', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 20; // 0.64 s, before the vowel; 20 frames are exactly 64 hops
+    const gapless = newCore();
+    gapless.core.reset(1, 'energy');
+    feed(gapless, 1, frames);
+    const gapped = newCore();
+    gapped.core.reset(1, 'energy');
+    feedWithGap(gapped, 1, frames, cut);
+    const shifted = segs(gapless.msgs).map((ev) => ({ ...ev, frame: ev.frame + GAP }));
+    const evs = segs(gapped.msgs);
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'end']);
+    expect(evs).toEqual(
+      shifted.map((ev) => (ev.kind === 'end' ? { ...ev, lastSpeechFrame: ev.lastSpeechFrame + GAP } : ev)),
+    );
+  });
+
+  it('tags within CAPTURE_GAP_SLACK (128) of the expected frame are no gap; one more frame either way is', () => {
+    expect(CAPTURE_GAP_SLACK).toBe(128);
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 55;
+    const kindsWith = (jump: number): string[] => {
+      const run = newCore();
+      run.core.reset(1, 'energy');
+      feedWithGap(run, 1, frames, cut, jump);
+      return kinds(run.msgs);
+    };
+    expect(kindsWith(CAPTURE_GAP_SLACK)).toEqual(['start', 'end']);
+    expect(kindsWith(-CAPTURE_GAP_SLACK)).toEqual(['start', 'end']);
+    expect(kindsWith(CAPTURE_GAP_SLACK + 1)).toEqual(['start', 'end', 'start', 'end']);
+    expect(kindsWith(-CAPTURE_GAP_SLACK - 1)).toEqual(['start', 'end', 'start', 'end']);
+    // The worklet's rounded tags at 44.1 kHz (1411.2 frames apart) are no gap either.
+    const run = newCore(44100);
+    run.core.reset(1, 'energy');
+    frames.forEach((f, k) => run.core.frame(1, tag441(k), f));
+    expect(kinds(run.msgs)).toEqual(['start', 'end']);
+  });
+
+  it('no hop straddles the gap: the partial hop is dropped, and the hops after it start at the re-anchor', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 56; // 56 · 512 samples: 179 hops and 32 samples of the 180th
+    const gapEnd = cut * SILERO_GRID + GAP;
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    run.core.setTrace(true);
+    feedWithGap(run, 1, frames, cut);
+    run.core.setTrace(false);
+    const post = Math.floor(((frames.length - cut) * FRAME) / ENERGY_HOP);
+    expect(linearHopFrames(traceBatches(run.msgs))).toEqual(hopGrid(179, gapEnd, post));
+    for (const m of levels(run.msgs)) {
+      const offset = m.frame < gapEnd ? m.frame : m.frame - gapEnd;
+      expect(offset % HOP_CTX, `level at ${m.frame}`).toBe(0);
+    }
+  });
+
+  it('the trace batch ends at the gap, so every batch follows on from its hop0Frame and sil0Frame', () => {
+    const frames = vowel3s();
+    const cut = 10; // 32 hops: a batch closes at the end of frame 7, and 7 hops (2 Silero frames) are held
+    const gapEnd = cut * SILERO_GRID + GAP;
+    const post = Math.floor(((frames.length - cut) * FRAME) / ENERGY_HOP);
+    // Energy: the 7 held hops are posted as a batch of their own.
+    const energy = newCore();
+    energy.core.reset(1, 'energy');
+    energy.core.setTrace(true);
+    feedWithGap(energy, 1, frames, cut);
+    energy.core.setTrace(false);
+    let batches = traceBatches(energy.msgs);
+    expect(shapes(batches.slice(0, 3))).toEqual([
+      [1, 25, 0],
+      [1, 7, 0],
+      [1, 25, 0],
+    ]);
+    expect(batches[2]!.hop0Frame).toBe(gapEnd);
+    expect(linearHopFrames(batches)).toEqual(hopGrid(32, gapEnd, post));
+    // Silero: the same, with the held frames' Silero values, which then also follow on from sil0Frame.
+    const silero = newCore();
+    silero.core.setModel(zeroModel());
+    silero.core.reset(1, 'silero');
+    silero.core.setTrace(true);
+    feedWithGap(silero, 1, frames, cut);
+    silero.core.setTrace(false);
+    batches = traceBatches(silero.msgs);
+    expect(shapes(batches.slice(0, 3))).toEqual([
+      [1, 25, 8],
+      [1, 7, 2],
+      [1, 25, 8],
+    ]);
+    expect([batches[1]!.hop0Frame, batches[1]!.sil0Frame]).toEqual([25 * HOP_CTX, 8 * SILERO_GRID]);
+    expect([batches[2]!.hop0Frame, batches[2]!.sil0Frame]).toEqual([gapEnd, gapEnd]);
+    expect(linearHopFrames(batches)).toEqual(hopGrid(32, gapEnd, post));
+    const silFrames = batches.flatMap((b) => Array.from(b.sileroP, (_, j) => b.sil0Frame + j * SILERO_GRID));
+    expect(silFrames).toEqual(frames.map((_, k) => k * SILERO_GRID + (k < cut ? 0 : GAP)));
+  });
+
+  it('on Silero, hops held without a Silero value at the gap are dropped: no batch has hops but no p', () => {
+    const frames = vowel3s();
+    const cut = 16; // 51 hops: batches close at the ends of frames 7 and 15, and hop 50 is left over
+    const gapEnd = cut * SILERO_GRID + GAP;
+    const run = newCore();
+    run.core.setModel(zeroModel());
+    run.core.reset(1, 'silero');
+    run.core.setTrace(true);
+    feedWithGap(run, 1, frames, cut);
+    run.core.setTrace(false);
+    const batches = traceBatches(run.msgs);
+    expect(shapes(batches.slice(0, 3))).toEqual([
+      [1, 25, 8],
+      [1, 25, 8],
+      [1, 25, 8],
+    ]);
+    expect(batches.every((b) => b.sileroP.length > 0)).toBe(true);
+    const post = Math.floor(((frames.length - cut) * FRAME) / ENERGY_HOP);
+    expect(linearHopFrames(batches)).toEqual(hopGrid(50, gapEnd, post));
+  });
 });
 
 // ---- Worker glue (dsp.worker.ts) with a fake `self` and a fake MessagePort ----

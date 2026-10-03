@@ -24,10 +24,20 @@
 // trace is complete. The values are the ones the VAD itself uses (bandDb is the gate's level, voicing the
 // energy path's score); nothing upstream of them changes, and with the trace off nothing changes at all.
 //
+// Capture gaps (#244): when the audio thread stalls for over 0.5 s, the capture worklet re-anchors its VAD feed
+// at the new frame (src/audio/capture.worklet.ts), so the tags jump and the audio in between is missing. A frame
+// whose firstFrame differs by more than CAPTURE_GAP_SLACK (one render quantum) from the previous frame's
+// firstFrame plus one VAD frame starts after a gap, and no hop, segment or trace batch spans the gap: the partial
+// hop is dropped; a segment in progress ends at its last step before the gap, as an `end` (reason 'silence') if
+// it passes the checks a silence end faces there (the minimum speech, then the energy voicing rule or the Silero
+// proximity gate), else as a `misfire`, and the segmenter starts over; and with the trace on, the batch ends at
+// the gap. The voicing window restarts from zeros, as at `reset`. The gate and its floor, the gate filter, the
+// LSTM, the pre-gate, the hop count and the onset block carry on. Without a gap, nothing changes.
+//
 // Pure TypeScript: no worker globals (`post` is injected; the clock defaults to `performance.now`), so the
 // whole core runs in Node tests. The per-frame path doesn't allocate: every buffer is preallocated, and
 // objects are created only for the messages it posts (and, with the trace on, the five arrays each
-// `traceBatch` transfers).
+// `traceBatch` transfers; at a capture gap, the segmenter's fresh state).
 
 import {
   ENERGY_HOP,
@@ -94,6 +104,14 @@ const TRACE_HOP_CAPACITY = TRACE_BATCH_HOPS + Math.ceil(VAD_FRAME / ENERGY_HOP);
  *  but the one that completes the batch adds 3 or 4 hops to it, so a batch gets at most ⌈25 / 3⌉ = 9 values;
  *  TRACE_BATCH_HOPS is a safe bound. */
 const TRACE_SILERO_CAPACITY = TRACE_BATCH_HOPS;
+
+/**
+ * Capture gaps (#244): a frame whose firstFrame differs by more than this many ctx frames (one 128-frame render
+ * quantum) from the previous frame's firstFrame plus one VAD frame (512 · ctxRate / 16000) starts after a gap.
+ * The worklet's tags are exact up to rounding (at most 1 frame apart), and it zero-fills every gap up to 0.5 s,
+ * so only a re-anchor moves them further.
+ */
+export const CAPTURE_GAP_SLACK = 128;
 
 /** One energy hop in ms (10). */
 const HOP_MS = (ENERGY_HOP * 1000) / VAD_RATE;
@@ -180,6 +198,8 @@ export class VadCore {
   private hopCount = 0;
   /** firstFrame of the epoch's first accepted frame; null until then. */
   private epochStartFrame: number | null = null;
+  /** firstFrame of the epoch's latest accepted frame (valid once epochStartFrame isn't null). */
+  private lastFirstFrame = 0;
   /** Hops (energy) or frames (Silero) starting before this ctx frame get prob 0 (onset block). */
   private onsetBlockEnd = 0;
   /** Energy path: voiced hops of the current segment, from its `start` hop on. */
@@ -287,7 +307,8 @@ export class VadCore {
   }
 
   /** Consumes one 512-sample frame at 16 kHz whose first sample is ctx frame `firstFrame`. Frames of any
-   *  epoch other than the current one (including every frame before the first reset) are dropped. */
+   *  epoch other than the current one (including every frame before the first reset) are dropped. A frame
+   *  after a capture gap (see CAPTURE_GAP_SLACK) first closes what the gap interrupts (`captureGap`). */
   frame(epoch: number, firstFrame: number, pcm16k: Float32Array): void {
     if (epoch !== this.epoch) return;
     if (pcm16k.length !== VAD_FRAME) {
@@ -296,7 +317,10 @@ export class VadCore {
     if (this.epochStartFrame === null) {
       this.epochStartFrame = firstFrame;
       this.onsetBlockEnd = firstFrame + this.onsetBlockFrames;
+    } else if (Math.abs(firstFrame - (this.lastFirstFrame + this.frameCtx)) > CAPTURE_GAP_SLACK) {
+      this.captureGap(epoch);
     }
+    this.lastFirstFrame = firstFrame;
     const x = this.filter.process(pcm16k, this.scratch);
     const hop = this.hop;
     const rawHop = this.rawHop;
@@ -314,6 +338,44 @@ export class VadCore {
     const m = this.silero;
     if (m !== null) this.stepSilero(epoch, firstFrame, pcm16k, m);
     if (this.trHops >= TRACE_BATCH_HOPS) this.postTrace(epoch, TRACE_BATCH_HOPS);
+  }
+
+  /**
+   * The frame about to be consumed starts after a capture gap (#244). The partial hop is dropped, so no hop
+   * straddles the gap, and the voicing window restarts from zeros (as at `reset`). A segment in progress ends at
+   * its last step before the gap (its frame label: the last Silero frame's firstFrame, or the last hop's frame on
+   * energy): an `end` with reason 'silence' and its lastSpeechFrame if it passes the checks a silence end would
+   * face there (at least minSpeechMs of speech, then MIN_VOICED_MS voiced on energy or the proximity gate on
+   * Silero), else a `misfire`; the segmenter then starts over. With the trace on, the batch ends at the gap, so
+   * every batch's hops follow on from its hop0Frame and its Silero values from its sil0Frame: the partial batch is
+   * posted, except that on Silero a partial batch without a Silero value is dropped, because a batch with hops but
+   * no p would read as a broken Silero stream. That is normally the ≤ 3 hops left over from the frame that closed
+   * the previous batch, whose p went out with it; up to a batch right after a late model switch.
+   */
+  private captureGap(epoch: number): void {
+    this.hopFill = 0;
+    this.voiceWin.fill(0);
+    const s = this.seg;
+    if (s.inSpeech) {
+      const silero = this.silero !== null;
+      const params = silero ? SILERO_SEG_PARAMS : ENERGY_SEG_PARAMS;
+      const frame = silero
+        ? this.lastFirstFrame
+        : this.histFrame[(this.hopCount - 1) % PROXIMITY_HISTORY_HOPS]!;
+      const speechMs = (s.lastSpeechStep - s.startStep + 1) * params.frameMs;
+      const passes =
+        speechMs >= params.minSpeechMs &&
+        (silero ? this.nearEnough(s.lastSpeechFrame) : this.voicedHops * HOP_MS >= MIN_VOICED_MS);
+      const ev: SegEvent = passes
+        ? { kind: 'end', frame, lastSpeechFrame: s.lastSpeechFrame, reason: 'silence' }
+        : { kind: 'misfire', frame };
+      this.emit(epoch, ev, this.gate.initialized ? this.gate.floorDb : Number.NaN);
+    }
+    this.seg = initialSegState();
+    if (this.traceOn) {
+      if (this.silero !== null && this.trSil === 0) this.trHops = 0;
+      else this.flushTrace();
+    }
   }
 
   private stepHop(epoch: number, ctxFrame: number): void {
