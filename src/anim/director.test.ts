@@ -13,7 +13,14 @@ import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
 import { REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
-import { directorReduce, directorStep, evaluate, initialDirector, mouthCloseScale } from './director.ts';
+import {
+  clipByName,
+  directorReduce,
+  directorStep,
+  evaluate,
+  initialDirector,
+  mouthCloseScale,
+} from './director.ts';
 import type { DirectorState, DirInput, DirOut, DirState, GestureKind } from './director.ts';
 import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
 import type { Pose } from './pose.ts';
@@ -2564,6 +2571,133 @@ describe('#240: a clip cut while playing crossfades out over 100 ms', () => {
     expect(
       countAllocations(() => {
         for (let i = 0; i < 1000; i++) evaluate(s, 12.2 + i * 0.0002, out);
+      }),
+    ).toBe(0);
+  });
+});
+
+// ==== #221: the clip lookup and the mouth channels through evaluate ===============================================
+/** The four mouth channels of `p`, in `MOUTH` order. */
+const mouthOf = (p: Pose): number[] => MOUTH.map((m) => p[m]!);
+/** `evaluate(s, now)` with the mouth channels (bear-view's call), into a fresh pose. */
+const withMouth = (s: DirectorState, now: number): Pose => evaluate(s, now, createPose(), true);
+/** The largest |a − b| over every channel, the mouth's included. */
+function fullDiff(a: Pose, b: Pose): number {
+  let m = 0;
+  for (let i = 0; i < CH_COUNT; i++) m = Math.max(m, Math.abs(a[i]! - b[i]!));
+  return m;
+}
+/** A pinch of both cheeks (squish, P3, held) and an all-over touch (giggle, P3), at `now`. */
+const pinch = (now: number): DirInput => gest('squish', 'cheekL', 'pinch', now);
+const allOver = (now: number): DirInput => gest('giggle', 'belly', 'allOver', now);
+
+describe('#221: clipByName and the mouth channels through evaluate', () => {
+  it('clipByName returns the clips the director plays: session, reaction, the flinch and the mirrored pet', () => {
+    for (const [name, c] of Object.entries(SESSION_CLIPS)) expect(clipByName(name), name).toBe(c);
+    for (const [name, c] of Object.entries(REACTION_CLIPS)) expect(clipByName(name), name).toBe(c);
+    expect(clipByName('flinch')?.tracks.map((tr) => tr.ch)).toStrictEqual([Ch.BodySquash]);
+    const pet = REACTION_CLIPS.pet;
+    const mirrored = clipByName('petMirrored');
+    expect(mirrored?.duration).toBe(pet.duration);
+    expect(mirrored?.tracks).toStrictEqual(
+      pet.tracks.map((tr) =>
+        tr.ch === Ch.HeadRot ? { ch: tr.ch, keys: tr.keys.map((key) => ({ ...key, v: -key.v })) } : tr,
+      ),
+    );
+    expect(clipByName('mystery')).toBeUndefined();
+  });
+
+  it('every clip it knows has its impulses in time order (bear-view applies them with a cursor)', () => {
+    const names = [...Object.keys(SESSION_CLIPS), ...Object.keys(REACTION_CLIPS), 'flinch', 'petMirrored'];
+    let kicked = 0;
+    for (const name of names) {
+      const c = clipByName(name);
+      expect(c, name).toBeDefined();
+      const imps = c?.impulses ?? [];
+      if (imps.length > 0) kicked++;
+      for (let i = 1; i < imps.length; i++)
+        expect(imps[i]!.t, `${name} kick ${i}`).toBeGreaterThanOrEqual(imps[i - 1]!.t);
+    }
+    expect(kicked, 'the clips with spring kicks').toBe(11);
+  });
+
+  it("with `mouth`, evaluate writes a clip's mouth tracks (giggle's jaw); every other channel is as without it", () => {
+    const s = stepAll(stateIn('Idle'), tickle(11)).s;
+    expect(s.clip).toStrictEqual({ name: 'giggle', start: 11 });
+    const sample = sampleClip(REACTION_CLIPS.giggle, 0.3, createPose());
+    expect(sample[Ch.Jaw]).toBeGreaterThan(0.3);
+    const out = createPose().fill(Number.NaN);
+    evaluate(s, 11.3, out, true);
+    expect(Math.abs(out[Ch.Jaw]! - sample[Ch.Jaw]!)).toBeLessThanOrEqual(1e-6);
+    for (const m of [Ch.MouthW, Ch.MouthRound, Ch.Teeth]) expect(out[m], `channel ${m}`).toBe(0);
+    // Without the flag the mouth channels are never written, and every other channel is the same.
+    const plain = createPose().fill(Number.NaN);
+    for (const [j, m] of MOUTH.entries()) plain[m] = 100 + j;
+    evaluate(s, 11.3, plain);
+    for (const [j, m] of MOUTH.entries()) expect(plain[m]).toBe(100 + j);
+    for (let i = 0; i < CH_COUNT; i++) if (!MOUTH.includes(i)) expect(out[i], `channel ${i}`).toBe(plain[i]);
+    // No clip: no base pose has a mouth, so the mouth channels are 0.
+    expect(mouthOf(withMouth(stateIn('Idle'), 11.3))).toStrictEqual([0, 0, 0, 0]);
+  });
+
+  it("a released squish's pucker eases out over 400 ms like its other tracks", () => {
+    const held = stepAll(stateIn('Idle'), pinch(11)).s;
+    expect(held.clip).toStrictEqual({ name: 'squish', start: 11 });
+    expect(withMouth(held, 11.2)[Ch.MouthRound]).toBe(1);
+    const released = stepAll(held, release(11.5)).s;
+    expect(withMouth(released, 11.5)[Ch.MouthRound]).toBe(1);
+    expect(Math.abs(withMouth(released, 11.7)[Ch.MouthRound]! - easeOut(0.5))).toBeLessThanOrEqual(1e-6);
+    expect(withMouth(released, 11.9)[Ch.MouthRound]).toBe(0);
+  });
+
+  it('a mouth-bearing clip cut by another crossfades its mouth over 100 ms (#240), both ways', () => {
+    const cases = [
+      {
+        label: 'giggle cuts a held squish',
+        before: stepAll(stateIn('Idle'), pinch(11)).s,
+        input: allOver(11.5),
+        at: 11.5,
+      },
+      {
+        label: 'squish cuts a giggle',
+        before: stepAll(stateIn('Idle'), tickle(11)).s,
+        input: pinch(11.3),
+        at: 11.3,
+      },
+    ];
+    for (const { label, before, input, at } of cases) {
+      const after = stepAll(before, input).s;
+      expect(after.prevClip, label).toMatchObject({ name: before.clip?.name, cutAt: at });
+      // At the cut: exactly the outgoing pose, the mouth included.
+      expect(fullDiff(withMouth(after, at), withMouth(before, at)), label).toBeLessThanOrEqual(1e-6);
+      // Midway: the even blend of the incoming and the outgoing clip, on the mouth channels too.
+      const t = at + 0.05;
+      const mid = mouthOf(withMouth(after, t));
+      const inc = mouthOf(withMouth(incoming(after), t));
+      const out = mouthOf(withMouth(outgoing(before, after), t));
+      for (let j = 0; j < MOUTH.length; j++)
+        expect(Math.abs(mid[j]! - (inc[j]! + out[j]!) / 2), `${label}: mouth ${j}`).toBeLessThanOrEqual(1e-6);
+      expect(
+        mid.some((v, j) => Math.abs(v - inc[j]!) > 1e-3),
+        `${label}: the outgoing mouth still shows`,
+      ).toBe(true);
+      // From +100 ms: the incoming clip alone.
+      for (const dt of [0.1, 0.15, 0.3]) {
+        expect(
+          fullDiff(withMouth(after, at + dt), withMouth(incoming(after), at + dt)),
+          `${label} +${dt}`,
+        ).toBeLessThanOrEqual(1e-6);
+      }
+    }
+  });
+
+  it('evaluate with the mouth makes no array allocation, through a cut crossfade too', () => {
+    const s = stepAll(stateIn('Idle'), pinch(11), allOver(11.5)).s;
+    expect(s.prevClip?.name).toBe('squish');
+    const out = createPose();
+    expect(
+      countAllocations(() => {
+        for (let i = 0; i < 1000; i++) evaluate(s, 11.5 + i * 0.0002, out, true);
       }),
     ).toBe(0);
   });

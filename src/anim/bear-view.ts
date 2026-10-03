@@ -3,13 +3,15 @@
  * owns the canvas, the rig, the pose buffers, the director, the layers, the springs and the frame loop.
  *
  * **Per frame** (loop.ts drives it):
- * - `substep(dt)`, at 120 Hz: director tick, `springs.step(dt)`, the layer weights' ramp, then the always-running
- *   layers (blink, breathing, gaze, ear twitch, mood) into a zeroed layer buffer. The previous substep's buffer is
- *   kept, so the frame can interpolate between the two with the stepper's alpha.
- * - `draw(t, alpha)`: the director's `evaluate` (base crossfade + session clip), plus the interpolated layers
- *   (which carry the gaze and ear springs: those layers are their only writers), then the mouth layer sampling
- *   the processed envelope at `clipTimeNow + L` with `now` = the rAF time, the mouth channels × `mouthCloseScale`,
- *   then reduced motion, then `render`.
+ * - `substep(dt)`, at 120 Hz: director tick, the playing clip's spring kicks that are due (#221), `springs.step(dt)`,
+ *   the layer weights' ramp, then the always-running layers (blink, breathing, gaze, ear twitch, mood) into a zeroed
+ *   layer buffer. The previous substep's buffer is kept, and the springs' positions before the step, so the frame
+ *   can interpolate between the two with the stepper's alpha.
+ * - `draw(t, alpha)`: the director's `evaluate` (base crossfade + clip, with the clip's mouth channels), plus the
+ *   interpolated layers (which carry the gaze and ear springs: those layers are their only writers), plus the
+ *   secondary springs interpolated the same way (#221), then the mouth: while a replay's mouth runs, the mouth layer
+ *   sampling the processed envelope at `clipTimeNow + L` with `now` = the rAF time, × `mouthCloseScale`; then
+ *   reduced motion, then `render`.
  *
  * **Director ← session.** `onAnim(ev)` reduces the director at the app clock's time (`deps.now()`). The director
  * clock is seconds on the `performance.now()` timebase, which rAF timestamps share; it never steps back. `anim`
@@ -35,7 +37,24 @@
  *
  * **Reduced motion** (`setReducedMotion`; main.ts passes `prefers-reduced-motion: reduce` OR Gentle mode): the
  * squash, sway and wobble channels (`BodySquash`, `BodyLean`, `HeadSquishX/Y`, `TuftRot`, `KerchiefA/B`, and the
- * clip's part of `HeadRot`) × 0.3, every spring ζ ≥ 0.9; blinks, mouth and gaze are kept.
+ * clip's and the head wobble spring's parts of `HeadRot`) × 0.3, every spring ζ ≥ 0.9; blinks, mouth and gaze are
+ * kept.
+ *
+ * **Reaction clips** (#221), as lab/rig.html previews them:
+ * - **Kicks.** A clip has started when `dir.clip` is a new object (the director never mutates one, so a new `start`
+ *   is a new object too). Each of its `impulses` `{t, spring, dv}` adds `dv` to that spring's velocity once, in the
+ *   first substep where `now − clip.start ≥ t`; the substeps of a frame share `T[NOW]`, so that is accurate to one
+ *   frame. A cursor walks the list (sorted by `t`, director.test.ts checks every clip); a new clip in the slot
+ *   restarts it, which drops the kicks the previous clip hadn't reached, even while that clip fades out as
+ *   `prevClip`.
+ * - **Secondary springs** (`SECONDARY_SPRINGS`: tuft, belly, neckerchief tails, head wobble, nose): no layer draws
+ *   them, so the frame adds each one's position, interpolated like the layers, to its `SPRING_CHANNEL`, before
+ *   reduced motion.
+ * - **Mouth.** While Talking the mouth is the replay's, as before: the mouth layer's, or closed until it starts.
+ *   Otherwise it is the clip's mouth tracks (squish's pucker, giggle's jaw), as `evaluate` writes them; in the 200 ms
+ *   after talkEnd, while the replay's mouth closes, the clip's fades in under it (replay × close + clip × (1 −
+ *   close)). `mouthCloseScale` applies to the replay's mouth only: `mouthCloseStart` stays set until the next talk,
+ *   so it would close every later reaction's mouth.
  *
  * **Input** (#93): the pointer adapter (#87) on the canvas, with `hit` = `hitTest` (#85) over the bone matrices
  * of the last drawn pose and the view in **CSS px** (`fitView` of the canvas's CSS size: the adapter's points
@@ -58,7 +77,9 @@
  * with no pointer down; the hit-test bone matrices are only marked stale per frame and recomputed on the next
  * pointer sample. Director transitions (events, gestures, a clip's end) allocate a new director state and their
  * outputs; that is per event, not per frame. Not free yet: once a reaction has bumped the mood, `mood.ts` boxes
- * ≈ 48 B per frame until it decays, which #229 fixes (`mood.ts` is outside #93).
+ * ≈ 48 B per frame until it decays, which #229 fixes (`mood.ts` is outside #93). The reaction clips' parts (#221)
+ * are preallocated too: the springs' previous positions, the clip's mouth, and the kick cursor, an index into the
+ * clip's own `impulses`.
  */
 import type { AnimEvent, SessionEvent, StateName } from '../app/events.ts';
 import { AWAKE } from '../app/machine.ts';
@@ -71,8 +92,16 @@ import { hitTest, REGIONS } from '../input/regions.ts';
 import type { Haptics } from '../platform/haptics.ts';
 import type { Visibility } from '../platform/visibility.ts';
 import { reactionFor } from '../reactions/table.ts';
+import type { Clip } from './clip.ts';
 import { DISPLAY_LATENCY_MS } from './constants.ts';
-import { directorReduce, directorStep, evaluate, initialDirector, mouthCloseScale } from './director.ts';
+import {
+  clipByName,
+  directorReduce,
+  directorStep,
+  evaluate,
+  initialDirector,
+  mouthCloseScale,
+} from './director.ts';
 import type { DirectorState, DirInput, DirOut, GestureInput } from './director.ts';
 import { createBlink, createBreathing, createEarTwitch, createGaze, createMood } from './layers/index.ts';
 import type { AnimContext, LayerWeights, LookAt } from './layers/index.ts';
@@ -86,7 +115,7 @@ import type { View } from './renderer.ts';
 import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { mulberry32 } from './rng.ts';
 import { SpringBank } from './springs.ts';
-import { configureSprings, SPRING, SPRING_COUNT } from './springs-map.ts';
+import { configureSprings, SECONDARY_SPRINGS, SPRING, SPRING_CHANNEL, SPRING_COUNT } from './springs-map.ts';
 
 /** Reduced motion scales the squash, sway and wobble channels by this (plan §4.6.6). */
 export const REDUCED_MOTION_SCALE = 0.3;
@@ -111,6 +140,8 @@ export const LOOK_HOLD_S = 2;
 export const LATENCY_OVERRIDE_MAX_MS = 200;
 /** Default seed of the layers' RNG; main.ts passes a random one. */
 const DEFAULT_SEED = 0x5eed;
+/** The mouth channels: the mouth layer's while a replay's mouth runs, a clip's otherwise (#221). */
+const MOUTH_CHANNELS: readonly number[] = [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth];
 
 /**
  * The layer channels whose motion keeps the loop at full rate: every channel except the breathing layer's
@@ -281,6 +312,14 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const mood = createMood();
   const mouth = new MouthLayer(deps.latencyMs ?? DISPLAY_LATENCY_MS);
   const mouthNow = (): number => T[FRAME_T]!;
+  /** The springs' positions before the latest substep's step: the frame interpolates the secondary springs (#221). */
+  const prevSprings = new Float32Array(SPRING_COUNT);
+  /** The clip whose kicks `applyKicks` applies (`dir.clip` when last seen), its kicks, and the next one's index. */
+  let kickClip: DirectorState['clip'] = null;
+  let kicks: Clip['impulses'] = undefined;
+  let kickNext = 0;
+  /** The clip's mouth channels while the replay's mouth closes after talkEnd (#221). */
+  const clipMouth = new Float32Array(MOUTH_CHANNELS.length);
 
   /** The layers' contribution at the previous and the latest substep. */
   const prevLayers = createPose();
@@ -369,6 +408,27 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     mouthId = playId;
   }
 
+  /**
+   * The playing clip's spring kicks that are due at `T[NOW]`, each once (#221). A new `dir.clip` object restarts the
+   * cursor, dropping the kicks the previous clip hadn't reached. No double crosses a call unless a kick fires.
+   */
+  function applyKicks(): void {
+    const c = dir.clip;
+    if (c !== kickClip) {
+      kickClip = c;
+      kicks = c === null ? undefined : clipByName(c.name)?.impulses;
+      kickNext = 0;
+    }
+    if (c === null || kicks === undefined) return;
+    const elapsed = T[NOW]! - c.start;
+    while (kickNext < kicks.length) {
+      const imp = kicks[kickNext]!;
+      if (imp.t > elapsed) return;
+      springs.impulse(imp.spring, imp.dv);
+      kickNext++;
+    }
+  }
+
   // ---- the frame -------------------------------------------------------------------------------------------
   function substep(dt: number): void {
     tickIn.now = T[NOW]!;
@@ -377,6 +437,9 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     const r = directorStep(dir, tickIn);
     dir = r.state;
     if (r.out.length !== 0) route(r.out);
+    // #221: the clip's kicks due by now, then the step from the positions the frame interpolates from.
+    applyKicks();
+    prevSprings.set(springs.pos);
     springs.step(dt);
     rampWeights(dt);
     prevLayers.set(curLayers);
@@ -390,7 +453,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   /** Writes the frame's pose at director time `now` with layer interpolation `alpha` into `pose`. */
   function compose(now: number, alpha: number): void {
-    evaluate(dir, now, pose);
+    evaluate(dir, now, pose, true);
     if (reduced && dir.clip !== null) {
       evaluate(withoutClip(dir), now, noClipPose);
       const base = noClipPose[Ch.HeadRot]!;
@@ -400,16 +463,33 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
       const a = prevLayers[i]!;
       pose[i] = pose[i]! + a + (curLayers[i]! - a) * alpha;
     }
-    const audio = engine.context();
-    if (mouthId !== -1 && audio !== null) mouth.update(pose, audio, mouthNow);
-    else zeroMouth(pose);
-    const close = mouthCloseScale(now, dir.mouthCloseStart);
-    if (close !== 1) {
-      pose[Ch.Jaw] = pose[Ch.Jaw]! * close;
-      pose[Ch.MouthW] = pose[Ch.MouthW]! * close;
-      pose[Ch.MouthRound] = pose[Ch.MouthRound]! * close;
-      pose[Ch.Teeth] = pose[Ch.Teeth]! * close;
+    // #221: the secondary springs, interpolated like the layers; the head wobble × 0.3 under reduced motion, like the
+    // clip's HeadRot (the reduced block below scales TuftRot and KerchiefA/B).
+    const pos = springs.pos;
+    for (let k = 0; k < SECONDARY_SPRINGS.length; k++) {
+      const i = SECONDARY_SPRINGS[k]!;
+      const ch = SPRING_CHANNEL[i]!;
+      const a = prevSprings[i]!;
+      const x = a + (pos[i]! - a) * alpha;
+      pose[ch] = pose[ch]! + (reduced && i === SPRING.head ? x * REDUCED_MOTION_SCALE : x);
     }
+    // The mouth (#221). `evaluate` wrote the clip's mouth channels. While a replay's mouth runs it overwrites them,
+    // × the close scale after talkEnd, with the clip's mouth fading in under it as it closes (never while talking).
+    // Talking before the replay's mouth starts (or without a context): closed. Otherwise the clip's mouth stays.
+    const audio = engine.context();
+    const close = mouthCloseScale(now, dir.mouthCloseStart);
+    if (mouthId !== -1 && audio !== null) {
+      const blend = close !== 1 && dir.talk === null;
+      if (blend) for (let k = 0; k < MOUTH_CHANNELS.length; k++) clipMouth[k] = pose[MOUTH_CHANNELS[k]!]!;
+      mouth.update(pose, audio, mouthNow);
+      if (close !== 1) {
+        for (let k = 0; k < MOUTH_CHANNELS.length; k++) {
+          const ch = MOUTH_CHANNELS[k]!;
+          const v = pose[ch]! * close;
+          pose[ch] = blend ? v + clipMouth[k]! * (1 - close) : v;
+        }
+      }
+    } else if (dir.talk !== null) zeroMouth(pose);
     // The mouth has closed after talkEnd: drop the envelope.
     if (mouthId !== -1 && dir.talk === null && close === 0) {
       mouth.setClip(null, 0);
