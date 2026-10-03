@@ -1,9 +1,9 @@
-// The settings sheet (plan §7 M3, M8; issues #66, #113). A gear button in the top-right corner opens a modal sheet
-// with the voice preset (Bear cub, Chipmunk, Big bear, Custom), the custom pitch slider (0.7–2.2, enabled only for
-// Custom), Quiet mode, Gentle mode, Haptics, Noisy room (noise suppression) and Sleep after (1–10 min). Every
-// control writes the settings store at once; main.ts and the session apply each setting (Quiet: the engine's bus;
-// Gentle: the bear's reduced motion; Haptics: `createHaptics`'s `getEnabled`; Noisy room: the next mic open;
-// Sleep after: the next sleep-timer start).
+// The settings sheet (plan §7 M3, M8; issues #66, #113, #114). A gear button in the top-right corner opens a modal
+// sheet with the voice preset (Bear cub, Chipmunk, Big bear, Custom), the custom pitch slider (0.7–2.2, enabled only
+// for Custom), Quiet mode, Gentle mode, Haptics, Noisy room (noise suppression), Sleep after (1–10 min) and the
+// "For parents" section. Every control writes the settings store at once; main.ts and the session apply each setting
+// (Quiet: the engine's bus; Gentle: the bear's reduced motion; Haptics: `createHaptics`'s `getEnabled`; Noisy room:
+// the next mic open; Sleep after: the next sleep-timer start).
 //
 // Guard (M8, plan Q3): the gear opens the sheet only after a continuous press of at least `GEAR_HOLD_MS` (1 s):
 // `pointerdown` … `pointerup` on the gear, or a held Enter / Space key. A ring fills during the press (styles.css);
@@ -12,17 +12,27 @@
 // blur; key repeats and other keys are ignored. Pressing is ignored, and opening refused, while the session is
 // Recording, Processing or Playing (`SHEET_BLOCKED`). The gear's `aria-description` says to hold it.
 //
-// The sheet is a modal `<dialog>` (`role="dialog"`, `aria-modal="true"`): focus starts on Close, Tab and Shift+Tab
-// wrap between the first control and Close, and Close or Escape closes it. The bear keeps running while it is open.
-// M6 (issue #98, plan §4.5, §4.7) adds Install, shown only while an install prompt is available, and
-// "New version – restart", enabled only while an update is ready (and ignored while Recording, Processing or
-// Playing, like the gear).
+// The sheet is a modal `<dialog>` (`role="dialog"`, `aria-modal="true"`): it opens scrolled to the top with focus on
+// Close, Tab and Shift+Tab wrap between the first control and Close, and Close or Escape closes it. The bear keeps
+// running while it is open.
+//
+// "For parents" (#114, plan §7 M8, §4.5, §2, §11), the section before Close, holds the sheet's only text:
+// - "Try the microphone again", which closes the sheet and then dispatches `settingsRetry` (the session acts on it
+//   only in MicDenied, plan §3.4 row 10; retrying lives here, never on the child-facing mic help), and how to allow
+//   the microphone in Chrome's site settings, as plain text;
+// - M6's Install (issue #98, plan §4.5, §4.7), shown only while an install prompt is available, and
+//   "New version – restart", enabled only while an update is ready (and ignored while Recording, Processing or
+//   Playing, like the gear);
+// - the privacy note (plan §2 "Privacy posture");
+// - "Open-source licences", which opens the full-screen licences view (licences-screen.ts) over the sheet.
+// Nothing in the sheet links anywhere: it has no anchors, and nothing opens a window.
 //
 // CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement(NS)/textContent only,
 // never HTML strings, and nothing sets a `style` attribute; styles.css styles it, including the ring's fill.
 
-import type { StateName } from '../app/events.ts';
+import type { SessionEvent, StateName } from '../app/events.ts';
 import { CUSTOM_PITCH_MAX, CUSTOM_PITCH_MIN, type Settings, type SettingsStore } from '../app/settings.ts';
+import { mountLicencesScreen, type LicencesScreen } from './licences-screen.ts';
 
 export const SETTINGS_TEXT = {
   open: 'Settings',
@@ -41,8 +51,16 @@ export const SETTINGS_TEXT = {
   minutes: 'min',
   /** The gear's accessible description (invisible: plan Q3's text-free rule is about visible text). */
   holdHint: 'Hold for 1 second',
+  forParents: 'For parents',
+  micRetry: 'Try the microphone again',
+  micHelp:
+    "If the microphone is blocked: open Chrome's menu → Settings → Site settings → Microphone, and allow this site.",
   install: 'Install',
   restart: 'New version – restart',
+  /** The parent privacy note, adapted from plan §2 "Privacy posture". */
+  privacy:
+    'Talking Bear works entirely on this device. It has no accounts, analytics or tracking, and never sends audio anywhere. What Juni hears stays in memory only until the replay finishes. Settings are stored on this device.',
+  licences: 'Open-source licences',
   close: 'Close',
 } as const;
 
@@ -84,8 +102,12 @@ export interface SettingsSheetDeps {
   bus: { setQuiet(on: boolean): void };
   /** The session's current state: the gear does nothing while it is in `SHEET_BLOCKED`. */
   state(): StateName;
+  /** The session's dispatch: "Try the microphone again" sends `settingsRetry` through it. */
+  dispatch(e: SessionEvent): void;
   /** Install and restart (M6). Without it the sheet has neither button. */
   pwa?: SheetPwa;
+  /** The licences view's fetch (licences-screen.ts); defaults to the global `fetch`. */
+  fetch?: (url: string) => Promise<Response>;
   /** Milliseconds on a monotonic clock, for the gear's press time; defaults to `performance.now()`. */
   now?: () => number;
 }
@@ -142,7 +164,7 @@ function progressRing(): SVGSVGElement {
   return svg;
 }
 
-/** Mounts the gear and its (closed) sheet into `root`. */
+/** Mounts the gear, its (closed) sheet and the (closed) licences view into `root`. */
 export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): SettingsSheet {
   const { store, bus } = deps;
   const now = deps.now ?? ((): number => performance.now());
@@ -231,6 +253,20 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
   for (const [, input, text] of toggles) dialog.append(labelled(input, text));
   dialog.append(sleepLabel);
 
+  // ---- For parents (#114): mic retry and help, Install and restart, the privacy note, the licences ----
+  const parents = element('section', 'settings-parents');
+  const parentsTitle = element('h3', null, SETTINGS_TEXT.forParents);
+  parentsTitle.id = `${group}-parents`;
+  parents.setAttribute('aria-labelledby', parentsTitle.id);
+  const retry = element('button', 'sheet-button', SETTINGS_TEXT.micRetry);
+  retry.type = 'button';
+  // Closed first, so the session's effects (the mic open, Chrome's prompt) run with no modal sheet over the bear.
+  retry.addEventListener('click', () => {
+    dialog.close();
+    deps.dispatch({ t: 'settingsRetry' });
+  });
+  parents.append(parentsTitle, retry, element('p', null, SETTINGS_TEXT.micHelp));
+
   /** Install and restart, if the app passed its PWA side. */
   let refreshPwa: () => void = noop;
   const { pwa } = deps;
@@ -256,9 +292,18 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
       install.hidden = hideInstall;
       restart.disabled = disableRestart;
     };
-    dialog.append(install, restart);
+    parents.append(install, restart);
   }
-  dialog.append(close);
+
+  const licencesButton = element('button', 'sheet-button', SETTINGS_TEXT.licences);
+  licencesButton.type = 'button';
+  /** The licences view, mounted after the sheet (below). */
+  let licences: LicencesScreen | null = null;
+  licencesButton.addEventListener('click', () => {
+    void licences?.open();
+  });
+  parents.append(element('p', null, SETTINGS_TEXT.privacy), licencesButton);
+  dialog.append(parents, close);
 
   /**
    * Shows the store's current values. A stored sleep timeout that is not one of the choices (only a hand-edited
@@ -278,7 +323,10 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
     render(store.get());
     if (!dialog.open) {
       dialog.showModal();
-      close.focus(); // the guarded start: a stray Enter or Space closes the sheet rather than change a setting
+      // The guarded start: a stray Enter or Space closes the sheet rather than change a setting. Close is last, so
+      // focusing it must not scroll the sheet: it opens at the top, voices first.
+      close.focus({ preventScroll: true });
+      dialog.scrollTop = 0;
     }
     return true;
   }
@@ -365,6 +413,8 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
 
   render(store.get());
   root.append(gear, dialog);
+  // After the sheet, so the sheet stays the first dialog under root; its modal stacks over the sheet when opened.
+  licences = mountLicencesScreen(root, { fetch: deps.fetch });
   return {
     open,
     close: () => {

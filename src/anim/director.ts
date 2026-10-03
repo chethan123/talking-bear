@@ -32,7 +32,9 @@
  * from `cutAt` + 100 ms, clear `prevClip`. See `crossfade`.
  *
  * **Mouth.** Leaving Talking sets `mouthCloseStart = now` and clears `talk`; `talk` clears
- * `mouthCloseStart`, so every talk starts with the mouth fully open to the mouth layer.
+ * `mouthCloseStart`, so every talk starts with the mouth fully open to the mouth layer. `evaluate` writes the mouth
+ * channels only when asked (`mouth`, #221): bear-view lets a reaction clip's mouth tracks through while not talking.
+ * `clipByName` hands bear-view the clip behind `clip.name`, whose spring kicks (`impulses`) it applies (#221).
  *
  * **Reactions** (plan §3.5, issue #91). A `gesture` input carries the reaction `reactionFor` (#90) found:
  * - **Gates:** ignored in Asleep and Waking; in Dozing it moves to Idle first.
@@ -269,6 +271,14 @@ const CLIPS: ReadonlyMap<string, Clip> = new Map<string, Clip>([
   [FLINCH.name, FLINCH],
   [PET_MIRRORED.name, PET_MIRRORED],
 ]);
+
+/**
+ * The clip the director plays under `name` (a `clip.name` or `prevClip.name`): a session or reaction clip, the
+ * flinch or the mirrored pet; undefined for a name it doesn't know. bear-view applies its `impulses` (#221).
+ */
+export function clipByName(name: string): Clip | undefined {
+  return CLIPS.get(name);
+}
 
 /** Scratch pose for the clip sample in `evaluate`, allocated once so `evaluate` never allocates. */
 const CLIP_DELTA: Pose = createPose();
@@ -903,10 +913,13 @@ export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
  * `clip·w·(1 − k) + prevClip·wp·k` with `k = 1 − smoothstep((now − cutAt)/0.1)`: exactly the outgoing clip at the
  * cut and the incoming one from +100 ms. `prevClip` is sampled at `now − start` (it plays on) and `wp` is its own
  * release ease-out (1 without one). Without a clip in the slot nothing is blended.
- * The mouth channels (`Jaw`, `MouthW`, `MouthRound`, `Teeth`) are never written: the mouth layer owns them.
+ * The mouth channels (`Jaw`, `MouthW`, `MouthRound`, `Teeth`) are written only with `mouth` (#221): no base pose has
+ * them, so they are the clip term alone, a reaction clip's mouth tracks (squish's pucker, giggle's jaw), with the
+ * same release ease-out and cut crossfade as every other channel. Without it they are never written: the mouth
+ * layer owns them while talking.
  * Never allocates.
  */
-export function evaluate(s: DirectorState, now: number, out: Pose): Pose {
+export function evaluate(s: DirectorState, now: number, out: Pose, mouth = false): Pose {
   const a = BASE[s.prevBase];
   const b = BASE[s.base];
   const f = (now - s.fadeStart) / CROSSFADE_S;
@@ -943,7 +956,7 @@ export function evaluate(s: DirectorState, now: number, out: Pose): Pose {
     }
   }
   for (let i = 0; i < CH_COUNT; i++) {
-    if (i === Ch.Jaw || i === Ch.MouthW || i === Ch.MouthRound || i === Ch.Teeth) continue;
+    if (!mouth && (i === Ch.Jaw || i === Ch.MouthW || i === Ch.MouthRound || i === Ch.Teeth)) continue;
     const ai = a[i]!;
     const v = ai + (b[i]! - ai) * t;
     if (!withClip) out[i] = v;
