@@ -475,7 +475,8 @@ class TimedRing {
 /** The VAD plot: its data rings and its drawing. */
 export interface VadPlot {
   /** Appends a trace batch at context rate `rate`: per hop the band dB and the replayed energy gate, per Silero
-   *  frame its p. */
+   *  frame its p. Hop i is at ctx frame hop0Frame + i hops and Silero frame j at sil0Frame + j VAD frames, its own
+   *  frame: the DSP worker ends a batch at a capture gap (vad-core.ts `captureGap`, #244), so no batch spans one. */
   trace(b: TraceBatch, rate: number): void;
   /** Appends a `level` event's floor: the energy gate's floor after the hop at ctx frame `frame` (NaN while
    *  uninitialised). */
@@ -686,7 +687,7 @@ class VadPlotImpl implements VadPlot {
     }
     const band = b.bandDb;
     for (let i = 0; i < band.length; i++) {
-      const f = b.hop0Frame + i * hop;
+      const f = b.hop0Frame + i * hop; // the hop's own frame: a batch never spans a capture gap (#244)
       geo[G_LIMIT] = f - hop / 2;
       this.sync(epoch);
       const db = band[i]!;

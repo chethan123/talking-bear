@@ -14,6 +14,7 @@ import type { Effect, SessionEvent, SessionState } from '../app/events.ts';
 import { initialSessionState } from '../app/machine.ts';
 import type { LevelEvent, TransitionListener } from '../app/session.ts';
 import type { EngineEvent } from '../audio/engine.ts';
+import type { WorkerToMain } from '../audio/messages.ts';
 import { DEFAULT_ENERGY_PARAMS, energyGateStep, initialEnergyGateState } from '../dsp/energy-gate.ts';
 import { SILERO_SEG_PARAMS } from '../dsp/segmenter.ts';
 import {
@@ -42,6 +43,7 @@ import {
   type DebugVadDeps,
   type TraceBatch,
 } from './debug-overlay.ts';
+import { VadCore } from '../workers/vad-core.ts';
 
 const RATE = 48_000;
 /** Ctx frames per 10 ms hop at RATE. */
@@ -455,6 +457,67 @@ describe('the plot', () => {
       RATE,
     );
     expect(plot.gateOpen(0)).toBe(false);
+  });
+
+  test('a capture re-anchor inside one batch’s span: the hops on both sides are drawn at their own frames', () => {
+    // #244: the DSP worker's own messages for a 500 Hz tone at −23 dBFS on the energy backend, with a 2 s capture
+    // re-anchor after 16 kHz frame 10. Hop 31 is the last one before the gap; a 25-hop batch running on across it
+    // (hops 25–49) would map the first 18 hops after it to frames 32–49 · HOP, inside the gap.
+    const msgs: WorkerToMain[] = [];
+    const core = new VadCore(RATE, (m) => msgs.push(m));
+    core.reset(1, 'energy');
+    core.setTrace(true);
+    const pre = 10;
+    const post = 20;
+    const gapEnd = pre * 1536 + 2 * RATE; // the frame the re-anchored frames resume at
+    for (let k = 0; k < pre + post; k++) {
+      const f = Float32Array.from(
+        { length: 512 },
+        (_, i) => 0.1 * Math.sin((2 * Math.PI * 500 * (k * 512 + i)) / 16000),
+      );
+      core.frame(1, k < pre ? k * 1536 : gapEnd + (k - pre) * 1536, f);
+    }
+    core.setTrace(false);
+    const canvas = document.createElement('canvas');
+    const drawn = createVadPlot(canvas, 1);
+    for (const m of msgs) {
+      if (m.t === 'level') drawn.level(m.epoch, m.frame, m.floorDb);
+      else if (m.t === 'traceBatch') drawn.trace(m, RATE);
+      else if (m.t === 'seg') drawn.seg(m.ev);
+    }
+    const end = gapEnd + post * 1536;
+    drawn.draw(end, RATE);
+    const g = canvas.getContext('2d');
+    if (g === null) throw new Error('no 2d context');
+    const t0 = end - DEBUG_PLOT_SECONDS * RATE;
+    const col = (frame: number): number =>
+      Math.floor(((frame - t0) / (DEBUG_PLOT_SECONDS * RATE)) * DEBUG_PLOT_WIDTH);
+    const band = rgba(DEBUG_PLOT_COLORS.band);
+    /** Rows of column x above the bar inked in the band colour (antialiased edges included). */
+    const bandRows = (x: number): number => {
+      let n = 0;
+      for (let y = 0; y < PLOT_H; y++) {
+        const [r, gr, b, a] = pixel(g, x, y);
+        if (a! >= 64 && Math.abs(r! - band[0]!) + Math.abs(gr! - band[1]!) + Math.abs(b! - band[2]!) <= 30)
+          n++;
+      }
+      return n;
+    };
+    const barY = DEBUG_PLOT_HEIGHT - DEBUG_GATE_BAR_PX / 2;
+    // After the gap: hops 6–15 of the re-anchored stream, at gapEnd + m · HOP (clear of the start marker there).
+    for (let m = 6; m <= 15; m++) {
+      const x = col(gapEnd + m * HOP);
+      expect(bandRows(x), `band at re-anchored hop ${m}`).toBeGreaterThan(0);
+      expect(pixel(g, x, barY), `gate bar at re-anchored hop ${m}`).toEqual(rgba(DEBUG_PLOT_COLORS.egate));
+    }
+    // Inside the gap, where hops 32–49 would have landed: nothing.
+    for (let h = 37; h <= 49; h++) {
+      const x = col(h * HOP);
+      expect(bandRows(x), `band at ${h} · HOP, in the gap`).toBe(0);
+      expect(pixel(g, x, barY)[3], `gate bar at ${h} · HOP, in the gap`).toBe(0);
+    }
+    // Before the gap: the hops of the batch the gap closed (25–31, left of the end marker at hop 31) and earlier.
+    for (const h of [15, 20, 26]) expect(bandRows(col(h * HOP)), `band at hop ${h}`).toBeGreaterThan(0);
   });
 
   test('it redraws at most 15 times a second, and not while nothing changes', () => {
