@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
 import type { Engine, EngineEvent } from '../audio/engine.ts';
-import { createMicManager, type MicManager } from '../audio/mic.ts';
+import { CONSTRAINTS, createMicManager, type MicManager } from '../audio/mic.ts';
 import type { SfxId } from '../audio/sfx-ids.ts';
 import { emptyEnvelope, PRESETS } from '../dsp/types.ts';
 import {
@@ -13,13 +13,14 @@ import {
   type PermissionStatusLike,
 } from '../platform/permissions.ts';
 import { createVisibility, type VisEvent, type Visibility } from '../platform/visibility.ts';
-import { createEffectRunner } from './effects.ts';
+import { createEffectRunner, NOISY_ROOM_CONSTRAINTS } from './effects.ts';
 import {
   DEFAULT_CONFIG,
   type AnimEvent,
   type Effect,
   type Overlay,
   type Permission,
+  type SessionConfig,
   type SessionEvent,
   type SessionState,
   type StateName,
@@ -33,6 +34,7 @@ import {
   type SessionDeps,
   type Sfx,
 } from './session.ts';
+import { DEFAULT_SETTINGS, type Settings } from './settings.ts';
 
 // ---- helpers -----------------------------------------------------------------------------------------------
 
@@ -100,6 +102,8 @@ function isAudioNode(v: object): v is AudioNode {
 }
 
 interface GumCall {
+  /** The constraints this getUserMedia call was made with. */
+  constraints: MediaStreamConstraints;
   /** Resolves this getUserMedia call with a stream of `n` new live tracks, and returns them. */
   resolve(n?: number): FakeTrack[];
   reject(err: unknown): void;
@@ -113,9 +117,10 @@ function fakeGum(): {
 } {
   const calls: GumCall[] = [];
   const tracks: FakeTrack[] = [];
-  const gum = (): Promise<MediaStream> =>
+  const gum = (constraints: MediaStreamConstraints): Promise<MediaStream> =>
     new Promise<MediaStream>((resolve, reject) => {
       calls.push({
+        constraints,
         resolve(n = 2) {
           const ts = Array.from({ length: n }, () => new FakeTrack());
           tracks.push(...ts);
@@ -220,9 +225,9 @@ function fakeEngine(timeline: string[]): FakeEngine {
       timeline.push('suspend');
       return Promise.resolve();
     },
-    openMic(req) {
-      timeline.push(`openMic ${req}`);
-      void mic.open(req).then(onMicResult);
+    openMic(req, extra) {
+      timeline.push(extra === undefined ? `openMic ${req}` : `openMic ${req} ${JSON.stringify(extra)}`);
+      void mic.open(req, extra).then(onMicResult);
     },
     closeMic() {
       timeline.push('closeMic');
@@ -435,6 +440,8 @@ function setup(
     permission?: Permission;
     visibility?: Visibility;
     permissionDep?: SessionDeps['permission'];
+    cfg?: SessionConfig;
+    settings?: () => Settings;
   } = {},
 ): Harness {
   const timeline: string[] = [];
@@ -470,6 +477,8 @@ function setup(
     visibility: opts.visibility ?? vis.vis,
     permission: opts.permissionDep ?? perm.permission,
     clock,
+    cfg: opts.cfg,
+    settings: opts.settings,
     onAnim(ev) {
       anims.push(ev);
       timeline.push(`anim ${ev.e}`);
@@ -704,9 +713,114 @@ describe('Validation 3: Q1 sleep', () => {
   });
 });
 
+// ---- settings (#113): the sleep timeout and the noisy-room toggle -------------------------------------------
+
+/** A mutable settings source, as main.ts passes the store's `get`. */
+function settingsSource(patch: Partial<Settings> = {}): {
+  get: () => Settings;
+  set(p: Partial<Settings>): void;
+} {
+  let current: Settings = { ...DEFAULT_SETTINGS, ...patch };
+  return {
+    get: () => current,
+    set(p) {
+      current = { ...current, ...p };
+    },
+  };
+}
+
+describe('settings (#113)', () => {
+  it('the sleep timeout from the settings is used on the next Listening entry', async () => {
+    const st = settingsSource({ sleepTimeoutSec: 60 });
+    const h = setup({ settings: st.get });
+    await toListening(h);
+    h.clock.advance(59_999);
+    expect(stateOf(h)).toBe('Listening');
+    h.clock.advance(1);
+    expect(stateOf(h)).toBe('Asleep');
+    // Changed while asleep: the next Listening entry starts the sleep timer with it.
+    st.set({ sleepTimeoutSec: 300 });
+    await toListening(h);
+    h.clock.advance(299_999);
+    expect(stateOf(h)).toBe('Listening');
+    h.clock.advance(1);
+    expect(stateOf(h)).toBe('Asleep');
+    expect(h.violations).toEqual([]);
+  });
+
+  it('a change while Listening leaves the running sleep timer alone; the next timer start uses it', async () => {
+    const st = settingsSource({ sleepTimeoutSec: 120 });
+    const h = setup({ settings: st.get });
+    await toListening(h);
+    st.set({ sleepTimeoutSec: 60 });
+    h.clock.advance(60_000);
+    expect(stateOf(h)).toBe('Listening'); // started at 120 s
+    // A reaction in Listening restarts the sleep timer (row 15): now with 60 s.
+    h.session.dispatch({ t: 'reaction', name: 'poke', priority: 2, sfx: null });
+    h.clock.advance(59_999);
+    expect(stateOf(h)).toBe('Listening');
+    h.clock.advance(1);
+    expect(stateOf(h)).toBe('Asleep');
+  });
+
+  it('only tSleepMs comes from the settings: the other cfg timings are kept', async () => {
+    const cfg: SessionConfig = { ...DEFAULT_CONFIG, tSleepMs: 999_000, tDozeMs: 25_000 };
+    const h = setup({ cfg, settings: settingsSource({ sleepTimeoutSec: 60 }).get });
+    await toListening(h);
+    h.clock.advance(60_000);
+    expect(stateOf(h)).toBe('Asleep');
+    expect(h.anims.filter((a) => a.e === 'doze')).toHaveLength(2); // 25 s and 50 s
+  });
+
+  it('noisy room adds noiseSuppression: true to the next openMic, and only to it', async () => {
+    const st = settingsSource();
+    const h = setup({ settings: st.get });
+    await toListening(h);
+    expect(h.timeline).toContain('openMic 1');
+    expect(at(h.eng.gum.calls, 0).constraints).toStrictEqual({ audio: { ...CONSTRAINTS } });
+    // Turned on while the mic is open: nothing re-opens it.
+    st.set({ noisyRoomNs: true });
+    expect(h.eng.gum.calls).toHaveLength(1);
+    // The next mic open (hide → visible → Waking) carries it.
+    h.vis.emit('hidden');
+    expect(stateOf(h)).toBe('Paused');
+    h.vis.emit('visible');
+    await flush();
+    expect(stateOf(h)).toBe('Waking');
+    expect(h.timeline).toContain('openMic 2 {"noiseSuppression":true}');
+    expect(at(h.eng.gum.calls, 1).constraints).toStrictEqual({
+      audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false },
+    });
+    // Off again: the plan §4.1.1 constraints only.
+    st.set({ noisyRoomNs: false });
+    h.vis.emit('hidden');
+    h.vis.emit('visible');
+    await flush();
+    expect(h.timeline).toContain('openMic 3');
+    expect(at(h.eng.gum.calls, 2).constraints).toStrictEqual({ audio: { ...CONSTRAINTS } });
+    expect(h.violations).toEqual([]);
+  });
+
+  it('the runner reads noisyRoomNs at each openMic; off (or without settings) openMic gets the req only', () => {
+    const st = settingsSource();
+    const r = runnerHarness(st.get);
+    const openMic = vi.spyOn(r.eng.engine, 'openMic');
+    r.run({ k: 'openMic', req: 7 });
+    st.set({ noisyRoomNs: true });
+    r.run({ k: 'openMic', req: 8 });
+    expect(openMic.mock.calls).toStrictEqual([[7], [8, { noiseSuppression: true }]]);
+    expect(at(at(openMic.mock.calls, 1), 1)).toBe(NOISY_ROOM_CONSTRAINTS);
+    expect(Object.isFrozen(NOISY_ROOM_CONSTRAINTS)).toBe(true);
+    const plain = runnerHarness();
+    const plainOpen = vi.spyOn(plain.eng.engine, 'openMic');
+    plain.run({ k: 'openMic', req: 9 });
+    expect(plainOpen.mock.calls).toStrictEqual([[9]]);
+  });
+});
+
 // ---- Validation 4: timers ----------------------------------------------------------------------------------
 
-function runnerHarness(): {
+function runnerHarness(settings?: () => Settings): {
   run: (fx: Effect) => void;
   dispatched: SessionEvent[];
   clock: FakeClock;
@@ -756,6 +870,7 @@ function runnerHarness(): {
       onApplyUpdate: () => {
         applyUpdates++;
       },
+      settings,
     },
     { dispatch: (e) => dispatched.push(e), state: (): SessionState => state },
   );

@@ -8,6 +8,10 @@
 //
 // Each `sfx` effect the runner schedules is reported to the `addSfxListener` listeners while it runs (so before
 // that step's transition listeners), with the context time its sound ends (#93: the e2e `sfxLog`).
+//
+// Settings (plan §7 M8, #113): with `deps.settings`, every step reduces with `cfg.tSleepMs` taken from the
+// current `sleepTimeoutSec`, so a change takes effect on the next sleep-timer start; the effect runner reads
+// `noisyRoomNs` at each `openMic` (effects.ts).
 
 import type { Engine, EngineEvent } from '../audio/engine.ts';
 import type { createPlayer } from '../audio/player.ts';
@@ -16,6 +20,7 @@ import type { createMicPermission } from '../platform/permissions.ts';
 import type { VisEvent, Visibility } from '../platform/visibility.ts';
 import type { Clock } from './clock.ts';
 import { createEffectRunner } from './effects.ts';
+import type { Settings } from './settings.ts';
 import {
   DEFAULT_CONFIG,
   type AnimEvent,
@@ -42,7 +47,14 @@ export interface SessionDeps {
   visibility: Visibility;
   permission: ReturnType<typeof createMicPermission>;
   clock: Clock;
+  /** The reducer's timings; `DEFAULT_CONFIG` by default. With `settings`, its `tSleepMs` is replaced (below). */
   cfg?: SessionConfig;
+  /**
+   * The current settings (main.ts: the store's `get`), read at every dispatch: the reducer's `tSleepMs` is
+   * `sleepTimeoutSec × 1000`, and each `openMic` effect adds `{ noiseSuppression: true }` while `noisyRoomNs` is
+   * on. Without it the session uses `cfg` as given and opens the mic with the plan §4.1.1 constraints only.
+   */
+  settings?(): Settings;
   onAnim?(ev: AnimEvent): void;
   /**
    * A `play{id}` effect started replay `id`, whose first sample is scheduled at context time `startCtxTime` (the
@@ -133,7 +145,19 @@ function listenerSet<A extends unknown[]>(
  * after the permission re-query has settled, and permission changes become `permissionChanged`.
  */
 export function createSession(initial: SessionState, deps: SessionDeps): Session {
-  const cfg = deps.cfg ?? DEFAULT_CONFIG;
+  const baseCfg = deps.cfg ?? DEFAULT_CONFIG;
+  /** `baseCfg` with the settings' sleep timeout, rebuilt only when that changes. */
+  let cfg = baseCfg;
+  let cfgSleepSec: number | null = null;
+  function config(): SessionConfig {
+    if (deps.settings === undefined) return baseCfg;
+    const sec = deps.settings().sleepTimeoutSec;
+    if (sec !== cfgSleepSec) {
+      cfgSleepSec = sec;
+      cfg = { ...baseCfg, tSleepMs: sec * 1000 };
+    }
+    return cfg;
+  }
   let current = initial;
   const queue: SessionEvent[] = [];
   let draining = false;
@@ -154,7 +178,7 @@ export function createSession(initial: SessionState, deps: SessionDeps): Session
     const from = current.name;
     let out: { state: SessionState; effects: Effect[] };
     try {
-      out = reduce(current, e, cfg);
+      out = reduce(current, e, config());
     } catch (err) {
       console.error('session: reduce failed', e, err); // the reducer is total; never drop the rest of the queue
       return;
