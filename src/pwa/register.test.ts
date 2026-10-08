@@ -249,6 +249,31 @@ describe('setupPwa: reload after an applied update', () => {
     expect(t.reload).toHaveBeenCalledTimes(1);
   });
 
+  it('every applyUpdate restarts the RELOAD_ARM_MS window: a retry near the deadline still reloads once', () => {
+    const t = setup({ controller: {} });
+    registered().onNeedRefresh?.();
+    t.api.applyUpdate(); // the first activation stalls
+    t.clock.advance(RELOAD_ARM_MS - 1000);
+    t.api.applyUpdate(); // the parent presses Restart again
+    t.clock.advance(2000); // past the first call's deadline
+    t.sw.dispatchEvent(new Event('controllerchange'));
+    expect(t.reload).toHaveBeenCalledTimes(1);
+    expect(t.events).toEqual([{ t: 'updateReady' }]); // its own path, not the activated-elsewhere one
+  });
+
+  it('the restarted window disarms RELOAD_ARM_MS after the latest applyUpdate', () => {
+    const t = setup({ controller: {} });
+    registered().onNeedRefresh?.();
+    t.api.applyUpdate();
+    t.clock.advance(RELOAD_ARM_MS - 1000);
+    t.api.applyUpdate();
+    t.clock.advance(RELOAD_ARM_MS);
+    expect(t.clock.pending()).toBe(1); // only the hourly check is left
+    t.sw.dispatchEvent(new Event('controllerchange'));
+    expect(t.reload).not.toHaveBeenCalled(); // visible: the activated-elsewhere path waits for C11
+    expect(t.events).toEqual([{ t: 'updateReady' }, { t: 'updateReady' }]);
+  });
+
   it('a second applyUpdate adds no second reload listener', () => {
     const t = setup();
     registered().onNeedRefresh?.();

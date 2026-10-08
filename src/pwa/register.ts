@@ -40,8 +40,9 @@ import type { Visibility } from '../platform/visibility.ts';
 export const UPDATE_CHECK_MS = 60 * 60 * 1000;
 
 /**
- * How long `applyUpdate()`'s reload stays armed after it sends SKIP_WAITING, in ms (#230 Decision 1). The
- * new worker takes control well within it; a `controllerchange` after it is handled as another tab's update.
+ * How long `applyUpdate()`'s reload stays armed, in ms, counted from the latest `applyUpdate()` (each one sends
+ * SKIP_WAITING again) (#230 Decision 1). The new worker takes control well within it; a `controllerchange`
+ * after it is handled as another tab's update.
  */
 export const RELOAD_ARM_MS = 10_000;
 
@@ -88,6 +89,8 @@ export function setupPwa(deps: PwaDeps): Pwa {
   let ready = false;
   /** `applyUpdate()`'s one-time `controllerchange` reload is attached (for `RELOAD_ARM_MS`). */
   let reloadArmed = false;
+  /** The pending disarm of that reload, restarted by every `applyUpdate()`. */
+  let disarmTimer: number | null = null;
   let reg: ServiceWorkerRegistration | undefined;
   let installEvent: BeforeInstallPromptEvent | null = null;
   /** Another tab activated a new version: this page runs old code until it reloads. */
@@ -162,13 +165,18 @@ export function setupPwa(deps: PwaDeps): Pwa {
         location.reload(); // the new worker already controls this page; nothing is waiting
         return;
       }
-      if (!reloadArmed && 'serviceWorker' in navigator) {
-        reloadArmed = true;
+      if ('serviceWorker' in navigator) {
         const container = navigator.serviceWorker;
-        container.addEventListener('controllerchange', reloadOnOwnUpdate, { once: true });
-        deps.clock.setTimeout(() => {
+        if (!reloadArmed) {
+          reloadArmed = true;
+          container.addEventListener('controllerchange', reloadOnOwnUpdate, { once: true });
+        }
+        // Every SKIP_WAITING gets the full window, so a retry near the deadline still reloads on its own path.
+        if (disarmTimer !== null) deps.clock.clearTimeout(disarmTimer);
+        disarmTimer = deps.clock.setTimeout(() => {
           container.removeEventListener('controllerchange', reloadOnOwnUpdate);
           reloadArmed = false;
+          disarmTimer = null;
         }, RELOAD_ARM_MS);
       }
       updateSW(true).catch((err: unknown) => warn('update', err));
