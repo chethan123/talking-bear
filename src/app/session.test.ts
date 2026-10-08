@@ -234,8 +234,9 @@ function fakeEngine(timeline: string[]): FakeEngine {
       mic.close();
       processed = null;
     },
-    arm(epoch, restoreFloorDb) {
-      timeline.push(restoreFloorDb === undefined ? `arm ${epoch}` : `arm ${epoch} ${restoreFloorDb}`);
+    arm(epoch, restoreFloorDb, marginBoostDb) {
+      const boost = marginBoostDb === undefined ? '' : ` +${marginBoostDb}`;
+      timeline.push(`${restoreFloorDb === undefined ? `arm ${epoch}` : `arm ${epoch} ${restoreFloorDb}`}${boost}`);
       if (hooks.armThrows > 0) {
         hooks.armThrows--;
         throw new Error('fake arm failure');
@@ -1172,6 +1173,7 @@ describe('effect mapping', () => {
       [{ k: 'restartWorker' }, 'restartWorker'],
       [{ k: 'arm', epoch: 3, restoreFloorDb: -50 }, 'arm 3 -50'],
       [{ k: 'arm', epoch: 4 }, 'arm 4'],
+      [{ k: 'arm', epoch: 5, restoreFloorDb: -50, marginBoostDb: 3 }, 'arm 5 -50 +3'], // #116
       [{ k: 'disarm', epoch: 4 }, 'disarm 4'],
       [{ k: 'take', epoch: 1, id: 2, fromFrame: 100, toFrame: 200 }, 'take 1 2 100 200'],
       [{ k: 'process', id: 5, preset: PRESETS.chipmunk }, 'process 5 chipmunk'],
@@ -1308,6 +1310,20 @@ describe('wiring', () => {
     h.eng.emit({ t: 'armed', epoch: 1, armFrame: 1234 });
     expect(h.transitions.at(-1)?.e).toEqual({ t: 'armed', epoch: 1, armFrame: 1234 });
     expect(h.session.state().armFrame).toBe(1234);
+  });
+
+  it('#116: Listening levels become one noiseFloor per second, and a loud floor shows the too-noisy badge', async () => {
+    const h = setup();
+    await toListening(h);
+    const epoch = h.session.state().epoch;
+    const count = h.transitions.length;
+    for (let i = 0; i < 40; i++) {
+      if (i > 0) h.clock.advance(30); // 1.17 s of levels, ≈ 33 per second
+      h.eng.emit({ t: 'level', epoch, frame: 480 * i, db: -24 - (i % 3), floorDb: -70 });
+    }
+    expect(h.transitions.slice(count).map((t) => t.e)).toEqual([{ t: 'noiseFloor', floorDb: -26 }]);
+    expect(h.session.state().tooNoisy).toBe(true);
+    expect(h.ui.at(-1)).toBe('tooNoisy');
   });
 
   it('visibility hidden, pagehide and freeze are dispatched; resume is ignored', async () => {

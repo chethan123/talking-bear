@@ -61,8 +61,7 @@ export const TOO_NOISY_FLOOR_DB = -35;
 export const NOISY_VOICED_RATIO = 0.3;
 /** #116: this many consecutive noisy caps raise the margins (or, at the top boost, switch to hold-to-talk). */
 export const NOISY_CAPS = 3;
-/** #116: each raise adds this many dB (0 → 3 → 6). */
-export const MARGIN_STEP_DB = 3;
+
 const HIDE_EVENTS: ReadonlySet<EventType> = new Set<EventType>(['hidden', 'pagehide', 'freeze']);
 
 export function initialSessionState(permission: Permission): SessionState {
@@ -477,14 +476,13 @@ function takeTo(s: SessionState, lastSpeechFrame: number, cfg: SessionConfig, p:
 }
 /**
  * Row 20's noisy counter (#116, plan §4.4): a capped end with a voiced ratio below 0.3 counts, any other end resets
- * it. At NOISY_CAPS the margins rise by MARGIN_STEP_DB (and the count restarts) until 6 dB; then hold-to-talk.
+ * it. At NOISY_CAPS the margins rise by 3 dB (and the count restarts) up to 6 dB; then hold-to-talk.
  */
 function noisyPatch(s: SessionState, ev: Extract<SegEvent, { kind: 'end' }>): Partial<SessionState> {
   const noisy = ev.reason === 'maxLength' && ev.voicedRatio !== undefined && ev.voicedRatio < NOISY_VOICED_RATIO;
   const noisyCaps = noisy ? s.noisyCaps + 1 : 0;
   if (noisyCaps < NOISY_CAPS) return { noisyCaps };
-  if (s.marginBoostDb === 0) return { noisyCaps: 0, marginBoostDb: MARGIN_STEP_DB };
-  if (s.marginBoostDb === MARGIN_STEP_DB) return { noisyCaps: 0, marginBoostDb: 2 * MARGIN_STEP_DB };
+  if (s.marginBoostDb < 6) return { noisyCaps: 0, marginBoostDb: s.marginBoostDb === 0 ? 3 : 6 }; // + 3 dB
   return { noisyCaps, holdToTalk: true };
 }
 /** The cap in ctx frames: round(maxUtteranceMs / 1000 · sampleRate). */
