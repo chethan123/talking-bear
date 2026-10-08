@@ -2706,8 +2706,88 @@ describe('#221: clipByName and the mouth channels through evaluate', () => {
 
 // ---- #229: evaluate's time through a slot ------------------------------------------------------------------------
 
-describe('evaluateFrom (#229)', () => {
-  it('is evaluate with the time read from clock[at]: bit for bit on every channel, mouth on and off', () => {
+/** director.ts's private constants, copied with the reference below. */
+const CROSSFADE_S_REF = 0.15;
+const RELEASE_S_REF = 0.4;
+const CUT_S_REF = 0.1;
+const CLIP_DELTA_REF: Pose = createPose();
+const PREV_DELTA_REF: Pose = createPose();
+
+/** main's `evaluate` (0b2a413) verbatim, before #229, with `CLIPS.get` spelled `clipByName` and `playing` renamed. */
+function referenceEvaluate(s: DirectorState, now: number, out: Pose, mouth = false): Pose {
+  const a = BASE[s.prevBase];
+  const b = BASE[s.base];
+  const f = (now - s.fadeStart) / CROSSFADE_S_REF;
+  const t = f < 1 ? (f > 0 ? f : 0) : 1;
+  let withClip = false;
+  let w = 1;
+  let k = 0;
+  let wp = 1;
+  const current = s.clip;
+  if (current !== null) {
+    const c = clipByName(current.name);
+    if (c !== undefined) {
+      sampleClip(c, now - current.start, CLIP_DELTA_REF);
+      withClip = true;
+      const r = s.reaction;
+      if (r !== null && r.release !== null && current.name === r.clip) {
+        const u = (now - r.release) / RELEASE_S_REF;
+        w = u > 0 ? (u < 1 ? 1 - u * u * (3 - 2 * u) : 0) : 1;
+      }
+      const p = s.prevClip;
+      if (p !== null) {
+        const u = (now - p.cutAt) / CUT_S_REF;
+        const pc = u < 1 ? clipByName(p.name) : undefined;
+        if (pc !== undefined) {
+          sampleClip(pc, now - p.start, PREV_DELTA_REF);
+          k = u > 0 ? 1 - u * u * (3 - 2 * u) : 1;
+          if (p.release !== null) {
+            const v = (now - p.release) / RELEASE_S_REF;
+            wp = v > 0 ? (v < 1 ? 1 - v * v * (3 - 2 * v) : 0) : 1;
+          }
+        }
+      }
+    }
+  }
+  for (let i = 0; i < CH_COUNT; i++) {
+    if (!mouth && (i === Ch.Jaw || i === Ch.MouthW || i === Ch.MouthRound || i === Ch.Teeth)) continue;
+    const ai = a[i]!;
+    const v = ai + (b[i]! - ai) * t;
+    if (!withClip) out[i] = v;
+    else if (k > 0) out[i] = v + CLIP_DELTA_REF[i]! * w * (1 - k) + PREV_DELTA_REF[i]! * wp * k;
+    else out[i] = v + CLIP_DELTA_REF[i]! * w;
+  }
+  return out;
+}
+
+/** Whether a property key is an array index. */
+function isIndex(key: string | symbol): key is string {
+  return typeof key === 'string' && /^\d+$/.test(key);
+}
+
+/**
+ * A pose whose channel writes and reads go to a `Float64Array` (`values`), so evaluations that differ below float32
+ * precision differ here too. `evaluate` only writes `out[i]`, which the proxy's `set` sends to `values`.
+ */
+function f64Pose(): { pose: Pose; values: Float64Array } {
+  const values = new Float64Array(CH_COUNT);
+  const pose = new Proxy(createPose(), {
+    get(target, key): unknown {
+      if (isIndex(key)) return values[Number(key)];
+      const v: unknown = Reflect.get(target, key);
+      return v;
+    },
+    set(_target, key, v: unknown): boolean {
+      if (!isIndex(key) || typeof v !== 'number') return false;
+      values[Number(key)] = v;
+      return true;
+    },
+  });
+  return { pose, values };
+}
+
+describe("evaluateFrom and evaluate against main's evaluate (#229)", () => {
+  it('evaluateFrom reads its time from clock[at], and both match the reference bit for bit at double precision', () => {
     const states: DirectorState[] = [];
     for (const name of STATES) states.push(...variants(name));
     for (const c of CLIP_NAMES) states.push(playing(c));
@@ -2720,22 +2800,30 @@ describe('evaluateFrom (#229)', () => {
     for (const { s } of driven.states) states.push(s);
     expect(states.some((s) => s.prevClip !== null)).toBe(true);
     expect(states.some((s) => s.reaction !== null && s.reaction.release !== null)).toBe(true);
+    // Float64Array outputs, so a difference below float32 precision shows too.
     const clock = new Float64Array(3);
-    const a = createPose();
-    const b = createPose();
+    const ref = f64Pose();
+    const viaFrom = f64Pose();
+    const viaEvaluate = f64Pose();
     let compared = 0;
     for (const s of states) {
       const t0 = s.clip?.start ?? s.fadeStart;
-      for (const now of [s.fadeStart, t0 + 0.05, t0 + 0.15, t0 + 1, Number.NaN]) {
+      for (const now of [s.fadeStart, t0 + 0.05, t0 + 0.0731, t0 + 0.15, t0 + 1, Number.NaN]) {
         for (const mouth of [false, true]) {
-          a.fill(7);
-          b.fill(7);
+          ref.values.fill(7);
+          viaFrom.values.fill(7);
+          viaEvaluate.values.fill(7);
+          clock.fill(-1e9);
           clock[2] = now;
-          expect(evaluate(s, now, a, mouth)).toBe(a);
-          expect(evaluateFrom(s, clock, 2, b, mouth)).toBe(b);
+          referenceEvaluate(s, now, ref.pose, mouth);
+          expect(evaluateFrom(s, clock, 2, viaFrom.pose, mouth)).toBe(viaFrom.pose);
+          expect(evaluate(s, now, viaEvaluate.pose, mouth)).toBe(viaEvaluate.pose);
+          const r = ref.values;
+          const a = viaFrom.values;
+          const b = viaEvaluate.values;
           for (let ch = 0; ch < CH_COUNT; ch++) {
-            if (!Object.is(a[ch], b[ch]))
-              expect.fail(`channel ${ch} at ${now} (mouth ${mouth}): ${a[ch]} vs ${b[ch]}`);
+            if (!Object.is(a[ch], r[ch]) || !Object.is(b[ch], r[ch]))
+              expect.fail(`channel ${ch} at ${now} (mouth ${mouth}): ${a[ch]}, ${b[ch]} vs ${r[ch]}`);
           }
           compared++;
         }

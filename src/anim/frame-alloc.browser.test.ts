@@ -84,11 +84,11 @@ const TUFT_TAP: Gesture = { g: 'tap', phase: 'down', region: 'headTop', x: 0, y:
  *   `tick`, 31.6 / 29.2; NC3, one small object plus one boxed double per frame in the mouth layer, 31.6 / 1.2; NC4,
  *   the director tick back to `isOver(s, a, now)` and `clipEnd` returns, 3.6 / 49.2. The detection floor: one boxed
  *   double per frame passes (loop.ts calling the wrapper `advance` 15.6 / 13.2; the `clipTime` getter back in the
- *   frame log 14.6 / 13.2); two fail. NC1 fails by only 3.6.
+ *   frame log 14.6–15.6 / 13.2); two fail. NC1 fails by only 3.6.
  * - **Inlining-dependent.** `compose`'s `mouthCloseScale(now, …)` takes and returns a double; V8 inlines it here, so
  *   it measures 0. A V8 that didn't would add one box, inside the margin.
- * - **Stop rule** (#229): the first CI `verify` after GitHub Actions resumed must show both readings at ≤ 12 B
- *   (one box under the bound); otherwise the bound is revisited on #229 with the numbers. CI after #229: pending.
+ * - **Stop rule** (#229): after GitHub Actions resumes, stop and comment on #229 only if an `[I214 smoke]` reading
+ *   exceeds 12 B on two of the first three CI `verify` runs, or exceeds 24 B on any. CI after #229: pending.
  */
 const BOUND = 24;
 

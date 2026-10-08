@@ -203,33 +203,74 @@ describe('Stepper.advance', () => {
   });
 });
 
-describe('Stepper.run', () => {
-  it('run(step) with io[IO_FRAME_DT] = dt matches advance(dt, step) bit for bit, frame after frame', () => {
+/** stepper.ts's private `STEP_EPS`, copied with the reference. */
+const STEP_EPS_REF = 1e-9;
+
+/** A stepper with main's `advance` (0b2a413) verbatim (its `frameDt` renamed `dt`), before #229: the reference `run` and `advance` must match. */
+class ReferenceStepper {
+  readonly #acc = new Float64Array(1);
+
+  advance(dt: number, step: (dt: number) => void): number {
+    // min(dt, MAX_FRAME_DT), written out: where V8 doesn't inline Math.min, it boxes the arguments.
+    let acc = this.#acc[0]! + (dt > 0 ? (dt < MAX_FRAME_DT ? dt : MAX_FRAME_DT) : 0);
+    let substeps = 0;
+    while (substeps < MAX_SUBSTEPS && acc >= SUBSTEP - STEP_EPS_REF) {
+      step(SUBSTEP);
+      acc -= SUBSTEP;
+      substeps++;
+    }
+    // A negative residue is rounding from the tolerance; a residue of a whole substep is over budget.
+    if (acc < 0 || acc >= SUBSTEP - STEP_EPS_REF) acc = 0;
+    this.#acc[0] = acc;
+    return acc / SUBSTEP;
+  }
+}
+describe("Stepper.run and Stepper.advance against main's advance (#229)", () => {
+  it('both match the reference bit for bit, frame after frame: alpha (Object.is) and substeps', () => {
     const special = fc.constantFrom(
       -1,
       -0,
+      0,
+      1,
       Number.NaN,
       Number.POSITIVE_INFINITY,
       Number.NEGATIVE_INFINITY,
-      0,
-      1,
+      Number.MIN_VALUE,
+      -Number.MIN_VALUE,
+      Number.MAX_VALUE,
+      1e308,
+      1e9,
+      MAX_FRAME_DT,
+      MAX_FRAME_DT - 2 ** -57,
+      MAX_FRAME_DT + 2 ** -57,
+      SUBSTEP - STEP_EPS_REF,
     );
     fc.assert(
-      fc.property(fc.array(fc.oneof(frameDt, special), { minLength: 1, maxLength: 200 }), (frames) => {
-        const viaAdvance = new Stepper();
-        const viaRun = new Stepper();
-        for (const dt of frames) {
-          const a = frame(viaAdvance, dt);
-          let substeps = 0;
-          viaRun.io[IO_FRAME_DT] = dt;
-          viaRun.run((h) => {
-            expect(h).toBe(SUBSTEP);
-            substeps++;
-          });
-          expect(substeps).toBe(a.substeps);
-          expect(Object.is(viaRun.io[IO_ALPHA], a.alpha)).toBe(true);
-        }
-      }),
+      fc.property(
+        fc.array(fc.oneof(frameDt, special, fc.double()), { minLength: 1, maxLength: 200 }),
+        (frames) => {
+          const reference = new ReferenceStepper();
+          const viaAdvance = new Stepper();
+          const viaRun = new Stepper();
+          for (const dt of frames) {
+            let expectedSubsteps = 0;
+            const expected = reference.advance(dt, () => {
+              expectedSubsteps++;
+            });
+            const a = frame(viaAdvance, dt);
+            let substeps = 0;
+            viaRun.io[IO_FRAME_DT] = dt;
+            viaRun.run((h) => {
+              expect(h).toBe(SUBSTEP);
+              substeps++;
+            });
+            expect(a.substeps).toBe(expectedSubsteps);
+            expect(substeps).toBe(expectedSubsteps);
+            expect(Object.is(a.alpha, expected), `advance alpha at dt ${dt}`).toBe(true);
+            expect(Object.is(viaRun.io[IO_ALPHA], expected), `run alpha at dt ${dt}`).toBe(true);
+          }
+        },
+      ),
       { numRuns: 500, seed: 0x7063 },
     );
   });
