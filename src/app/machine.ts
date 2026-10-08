@@ -1,10 +1,11 @@
 // The session state machine: a pure reducer `reduce(state, event, config) → { state, effects }` implementing
-// plan §3.4 (rows 1–46, 35b, 40b, entry/exit actions) with the clarifications C1–C12 of issue #28.
+// plan §3.4 (rows 1–46, 3b, 3c, 35b, 40b, entry/exit actions) with the clarifications C1–C12 of issue #28.
 // Pure: no I/O, no time, never mutates its input. Handlers return the same state object when nothing changes.
 //
 // Effect order for a transition: (1) the old state's exit actions, (2) the row's effects, (3) the new state's
 // entry actions (`disarm` first when leaving ARMED), (4) derived effects: `wakeLock` (C1), then `ui` (C2).
-// `reduce` then appends `applyUpdate` last when a hide event leaves the machine in Asleep or Paused (C11).
+// `reduce` then appends `applyUpdate` last when a hide event leaves the machine in Asleep or Paused (C11), and an
+// Asleep tap or settings retry after another tab's update emits only `applyUpdate` (#277, row 3c).
 
 import { ONSET_BLOCK_MS } from '../audio/constants.ts';
 import type { SegEvent } from '../dsp/segmenter.ts';
@@ -73,6 +74,7 @@ export function initialSessionState(permission: Permission): SessionState {
     sfxEndedSeq: 0,
     micDeniedSfx: false,
     updateReady: false,
+    updateActivated: false,
     preset: PRESETS.cub,
   };
 }
@@ -266,8 +268,16 @@ function wakeByPermission(s: SessionState, cfg: SessionConfig, p: Partial<Sessio
       return transitionTo(s, 'MicDenied', cfg, [{ k: 'resumeCtx' }, anim({ e: 'wake' })], p);
   }
 }
-/** Rows 1–3 (Asleep + tapBear), row 39 (Paused + visible), and Asleep + settingsRetry (#266): wake by permission. */
+/** Row 39 (Paused + visible): wake by permission (as rows 1–3). */
 const onWakeTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out => wakeByPermission(s, cfg);
+/**
+ * Asleep + tapBear (rows 1–3, 3c) and Asleep + settingsRetry (3b, 3c). If another tab activated the update, this
+ * page runs old code whose lazy URLs the new worker no longer serves, so it reloads (`applyUpdate`) instead of
+ * waking. The flag is kept until C11, so a second pointerdown before the reload commits reloads again and never
+ * wakes on old code (#277).
+ */
+const onAsleepWake = (s: SessionState, _e: unknown, cfg: SessionConfig): Out =>
+  s.updateActivated ? stay(s, {}, [{ k: 'applyUpdate' }]) : wakeByPermission(s, cfg);
 /** Row 42: tap to retry from Error starts a fresh wake, as row 1 does (approved deviations D4, D25). */
 const onErrorTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out =>
   wakeByPermission(s, cfg, { workerRestarts: 0 });
@@ -287,7 +297,9 @@ const onSfxEnded: Handler<'sfxAtSpeakerEnded'> = (s, e) =>
   stay(s, { sfxEndedSeq: Math.max(s.sfxEndedSeq, e.seq) });
 const onTrackMuted: Handler<'trackMuted'> = (s) => stay(s, { micMuted: true }); // row 18 in Listening
 const onTrackUnmuted: Handler<'trackUnmuted'> = (s) => stay(s, { micMuted: false });
-const onUpdateReady: Handler<'updateReady'> = (s) => stay(s, { updateReady: true });
+/** C11; #277: `activated` (another tab's update) is sticky until C11, so a later plain `updateReady` keeps it. */
+const onUpdateReady: Handler<'updateReady'> = (s, e) =>
+  stay(s, e.activated === true ? { updateReady: true, updateActivated: true } : { updateReady: true });
 /** M3 settings (issue #66): the preset of the next `process`, in every state; the same state if it is equal. */
 const onSettingsChanged: Handler<'settingsChanged'> = (s, e) =>
   e.preset.id === s.preset.id && e.preset.pitchRatio === s.preset.pitchRatio
@@ -494,9 +506,9 @@ const recordingTimer: Handler<'timer'> = (s, e, cfg) =>
  */
 export const TABLE: { readonly [S in StateName]: Row } = {
   Asleep: {
-    tapBear: onWakeTap, // rows 1–3
+    tapBear: onAsleepWake, // rows 1–3, 3c
     parentContinue: 'ignore',
-    settingsRetry: onWakeTap, // #266: the parent's retry wakes exactly as the tap does (rows 1–3)
+    settingsRetry: onAsleepWake, // 3b, 3c: the parent's retry wakes (or reloads) exactly as the tap does
     permissionChanged: onPermissionChanged,
     micGranted: 'ignore',
     micDenied: 'ignore',
@@ -919,7 +931,10 @@ export function reduce(
   const next = out.state;
   if (HIDE_EVENTS.has(e.t) && (next.name === 'Asleep' || next.name === 'Paused') && next.updateReady) {
     // C11 / plan §4.7: apply the update synchronously in the hide dispatch, after everything has stopped.
-    return { state: { ...next, updateReady: false }, effects: [...out.effects, { k: 'applyUpdate' }] };
+    return {
+      state: { ...next, updateReady: false, updateActivated: false },
+      effects: [...out.effects, { k: 'applyUpdate' }],
+    };
   }
   return out;
 }

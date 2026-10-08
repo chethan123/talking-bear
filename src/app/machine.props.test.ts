@@ -412,4 +412,60 @@ describe('session reducer properties (plan §4.9.1)', () => {
     expect(customByWalk).toBeGreaterThan(0);
     expect([...probedIn].toSorted()).toEqual(Object.keys(TABLE).toSorted());
   });
+
+  it('11: updateReady{activated} makes an Asleep tap or retry reload, and changes nothing else (#277)', () => {
+    const PROBES: SessionEvent[] = [
+      { t: 'tapBear' },
+      { t: 'settingsRetry' },
+      { t: 'visible' },
+      { t: 'hidden' },
+      { t: 'parentContinue' },
+    ];
+    const probedIn = new Set<StateName>();
+    let asleepReloads = 0;
+    property((w) => {
+      runWalk(
+        w,
+        () => {},
+        (sim) => {
+          const s = sim.state;
+          probedIn.add(s.name);
+          const a = reduce(s, { t: 'updateReady', activated: true });
+          if (a.effects.length > 0 || !a.state.updateActivated || !a.state.updateReady) {
+            fail(
+              sim,
+              `P11: updateReady{activated} in ${s.name} emitted ${a.effects.length} effects or set no flag`,
+            );
+          }
+          const b = reduce(s, { t: 'updateReady' });
+          for (const e of PROBES) {
+            const x = reduce(a.state, e);
+            const y = reduce(b.state, e);
+            if (s.name === 'Asleep' && (e.t === 'tapBear' || e.t === 'settingsRetry')) {
+              asleepReloads++;
+              if (x.state !== a.state || x.effects.length !== 1 || x.effects[0]?.k !== 'applyUpdate') {
+                fail(
+                  sim,
+                  `P11: ${fmt(e)} in flagged Asleep emitted [${x.effects.map((f) => f.k).join(', ')}]`,
+                );
+              }
+              continue;
+            }
+            // Cheap comparisons (this runs for every reachable state): effects by value, states key by key.
+            if (JSON.stringify(x.effects) !== JSON.stringify(y.effects)) {
+              fail(sim, `P11: the flag changed the effects of ${fmt(e)} in ${s.name}`);
+            }
+            const changed = changedKeys(
+              { ...x.state, updateActivated: false },
+              { ...y.state, updateActivated: false },
+            );
+            if (changed.length > 0)
+              fail(sim, `P11: the flag changed [${changed.join(', ')}] on ${fmt(e)} in ${s.name}`);
+          }
+        },
+      );
+    });
+    expect([...probedIn].toSorted()).toEqual(Object.keys(TABLE).toSorted());
+    expect(asleepReloads).toBeGreaterThan(0);
+  });
 });
