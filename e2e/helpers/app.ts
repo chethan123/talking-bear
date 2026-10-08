@@ -668,12 +668,17 @@ export async function expectLoop(
   try {
     ended = await waitForLoop(page, woke, 15_000);
   } catch (err) {
-    // A capture re-anchor that cut the take as a misfire fails the loop check first: name it (#268). If the page
-    // can't be read any more, the original failure stands.
-    const why = await Promise.all([recentLevels(page), steps(page)]).then(
-      ([levels, all]) => reanchorAfterLoop(levels, all, woke.index),
-      () => undefined,
-    );
+    // A capture re-anchor that cut the take as a misfire fails the loop check first: name it (#268). The levels are
+    // read before the steps, so every level's epoch has its `armed` step in the snapshot (as in
+    // expectNoCaptureReanchor). If the page can't be read any more, the original failure stands.
+    let why: string | undefined;
+    try {
+      const levels = await recentLevels(page);
+      const all = await steps(page);
+      why = reanchorAfterLoop(levels, all, woke.index);
+    } catch {
+      why = undefined;
+    }
     if (why !== undefined) throw new Error(why, { cause: err });
     throw err;
   }

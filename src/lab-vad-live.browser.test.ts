@@ -475,6 +475,7 @@ describe('lab/vad-live capture jumps (#268)', () => {
     level(page, 3, 1_100_000); // a jump while listening, in fan
     expect(summary().counts.fan).toMatchObject({ captureJumps: 1 });
   });
+
   test('a misfire at a jump re-arms: the rest of the phrase, whose pre-roll reaches back over the jump, is excluded too', async () => {
     const page = await livePage(true);
     let f = levels(page, 1, 0, 20);
@@ -500,5 +501,30 @@ describe('lab/vad-live capture jumps (#268)', () => {
     step(page, 'Listening', 'Recording', segStart(4, after2 + 14_400));
     expect(button('Hit').disabled).toBe(false);
     expect(quiet()).toMatchObject({ captureJumps: 2, recordings: 1, misfires: 0 });
+  });
+
+  test('a new AudioContext forgets the latest jump: an onset at a low frame after it counts', async () => {
+    const page = await livePage();
+    level(page, 1, 900_000);
+    level(page, 1, 1_000_000); // a jump while listening: the first level after it is at frame 1 000 000
+    expect(quiet().captureJumps).toBe(1);
+    step(page, 'Listening', 'Listening', { t: 'ctxRunning', sampleRate: 48_000 }, arm(2)); // the frames restart
+    levels(page, 2, 30_000, 10);
+    step(page, 'Listening', 'Recording', segStart(2, 50_000));
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1 });
+    expect(button('Hit').disabled).toBe(false);
+  });
+
+  test("an exclusion takes back only the excluded take's counts, not an earlier take's", async () => {
+    const page = await livePage();
+    cleanTake(page, 1, 100_000); // counted, then a new listen as epoch 2
+    expect(quiet()).toMatchObject({ recordings: 1, completed: 1 });
+    let f = levels(page, 2, 500_000, 20);
+    step(page, 'Listening', 'Recording', segStart(2, f));
+    f = levels(page, 2, f + 1440, 30);
+    step(page, 'Recording', 'Processing', segEnd(2, f));
+    level(page, 2, f + 1440 + 96_000); // a 2 s re-anchor cuts the armed epoch-2 take
+    replay(page, 3);
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1, completed: 1 });
   });
 });
