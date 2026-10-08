@@ -40,7 +40,9 @@
 // segment ended: the worker posts a gap end just before the first level after the gap), or if its pre-roll reaches
 // back over the latest jump on the ctx timeline, in any epoch (onset − PREROLL_MS before the first level after the
 // jump). The latter is also the rest of a phrase cut as a misfire: the misfire re-arms at once, and the phrase goes on
-// as a new take in the new epoch. A new AudioContext (`ctxRunning`) restarts the frame count and forgets the jump.
+// as a new take in the new epoch. Only a jump seen while `tallying()` is remembered for this. A new AudioContext
+// (`ctxRunning`) restarts the frame count and forgets the jump, and so does an input reselection (the `reselectInput`
+// effect): a stall around a device switch belongs to the old input, not to the new input's first phrase.
 //
 // Layout: all of the app's layers are position: fixed, so the app root gets a height and `contain: strict`, which
 // makes it their containing block, and the tally panel follows it. The rules come from a constructed stylesheet
@@ -165,7 +167,10 @@ let sampleRate: number | null = null;
 /** The previous `level` event's epoch (null before the first) and ctx frame: the jump rule compares the two. */
 let levelEpoch: number | null = null;
 let levelFrame = 0;
-/** The ctx frame of the first level after the latest capture jump (null: none since the context last started). */
+/**
+ * The ctx frame of the first level after the latest capture jump seen while tallying (null: none since the context
+ * last started running or the input was last reselected).
+ */
 let jumpFrame: number | null = null;
 /** The latest armed take can still be excluded by a capture jump (#268): see the header. */
 let takeOpen = false;
@@ -378,8 +383,8 @@ function onLevel(epoch: number, frame: number): void {
     if (ofTake && segEnded) takeOpen = false; // its segment ended before any gap: it no longer straddles one
     return;
   }
-  jumpFrame = frame;
   if (!tallying()) return;
+  jumpFrame = frame;
   const c = ofTake ? takeCondition : condition;
   if (ofTake) excludeTake();
   counts[c].captureJumps++;
@@ -429,6 +434,7 @@ boot(appRoot, {
       if (TAKE_ENDS.has(to)) takeArmed = false;
       // The `arm` effect (the worker's `reset`) starts a listen; a Listening → Listening stay has none.
       for (const fx of effects) {
+        if (fx.k === 'reselectInput') jumpFrame = null; // a new input: an earlier stall can't reach its phrases
         if (fx.k !== 'arm') continue;
         cleanArm = tallying();
         if (cleanArm && !cleanEpochSeen) {

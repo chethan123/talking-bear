@@ -527,4 +527,30 @@ describe('lab/vad-live capture jumps (#268)', () => {
     replay(page, 3);
     expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1, completed: 1 });
   });
+
+  test('a jump seen before the tally is live is not remembered: an onset within 300 ms after it counts', async () => {
+    const page = await openPage();
+    page.resolve();
+    await settle();
+    wake(page); // the overlay is still loading: not tallying
+    level(page, 1, 900_000);
+    level(page, 1, 1_000_000); // a jump before tallying starts
+    page.opts.onDebugOverlay?.(true);
+    step(page, 'Listening', 'Listening', { t: 'timer', name: 'doze' }, arm(2)); // a clean re-arm
+    step(page, 'Listening', 'Recording', segStart(2, 1_007_200)); // 150 ms after the first level after the jump
+    expect(quiet()).toMatchObject({ captureJumps: 0, recordings: 1 });
+    expect(button('Hit').disabled).toBe(false);
+  });
+
+  test("an input reselection forgets the latest jump: the new input's first onset within 300 ms counts", async () => {
+    const page = await livePage();
+    level(page, 1, 900_000);
+    level(page, 1, 1_000_000); // a jump while listening, counted
+    expect(quiet().captureJumps).toBe(1);
+    step(page, 'Listening', 'Waking', { t: 'inputsChanged' }, [{ k: 'closeMic' }, { k: 'reselectInput' }]); // row 40
+    step(page, 'Waking', 'Listening', { t: 'micGranted', req: 2 }, arm(2));
+    step(page, 'Listening', 'Recording', segStart(2, 1_007_200));
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1 });
+    expect(button('Hit').disabled).toBe(false);
+  });
 });
