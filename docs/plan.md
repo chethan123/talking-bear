@@ -138,6 +138,14 @@ A short parent-readable version of this lives in the settings sheet (M8).
 
 Wall-clock time is used only for UI timers (doze, sleep, processing timeout). It is injected as a `Clock` so tests are deterministic.
 
+**Capture gaps.** Chrome's `currentFrame` can jump. The capture worklet's ring zero-fills every jump. Up to 0.5 s (`Math.round(sampleRate / 2)` ctx frames), the decimator is fed the same zeros, so the frame tags stay on the ring's frames and contiguous. A longer jump, an audio-thread stall over 0.5 s, **re-anchors** the VAD feed instead: the decimator is reset, the partial VAD frame is dropped, and the next frame starts at the jump frame. In the worker, a frame whose `firstFrame` differs by more than one render quantum (`CAPTURE_GAP_SLACK`, 128 ctx frames) from the previous frame's (same epoch) `firstFrame` plus one VAD frame starts after a gap. Before consuming it, VadCore (#244, decisions D3–D5 of its approved plan):
+
+- drops the partial 10 ms hop and restarts the voicing window from zeros, as at `reset`;
+- ends a segment in progress at its last step before the gap (the last Silero frame, or the last energy hop): `end{reason: 'silence'}` with its `lastSpeechFrame` if it passes the checks a silence end faces there (the minimum speech, then the energy voicing rule or the Silero proximity gate), otherwise `misfire`. The segmenter then starts over;
+- with the trace on, ends the trace batch at the gap: the partial batch is posted, except that on Silero a partial batch without a Silero value is dropped.
+
+So no hop, segment or trace batch spans a gap. The take of a segment ended at the gap (row 20) lies before it, apart from at most its 150 ms tail, which can reach into the ring's zero fill; the 300 ms pre-roll of a segment that starts after the gap can likewise reach back into the zeros. The epoch and its backend, the energy gate and its floor, the gate filter, the Silero LSTM state, the pre-gate, the hop count (the `level` cadence), the proximity gate's hop history and the onset block carry over. No new event or end reason is involved.
+
 ### 3.2 Audio pipeline (data flow)
 
 ```mermaid
@@ -391,6 +399,7 @@ stateDiagram-v2
 | 1 | Asleep | `tapBear` | permission `granted` | Waking | `resumeCtx`, `openMic`, `wakeLock on`, `timer waking 5 s`, `anim wake` |
 | 2 | Asleep | `tapBear` | permission `prompt` (first run, or a one-time grant expired) | NeedsParent | `resumeCtx`, `wakeLock on`, `ui parentPermission`, `timer sleep`. This is the one screen with text, for a parent ([§4.5](#45-android-chrome-specifics)). |
 | 3 | Asleep | `tapBear` | permission `denied` | MicDenied | `resumeCtx`, `ui micHelp`, `anim wake` (the bear is awake for reactions, row 11) |
+| 3b | Asleep | `settingsRetry` | — | as rows 1 / 2 / 3 by permission | (#266) |
 | 4 | NeedsParent | `parentContinue` | — | Waking | `openMic`: Chrome's prompt appears now, in front of the parent |
 | 5 | NeedsParent | `timer sleep` \| `hidden` | — | Asleep | — |
 | 6 | Waking | `micGranted` \| `ctxRunning` | the *other* flag is already set | Listening | `cancelTimer waking` (entry actions arm) |
@@ -893,7 +902,7 @@ The default ratio is settled by the M3 listening test ([§7](#7-milestones-build
 - **Handling:** `navigator.permissions.query({name:'microphone'})` (Chrome 64+) plus `onchange`, re-checked on every `visibilitychange` [V R30].
 - **Designed for a child who can't read (Q3):**
   - Chrome's prompt is text-only, so the mic is **never requested straight from a child's tap**. When permission is `prompt` (first run, or an expired one-time grant), tapping the bear opens a **parent sheet** (§3.4 `NeedsParent`). It is the only text screen in the app. It explains that the bear only listens on the device and nothing is sent anywhere, and has a Continue button that triggers Chrome's prompt.
-  - In `MicDenied`, **bear taps never re-prompt**. Repeated dismissals can put the site under Chrome's prompt embargo [M], after which only site settings can fix it. Retrying lives behind the settings long-press, which also tells a parent how to re-enable the mic in site settings.
+  - In `MicDenied`, **bear taps never re-prompt**. Repeated dismissals can put the site under Chrome's prompt embargo [M], after which only site settings can fix it. Retrying lives behind the settings long-press, which also tells a parent how to re-enable the mic in site settings; the settings retry from Asleep wakes as a tap does (§3.4 row 3b).
   - X-E7 also records whether the WebAPK shows an additional Android runtime dialog, and what three "Don't allow" dismissals in a row do.
 - **Accidental install:** listen for `beforeinstallprompt` and call `preventDefault()`, so no install UI appears in front of a child. Offer "Install" only inside settings. `beforeinstallprompt` is Chromium-only and non-standard [V R30].
 
