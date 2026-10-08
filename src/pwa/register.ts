@@ -21,8 +21,9 @@
  *   `controllerchange` it didn't arm sets `updateReady()` and dispatches `updateReady`. A hidden page is
  *   already in Asleep or Paused, so it reloads at once; a visible one waits for the session's C11 path, which
  *   calls `applyUpdate()` at the next hide in Asleep or Paused and so reloads it (there is no waiting worker
- *   left to activate). The first `clientsClaim` takeover of an uncontrolled page (a first visit) is not an
- *   update and changes nothing.
+ *   left to activate). That dispatch carries `activated: true`, so a visible page in Asleep also reloads at its
+ *   next tap or settings retry instead of waking on old lazy URLs (#277, plan §3.4 row 3c). The first
+ *   `clientsClaim` takeover of an uncontrolled page (a first visit) is not an update and changes nothing.
  * - **Update checks:** a single-page app never navigates, so `reg.update()` runs on every `visible` and hourly
  *   (frozen tabs run no timers; the next `visible` catches up).
  * - **Offline:** after the first `offlineReady`, ask for persistent storage.
@@ -74,6 +75,8 @@ export interface Pwa {
   promptInstall(): Promise<void>;
   /** True once a new service worker is waiting (`onNeedRefresh`), or another tab activated one. */
   updateReady(): boolean;
+  /** True once another tab activated a new version: this page runs old code until it reloads (#277). */
+  activatedElsewhere(): boolean;
 }
 
 const warn = (what: string, err: unknown): void => {
@@ -125,7 +128,8 @@ export function setupPwa(deps: PwaDeps): Pwa {
       if (reloadArmed) return; // our own applyUpdate(): its listener reloads
       activatedElsewhere = true;
       ready = true;
-      deps.dispatch({ t: 'updateReady' }); // the session applies it at the next hide in Asleep or Paused
+      // The session reloads at an Asleep tap or settings retry (#277), or at the next hide in Asleep or Paused.
+      deps.dispatch({ t: 'updateReady', activated: true });
       // Already hidden: every hide leaves the session in Asleep or Paused (rows 5, 38, 43), so this is C11's moment.
       if (deps.visibility.current() === 'hidden') location.reload();
     });
@@ -195,5 +199,6 @@ export function setupPwa(deps: PwaDeps): Pwa {
       }
     },
     updateReady: () => ready,
+    activatedElsewhere: () => activatedElsewhere,
   };
 }

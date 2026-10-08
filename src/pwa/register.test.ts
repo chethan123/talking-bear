@@ -131,7 +131,7 @@ describe('setupPwa: update policy', () => {
     const t = setup();
     registered().onNeedRefresh?.();
     expect(t.api.updateReady()).toBe(true);
-    expect(t.events).toEqual([{ t: 'updateReady' }]);
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }]);
   });
 
   it('after onNeedRefresh, applyUpdate calls updateSW(true) synchronously', () => {
@@ -182,7 +182,7 @@ describe('setupPwa: reload after an applied update', () => {
     registered().onNeedRefresh?.();
     t.sw.dispatchEvent(new Event('controllerchange'));
     expect(t.reload).not.toHaveBeenCalled();
-    expect(t.events).toEqual([{ t: 'updateReady' }]); // onNeedRefresh's only
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }]); // onNeedRefresh's only
   });
 
   it("the plugin's own reload (onNeedReload) does nothing", () => {
@@ -208,7 +208,7 @@ describe('setupPwa: reload after an applied update', () => {
       expect(t.reload).toHaveBeenCalledTimes(1);
       t.sw.dispatchEvent(new Event('controllerchange'));
       expect(t.reload).toHaveBeenCalledTimes(1);
-      expect(t.events).toEqual([{ t: 'updateReady' }]); // its own update is not another tab's
+      expect(t.events).toStrictEqual([{ t: 'updateReady' }]); // its own update is not another tab's
     },
   );
 
@@ -231,7 +231,7 @@ describe('setupPwa: reload after an applied update', () => {
     // A later activation (another tab's next version) must not reload this visible page, whatever its state.
     t.sw.dispatchEvent(new Event('controllerchange'));
     expect(t.reload).not.toHaveBeenCalled();
-    expect(t.events).toEqual([{ t: 'updateReady' }, { t: 'updateReady' }]);
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }, { t: 'updateReady', activated: true }]);
     // The session applies it at the next hide in Asleep or Paused: that reloads at once.
     t.api.applyUpdate();
     expect(t.reload).toHaveBeenCalledTimes(1);
@@ -258,7 +258,7 @@ describe('setupPwa: reload after an applied update', () => {
     t.clock.advance(2000); // past the first call's deadline
     t.sw.dispatchEvent(new Event('controllerchange'));
     expect(t.reload).toHaveBeenCalledTimes(1);
-    expect(t.events).toEqual([{ t: 'updateReady' }]); // its own path, not the activated-elsewhere one
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }]); // its own path, not the activated-elsewhere one
   });
 
   it('the restarted window disarms RELOAD_ARM_MS after the latest applyUpdate', () => {
@@ -271,7 +271,7 @@ describe('setupPwa: reload after an applied update', () => {
     expect(t.clock.pending()).toBe(1); // only the hourly check is left
     t.sw.dispatchEvent(new Event('controllerchange'));
     expect(t.reload).not.toHaveBeenCalled(); // visible: the activated-elsewhere path waits for C11
-    expect(t.events).toEqual([{ t: 'updateReady' }, { t: 'updateReady' }]);
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }, { t: 'updateReady', activated: true }]);
   });
 
   it('a second applyUpdate adds no second reload listener', () => {
@@ -298,7 +298,7 @@ describe('setupPwa: an update another tab activated (#230)', () => {
     t.sw.dispatchEvent(new Event('controllerchange'));
     expect(t.reload).not.toHaveBeenCalled();
     expect(t.api.updateReady()).toBe(true);
-    expect(t.events).toEqual([{ t: 'updateReady' }]);
+    expect(t.events).toStrictEqual([{ t: 'updateReady', activated: true }]);
   });
 
   it('a hidden page (Asleep or Paused) reloads at once', () => {
@@ -306,14 +306,14 @@ describe('setupPwa: an update another tab activated (#230)', () => {
     t.visibility.simulate('hidden');
     t.sw.dispatchEvent(new Event('controllerchange'));
     expect(t.reload).toHaveBeenCalledTimes(1);
-    expect(t.events).toEqual([{ t: 'updateReady' }]);
+    expect(t.events).toStrictEqual([{ t: 'updateReady', activated: true }]);
   });
 
   it('after it, applyUpdate reloads synchronously, once, without SKIP_WAITING', () => {
     const t = setup({ controller: {} });
     registered().onNeedRefresh?.(); // both tabs saw the waiting worker
     t.sw.dispatchEvent(new Event('controllerchange')); // the other tab activated it
-    expect(t.events).toEqual([{ t: 'updateReady' }, { t: 'updateReady' }]);
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }, { t: 'updateReady', activated: true }]);
     expect(t.reload).not.toHaveBeenCalled();
     t.api.applyUpdate();
     // No await between the call and the assertion: the session's hidden handler relies on this.
@@ -332,8 +332,47 @@ describe('setupPwa: an update another tab activated (#230)', () => {
     expect(t.reload).not.toHaveBeenCalled();
     expect(t.updateSW).not.toHaveBeenCalled();
     t.sw.dispatchEvent(new Event('controllerchange')); // a later version, activated by another tab
-    expect(t.events).toEqual([{ t: 'updateReady' }]);
+    expect(t.events).toStrictEqual([{ t: 'updateReady', activated: true }]);
     expect(t.reload).not.toHaveBeenCalled();
+  });
+});
+
+describe('setupPwa: the activated flag (#277)', () => {
+  it('only the activated-elsewhere dispatch carries activated: true (#277)', () => {
+    const t = setup({ controller: {} });
+    registered().onNeedRefresh?.(); // its own update: no flag
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }]);
+    t.api.applyUpdate();
+    t.sw.dispatchEvent(new Event('controllerchange')); // its own worker took control: the armed reload
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }]);
+    t.clock.advance(RELOAD_ARM_MS); // disarmed
+    t.sw.dispatchEvent(new Event('controllerchange')); // another tab activated a later version
+    expect(t.events).toStrictEqual([{ t: 'updateReady' }, { t: 'updateReady', activated: true }]);
+
+    // An uncontrolled page's first takeover (clientsClaim) dispatches nothing.
+    vi.unstubAllGlobals();
+    pwa.options.length = 0;
+    const first = setup({ controller: null });
+    first.sw.dispatchEvent(new Event('controllerchange'));
+    expect(first.events).toStrictEqual([]);
+  });
+
+  it("activatedElsewhere() is false until another tab's update, and stays false for its own", () => {
+    const own = setup({ controller: {} });
+    expect(own.api.activatedElsewhere()).toBe(false);
+    registered().onNeedRefresh?.();
+    expect(own.api.activatedElsewhere()).toBe(false);
+    own.api.applyUpdate();
+    own.sw.dispatchEvent(new Event('controllerchange')); // its own armed reload
+    expect(own.api.activatedElsewhere()).toBe(false);
+
+    vi.unstubAllGlobals();
+    pwa.options.length = 0;
+    const other = setup({ controller: {} });
+    expect(other.api.activatedElsewhere()).toBe(false);
+    other.sw.dispatchEvent(new Event('controllerchange')); // another tab activated it
+    expect(other.api.activatedElsewhere()).toBe(true);
+    expect(other.api.updateReady()).toBe(true);
   });
 });
 
