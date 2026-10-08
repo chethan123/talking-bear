@@ -18,6 +18,7 @@ import {
   directorReduce,
   directorStep,
   evaluate,
+  evaluateFrom,
   initialDirector,
   mouthCloseScale,
 } from './director.ts';
@@ -2700,5 +2701,46 @@ describe('#221: clipByName and the mouth channels through evaluate', () => {
         for (let i = 0; i < 1000; i++) evaluate(s, 11.5 + i * 0.0002, out, true);
       }),
     ).toBe(0);
+  });
+});
+
+// ---- #229: evaluate's time through a slot ------------------------------------------------------------------------
+
+describe('evaluateFrom (#229)', () => {
+  it('is evaluate with the time read from clock[at]: bit for bit on every channel, mouth on and off', () => {
+    const states: DirectorState[] = [];
+    for (const name of STATES) states.push(...variants(name));
+    for (const c of CLIP_NAMES) states.push(playing(c));
+    // Reactions held, released and easing out, one-shots, and cut fades with a prevClip, at 120 Hz.
+    const driven = drive(
+      stateIn('Idle', 9),
+      [petStroke(10), petStroke(10.3), release(10.6), noseTap(11), flick(11.05), tickle(11.4), release(11.6)],
+      12.5,
+    );
+    for (const { s } of driven.states) states.push(s);
+    expect(states.some((s) => s.prevClip !== null)).toBe(true);
+    expect(states.some((s) => s.reaction !== null && s.reaction.release !== null)).toBe(true);
+    const clock = new Float64Array(3);
+    const a = createPose();
+    const b = createPose();
+    let compared = 0;
+    for (const s of states) {
+      const t0 = s.clip?.start ?? s.fadeStart;
+      for (const now of [s.fadeStart, t0 + 0.05, t0 + 0.15, t0 + 1, Number.NaN]) {
+        for (const mouth of [false, true]) {
+          a.fill(7);
+          b.fill(7);
+          clock[2] = now;
+          expect(evaluate(s, now, a, mouth)).toBe(a);
+          expect(evaluateFrom(s, clock, 2, b, mouth)).toBe(b);
+          for (let ch = 0; ch < CH_COUNT; ch++) {
+            if (!Object.is(a[ch], b[ch]))
+              expect.fail(`channel ${ch} at ${now} (mouth ${mouth}): ${a[ch]} vs ${b[ch]}`);
+          }
+          compared++;
+        }
+      }
+    }
+    expect(compared).toBeGreaterThan(1000);
   });
 });

@@ -316,19 +316,45 @@ type Row = { readonly [K in AnimKind]: Handler<K> | 'ignore' };
 /** Where a step's outputs go; null when the caller (`directorReduce`) drops them. */
 type Out = DirOut[] | null;
 
+/** Where `writeClipEnd` puts its result (#229). */
+const END = new Float64Array(1);
 /**
- * End of `clip` on the director clock. A clip the director doesn't know has already ended. The active
- * reaction's clip ends 400 ms after its release; while held, a sustained clip never ends.
+ * The time of the tick in progress: `tick` writes it and `crossfade` reads it for that tick's `prevClip` expiry.
+ * `crossfade` sees every input kind, and reading the time from the input there makes V8 box it as a new heap number
+ * on every substep of a cut fade (#229).
  */
-function clipEnd(s: DirectorState, clip: { name: string; start: number }): number {
+const TICK_NOW = new Float64Array(1);
+
+/**
+ * Writes the end of `clip` on the director clock to `END[0]`. A clip the director doesn't know has already ended.
+ * The active reaction's clip ends 400 ms after its release; while held, a sustained clip never ends. The tick runs
+ * it every substep, so the end goes through a slot rather than a return value, which V8's mid tier boxes as a new
+ * heap number at a call it doesn't inline (#229).
+ */
+function writeClipEnd(s: DirectorState, clip: { name: string; start: number }): void {
   const c = CLIPS.get(clip.name);
-  if (c === undefined) return clip.start;
+  if (c === undefined) {
+    END[0] = clip.start;
+    return;
+  }
   const a = s.reaction;
   if (a !== null && clip.name === a.clip) {
-    if (a.release !== null) return a.release + RELEASE_S;
-    if (c.sustained === true && a.r.sustained) return Number.POSITIVE_INFINITY;
+    if (a.release !== null) {
+      END[0] = a.release + RELEASE_S;
+      return;
+    }
+    if (c.sustained === true && a.r.sustained) {
+      END[0] = Number.POSITIVE_INFINITY;
+      return;
+    }
   }
-  return clip.start + c.duration;
+  END[0] = clip.start + c.duration;
+}
+
+/** End of `clip` on the director clock (`writeClipEnd`), for the event paths. */
+function clipEnd(s: DirectorState, clip: { name: string; start: number }): number {
+  writeClipEnd(s, clip);
+  return END[0]!;
 }
 
 /**
@@ -782,17 +808,36 @@ function release(s: DirectorState, i: ReleaseInput, out: Out): DirectorState {
  * It runs once per 120 Hz substep, so it takes the input itself rather than its time: the smoke's path (no
  * reaction, no clip) passes no double across a call, which V8's mid tier would box (#229, the frame-allocation
  * smoke of #214). A non-finite time changes nothing: `t − t` is 0 for every finite `t` and NaN otherwise, a check
- * that, unlike `Number.isFinite`, needs no call.
+ * that, unlike `Number.isFinite`, needs no call. With a clip in the slot or a one-shot reaction on, no double crosses a
+ * call either: the clip end comes back through `END`, `isOver` is written out, and the time reaches `crossfade`
+ * through `TICK_NOW` (#229).
  */
 function tick(s: DirectorState, i: { readonly now: number }, out: Out): DirectorState {
   const now = i.now;
+  TICK_NOW[0] = now;
   if (now - now !== 0) return s;
   const a = s.reaction;
-  if (a !== null && (a.release !== null ? now >= a.release + RELEASE_S : !a.r.sustained && isOver(s, a, now)))
-    return endReaction(s, a, now, out);
+  if (a !== null) {
+    // isOver(s, a, now), written out: a call V8 doesn't inline boxes the double `now` (#229).
+    let over = false;
+    if (a.release !== null) over = now >= a.release + RELEASE_S;
+    else if (!a.r.sustained) {
+      const c = s.clip;
+      if (c === null || c.name !== a.clip) over = true;
+      else {
+        writeClipEnd(s, c);
+        over = now >= END[0]!;
+      }
+    }
+    if (over) return endReaction(s, a, now, out);
+  }
   const q = s.queued;
   if (q !== null && now > q.at + QUEUE_S) return { ...s, queued: null };
-  if (s.clip !== null && now < clipEnd(s, s.clip)) return s;
+  const c = s.clip;
+  if (c !== null) {
+    writeClipEnd(s, c);
+    if (now < END[0]!) return s;
+  }
   if (s.name === 'Waking') return enter(s, 'Idle', now, null);
   return s.clip === null ? s : { ...s, clip: null };
 }
@@ -856,7 +901,7 @@ function poseJump(a: Pose, b: Pose): number {
  *   (1 − k)·|cut − incoming|, never more than a plain cut, so the choice never pops worse than no crossfade.
  * - **Expiry:** the first tick at or after `cutAt` + 100 ms clears `prevClip`.
  * Otherwise it returns `next` itself. A step that changes nothing, with no `prevClip`, returns at the first line
- * and reads no time (the frame's quiet tick, #229).
+ * and reads no time (the frame's quiet tick, #229). The expiry reads a tick's time from `TICK_NOW`, not `i.now`.
  */
 function crossfade(s: DirectorState, next: DirectorState, i: DirInput): DirectorState {
   if (next === s && s.prevClip === null) return s;
@@ -875,8 +920,9 @@ function crossfade(s: DirectorState, next: DirectorState, i: DirInput): Director
     const keepJump = poseJump(evaluate(next, now, CUT_KEEP), CUT_FROM);
     return keepJump <= poseJump(evaluate(cut, now, CUT_NEW), CUT_FROM) ? next : cut;
   }
+  // A tick's time is `TICK_NOW[0]`: `tick` has just written it (directorStep and directorReduce run it first).
   const p = next.prevClip;
-  return p !== null && i.k === 'tick' && i.now >= p.cutAt + CUT_S ? { ...next, prevClip: null } : next;
+  return p !== null && i.k === 'tick' && TICK_NOW[0]! >= p.cutAt + CUT_S ? { ...next, prevClip: null } : next;
 }
 
 /** The outputs of the step in progress (`directorStep` is not re-entrant). */
@@ -905,6 +951,9 @@ export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
   return crossfade(s, i.k === 'tick' ? tick(s, i, null) : step(s, i, null), i);
 }
 
+/** `evaluate`'s time, for `evaluateFrom`. */
+const EVAL_NOW = new Float64Array(1);
+
 /**
  * Writes the director's pose at `now` into `out` and returns `out`: the crossfade
  * `prevBase + (base − prevBase)·t`, `t = clamp((now − fadeStart)/0.15, 0, 1)`, plus the active clip's sample;
@@ -920,6 +969,23 @@ export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
  * Never allocates.
  */
 export function evaluate(s: DirectorState, now: number, out: Pose, mouth = false): Pose {
+  EVAL_NOW[0] = now;
+  return evaluateFrom(s, EVAL_NOW, 0, out, mouth);
+}
+
+/**
+ * `evaluate(s, clock[at], out, mouth)`: the time is read from a `Float64Array` slot rather than passed, because
+ * V8's mid tier boxes a double passed to a call it doesn't inline (#229). bear-view calls it every frame with its
+ * director clock slot. Never allocates.
+ */
+export function evaluateFrom(
+  s: DirectorState,
+  clock: Readonly<Float64Array>,
+  at: number,
+  out: Pose,
+  mouth = false,
+): Pose {
+  const now = clock[at]!;
   const a = BASE[s.prevBase];
   const b = BASE[s.base];
   const f = (now - s.fadeStart) / CROSSFADE_S;
