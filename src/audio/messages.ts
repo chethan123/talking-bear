@@ -55,14 +55,16 @@ export type WorkerToMain =
   | { t: 'floorSnapshot'; epoch: number; floorDb: number } // taken at onset, restored at re-arm
   | { t: 'vadStats'; p95Ms: number }
   | { t: 'vadReady'; backend: 'silero' } // the worker's Silero model is loaded and set
-  // The feature trace, every 25 hops (250 ms) while `trace` is on, and the partial batch on `reset` / trace off.
-  // Per 10 ms hop: dBFS of the unfiltered and of the band-limited 16 kHz hop, and the voicing score; per 32 ms
-  // Silero frame: the model's p (before onset blocking) and its inference time in ms (both empty unless the
-  // epoch runs on Silero). hop0Frame / sil0Frame: ctx frames of the batch's first hop / first Silero frame
-  // (NaN when that stream is empty). While the trace stays on, each batch starts where the previous one of its
-  // epoch ended. Turned on mid-epoch, the first batch starts at the next hop to complete, so its hop0Frame can
-  // precede its sil0Frame. Turned on before an epoch's first frame, the first batch has hop0Frame = sil0Frame =
-  // that frame's firstFrame.
+  // The feature trace, every 25 hops (250 ms) while `trace` is on, and the partial batch on `reset`, trace off
+  // and a capture re-anchor (on Silero, a partial batch with no p is dropped there). Per 10 ms hop: dBFS of the
+  // unfiltered and of the band-limited 16 kHz hop, and the voicing score; per 32 ms Silero frame: the model's p
+  // (before onset blocking) and its inference time in ms (both empty unless the epoch runs on Silero).
+  // hop0Frame / sil0Frame: ctx frames of the batch's first hop / first Silero frame (NaN when that stream is
+  // empty). While the trace stays on, each batch starts where the previous one of its epoch ended, except
+  // across a capture re-anchor (plan §3.1, capture gaps): VadCore ends the batch at the gap, so a batch never
+  // spans one, and the next batch starts at the first hop after it. Turned on mid-epoch, the first batch starts
+  // at the next hop to complete, so its hop0Frame can precede its sil0Frame. Turned on before an epoch's first
+  // frame, the first batch has hop0Frame = sil0Frame = that frame's firstFrame.
   | {
       t: 'traceBatch';
       epoch: number;
