@@ -124,7 +124,7 @@ function onMainMessage(e: MessageEvent<MainToWorker>): void {
     case 'reset':
       try {
         if (core === null) throw new Error('reset before init');
-        core.reset(msg.epoch, msg.vad, msg.restoreFloorDb, msg.pregate, msg.proximityDb);
+        core.reset(msg.epoch, msg.vad, msg.restoreFloorDb, msg.pregate, msg.proximityDb, msg.marginBoostDb);
         // A Silero epoch without a model runs on energy: retry a failed load (#251). Once it lands, setModel
         // switches this epoch to Silero if its segmenter is still idle.
         if (msg.vad === 'silero') loadModel();

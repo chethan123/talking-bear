@@ -18,6 +18,7 @@ import {
   PREROLL_MS,
   PROXIMITY_DB,
   TAIL_MS,
+  VOICING_WINDOW,
 } from '../audio/constants.ts';
 import type { WorkerToMain } from '../audio/messages.ts';
 import { DEFAULT_ENERGY_PARAMS, createGateFilter, frameDb } from '../dsp/energy-gate.ts';
@@ -28,7 +29,7 @@ import { createSilero, type SileroModel } from '../dsp/silero/model.ts';
 import { decodeWeights, type SileroWeights } from '../dsp/silero/weights.ts';
 import { PRESETS } from '../dsp/types.ts';
 import { processVoice } from '../dsp/voice.ts';
-import { createVoicing } from '../dsp/voicing.ts';
+import { VOICED_THRESHOLD, createVoicing, type Voicing } from '../dsp/voicing.ts';
 import {
   CAPTURE_GAP_SLACK,
   LEVEL_EVERY_HOPS,
@@ -111,6 +112,51 @@ function ofType<T extends WorkerToMain['t']>(msgs: WorkerToMain[], t: T): Extrac
 
 function levels(msgs: WorkerToMain[]): Extract<WorkerToMain, { t: 'level' }>[] {
   return ofType(msgs, 'level');
+}
+
+/**
+ * Reference voicing (#116): for each 10 ms hop h of `frames` (one listen fed from ctx frame 0, no gap), whether
+ * the last VOICING_WINDOW gate-filtered samples at its end (zeros before the start) score above VOICED_THRESHOLD,
+ * as VadCore scores them.
+ */
+function hopVoiced(frames: Float32Array[]): boolean[] {
+  const filter = createGateFilter(16000);
+  const x = new Float32Array(frames.length * FRAME);
+  frames.forEach((f, k) => filter.process(f, x.subarray(k * FRAME, (k + 1) * FRAME)));
+  const voicing = createVoicing(16000);
+  const win = new Float32Array(VOICING_WINDOW);
+  return Array.from({ length: Math.floor(x.length / ENERGY_HOP) }, (_, h) => {
+    const end = (h + 1) * ENERGY_HOP;
+    const from = Math.max(0, end - VOICING_WINDOW);
+    win.fill(0);
+    win.set(x.subarray(from, end), VOICING_WINDOW - (end - from));
+    return voicing.score(win) > VOICED_THRESHOLD;
+  });
+}
+
+/** The voiced fraction of hops [first, last] (inclusive). */
+function ratioOf(voiced: readonly boolean[], first: number, last: number): number {
+  let n = 0;
+  for (let h = first; h <= last; h++) if (voiced[h] === true) n++;
+  return n / (last - first + 1);
+}
+
+/**
+ * 16 kHz frames (#116): `lead` frames of digital silence, `burst` frames of a 1 kHz sine at `db` dBFS RMS (exactly
+ * ten periods per 10 ms hop, so every full burst hop reads `db` in the gate band), then `tail` silent frames.
+ */
+function toneBurstFrames(db: number, lead: number, burst: number, tail: number): Float32Array[] {
+  const a = Math.SQRT2 * 10 ** (db / 20);
+  return Array.from({ length: lead + burst + tail }, (_, k) =>
+    k >= lead && k < lead + burst
+      ? Float32Array.from({ length: FRAME }, (_, i) => a * Math.sin((2 * Math.PI * 1000 * (k * FRAME + i)) / 16000))
+      : new Float32Array(FRAME),
+  );
+}
+
+/** The hops [first, last] a Silero segment from frame s to frame e counts: those completing in frames (s, e]. */
+function sileroHops(s: number, e: number): [number, number] {
+  return [Math.ceil(((s + 1) * FRAME + 1) / ENERGY_HOP) - 1, Math.floor(((e + 1) * FRAME) / ENERGY_HOP) - 1];
 }
 
 describe('VadCore on the fixtures (energy backend, ctxRate 48000)', () => {
@@ -366,6 +412,8 @@ function addNoise(x: Float32Array, n: Float32Array): Float32Array {
 
 /** Silero frame labels: every 512-sample frame starts at a multiple of 512 · 3 ctx frames. */
 const SILERO_GRID = FRAME * 3;
+/** One 10 ms hop in ctx frames (#116 tests): hop h of a listen fed from frame 0 starts at h · 480. */
+const HOP_CTX_116 = ENERGY_HOP * 3;
 
 /** Checks that the message right before the first `start` seg is a floorSnapshot with a finite floor. */
 function expectSnapshotBeforeStart(msgs: WorkerToMain[]): void {
@@ -767,13 +815,15 @@ describe('VadCore proximity gate (Silero segments)', () => {
     const pass = runSilero(frames, burstModel(LEAD, LEAD + BURST), false, 6);
     const fail = runSilero(frames, burstModel(LEAD, LEAD + BURST), false, 15);
     const evs = segs(pass.msgs);
+    const endFrame = evs[1]?.frame ?? Number.NaN;
     expect(evs).toEqual([
       { kind: 'start', frame: LEAD * SILERO_GRID },
       {
         kind: 'end',
-        frame: evs[1]?.frame,
+        frame: endFrame,
         lastSpeechFrame: (LEAD + BURST - 1) * SILERO_GRID,
         reason: 'silence',
+        voicedRatio: ratioOf(hopVoiced(frames), ...sileroHops(LEAD, endFrame / SILERO_GRID)),
       },
     ]);
     expectSnapshotBeforeStart(pass.msgs);
@@ -804,7 +854,11 @@ describe('VadCore proximity gate (Silero segments)', () => {
     const end = { kind: 'end', frame: (LEAD + burst - 1) * SILERO_GRID, reason: 'maxLength' } as const;
     expect(segs(pass.msgs)).toEqual([
       { kind: 'start', frame: LEAD * SILERO_GRID },
-      { ...end, lastSpeechFrame: end.frame },
+      {
+        ...end,
+        lastSpeechFrame: end.frame,
+        voicedRatio: ratioOf(hopVoiced(frames), ...sileroHops(LEAD, LEAD + burst - 1)),
+      },
     ]);
     expect(segs(fail.msgs)).toEqual([
       { kind: 'start', frame: LEAD * SILERO_GRID },
@@ -893,6 +947,163 @@ describe('VadCore proximity gate (Silero segments)', () => {
     fallback.core.reset(1, 'silero', undefined, false, 1000);
     feed(fallback, 1, frames16k(fixture('vowel_f0-140')));
     expect(fallback.msgs.slice(1)).toEqual(energy);
+  });
+});
+
+describe('VadCore voicedRatio and marginBoostDb (#116)', () => {
+  /** A Voicing that counts its score() calls. */
+  function countingVoicing(): Voicing & { calls: number } {
+    const inner = createVoicing(16000);
+    const v = {
+      calls: 0,
+      score(win: Float32Array): number {
+        v.calls++;
+        return inner.score(win);
+      },
+    };
+    return v;
+  }
+
+  /** Every `end` among `msgs` carries a numeric voicedRatio. */
+  function expectRatios(msgs: WorkerToMain[]): void {
+    for (const ev of segs(msgs)) if (ev.kind === 'end') expect(typeof ev.voicedRatio).toBe('number');
+  }
+
+  it('1: energy, vowel_f0-140: the end carries the voiced fraction of its hops, start hop to end hop', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const { msgs } = runFixture('vowel_f0-140');
+    const [start, end] = segs(msgs);
+    if (start?.kind !== 'start' || end?.kind !== 'end') throw new Error('expected start, end');
+    const want = ratioOf(hopVoiced(frames), start.frame / HOP_CTX_116, end.frame / HOP_CTX_116);
+    expect(end.voicedRatio).toBe(want);
+    expect(want).toBeGreaterThan(0.3);
+    expect(want).toBeLessThanOrEqual(1);
+    expectRatios(msgs);
+  });
+
+  it('2: energy, long_12s: the maxLength end of a long vowel is mostly voiced', () => {
+    const frames = frames16k(fixture('long_12s'));
+    const { msgs } = runFixture('long_12s');
+    const [start, end] = segs(msgs);
+    if (start?.kind !== 'start' || end?.kind !== 'end') throw new Error('expected start, end');
+    expect(end.reason).toBe('maxLength');
+    expect(end.voicedRatio).toBe(ratioOf(hopVoiced(frames), start.frame / HOP_CTX_116, end.frame / HOP_CTX_116));
+    expect(end.voicedRatio).toBeGreaterThan(0.3);
+    expectRatios(msgs);
+  });
+
+  it('3: Silero: the end counts the hops of the frames after the start frame, through the end frame', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const { msgs } = runSilero(frames, scriptedModel(0.9, 0.1));
+    const [start, end] = segs(msgs);
+    if (start?.kind !== 'start' || end?.kind !== 'end') throw new Error('expected start, end');
+    const want = ratioOf(
+      hopVoiced(frames),
+      ...sileroHops(start.frame / SILERO_GRID, end.frame / SILERO_GRID),
+    );
+    expect(end.voicedRatio).toBe(want);
+    expect(want).toBeGreaterThan(0.3);
+    expectRatios(msgs);
+  });
+
+  it('4: voicing is scored only for hops inside a segment, and for every hop with the trace on', () => {
+    const silence = frames16k(fixture('silence_2s'));
+    const vowel = frames16k(fixture('vowel_f0-140'));
+    const hopsIn = (frames: Float32Array[]): number => Math.floor((frames.length * FRAME) / ENERGY_HOP);
+    const count = (
+      frames: Float32Array[],
+      vad: 'energy' | 'silero',
+      trace = false,
+    ): { calls: number; msgs: WorkerToMain[] } => {
+      const voicing = countingVoicing();
+      const run = newCore(CTX_RATE, { voicing });
+      if (vad === 'silero') run.core.setModel(scriptedModel(0.9, 0.1));
+      run.core.setTrace(trace);
+      run.core.reset(1, vad);
+      feed(run, 1, frames);
+      return { calls: voicing.calls, msgs: run.msgs };
+    };
+    expect(count(silence, 'energy').calls).toBe(0);
+    expect(count(silence, 'silero').calls).toBe(0);
+    const energy = count(vowel, 'energy');
+    const [es, ee] = segs(energy.msgs);
+    expect(kinds(energy.msgs)).toEqual(['start', 'end']);
+    expect(energy.calls).toBe(ee!.frame / HOP_CTX_116 - es!.frame / HOP_CTX_116 + 1);
+    const silero = count(vowel, 'silero');
+    const [ss, se] = segs(silero.msgs);
+    expect(kinds(silero.msgs)).toEqual(['start', 'end']);
+    const [first, last] = sileroHops(ss!.frame / SILERO_GRID, se!.frame / SILERO_GRID);
+    expect(silero.calls).toBe(last - first + 1);
+    expect(count(vowel, 'energy', true).calls).toBe(hopsIn(vowel));
+    expect(count(silence, 'silero', true).calls).toBe(hopsIn(silence));
+  });
+
+  it('6: energy: marginBoostDb raises the onset margin', () => {
+    // A floor restored at −60 dBFS (digital silence never moves it), then a tone 12 dB above it: an onset with the
+    // 10 dB margin, none with 10 + 3.
+    const frames = toneBurstFrames(-48, 20, 30, 40);
+    const run = (boost?: number): string[] => {
+      const r = newCore();
+      r.core.reset(1, 'energy', -60, false, undefined, boost);
+      feed(r, 1, frames);
+      return kinds(r.msgs);
+    };
+    expect(run()).toEqual(['start', 'end']);
+    expect(run(3)).toEqual([]);
+    expect(run(1.9)).toEqual(['start', 'end']); // 12 > 11.9: the boost is added, not rounded
+  });
+
+  it('6b: energy: marginBoostDb raises the offset margin, so a segment closes earlier', () => {
+    // A loud onset (+20 dB), then a plateau 7 dB above the floor: it holds the gate open with the 5 dB offset
+    // margin, not with 5 + 3, so the segment closes ≈ 1.5 s earlier.
+    const x = concat48(
+      whiteNoise48(51, 1.5, -50),
+      whiteNoise48(52, 0.3, -30),
+      whiteNoise48(53, 1.5, -43),
+      whiteNoise48(54, 2, -50),
+    );
+    const closeAt = (boost?: number): number => {
+      const r = newCore();
+      r.core.reset(1, 'energy', undefined, false, undefined, boost);
+      feed(r, 1, frames16k(x));
+      const evs = segs(r.msgs);
+      expect(evs.map((e) => e.kind)).toEqual(['start', 'misfire']);
+      return evs[1]!.frame;
+    };
+    expect(closeAt() - closeAt(3)).toBeGreaterThanOrEqual(1.2 * CTX_RATE);
+  });
+
+  it('7: Silero: marginBoostDb is added to the proximity X, per epoch', () => {
+    const frames = burstFrames(71, -50, 12, LEAD, BURST, TAIL);
+    const m = proximityMargin(frames, runSilero(frames, burstModel(LEAD, LEAD + BURST), false, 6).msgs);
+    expect(m).toBeGreaterThan(9);
+    expect(m).toBeLessThan(15);
+    const run = newCore();
+    const epoch = (n: number, boost?: number): string[] => {
+      run.msgs.length = 0;
+      run.core.setModel(burstModel(LEAD, LEAD + BURST));
+      run.core.reset(n, 'silero', undefined, false, 9, boost);
+      feed(run, n, frames, n * 10 * CTX_RATE);
+      return kinds(run.msgs);
+    };
+    expect(epoch(1)).toEqual(['start', 'end']); // X = 9
+    expect(epoch(2, 6)).toEqual(['start', 'misfire']); // X = 15
+    expect(epoch(3)).toEqual(['start', 'end']); // the next reset without it: X = 9 again
+  });
+
+  it('8: an undefined, NaN or infinite marginBoostDb is 0', () => {
+    const frames = frames16k(fixture('vowel_f0-140_pink_snr10'));
+    const run = (boost?: number): WorkerToMain[] => {
+      const r = newCore();
+      r.core.reset(1, 'energy', undefined, false, undefined, boost);
+      feed(r, 1, frames);
+      return r.msgs;
+    };
+    const plain = run();
+    expect(kinds(plain)).toEqual(['start', 'end']);
+    for (const b of [0, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(run(b)).toEqual(plain);
+    }
   });
 });
 
@@ -1817,7 +2028,14 @@ describe('VadCore capture gaps (#244)', () => {
     // The segment ends at its last hop before the gap, before any message about the audio after it.
     const lastHop = (176 - 1) * HOP_CTX;
     expect(evs.map((e) => e.kind)).toEqual(['start', 'end', 'start', 'end']);
-    expect(evs[1]).toEqual({ kind: 'end', frame: lastHop, lastSpeechFrame: lastHop, reason: 'silence' });
+    expect(evs[1]).toEqual({
+      kind: 'end',
+      frame: lastHop,
+      lastSpeechFrame: lastHop,
+      reason: 'silence',
+      // #116: the hops from the start hop to the last hop before the gap.
+      voicedRatio: ratioOf(hopVoiced(frames.slice(0, cut)), evs[0]!.frame / HOP_CTX, 175),
+    });
     expect(segIndex(run.msgs, 1)).toBeLessThan(firstLevelAt(run.msgs, gapEnd));
     expect(takes[0]![1]).toBe(lastHop + TAIL_CTX);
     // The vowel after the gap is a segment of its own, from the re-anchor on.
@@ -1840,13 +2058,21 @@ describe('VadCore capture gaps (#244)', () => {
     const lastBefore = (cut - 1) * SILERO_GRID;
     expect(evs).toEqual([
       { kind: 'start', frame: LEAD * SILERO_GRID },
-      { kind: 'end', frame: lastBefore, lastSpeechFrame: lastBefore, reason: 'silence' },
+      {
+        kind: 'end',
+        frame: lastBefore,
+        lastSpeechFrame: lastBefore,
+        reason: 'silence',
+        // #116: the hops of the frames after the start frame, through the last frame before the gap.
+        voicedRatio: ratioOf(hopVoiced(frames.slice(0, cut)), ...sileroHops(LEAD, cut - 1)),
+      },
       { kind: 'start', frame: cut * SILERO_GRID + GAP },
       {
         kind: 'end',
         frame: evs[3]?.frame,
         lastSpeechFrame: (LEAD + BURST - 1) * SILERO_GRID + GAP,
         reason: 'silence',
+        voicedRatio: expect.any(Number),
       },
     ]);
     expect(segIndex(pass.msgs, 1)).toBeLessThan(firstLevelAt(pass.msgs, cut * SILERO_GRID + GAP));
@@ -2382,7 +2608,7 @@ describe('dsp.worker glue', () => {
     expect(fetchStub).toHaveBeenCalledTimes(2);
   });
 
-  it('reset forwards restoreFloorDb, pregate and proximityDb to the VadCore', async () => {
+  it('reset forwards restoreFloorDb, pregate, proximityDb and marginBoostDb to the VadCore', async () => {
     const { VadCore: WorkerCore } = await import('./vad-core.ts'); // the worker's instance of the module
     const reset = vi.spyOn(WorkerCore.prototype, 'reset');
     self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
@@ -2393,8 +2619,25 @@ describe('dsp.worker glue', () => {
       restoreFloorDb: -50,
       pregate: true,
       proximityDb: 9,
+      marginBoostDb: 3,
     });
-    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true, 9);
+    expect(reset).toHaveBeenCalledWith(2, 'silero', -50, true, 9, 3);
+  });
+
+  it('#116: a reset with marginBoostDb raises the onset margin of the core it reaches', () => {
+    // A floor restored at −60 dBFS and a tone 12 dB above it: an onset with the default 10 dB margin, none with
+    // 10 + 3.
+    const frames = toneBurstFrames(-48, 20, 30, 40);
+    const starts = (extra: { marginBoostDb?: number }): number => {
+      self.posted.length = 0;
+      const port = new FakePort();
+      self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+      self.dispatch({ t: 'reset', epoch: 9, vad: 'energy', restoreFloorDb: -60, ...extra });
+      frames.forEach((pcm16k, i) => port.dispatch({ t: 'frame', epoch: 9, firstFrame: i * SILERO_GRID, pcm16k }));
+      return kinds(self.posted.map((p) => p.msg)).filter((k) => k === 'start').length;
+    };
+    expect(starts({})).toBeGreaterThan(0);
+    expect(starts({ marginBoostDb: 3 })).toBe(0);
   });
 
   /** Inits a VadCore on a new port, resets it to `epoch` (energy) and feeds it `frames`. */
