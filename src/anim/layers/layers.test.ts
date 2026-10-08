@@ -809,6 +809,18 @@ describe('gaze', () => {
     expect(differ).toBe(0);
   });
 
+  it('sinceSaccade is +Infinity after construction and after updates before the first saccade', () => {
+    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    expect(layer.sinceSaccade).toBe(Number.POSITIVE_INFINITY);
+    const ctx = makeCtx();
+    // 60 updates of 1/60 s: 1 s, before SACCADE_MIN (1.5 s), the earliest first saccade.
+    for (let k = 0; k < 60; k++) {
+      layer.update(DT, createPose(), ctx);
+      expect(layer.count).toBe(0);
+      expect(layer.sinceSaccade).toBe(Number.POSITIVE_INFINITY);
+    }
+  });
+
   it('rejects bad spring indices', () => {
     expect(() => createGaze({ headRot: -1, headTilt: 0 })).toThrow(RangeError);
     expect(() => createGaze({ headRot: 0, headTilt: 1.5 })).toThrow(RangeError);
@@ -923,6 +935,18 @@ describe('ear twitch', () => {
         if (s !== IDX.earL && s !== IDX.earR) expect([springs.pos[s], springs.vel[s]]).toEqual([0, 0]);
       }
     });
+  });
+
+  it('sinceTwitch is +Infinity after construction and after updates before the first twitch', () => {
+    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+    expect(layer.sinceTwitch).toBe(Number.POSITIVE_INFINITY);
+    const ctx = makeCtx();
+    // 300 updates of 1/60 s: 5 s, before EAR_TWITCH_MIN (6 s), the earliest first twitch.
+    for (let k = 0; k < 300; k++) {
+      layer.update(DT, createPose(), ctx);
+      expect(layer.count).toBe(0);
+      expect(layer.sinceTwitch).toBe(Number.POSITIVE_INFINITY);
+    }
   });
 
   it('rejects bad spring indices', () => {
