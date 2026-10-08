@@ -975,10 +975,12 @@ describe('clarifications C1–C12', () => {
         const plain = run(stateIn(name), { t });
         expect(plain.state.name).toBe(hideTarget(name));
         expect(plain.effects.some((f) => f.k === 'applyUpdate')).toBe(false);
-        const ready = run(stateIn(name, { updateReady: true }), { t });
-        expect(ready.effects.at(-1)).toStrictEqual({ k: 'applyUpdate' });
-        expect(ready.effects.slice(0, -1)).toStrictEqual(plain.effects);
-        expect(ready.state).toStrictEqual({ ...plain.state, updateReady: false });
+        for (const flags of [{ updateReady: true }, { updateReady: true, updateActivated: true }]) {
+          const ready = run(stateIn(name, flags), { t });
+          expect(ready.effects.at(-1)).toStrictEqual({ k: 'applyUpdate' });
+          expect(ready.effects.slice(0, -1)).toStrictEqual(plain.effects);
+          expect(ready.state).toStrictEqual({ ...plain.state, updateReady: false, updateActivated: false });
+        }
       }
     }
     // Already asleep: hidden has no effect but the update.
@@ -1302,6 +1304,114 @@ describe("#266: settingsRetry from Asleep (the parent's retry wakes as the tap d
   });
 });
 
+// ---- #277: a visible Asleep page another tab updated reloads at its next wake (row 3c) ---------------------------
+describe('#277: an Asleep wake after another tab activated the update reloads instead', () => {
+  const PERMISSIONS = ['granted', 'prompt', 'denied'] as const;
+  const APPLY: Effect[] = [{ k: 'applyUpdate' }];
+  const flagged = (name: StateName, over: Partial<SessionState> = {}): SessionState =>
+    stateIn(name, { updateReady: true, updateActivated: true, ...over });
+
+  it('updateReady{activated} sets both flags in every state; a later plain updateReady keeps the flag', () => {
+    for (const name of STATES) {
+      const a = run(stateIn(name), { t: 'updateReady', activated: true });
+      expect(a.effects).toStrictEqual([]);
+      expect(a.state).toStrictEqual({ ...stateIn(name), updateReady: true, updateActivated: true });
+      const p = run(stateIn(name), { t: 'updateReady' });
+      expect(p.effects).toStrictEqual([]);
+      expect(p.state).toStrictEqual({ ...stateIn(name), updateReady: true });
+      expect(p.state.updateActivated).toBe(false);
+      // Its own onNeedRefresh of an even newer version: the page still runs old code.
+      expectIgnored(a.state, { t: 'updateReady' });
+      expectIgnored(a.state, { t: 'updateReady', activated: true });
+    }
+  });
+
+  it('Asleep + tapBear with the flag → applyUpdate only, the same state, no wake effects (Validation 2a)', () => {
+    for (const permission of PERMISSIONS) {
+      const s = flagged('Asleep', { permission });
+      expectStep(s, { t: 'tapBear' }, 'Asleep', APPLY);
+      expect(run(s, { t: 'tapBear' }).state).toBe(s);
+    }
+  });
+
+  it('Asleep + settingsRetry with the flag → applyUpdate only, as the tap (Decision 1)', () => {
+    for (const permission of PERMISSIONS) {
+      const s = flagged('Asleep', { permission });
+      expectStep(s, { t: 'settingsRetry' }, 'Asleep', APPLY);
+      expect(run(s, { t: 'settingsRetry' }).state).toBe(s);
+    }
+  });
+
+  it('without the flag, Asleep + tapBear is rows 1–3, with or without its own update ready (Validation 2b)', () => {
+    for (const updateReady of [false, true]) {
+      expectStep(
+        stateIn('Asleep', { updateReady }),
+        { t: 'tapBear' },
+        'Waking',
+        [RESUME, anim('wake'), ...wakingEntry(REQ + 1), wakeLock(true), ui(null)],
+        { micReq: REQ + 1, micGranted: false },
+      );
+      expectStep(stateIn('Asleep', { updateReady, permission: 'prompt' }), { t: 'tapBear' }, 'NeedsParent', [
+        RESUME,
+        SLEEP_T,
+        wakeLock(true),
+        ui('parentPermission'),
+      ]);
+      expectStep(stateIn('Asleep', { updateReady, permission: 'denied' }), { t: 'tapBear' }, 'MicDenied', [
+        RESUME,
+        anim('wake'),
+        SLEEP_T,
+        ui('micHelp'),
+      ]);
+    }
+  });
+
+  it('the flag changes nothing but the Asleep wake: every state × every event type (Validation 2c)', () => {
+    let pairs = 0;
+    for (const name of STATES) {
+      const withFlag = flagged(name);
+      const plain = stateIn(name, { updateReady: true });
+      for (const t of EVENT_TYPES) {
+        if (name === 'Asleep' && (t === 'tapBear' || t === 'settingsRetry')) continue;
+        for (const e of SAMPLES[t](plain) as SessionEvent[]) {
+          const x = run(withFlag, e);
+          const y = run(plain, e);
+          const label = `${name} + ${JSON.stringify(e)}`;
+          expect(x.effects, label).toStrictEqual(y.effects);
+          expect({ ...x.state, updateActivated: false }, label).toStrictEqual({
+            ...y.state,
+            updateActivated: false,
+          });
+          expect(x.state.updateActivated, label).toBe(!x.effects.some((f) => f.k === 'applyUpdate'));
+          pairs++;
+        }
+      }
+    }
+    expect(pairs).toBeGreaterThan(STATES.length * (EVENT_TYPES.length - 1));
+  });
+
+  it('before the reload commits, a second tap or retry reloads again and never wakes; C11 then clears the flag', () => {
+    const s = flagged('Asleep');
+    let r = run(s, { t: 'tapBear' });
+    r = run(r.state, { t: 'tapBear' }); // a second pointerdown (two fingers, a quick double tap)
+    expect(r.effects).toStrictEqual(APPLY);
+    expect(r.state).toBe(s);
+    r = run(r.state, { t: 'settingsRetry' });
+    expect(r.effects).toStrictEqual(APPLY);
+    expect(r.state).toBe(s);
+    r = run(r.state, { t: 'hidden' }); // C11
+    expect(r.effects).toStrictEqual(APPLY);
+    expect(r.state).toStrictEqual({ ...s, updateReady: false, updateActivated: false });
+    expectStep(
+      r.state,
+      { t: 'tapBear' },
+      'Waking',
+      [RESUME, anim('wake'), ...wakingEntry(REQ + 1), wakeLock(true), ui(null)],
+      { micReq: REQ + 1, micGranted: false },
+    ); // row 1
+  });
+});
+
 // ---- Validation 4 and 5: the full (state × event) cross product ------------------------------------------------
 /** Representative current events for every event type. A missing type is a compile error. */
 const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
@@ -1352,7 +1462,7 @@ const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
   pagehide: () => [{ t: 'pagehide' }],
   freeze: () => [{ t: 'freeze' }],
   visible: () => [{ t: 'visible' }],
-  updateReady: () => [{ t: 'updateReady' }],
+  updateReady: () => [{ t: 'updateReady' }, { t: 'updateReady', activated: true }],
   settingsChanged: () => [
     { t: 'settingsChanged', preset: PRESETS.chipmunk },
     { t: 'settingsChanged', preset: { id: 'custom', pitchRatio: 1.85 } },
@@ -1451,6 +1561,7 @@ function variants(name: StateName): SessionState[] {
       floorDb: undefined,
       capHits: 2,
     }),
+    stateIn(name, { updateReady: true, updateActivated: true }), // #277: another tab activated the update
   ];
 }
 
@@ -1473,9 +1584,17 @@ function checkInvariants(s: SessionState, e: SessionEvent, effects: Effect[], ne
   expect(effects.some((f) => f.k === 'disarm')).toBe(ARMED.has(s.name) && !ARMED.has(next.name));
   expect(effects.some((f) => f.k === 'openMic')).toBe(next.name === 'Waking' && next.micReq !== s.micReq);
   if (effects.some((f) => f.k === 'applyUpdate')) {
-    expect(['hidden', 'pagehide', 'freeze']).toContain(e.t);
-    expect(['Asleep', 'Paused']).toContain(next.name);
+    if (s.name === 'Asleep' && s.updateActivated && (e.t === 'tapBear' || e.t === 'settingsRetry')) {
+      // #277, row 3c: an Asleep wake after another tab's update only reloads, and keeps the state.
+      expect(effects).toStrictEqual([{ k: 'applyUpdate' }]);
+      expect(next).toBe(s);
+    } else {
+      // C11
+      expect(['hidden', 'pagehide', 'freeze']).toContain(e.t);
+      expect(['Asleep', 'Paused']).toContain(next.name);
+    }
   }
+  if (next.updateActivated) expect(next.updateReady).toBe(true);
 }
 
 describe('cross product (state × event)', () => {
@@ -1520,7 +1639,7 @@ describe('cross product (state × event)', () => {
         }
       }
     }
-    expect(stale).toBe(STATES.length * 2 * 16);
+    expect(stale).toBe(STATES.length * 3 * 16);
   });
 
   it('reduce never mutates its input (the frozen input is unchanged)', () => {
@@ -1592,6 +1711,7 @@ describe('initial state and config', () => {
       sfxEndedSeq: 0,
       micDeniedSfx: false,
       updateReady: false,
+      updateActivated: false,
       preset: PRESETS.cub,
     });
   });

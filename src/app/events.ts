@@ -69,7 +69,7 @@ export type SessionEvent =
   | { t: 'pagehide' }
   | { t: 'freeze' }
   | { t: 'visible' }
-  | { t: 'updateReady' }
+  | { t: 'updateReady'; activated?: true } // activated: another tab activated the update (#277)
   // M3 settings (issue #66): the voice preset the next `process` uses. Every state updates `preset`, no effects.
   | { t: 'settingsChanged'; preset: VoicePreset };
 export type EventType = SessionEvent['t'];
@@ -118,6 +118,11 @@ export interface SessionState {
   /** A MicDenied reaction played an sfx since the last Waking completion (D22). */
   micDeniedSfx: boolean;
   updateReady: boolean;
+  /**
+   * Another tab activated the update: this page runs old code, so an Asleep wake reloads it instead (#277).
+   * Implies `updateReady`; only C11 clears it.
+   */
+  updateActivated: boolean;
   preset: VoicePreset;
 }
 
