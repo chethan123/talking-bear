@@ -18,6 +18,8 @@
  * - Spring kicks use `SPRING` indices (springs-map.ts). Each kick is sized by the peak it gives from rest
  *   with the spring's own constants (`kick`).
  * - Content (plan Q3): surprise, ticklishness, delight or mild grumpiness only.
+ * - Mimes (`MIME_CLIPS`, #115) are clips the app asks the director for by name (`{k:'clip'}`), not reactions of the
+ *   #90 table: the MicDenied cupped ear.
  */
 import type { Clip, Key, Track } from '../clip.ts';
 import { Ch } from '../pose.ts';
@@ -694,6 +696,55 @@ const kerchiefAdjust: Clip = {
     { t: 0.5, spring: SPRING.kerchiefB, dv: kick(SPRING.kerchiefB, TAIL_SWING) },
   ],
 };
+
+// ---- mimes ------------------------------------------------------------------------------------------------
+
+/** The cupped ear's timing (s): the paw rises, holds for 1.5 s (#115), and comes back down. */
+const CUP_RAISE_S = 0.4;
+const CUP_HOLD_S = 1.5;
+const CUP_LOWER_S = 0.5;
+/**
+ * The left paw raised beside the head. The arm (170 units) can't reach the ear, 440 units above the shoulder; at
+ * 145° the paw stays in front of the head silhouette, which is drawn over the arm (165° hid most of it).
+ */
+const CUP_ARM = 145 * DEG;
+/** The head rolls toward the raised paw (counter-clockwise: `HeadRot` −), bringing the ear down to it. */
+const CUP_LEAN = 12 * DEG;
+/** The left ear turns outward, toward the paw (`EarRotL` −). */
+const CUP_EAR = 15 * DEG;
+/** Brows up: listening hard. */
+const CUP_BROW = 4;
+
+/**
+ * MicDenied (#115): "I can't hear you": the left paw goes up beside the left ear, the head tilts toward it and the
+ * ear turns out to it, brows up; held for 1.5 s, then back to neutral. Calm, so it has no gentle variant: reduced
+ * motion already scales its `HeadRot`.
+ */
+const cuppedEar: Clip = (() => {
+  const held = CUP_RAISE_S + CUP_HOLD_S;
+  const end = held + CUP_LOWER_S;
+  const hold = (ch: number, v: number): Track =>
+    track(ch, k(0, 0, 'inOut'), k(CUP_RAISE_S, v), k(held, v, 'inOut'), k(end, 0));
+  return {
+    name: 'cuppedEar',
+    duration: end,
+    tracks: [
+      hold(ARM.L, ARM_UP.L * CUP_ARM),
+      hold(Ch.HeadRot, -ARM_UP.L * CUP_LEAN),
+      hold(Ch.EarRotL, EAR_OUT.L * CUP_EAR),
+      ...brows(k(0, 0, 'out'), k(0.3, CUP_BROW), k(held, CUP_BROW, 'inOut'), k(end, 0)),
+    ],
+  };
+})();
+
+/** The mimes, by name: clips the app asks the director for by name (`{k:'clip'}`, #115). */
+export type MimeClipName = 'cuppedEar';
+
+/**
+ * The mime clips; each clip's `name` equals its key. They are not reactions of the #90 table, so they are kept out
+ * of `REACTION_CLIPS`; the director plays them too.
+ */
+export const MIME_CLIPS: Readonly<Record<MimeClipName, Clip>> = { cuppedEar };
 
 // ---- the set ------------------------------------------------------------------------------------------------
 
