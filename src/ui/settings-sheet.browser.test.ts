@@ -889,7 +889,7 @@ describe('For parents (#114)', () => {
     expect(dialog().open).toBe(false);
   });
 
-  test('the retry dispatches settingsRetry in every state: the session decides (it acts only in MicDenied)', () => {
+  test('the retry dispatches settingsRetry in every state: the session decides (it acts only in MicDenied and Asleep)', () => {
     for (const name of STATES) {
       const h = harness();
       const sheet = mountSettingsSheet(root, h.deps);

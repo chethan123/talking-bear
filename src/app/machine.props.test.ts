@@ -370,7 +370,8 @@ describe('session reducer properties (plan §4.9.1)', () => {
     expect(report.cause).toBeInstanceOf(Error);
     const trace = report.cause instanceof Error ? report.cause.message : '';
     expect(trace).toMatch(/^reached Listening\ntrace \(\d+ events\):\n/);
-    expect(trace).toMatch(/ inject tapBear: Asleep -> /); // only a tap leaves Asleep
+    // Only tapBear and settingsRetry (#266) leave Asleep, identically, so the shrinker keeps the tap.
+    expect(trace).toMatch(/ inject tapBear: Asleep -> /);
     expect(trace).toMatch(/: \w+ -> Listening \[/);
   });
 
