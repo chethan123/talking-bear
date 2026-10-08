@@ -215,6 +215,7 @@ interface FixtureSpec {
 }
 
 const TEST: FixtureTarget[] = ['test'];
+const E2E: FixtureTarget[] = ['e2e'];
 const BOTH: FixtureTarget[] = ['test', 'e2e'];
 
 const seconds = (s: number): number => Math.round(s * SAMPLE_RATE);
@@ -277,6 +278,14 @@ const FIXTURE_SPECS: FixtureSpec[] = [
     name: 'vowel_short_100ms',
     targets: TEST,
     build: (rng) => ({ sound: vowel(rng, 140, 0.1), speech: true, f0: 140 }),
+  },
+  {
+    // The fake mic of e2e/noisy.spec.ts (#116): a room whose background never falls silent. Full-band pink noise
+    // at −20 dBFS RMS reads well above the −35 dBFS too-noisy threshold in the VAD's 200–3400 Hz gate band (at
+    // −30 dBFS it would read ≈ −34, too close to trip it reliably).
+    name: 'noise_pink_-20dbfs_20s',
+    targets: E2E,
+    build: (rng) => ({ sound: scaleToRmsDb(pinkNoise(rng, seconds(20)), -20) }),
   },
 ];
 

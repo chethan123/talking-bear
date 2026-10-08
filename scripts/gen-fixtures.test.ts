@@ -61,6 +61,8 @@ const EXPECTED: ExpectedFixture[] = [
     speech: true,
     f0: 140,
   },
+  // #116: the noisy.spec fake mic (e2e only).
+  { name: 'noise_pink_-20dbfs_20s', targets: ['e2e'], sound: 960_000, tail: 14_400, total: 1_022_400 },
 ];
 
 const FILES = EXPECTED.flatMap((e) => e.targets.map((target) => ({ ...e, target })));
@@ -150,6 +152,11 @@ describe.each(FILES)('$target/fixtures/$name', (e) => {
   });
 });
 
+/** The directory a fixture is loaded from: test/fixtures, or e2e/fixtures for an e2e-only one. */
+function targetOf(name: string): string {
+  return EXPECTED.find((e) => e.name === name)!.targets[0]!;
+}
+
 /** End (exclusive) of a fixture's sound span. */
 function soundEnd(name: string): number {
   return LEAD_SAMPLES + EXPECTED.find((e) => e.name === name)!.sound;
@@ -238,8 +245,9 @@ describe('signal levels', () => {
     ['noise_white_-60dbfs_3s', -60],
     ['noise_pink_-40dbfs_5s', -40],
     ['sine_1k_-20dbfs_1s', -20],
+    ['noise_pink_-20dbfs_20s', -20],
   ])('%s has RMS %d dBFS over the sound span', (name, db) => {
-    const x = load(name);
+    const x = load(name, targetOf(name));
     expect(Math.abs(rmsDb(x, LEAD_SAMPLES, soundEnd(name)) - db)).toBeLessThanOrEqual(0.05);
   });
 
@@ -283,8 +291,9 @@ describe('signal levels', () => {
   test.each([
     ['noise_pink_-40dbfs_5s', 10],
     ['noise_white_-60dbfs_3s', 0],
+    ['noise_pink_-20dbfs_20s', 10],
   ])('%s: PSD in 100–200 Hz is %d ± 2 dB above 1–2 kHz', (name, db) => {
-    const x = load(name);
+    const x = load(name, targetOf(name));
     const slope =
       bandDensityDb(x, LEAD_SAMPLES, soundEnd(name), 100, 200) -
       bandDensityDb(x, LEAD_SAMPLES, soundEnd(name), 1000, 2000);
