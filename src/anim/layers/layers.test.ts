@@ -40,6 +40,7 @@ import {
   createGaze,
   createMood,
 } from './index.ts';
+import { EAR_ORIENT_MAX, EAR_ORIENT_TAU } from './ear-twitch.ts';
 import type { AnimContext, Layer, LayerWeights, LookAt, MoodLayer } from './index.ts';
 
 /** The issue's simulation step (#78 Validation): dt = 1/60 s. */
@@ -954,6 +955,231 @@ describe('ear twitch', () => {
     expect(() => createEarTwitch({ earL: 0, earR: Number.NaN })).toThrow(RangeError);
     const layer = createEarTwitch({ earL: BANK_SIZE, earR: 0 });
     expect(() => layer.update(DT, createPose(), makeCtx())).toThrow(RangeError);
+  });
+});
+
+/** Degrees to radians. */
+const DEG = Math.PI / 180;
+/** Slack on the step times of the #255 tests: i·dt and (i + 1)·dt carry rounding error. */
+const T_EPS = 1e-9;
+
+/** The ear channels of a fresh ear layer after each step, its twitch clock, and its bank (#255). */
+interface EarTrace {
+  earL: Float64Array;
+  earR: Float64Array;
+  count: Float64Array;
+  right: Float64Array;
+  since: Float64Array;
+  springs: SpringBank;
+}
+
+/**
+ * Steps a fresh ear layer (IDX springs, seed SEED) the app's way at `dt` for `seconds`, on a +0-filled pose: at
+ * step i, `ctx.lookAt = lookAtAt(i·dt)` (the step's start time), then `springs.step(dt)` and `update`. Step i ends
+ * at (i + 1)·dt.
+ */
+function earRun(
+  dt: number,
+  seconds: number,
+  lookAtAt: (t: number) => LookAt | null,
+  weights: LayerWeights = { ...FULL },
+): EarTrace {
+  const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+  const ctx = makeCtx(SEED, weights);
+  const steps = Math.round(seconds / dt);
+  const out: EarTrace = {
+    earL: new Float64Array(steps),
+    earR: new Float64Array(steps),
+    count: new Float64Array(steps),
+    right: new Float64Array(steps),
+    since: new Float64Array(steps),
+    springs: ctx.springs,
+  };
+  const pose = createPose();
+  for (let i = 0; i < steps; i++) {
+    ctx.lookAt = lookAtAt(i * dt);
+    ctx.springs.step(dt);
+    pose.fill(0);
+    layer.update(dt, pose, ctx);
+    out.earL[i] = pose[Ch.EarRotL]!;
+    out.earR[i] = pose[Ch.EarRotR]!;
+    out.count[i] = layer.count;
+    out.right[i] = layer.right;
+    out.since[i] = layer.sinceTwitch;
+  }
+  return out;
+}
+
+const NO_TOUCH = (): null => null;
+
+/** A touch at `point` held while 1 s ≤ t < 3 s (t: a step's start time). */
+function heldFrom1To3(point: LookAt): (t: number) => LookAt | null {
+  return (t) => (t >= 1 - T_EPS && t < 3 - T_EPS ? point : null);
+}
+
+/** The left ear's Δ (touch − no touch) at the last step ending by 1.15 s, with `heldFrom1To3(point)` at `dt`. */
+function deltaBy150ms(point: LookAt, dt: number): number {
+  const touch = earRun(dt, 2, heldFrom1To3(point));
+  const none = earRun(dt, 2, NO_TOUCH);
+  let last = -1;
+  for (let i = 0; (i + 1) * dt <= 1.15 + T_EPS; i++) last = i;
+  return touch.earL[last]! - none.earL[last]!;
+}
+
+/** Δ (touch − no touch) of both ears after 1 s held at `point`, at SUBSTEP. */
+function settledDelta(point: LookAt): [number, number] {
+  const t = earRun(SUBSTEP, 1, () => point);
+  const n = earRun(SUBSTEP, 1, NO_TOUCH);
+  const k = t.earL.length - 1;
+  return [t.earL[k]! - n.earL[k]!, t.earR[k]! - n.earR[k]!];
+}
+
+describe('ear orientation toward a background touch (#255)', () => {
+  it('uses an 8° cap and a 50 ms time constant', () => {
+    expect(EAR_ORIENT_MAX).toBe((8 * Math.PI) / 180);
+    expect(EAR_ORIENT_TAU).toBe(0.05);
+  });
+
+  describe.each<{ side: string; point: LookAt; sign: number }>([
+    { side: 'left', point: { x: 100, y: 385 }, sign: -1 },
+    { side: 'right', point: { x: 900, y: 385 }, sign: 1 },
+  ])('a touch $side of the head, held from 1 s to 3 s', ({ point, sign }) => {
+    it.each([
+      { name: 'SUBSTEP', dt: SUBSTEP },
+      { name: '1/60 s', dt: 1 / 60 },
+    ])('turns both ears $side within 150 ms and back within 300 ms at $name', ({ dt }) => {
+      // 4 s: the first twitch is at 6 s or later, so the springs rest and the no-touch channels are 0.
+      const touch = earRun(dt, 4, heldFrom1To3(point));
+      const none = earRun(dt, 4, NO_TOUCH);
+      const cap = EAR_ORIENT_MAX;
+      let first = -1;
+      let last150 = -1;
+      for (let i = 0; i < touch.earL.length; i++) {
+        const dL = touch.earL[i]! - none.earL[i]!;
+        const dR = touch.earR[i]! - none.earR[i]!;
+        expect(dL, `step ${i}`).toBe(dR);
+        expect(Math.abs(dL), `step ${i}`).toBeLessThanOrEqual(cap + 1e-9);
+        if (first === -1 && i * dt >= 1 - T_EPS) first = i;
+        if ((i + 1) * dt <= 1.15 + T_EPS) last150 = i;
+        if ((i + 1) * dt >= 3.3 - T_EPS) expect(Math.abs(dL), `step ${i}`).toBeLessThan(1 * DEG);
+      }
+      expect(touch.count[touch.count.length - 1]).toBe(0);
+      // Eased, not snapped: the first step of the touch moves the ears by less than half the cap.
+      const d0 = touch.earL[first]! - none.earL[first]!;
+      expect(sign * d0).toBeGreaterThan(0);
+      expect(Math.abs(d0)).toBeLessThan(cap / 2);
+      // More than half the cap, toward the point, on both ears by 150 ms.
+      const d150L = touch.earL[last150]! - none.earL[last150]!;
+      const d150R = touch.earR[last150]! - none.earR[last150]!;
+      expect(sign * d150L).toBeGreaterThan(cap / 2);
+      expect(sign * d150R).toBeGreaterThan(cap / 2);
+      expect(d150L).toBe(deltaBy150ms(point, dt));
+    });
+
+    it('reaches the same angle by 150 ms at SUBSTEP and at 1/60 s (frame-rate independent)', () => {
+      const a = deltaBy150ms(point, SUBSTEP);
+      expect(sign * a).toBeGreaterThan(EAR_ORIENT_MAX / 2);
+      expect(Math.abs(a - deltaBy150ms(point, 1 / 60))).toBeLessThanOrEqual(1e-6);
+    });
+  });
+
+  it('scales with the horizontal offset from the head’s centre line only, capped, and ignores a non-finite point', () => {
+    const cap = EAR_ORIENT_MAX;
+    expect(settledDelta({ x: EYES_CENTER.x, y: 385 })).toEqual([0, 0]);
+    for (const [point, want] of [
+      [{ x: EYES_CENTER.x + LOOK_SATURATE / 2, y: 385 }, cap / 2],
+      [{ x: EYES_CENTER.x - LOOK_SATURATE / 2, y: 1300 }, -cap / 2],
+      [{ x: 5000, y: 385 }, cap],
+      [{ x: -3000, y: 385 }, -cap],
+    ] as const) {
+      for (const d of settledDelta(point))
+        expect(Math.abs(d - want), `${point.x}, ${point.y}`).toBeLessThanOrEqual(1e-6);
+    }
+    expect(settledDelta({ x: Number.NaN, y: 385 })).toEqual([0, 0]);
+    expect(settledDelta({ x: 300, y: Number.POSITIVE_INFINITY })).toEqual([0, 0]);
+  });
+
+  it('changes nothing without a touch: the ear channels hash as on main 49ee2b3 (seed 0x7467)', () => {
+    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+    const ctx = makeCtx();
+    const b = base();
+    const pose = createPose();
+    const bits = new Uint32Array(pose.buffer);
+    let h = 0x811c9dc5;
+    let foreign = 0;
+    for (let i = 0; i < 7200; i++) {
+      ctx.weights.ears = i < 3600 ? 1 : 0.6;
+      ctx.springs.step(SUBSTEP);
+      pose.set(b);
+      layer.update(SUBSTEP, pose, ctx);
+      h = Math.imul(h ^ bits[Ch.EarRotL]!, 0x01000193) >>> 0;
+      h = Math.imul(h ^ bits[Ch.EarRotR]!, 0x01000193) >>> 0;
+      for (let c = 0; c < CH_COUNT; c++) {
+        if (c !== Ch.EarRotL && c !== Ch.EarRotR && !Object.is(pose[c], b[c])) foreign++;
+      }
+    }
+    // Recorded on main 49ee2b3, before the orientation existed, with this exact recipe.
+    expect(h.toString(16)).toBe('3c681048');
+    expect([layer.count, layer.right]).toEqual([4, 2]);
+    expect(foreign).toBe(0);
+  });
+
+  it('keeps the idle twitches on top of the orientation, with the same timing', () => {
+    const cap = EAR_ORIENT_MAX;
+    const touch = earRun(SUBSTEP, 60, () => ({ x: 100, y: 385 }));
+    const none = earRun(SUBSTEP, 60, NO_TOUCH);
+    expect(touch.count).toEqual(none.count);
+    expect(touch.since).toEqual(none.since);
+    let worst = 0;
+    for (let i = 0; i < touch.earL.length; i++) {
+      if ((i + 1) * SUBSTEP < 1 - T_EPS) continue;
+      worst = Math.max(
+        worst,
+        Math.abs(touch.earL[i]! - none.earL[i]! + cap),
+        Math.abs(touch.earR[i]! - none.earR[i]! + cap),
+      );
+    }
+    expect(worst).toBeLessThanOrEqual(1e-6);
+    // Each twitch shows on the twitched ear: within 100 ms it is more than 6° away from the orientation alone.
+    let twitches = 0;
+    for (let i = 1; i < touch.count.length; i++) {
+      if (touch.count[i] === touch.count[i - 1]) continue;
+      twitches++;
+      const ear = touch.right[i] !== touch.right[i - 1] ? touch.earR : touch.earL;
+      let away = 0;
+      for (let j = i; j < Math.min(ear.length, i + Math.round(0.1 / SUBSTEP)); j++) {
+        away = Math.max(away, Math.abs(ear[j]! + cap));
+      }
+      expect(away, `twitch at step ${i}`).toBeGreaterThan(6 * DEG);
+    }
+    expect(twitches).toBeGreaterThanOrEqual(3);
+    // No spring physics: the bank's targets stay 0, and the other springs at rest.
+    const { springs } = touch;
+    for (let s = 0; s < BANK_SIZE; s++) {
+      expect(springs.target[s]).toBe(0);
+      if (s !== IDX.earL && s !== IDX.earR) expect([springs.pos[s], springs.vel[s]]).toEqual([0, 0]);
+    }
+  });
+
+  it('scales with the ears weight: half at 0.5, nothing at 0', () => {
+    const point: LookAt = { x: 100, y: 385 };
+    const full = earRun(SUBSTEP, 2, () => point, { ...FULL, ears: 1 });
+    const fullNone = earRun(SUBSTEP, 2, NO_TOUCH, { ...FULL, ears: 1 });
+    const half = earRun(SUBSTEP, 2, () => point, { ...FULL, ears: 0.5 });
+    const halfNone = earRun(SUBSTEP, 2, NO_TOUCH, { ...FULL, ears: 0.5 });
+    let err = 0;
+    for (let i = 0; i < full.earL.length; i++) {
+      err = Math.max(
+        err,
+        Math.abs(half.earL[i]! - halfNone.earL[i]! - 0.5 * (full.earL[i]! - fullNone.earL[i]!)),
+        Math.abs(half.earR[i]! - halfNone.earR[i]! - 0.5 * (full.earR[i]! - fullNone.earR[i]!)),
+      );
+    }
+    expect(err).toBeLessThanOrEqual(1e-6);
+    expect(Math.abs(full.earL.at(-1)! + EAR_ORIENT_MAX)).toBeLessThanOrEqual(1e-6);
+    const zero = earRun(SUBSTEP, 2, () => point, { ...FULL, ears: 0 });
+    expect(zero.earL.every((v) => Object.is(v, 0))).toBe(true);
+    expect(zero.earR.every((v) => Object.is(v, 0))).toBe(true);
   });
 });
 
