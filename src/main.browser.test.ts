@@ -4,8 +4,9 @@
 // a module that fails to load can't be mocked in Browser Mode (a throwing factory fails the run), so that path is
 // tested on `mountDebugOverlayWhenLoaded`, which `boot` hands the import to.
 import { afterEach, describe, expect, test, vi } from 'vitest';
+import type { Session } from './app/session.ts';
 import { boot, mountDebugOverlayWhenLoaded } from './main.ts';
-import type { Pwa } from './pwa/register.ts';
+import type { Pwa, PwaDeps } from './pwa/register.ts';
 import type { DebugOverlayDeps } from './ui/debug-overlay.ts';
 
 const h = vi.hoisted(() => ({
@@ -14,12 +15,24 @@ const h = vi.hoisted(() => ({
   mounts: 0,
   /** Every `setTrace` call on the engine the overlay got, `boot`'s own included. */
   trace: [] as boolean[],
+  /** What the mocked PWA reports at boot (#277), and the deps `boot` gave it. */
+  pwaReady: false,
+  pwaActivated: false,
+  pwaDeps: null as PwaDeps | null,
 }));
 
 // register.ts imports `virtual:pwa-register`, which exists only inside a Vite build with vite-plugin-pwa; Browser
 // Mode can't even resolve it, so the whole module is replaced (no service worker in this test).
 vi.mock('./pwa/register.ts', () => ({
-  setupPwa: (): Pwa => ({ applyUpdate: () => {}, promptInstall: async () => {}, updateReady: () => false }),
+  setupPwa: (deps: PwaDeps): Pwa => {
+    h.pwaDeps = deps;
+    return {
+      applyUpdate: () => {},
+      promptInstall: async () => {},
+      updateReady: () => h.pwaReady,
+      activatedElsewhere: () => h.pwaActivated,
+    };
+  },
 }));
 
 vi.mock('./ui/debug-overlay.ts', () => ({
@@ -62,6 +75,9 @@ afterEach(() => {
   h.mode = 'mount';
   h.mounts = 0;
   h.trace.length = 0;
+  h.pwaReady = false;
+  h.pwaActivated = false;
+  h.pwaDeps = null;
   for (const r of roots.splice(0)) r.remove();
   vi.restoreAllMocks();
 });
@@ -114,5 +130,45 @@ describe('mountDebugOverlayWhenLoaded', () => {
     );
     await vi.waitFor(() => expect(error).toHaveBeenCalledWith('onDebugOverlay threw', expect.any(Error)));
     expect(trace.setTrace).not.toHaveBeenCalled();
+  });
+});
+
+describe('boot: the updateReady relay (#277)', () => {
+  /** Boots into a fresh root and resolves with the session once `boot` has finished. */
+  async function bootSession(): Promise<Session> {
+    const root = document.createElement('div');
+    document.body.append(root);
+    roots.push(root);
+    const got: { session?: Session } = {};
+    await boot(root, {
+      debug: false,
+      onSession: (s) => {
+        got.session = s;
+      },
+    });
+    if (got.session === undefined) throw new Error('test: boot created no session');
+    return got.session;
+  }
+
+  test('an update another tab activated before the session existed is caught up with its flag', async () => {
+    h.pwaReady = true;
+    h.pwaActivated = true;
+    const session = await bootSession();
+    expect(session.state()).toMatchObject({ name: 'Asleep', updateReady: true, updateActivated: true });
+  });
+
+  test("the page's own update before the session existed is caught up without the flag", async () => {
+    h.pwaReady = true;
+    const session = await bootSession();
+    expect(session.state()).toMatchObject({ updateReady: true, updateActivated: false });
+  });
+
+  test('a dispatch after boot reaches the session unchanged, flag included', async () => {
+    const session = await bootSession();
+    expect(session.state()).toMatchObject({ updateReady: false, updateActivated: false });
+    const deps = h.pwaDeps;
+    if (deps === null) throw new Error('test: setupPwa was not called');
+    deps.dispatch({ t: 'updateReady', activated: true });
+    expect(session.state()).toMatchObject({ updateReady: true, updateActivated: true });
   });
 });

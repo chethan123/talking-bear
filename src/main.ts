@@ -164,8 +164,10 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     onApplyUpdate: () => pwa.applyUpdate(),
   });
   opts.onSession?.(session);
-  // An update found before the session existed (its relayed dispatch was dropped).
-  if (pwa.updateReady()) session.dispatch({ t: 'updateReady' });
+  // An update found before the session existed (its relayed dispatch was dropped), with its activated flag (#277).
+  if (pwa.updateReady()) {
+    session.dispatch(pwa.activatedElsewhere() ? { t: 'updateReady', activated: true } : { t: 'updateReady' });
+  }
 
   // E2E hooks (plan §4.9.3): dead-code-eliminated from production builds, where the flag is unset. Installed
   // before the UI is mounted, so no pointer input can reach the session before the hooks are listening.
