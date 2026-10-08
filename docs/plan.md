@@ -1546,7 +1546,7 @@ The production image also exposes `data-state` on the bear element, so a hook-fr
 | `sfx-gating` | a reaction sound never starts a recording |
 | `gestures` | CDP `Input.dispatchTouchEvent` for multi-touch |
 | `offline` | SW ready → `context.setOffline(true)` → reload → full loop |
-| `update` | proxy serves v1; start recording; flip the proxy to v2; `reg.update()` → no reload while `Recording`/`Playing`; `__bearTest.setVisibility('hidden')` from idle → update applied; no 404s |
+| `update` | proxy serves v1; in Asleep flip the proxy to v2 and `reg.update()`, holding v2's precache fetch; start recording; release it (#275) → no reload while `Recording`/`Playing`; `__bearTest.setVisibility('hidden')` from idle → update applied; no 404s |
 | `installability` | CDP `Page.getInstallabilityErrors` (experimental; exists in `browser_protocol.json` [V R77]) returns `[]` with `channel:'chromium'`; the negative-control manifest returns errors |
 | `csp` | zero violations over the full flow |
 
