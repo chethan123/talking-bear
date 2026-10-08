@@ -17,8 +17,9 @@
  * clock is seconds on the `performance.now()` timebase, which rAF timestamps share; it never steps back. `anim`
  * inputs output nothing, so `onAnim` keeps `directorReduce`.
  *
- * **Director → session** (#93). Every other director input goes through `directorStep`: the 120 Hz tick in
- * `substep` (a queued reaction starts on a tick), and the gestures and releases of the pointer input below. The
+ * **Director → session** (#93). Every other director input goes through `directorStep`, except the MicDenied mime's
+ * `clip` input, which outputs nothing, so it uses `directorReduce`: the 120 Hz tick in `substep` (a queued reaction
+ * starts on a tick), and the gestures and releases of the pointer input below. The
  * step's new state is stored first, then its outputs are routed: `toSession` → `deps.dispatch`
  * (`session.dispatch`), `haptic` → `deps.haptics.play`, `mood` → the mood layer's `bump`. `session.dispatch` can
  * feed `anim` effects (`talkEnd`) straight back into the director, which must see the new state.
@@ -56,6 +57,16 @@
  *   close)). `mouthCloseScale` applies to the replay's mouth only: `mouthCloseStart` stays set until the next talk,
  *   so it would close every later reaction's mouth.
  *
+ * **MicDenied mime** (#115, plan §4.5, §7 M8): while the session is in MicDenied the bear mimes a cupped ear, the
+ * director's `{k:'clip', name: MIC_DENIED_MIME}`, on entering MicDenied and every `MIC_DENIED_MIME_S` after each
+ * play. `substep` polls `deps.state()` and keeps the time the next mime is due in a `T` slot, on the director clock:
+ * no timers. A mime is due at once on entry, but it waits until the director is ready: past Asleep and Waking (a
+ * defensive check: in Waking the wake clip already fills the slot, and the director would drop a clip there) and with
+ * no session clip playing (the wake clip, MicDenied's `shrug`), so it never cuts one. With a reaction active the
+ * director's P2 rules decide (it interrupts a P1/P2, waits in the queue behind a P3/P4). Leaving MicDenied clears the
+ * slot. In Dozing (the session sends `doze` once in MicDenied) the next mime wakes the bear to Idle, as any accepted
+ * P2 does, so he stays awake while the help is up.
+ *
  * **Input** (#93): the pointer adapter (#87) on the canvas, with `hit` = `hitTest` (#85) over the bone matrices
  * of the last drawn pose and the view in **CSS px** (`fitView` of the canvas's CSS size: the adapter's points
  * are CSS px relative to the canvas, never backing-store px). `adapter.tick()` runs in every drawn frame, so a
@@ -75,7 +86,9 @@
  * callbacks are created once, and the doubles kept between frames live in a `Float64Array`. A quiet director tick
  * returns `directorStep`'s shared frozen result (no outputs, nothing to route); `adapter.tick()` returns at once
  * with no pointer down; the hit-test bone matrices are only marked stale per frame and recomputed on the next
- * pointer sample. Director transitions (events, gestures, a clip's end) allocate a new director state and their
+ * pointer sample. The MicDenied mime's poll reads the session state (a string) per substep and, outside MicDenied,
+ * only writes NaN to its slot; its NaN test is inline and its time stays in `T`, so no double crosses a call (#115).
+ * Director transitions (events, gestures, a clip's end) allocate a new director state and their
  * outputs; that is per event, not per frame. The reaction clips' parts (#221) are preallocated too: the springs'
  * previous positions, the clip's mouth, and the kick cursor, an index into the clip's own `impulses`.
  * No per-frame double crosses a call V8 may leave un-inlined, since V8 boxes those as new heap numbers (#229): the
@@ -105,7 +118,7 @@ import {
   initialDirector,
   mouthCloseScale,
 } from './director.ts';
-import type { DirectorState, DirInput, DirOut, GestureInput } from './director.ts';
+import type { ClipInput, DirectorState, DirInput, DirOut, GestureInput } from './director.ts';
 import { createBlink, createBreathing, createEarTwitch, createGaze, createMood } from './layers/index.ts';
 import type { AnimContext, LayerWeights, LookAt } from './layers/index.ts';
 import { MouthLayer } from './layers/mouth.ts';
@@ -135,6 +148,10 @@ export const LAYER_REST_DELTA = 1e-4;
 const BASE_FADE_S = 0.15;
 /** Layer weights ramp to a new state's values over this long, like the base crossfade. */
 export const WEIGHT_RAMP_S = 0.15;
+/** The clip the bear mimes while the session is in MicDenied (#115): a paw to the ear, "I can't hear you". */
+export const MIC_DENIED_MIME = 'cuppedEar';
+/** The MicDenied mime repeats this long after each play (s, #115). */
+export const MIC_DENIED_MIME_S = 10;
 /** Frames `frameLog()` keeps (X-A2 logging). */
 export const FRAME_LOG_SIZE = 600;
 /** How long the gaze holds a background touch's point (s): a tap's, or a background stroke's latest move (#93). */
@@ -288,6 +305,8 @@ const LOOK_UNTIL = 4;
 /** The latest pointer sample's position, CSS px relative to the canvas. */
 const SAMPLE_X = 5;
 const SAMPLE_Y = 6;
+/** Director time (s) at which the next MicDenied mime is due; NaN outside MicDenied (#115). */
+const MIME_AT = 7;
 /** The session states in which any `pointerdown` wakes the bear (Paused never sees one while visible). */
 const TAP_TO_WAKE: ReadonlySet<StateName> = new Set<StateName>(['Asleep', 'Error', 'Paused']);
 
@@ -304,12 +323,15 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   /** `view` in CSS px of the canvas: hit tests, `regionCenter` and the gaze map pointer points through it. */
   const cssView: View = { scale: 1, ox: 0, oy: 0 };
 
-  const T = new Float64Array(7);
+  const T = new Float64Array(8);
   T[NOW] = deps.now() / 1000;
+  T[MIME_AT] = Number.NaN;
 
   // ---- director, layers, springs, mouth ------------------------------------------------------------------
   let dir: DirectorState = initialDirector(T[NOW]);
   const tickIn: { k: 'tick'; now: number } = { k: 'tick', now: 0 };
+  /** The MicDenied mime's director input, reused (#115). */
+  const mimeIn: ClipInput = { k: 'clip', name: MIC_DENIED_MIME, now: 0 };
   const springs = new SpringBank(SPRING_COUNT);
   configureSprings(springs);
   const weights: LayerWeights = { ...WEIGHTS_ASLEEP };
@@ -438,6 +460,23 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     }
   }
 
+  /**
+   * The MicDenied mime (#115; see the module comment): due at once on entry, then `MIC_DENIED_MIME_S` after each
+   * play; sent once the director is ready. Called per substep while the session is in MicDenied. The NaN test is
+   * inline (`due !== due`) and no double crosses a call (#229).
+   */
+  function micDeniedMime(): void {
+    const now = T[NOW]!;
+    const due = T[MIME_AT]!;
+    if (due !== due) T[MIME_AT] = now;
+    if (now < T[MIME_AT]!) return;
+    const d = dir;
+    if (d.name === 'Asleep' || d.name === 'Waking' || (d.clip !== null && d.reaction === null)) return;
+    mimeIn.now = now;
+    dir = directorReduce(d, mimeIn);
+    T[MIME_AT] = now + MIC_DENIED_MIME_S;
+  }
+
   // ---- the frame -------------------------------------------------------------------------------------------
   function substep(dt: number): void {
     tickIn.now = T[NOW]!;
@@ -446,6 +485,9 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     const r = directorStep(dir, tickIn);
     dir = r.state;
     if (r.out.length !== 0) route(r.out);
+    // #115: the cupped-ear mime while the session is in MicDenied.
+    if (deps.state() === 'MicDenied') micDeniedMime();
+    else T[MIME_AT] = Number.NaN;
     // #221: the clip's kicks due by now, then the step from the positions the frame interpolates from.
     applyKicks();
     prevSprings.set(springs.pos);
