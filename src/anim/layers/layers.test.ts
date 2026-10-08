@@ -1047,7 +1047,7 @@ describe('ear orientation toward a background touch (#255)', () => {
     it.each([
       { name: 'SUBSTEP', dt: SUBSTEP },
       { name: '1/60 s', dt: 1 / 60 },
-    ])('turns both ears $side within 150 ms and back within 300 ms at $name', ({ dt }) => {
+    ])('turns both ears toward the point within 150 ms and back within 300 ms at $name', ({ dt }) => {
       // 4 s: the first twitch is at 6 s or later, so the springs rest and the no-touch channels are 0.
       const touch = earRun(dt, 4, heldFrom1To3(point));
       const none = earRun(dt, 4, NO_TOUCH);
