@@ -13,7 +13,14 @@ import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
 import { REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
-import { directorReduce, directorStep, evaluate, initialDirector, mouthCloseScale } from './director.ts';
+import {
+  clipByName,
+  directorReduce,
+  directorStep,
+  evaluate,
+  initialDirector,
+  mouthCloseScale,
+} from './director.ts';
 import type { DirectorState, DirInput, DirOut, DirState, GestureKind } from './director.ts';
 import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
 import type { Pose } from './pose.ts';
@@ -129,8 +136,9 @@ function run(s: DirectorState, ...inputs: DirInput[]): DirectorState {
   return r;
 }
 
-/** The reaction fields of a director with no reaction history (`initialDirector`'s). */
+/** The reaction fields of a director with no reaction history, and no cut clip (`initialDirector`'s). */
 const NO_REACTION = {
+  prevClip: null,
   reaction: null,
   queued: null,
   cooldowns: [],
@@ -168,6 +176,7 @@ function variants(name: DirState): DirectorState[] {
 /** Freezes `s` and its nested objects, so any write by the reducer throws (ES modules are strict). */
 function deepFreeze(s: DirectorState): DirectorState {
   if (s.clip !== null) Object.freeze(s.clip);
+  if (s.prevClip !== null) Object.freeze(s.prevClip);
   if (s.talk !== null) Object.freeze(s.talk);
   if (s.reaction !== null) Object.freeze(s.reaction);
   if (s.queued !== null) Object.freeze(s.queued);
@@ -186,6 +195,11 @@ function expectedEnter(s: DirectorState, target: DirState, now: number): Directo
   if (target === 'Waking') clip = { name: 'wake', start: now };
   else if (target === 'Asleep') clip = { name: 'sleep', start: now };
   else clip = s.clip?.name === 'sleep' ? null : s.clip;
+  // #240: a new clip over one still playing cuts it (these states hold no reaction, so no release).
+  const old = s.clip;
+  const oldName = CLIP_NAMES.find((n) => n === old?.name);
+  const cut =
+    clip !== null && clip !== old && old !== null && oldName !== undefined && now < endOf(oldName, old.start);
   return {
     name: target,
     since: now,
@@ -193,6 +207,7 @@ function expectedEnter(s: DirectorState, target: DirState, now: number): Directo
     prevBase: moved ? s.base : s.prevBase,
     fadeStart: moved ? now : s.fadeStart,
     clip,
+    prevClip: cut ? { name: old.name, start: old.start, cutAt: now, release: null } : s.prevClip,
     talk: target === 'Talking' ? { id: 7, startCtxTime: null } : null,
     mouthCloseStart: target === 'Talking' ? null : s.name === 'Talking' ? now : s.mouthCloseStart,
     reaction: s.reaction,
@@ -554,10 +569,11 @@ describe('session sequences', () => {
     expect(s.clip).toBeNull();
   });
 
-  it('wake 0.05 s into the sleep clip replaces it with the wake clip (the known early-clip pop)', () => {
+  it('wake 0.05 s into the sleep clip replaces it with the wake clip; the sleep clip fades out under it (#240), the base fade restarts as before', () => {
     const s = run(stateIn('Idle'), anim({ e: 'sleep' }, 10.5), anim({ e: 'wake' }, 10.55));
     expect(s).toMatchObject({ name: 'Waking', base: 'idle', prevBase: 'asleep', fadeStart: 10.55 });
     expect(s.clip).toStrictEqual({ name: 'wake', start: 10.55 });
+    expect(s.prevClip).toStrictEqual({ name: 'sleep', start: 10.5, cutAt: 10.55, release: null });
   });
 
   it('talk.startCtxTime stays null: AnimEvent talk carries only the id', () => {
@@ -604,10 +620,14 @@ describe('clips and ticks', () => {
     expect(directorReduce(s, anim({ e: 'earTwitch' }, 11))).toBe(s);
   });
 
-  it('wake and sleep replace a playing additive clip', () => {
+  it('wake and sleep replace a playing additive clip, which fades out under theirs (#240)', () => {
     const s = playing('confused');
-    expect(directorReduce(s, anim({ e: 'wake' }, 10.6)).clip).toStrictEqual({ name: 'wake', start: 10.6 });
-    expect(directorReduce(s, anim({ e: 'sleep' }, 10.6)).clip).toStrictEqual({ name: 'sleep', start: 10.6 });
+    const cut = { name: 'confused', start: 10.5, cutAt: 10.6, release: null };
+    for (const e of ['wake', 'sleep'] as const) {
+      const r = directorReduce(s, anim({ e }, 10.6));
+      expect(r.clip).toStrictEqual({ name: e, start: 10.6 });
+      expect(r.prevClip).toStrictEqual(cut);
+    }
   });
 
   it('an additive clip leaves name, since, base, prevBase and fadeStart alone', () => {
@@ -671,6 +691,12 @@ describe('property: random session input sequences', () => {
             expect(Object.hasOwn(SESSION_CLIPS, r.clip.name)).toBe(true); // I5
             expect(r.clip.start).toBeLessThanOrEqual(now);
           }
+          if (r.prevClip !== null) {
+            expect(Object.hasOwn(SESSION_CLIPS, r.prevClip.name)).toBe(true); // I9 (#240)
+            expectCutClip(r.prevClip, kind === 'tick', now);
+            if (r.prevClip !== prev.prevClip) expectSeamlessCut(prev, r, now);
+          }
+          expectNoWorseSecondCut(prev, r, now);
           expect(r === prev || !isDeepStrictEqual(r, prev)).toBe(true); // I6
           if (r.base !== prev.base) {
             // I8: a base change starts a crossfade from the previous base
@@ -716,6 +742,53 @@ function composite(s: DirectorState, now: number): Pose {
   const clip = CLIP_NAMES.find((n) => n === c.name);
   if (clip === undefined) return p;
   return addPose(p, sampleClip(SESSION_CLIPS[clip], now - c.start, createPose()), 1, p);
+}
+
+/**
+ * #240 invariants of a `prevClip`: it started no later than its cut, which is no later than `now`, and a tick
+ * (`ticked`) leaves none whose 100 ms are up.
+ */
+function expectCutClip(p: NonNullable<DirectorState['prevClip']>, ticked: boolean, now: number): void {
+  expect(p.start).toBeLessThanOrEqual(p.cutAt);
+  expect(p.cutAt).toBeLessThanOrEqual(now);
+  if (ticked) expect(now).toBeLessThan(p.cutAt + 0.1);
+}
+
+/**
+ * #240: the step from `prev` to `r` cut `prev`'s clip at `now`, so the pose at the cut is unchanged (±1e-6), unless
+ * the step restarted a base crossfade that was still running (a pop of its own) or an earlier cut was still
+ * blending (a second cut, plan Decision 5: `expectNoWorseSecondCut` covers it).
+ */
+function expectSeamlessCut(prev: DirectorState, r: DirectorState, now: number): void {
+  expect(r.prevClip).toMatchObject({ name: prev.clip?.name, start: prev.clip?.start, cutAt: now });
+  const sameFade = r.base === prev.base && r.prevBase === prev.prevBase && r.fadeStart === prev.fadeStart;
+  const freshFade = r.fadeStart === now && r.prevBase === prev.base && now >= prev.fadeStart + 0.15;
+  const blending = prev.prevClip !== null && now < prev.prevClip.cutAt + 0.1;
+  if (!(sameFade || freshFade) || blending) return;
+  const was = evaluate(prev, now, createPose());
+  expect(bodyDiff(evaluate(r, now, createPose()), was)).toBeLessThanOrEqual(1e-6);
+}
+
+/**
+ * #240: a step that put another clip into the slot while `prev` was still fading an earlier cut out (a second
+ * cut, plan Decision 5) never moves the pose more than main, with no crossfade at all, would (±1e-6), unless the
+ * step restarted a base crossfade that was still running.
+ */
+function expectNoWorseSecondCut(prev: DirectorState, r: DirectorState, now: number): void {
+  const p = prev.prevClip;
+  const a = prev.clip;
+  const b = r.clip;
+  if (p === null || !(now < p.cutAt + 0.1) || a === null || b === null) return;
+  if (a.name === b.name && a.start === b.start) return;
+  const sameFade = r.base === prev.base && r.prevBase === prev.prevBase && r.fadeStart === prev.fadeStart;
+  const freshFade = r.fadeStart === now && r.prevBase === prev.base && now >= prev.fadeStart + 0.15;
+  if (!(sameFade || freshFade)) return;
+  const jump = bodyDiff(evaluate(r, now, createPose()), evaluate(prev, now, createPose()));
+  const plain = bodyDiff(
+    evaluate({ ...r, prevClip: null }, now, createPose()),
+    evaluate({ ...prev, prevClip: null }, now, createPose()),
+  );
+  expect(jump).toBeLessThanOrEqual(plain + 1e-6);
 }
 
 // ---- Validation 3: the 150 ms crossfade --------------------------------------------------------------------------
@@ -967,12 +1040,13 @@ function heapGrowth(fn: () => void): number {
 }
 
 describe('evaluate: no allocation (10 000 evaluations, heap growth < 1 MB)', () => {
-  /** Mid-fade with the wake clip, Idle + confused, Talking, Asleep + the sleep clip. */
+  /** Mid-fade with the wake clip, Idle + confused, Talking, Asleep + the sleep clip, wake cutting confused (#240). */
   const STATES_FOR_ALLOC: readonly DirectorState[] = [
     run(initialDirector(0), anim({ e: 'wake' }, 1)),
     run(stateIn('Idle', 0), anim({ e: 'confused' }, 1)),
     stateIn('Talking', 0),
     run(stateIn('Idle', 0), anim({ e: 'sleep' }, 1)),
+    run(stateIn('Idle', 0), anim({ e: 'confused' }, 1), anim({ e: 'wake' }, 1.2)),
   ];
   const N = 10_000;
   /** Times sweeping [0.9, 2.3]: before the fades, through them and the clips, and past the clip ends. */
@@ -984,7 +1058,7 @@ describe('evaluate: no allocation (10 000 evaluations, heap growth < 1 MB)', () 
     let allOut = true;
     const allocations = countAllocations(() => {
       for (let i = 0; i < N; i++) {
-        if (evaluate(STATES_FOR_ALLOC[i & 3]!, tAt(i), out) !== out) allOut = false;
+        if (evaluate(STATES_FOR_ALLOC[i % STATES_FOR_ALLOC.length]!, tAt(i), out) !== out) allOut = false;
       }
     });
     expect(allocations).toBe(0);
@@ -995,7 +1069,7 @@ describe('evaluate: no allocation (10 000 evaluations, heap growth < 1 MB)', () 
   it('grows the heap by < 1 MB over 10 000 evaluations, once V8 has optimised it', () => {
     const out = createPose();
     const runAll = (): void => {
-      for (let i = 0; i < N; i++) evaluate(STATES_FOR_ALLOC[i & 3]!, tAt(i), out);
+      for (let i = 0; i < N; i++) evaluate(STATES_FOR_ALLOC[i % STATES_FOR_ALLOC.length]!, tAt(i), out);
     };
     // As in clip.test.ts: warm up after a collection, then take the best of up to 20 runs, each from a freshly
     // collected heap (a run during which any GC ran counts as +Infinity). An evaluate that allocates a pose per
@@ -2155,6 +2229,12 @@ describe('#91 property: random gesture and session sequences', () => {
             expect(KNOWN_CLIPS.has(r.clip.name), r.clip.name).toBe(true);
             expect(r.clip.start).toBeLessThanOrEqual(now);
           }
+          if (r.prevClip !== null) {
+            expect(KNOWN_CLIPS.has(r.prevClip.name), r.prevClip.name).toBe(true);
+            expectCutClip(r.prevClip, i.k === 'tick', now);
+            if (r.prevClip !== prev.prevClip) expectSeamlessCut(prev, r, now);
+          }
+          expectNoWorseSecondCut(prev, r, now);
           if (prev.name === 'Asleep' || prev.name === 'Waking') {
             if (i.k === 'gesture' || i.k === 'release') expect(r).toBe(prev);
           }
@@ -2225,6 +2305,399 @@ describe('#91 allocation: quiet ticks and the release ease-out', () => {
     expect(
       countAllocations(() => {
         for (let i = 0; i < 1000; i++) evaluate(s, 12 + i * 0.0005, out);
+      }),
+    ).toBe(0);
+  });
+});
+
+// ==== #240: a clip cut while playing crossfades out over 100 ms ===================================================
+/** One cut: `input` at `at` replaces the clip `before` is playing. */
+interface Cut {
+  label: string;
+  before: DirectorState;
+  input: DirInput;
+  at: number;
+}
+
+/** The cuts #240 names: interruptions, an additive reaction, the flinch, a release ease-out, wake and sleep. */
+function cuts(): Cut[] {
+  const idle = stateIn('Idle');
+  return [
+    {
+      label: 'hug (P4) over a running dizzy',
+      before: stepAll(idle, flick(11), flick(12), flick(13)).s,
+      input: gest('hug', 'belly', 'hug', 13.5),
+      at: 13.5,
+    },
+    {
+      label: 'a P3 long-press over a playing P2 sneeze',
+      before: stepAll(idle, noseTap(11)).s,
+      input: gest('earDroopL', 'earL', 'longPress', 11.2),
+      at: 11.2,
+    },
+    {
+      label: 'Attentive: an additive sneeze over an additive cheek puff',
+      before: stepAll(stateIn('Attentive'), gest('cheekPuffR', 'cheekR', 'tap', 11)).s,
+      input: noseTap(11.2),
+      at: 11.2,
+    },
+    {
+      label: 'talkEnd: the announced reaction starts over the flinch',
+      before: stepAll(
+        stateIn('Talking'),
+        gest('cheekPuffR', 'cheekR', 'tap', 11),
+        gest('earDroopL', 'earL', 'longPress', 11.05),
+      ).s,
+      input: anim({ e: 'talkEnd' }, 11.1),
+      at: 11.1,
+    },
+    {
+      label: 'hug over a released pet easing out',
+      before: stepAll(idle, petStroke(11), release(12)).s,
+      input: gest('hug', 'belly', 'hug', 12.2),
+      at: 12.2,
+    },
+    {
+      label: 'wake over a playing shrug',
+      before: playing('shrug'),
+      input: anim({ e: 'wake' }, 10.6),
+      at: 10.6,
+    },
+    {
+      label: 'sleep over a held hug',
+      before: stepAll(idle, gest('hug', 'belly', 'hug', 11)).s,
+      input: anim({ e: 'sleep' }, 11.5),
+      at: 11.5,
+    },
+  ];
+}
+
+/** `s` without its cut clip: the incoming clip alone. */
+const incoming = (s: DirectorState): DirectorState => ({ ...s, prevClip: null });
+
+/** The outgoing clip alone on `after`'s base: its clip back in the slot, under the reaction it played for. */
+const outgoing = (before: DirectorState, after: DirectorState): DirectorState => ({
+  ...after,
+  clip: before.clip,
+  reaction: before.reaction,
+  prevClip: null,
+});
+
+/** `evaluate(s, now)` into a fresh pose. */
+const poseAt = (s: DirectorState, now: number): Pose => evaluate(s, now, createPose());
+
+describe('#240: a clip cut while playing crossfades out over 100 ms', () => {
+  it("evaluate at the cut equals the outgoing clip's pose (±1e-6), where the incoming clip alone would jump", () => {
+    for (const { label, before, input, at } of cuts()) {
+      const after = stepAll(before, input).s;
+      const c = before.clip!;
+      const a = before.reaction;
+      expect(after.clip, label).not.toBeNull();
+      expect(after.prevClip, label).toStrictEqual({
+        name: c.name,
+        start: c.start,
+        cutAt: at,
+        release: a !== null && a.clip === c.name ? a.release : null,
+      });
+      const was = poseAt(before, at);
+      expect(bodyDiff(poseAt(after, at), was), label).toBeLessThanOrEqual(1e-6);
+      expect(bodyDiff(poseAt(outgoing(before, after), at), was), label).toBeLessThanOrEqual(1e-6);
+      expect(bodyDiff(poseAt(incoming(after), at), was), `${label}: the pop`).toBeGreaterThan(1e-3);
+    }
+  });
+
+  it("from +100 ms it equals the incoming clip's pose (±1e-6); the first tick from there clears prevClip", () => {
+    for (const { label, before, input, at } of cuts()) {
+      const after = stepAll(before, input).s;
+      for (const dt of [0.1, 0.125, 0.3, 1]) {
+        expect(
+          bodyDiff(poseAt(after, at + dt), poseAt(incoming(after), at + dt)),
+          `${label} +${dt}`,
+        ).toBeLessThanOrEqual(1e-6);
+      }
+      expect(directorReduce(after, tick(at + 0.05)), label).toBe(after);
+      expect(directorReduce(after, tick(at + 0.1 - 1e-9)), label).toBe(after);
+      expect(stepAll(after, tick(at + 0.1)).s, label).toStrictEqual(incoming(after));
+    }
+  });
+
+  it('midway (+50 ms) it is the even blend of the two, strictly between them on at least one channel', () => {
+    for (const { label, before, input, at } of cuts()) {
+      const after = stepAll(before, input).s;
+      const t = at + 0.05;
+      const mid = poseAt(after, t);
+      const inc = poseAt(incoming(after), t);
+      const out = poseAt(outgoing(before, after), t);
+      expect(bodyDiff(mid, lerpPose(inc, out, 0.5, createPose())), label).toBeLessThanOrEqual(1e-6);
+      let between = 0;
+      for (let i = 0; i < CH_COUNT; i++) {
+        if (Math.min(inc[i]!, out[i]!) < mid[i]! && mid[i]! < Math.max(inc[i]!, out[i]!)) between++;
+      }
+      expect(between, label).toBeGreaterThan(0);
+    }
+  });
+
+  it('no blend after a natural end or a release ease-out', () => {
+    // A one-shot at its natural end: a reaction at that instant, or after the tick that ends it, cuts nothing.
+    const sneeze = stepAll(stateIn('Idle'), noseTap(11)).s;
+    const end = 11 + REACTION_CLIPS.sneeze.duration;
+    expect(stepAll(sneeze, gest('cheekPuffR', 'cheekR', 'tap', end)).s.prevClip).toBeNull();
+    const ended = stepAll(sneeze, tick(end)).s;
+    expect(ended).toMatchObject({ name: 'Idle', clip: null, prevClip: null });
+    expect(stepAll(ended, gest('cheekPuffR', 'cheekR', 'tap', end + 0.1)).s.prevClip).toBeNull();
+    // A release ease-out: the release cuts nothing, nor does the queued reaction starting at its end.
+    const released = stepAll(stateIn('Idle'), petStroke(11), release(12), noseTap(12.3)).s;
+    expect(released.prevClip).toBeNull();
+    expect(released.queued?.r).toBe(R('sneeze'));
+    expect(stepAll(released, tick(12.4)).s).toMatchObject({
+      name: 'Reacting',
+      clip: { name: 'sneeze', start: 12.4 },
+      prevClip: null,
+    });
+    // A finite clip a refresh restarts once ended (#91 M21) cuts nothing either.
+    expect(stepAll(stateIn('Idle'), tickle(11), tickle(11.8125)).s.prevClip).toBeNull();
+  });
+
+  it('a released clip cut mid-ease-out eases out on under the fade, from the release instant to past its end', () => {
+    const held = stepAll(stateIn('Idle'), petStroke(11)).s;
+    const atRelease = stepAll(held, release(12), gest('hug', 'belly', 'hug', 12)).s;
+    expect(atRelease.prevClip).toStrictEqual({ name: 'pet', start: 11, cutAt: 12, release: 12 });
+    expect(bodyDiff(poseAt(atRelease, 12), poseAt(stepAll(held, release(12)).s, 12))).toBeLessThanOrEqual(
+      1e-6,
+    );
+    // Cut 350 ms into the ease-out: at +70 ms the pet's ease-out is over, so only the hug's (1 − k) share is left.
+    const late = stepAll(held, release(12), gest('hug', 'belly', 'hug', 12.35)).s;
+    const t = 12.42;
+    const k = easeOut((t - 12.35) / 0.1);
+    const hug = sampleClip(REACTION_CLIPS.hug, t - 12.35, createPose());
+    expect(bodyDiff(poseAt(late, t), addPose(BASE.idle, hug, 1 - k, createPose()))).toBeLessThanOrEqual(1e-6);
+  });
+
+  it('a clip dropped with no successor is no cut, and it clears a prevClip still fading', () => {
+    const dropped = run(stateIn('Idle'), anim({ e: 'sleep' }, 10.5), anim({ e: 'idle' }, 10.8));
+    expect(dropped).toMatchObject({ name: 'Idle', clip: null, prevClip: null });
+    // sleep cuts the wake clip, then idle drops the sleep clip inside that cut's 100 ms: the wake clip must not
+    // come back at its weight when the next clip starts (code review finding 1: 0.113 and 0.360 against main's 0).
+    for (const [sleepAt, idleAt, tapAt] of [
+      [1.5, 1.55, 1.57],
+      [1.5, 1.5, 1.52],
+    ] as const) {
+      const cut = run(initialDirector(0), anim({ e: 'wake' }, 1), anim({ e: 'sleep' }, sleepAt));
+      expect(cut.prevClip).toMatchObject({ name: 'wake', cutAt: sleepAt });
+      const emptied = stepAll(cut, anim({ e: 'idle' }, idleAt)).s;
+      expect(emptied).toMatchObject({ name: 'Idle', clip: null, prevClip: null });
+      const tapped = stepAll(emptied, gest('cheekPuffL', 'cheekL', 'tap', tapAt)).s;
+      expect(tapped.clip).toStrictEqual({ name: 'cheekPuffL', start: tapAt });
+      expect(tapped.prevClip).toBeNull();
+      expect(bodyDiff(poseAt(tapped, tapAt), poseAt(emptied, tapAt))).toBeLessThanOrEqual(1e-6);
+    }
+  });
+
+  it('a second cut 30 ms into a fade keeps the older prevClip; one 80 ms into it replaces it', () => {
+    const before = stepAll(stateIn('Idle'), noseTap(11), gest('cheekPuffL', 'cheekL', 'tap', 11.5)).s;
+    expect(before.prevClip).toStrictEqual({ name: 'sneeze', start: 11, cutAt: 11.5, release: null });
+    const early = stepAll(before, gest('cheekPuffR', 'cheekR', 'tap', 11.53)).s;
+    expect(early.clip).toStrictEqual({ name: 'cheekPuffR', start: 11.53 });
+    expect(early.prevClip).toBe(before.prevClip);
+    // At +50 ms both choices move the pose by exactly the same amount (0.2777…): a tie keeps the older one.
+    expect(stepAll(before, gest('cheekPuffR', 'cheekR', 'tap', 11.55)).s.prevClip).toBe(before.prevClip);
+    const late = stepAll(before, gest('cheekPuffR', 'cheekR', 'tap', 11.58)).s;
+    expect(late.clip).toStrictEqual({ name: 'cheekPuffR', start: 11.58 });
+    expect(late.prevClip).toStrictEqual({ name: 'cheekPuffL', start: 11.5, cutAt: 11.58, release: null });
+  });
+
+  it('a second cut keeps whichever outgoing clip moves the pose less, never more than a plain cut would', () => {
+    // A late second cut can keep the older clip too: at +80 ms the sneeze still outweighs the barely started
+    // long-press by far, so dropping the sneeze would jump about 4× as far as a plain cut.
+    const before = stepAll(stateIn('Idle'), noseTap(11), gest('earDroopL', 'earL', 'longPress', 11.2)).s;
+    expect(stepAll(before, gest('hug', 'belly', 'hug', 11.28)).s.prevClip).toBe(before.prevClip);
+    // The pop probe's rows (#240 plan review, finding 1): the jump at the second cut is never above main's.
+    const cheeks = stepAll(stateIn('Idle'), noseTap(11), gest('cheekPuffL', 'cheekL', 'tap', 11.5)).s;
+    const rows: [DirectorState, DirInput & { now: number }][] = [
+      ...[0.01, 0.03, 0.05, 0.08, 0.095].map((dt): [DirectorState, DirInput & { now: number }] => [
+        cheeks,
+        { k: 'gesture', r: R('cheekPuffR'), region: 'cheekR', gesture: 'tap', now: 11.5 + dt },
+      ]),
+      ...[11.21, 11.23, 11.25, 11.26, 11.28, 11.295].map((t): [DirectorState, DirInput & { now: number }] => [
+        before,
+        { k: 'gesture', r: R('hug'), region: 'belly', gesture: 'hug', now: t },
+      ]),
+    ];
+    for (const [s, i] of rows) {
+      const r = stepAll(s, i).s;
+      const jump = bodyDiff(poseAt(r, i.now), poseAt(s, i.now));
+      const plain = bodyDiff(poseAt(incoming(r), i.now), poseAt(incoming(s), i.now));
+      expect(jump, `${s.clip?.name} → ${r.clip?.name} at ${i.now}`).toBeLessThanOrEqual(plain + 1e-6);
+    }
+  });
+
+  it("a cut carries a reaction's release only when the cut clip is that reaction's own clip", () => {
+    // Talking with a held tickle whose giggle has ended: a P2 flinch takes the free slot, the tickle is released,
+    // and the announced long-press starts over the flinch at talkEnd. The flinch is cut, the tickle's release isn't.
+    const s = stepAll(
+      stateIn('Thinking'),
+      tickle(10.1),
+      anim({ e: 'talk', id: 3 }, 10.2),
+      gest('cheekPuffR', 'cheekR', 'tap', 11),
+      release(11.02),
+      gest('earDroopL', 'earL', 'longPress', 11.05),
+    ).s;
+    expect(s).toMatchObject({ name: 'Talking', clip: { name: 'flinch', start: 11 }, prevClip: null });
+    expect(s.reaction).toMatchObject({ clip: 'giggle', release: 11.02 });
+    expect(s.queued).toMatchObject({ r: R('earDroopL'), announced: true });
+    const r = stepAll(s, anim({ e: 'talkEnd' }, 11.1)).s;
+    expect(r.clip).toStrictEqual({ name: 'earDroopL', start: 11.1 });
+    expect(r.prevClip).toStrictEqual({ name: 'flinch', start: 11, cutAt: 11.1, release: null });
+  });
+
+  it('other inputs keep prevClip; evaluate ignores it once 100 ms are up, with no clip in the slot, or unknown', () => {
+    const [first] = cuts();
+    const after = stepAll(first!.before, first!.input).s; // dizzy cut at 13.5
+    expect(stepAll(after, gentle(true)).s.prevClip).toBe(after.prevClip);
+    expect(directorReduce(after, anim(SAMPLES.reaction, 13.55))).toBe(after);
+    // Stale (no tick since its 100 ms ended): nothing is blended.
+    expect(bodyDiff(poseAt(after, 13.7), poseAt(incoming(after), 13.7))).toBe(0);
+    // No clip in the slot (bear-view's reduced motion evaluates the state without its clip): nothing is blended.
+    const noClip: DirectorState = { ...after, clip: null };
+    expect(bodyDiff(poseAt(noClip, 13.55), poseAt(incoming(noClip), 13.55))).toBe(0);
+    // A cut clip the director doesn't know: nothing is blended.
+    const mystery: DirectorState = { ...after, prevClip: { ...after.prevClip!, name: 'mystery' } };
+    expect(bodyDiff(poseAt(mystery, 13.55), poseAt(incoming(after), 13.55))).toBe(0);
+  });
+
+  it('evaluate through a cut crossfade makes no array allocation', () => {
+    const s = stepAll(stateIn('Idle'), petStroke(11), release(12), gest('hug', 'belly', 'hug', 12.2)).s;
+    const out = createPose();
+    expect(
+      countAllocations(() => {
+        for (let i = 0; i < 1000; i++) evaluate(s, 12.2 + i * 0.0002, out);
+      }),
+    ).toBe(0);
+  });
+});
+
+// ==== #221: the clip lookup and the mouth channels through evaluate ===============================================
+/** The four mouth channels of `p`, in `MOUTH` order. */
+const mouthOf = (p: Pose): number[] => MOUTH.map((m) => p[m]!);
+/** `evaluate(s, now)` with the mouth channels (bear-view's call), into a fresh pose. */
+const withMouth = (s: DirectorState, now: number): Pose => evaluate(s, now, createPose(), true);
+/** The largest |a − b| over every channel, the mouth's included. */
+function fullDiff(a: Pose, b: Pose): number {
+  let m = 0;
+  for (let i = 0; i < CH_COUNT; i++) m = Math.max(m, Math.abs(a[i]! - b[i]!));
+  return m;
+}
+/** A pinch of both cheeks (squish, P3, held) and an all-over touch (giggle, P3), at `now`. */
+const pinch = (now: number): DirInput => gest('squish', 'cheekL', 'pinch', now);
+const allOver = (now: number): DirInput => gest('giggle', 'belly', 'allOver', now);
+
+describe('#221: clipByName and the mouth channels through evaluate', () => {
+  it('clipByName returns the clips the director plays: session, reaction, the flinch and the mirrored pet', () => {
+    for (const [name, c] of Object.entries(SESSION_CLIPS)) expect(clipByName(name), name).toBe(c);
+    for (const [name, c] of Object.entries(REACTION_CLIPS)) expect(clipByName(name), name).toBe(c);
+    expect(clipByName('flinch')?.tracks.map((tr) => tr.ch)).toStrictEqual([Ch.BodySquash]);
+    const pet = REACTION_CLIPS.pet;
+    const mirrored = clipByName('petMirrored');
+    expect(mirrored?.duration).toBe(pet.duration);
+    expect(mirrored?.tracks).toStrictEqual(
+      pet.tracks.map((tr) =>
+        tr.ch === Ch.HeadRot ? { ch: tr.ch, keys: tr.keys.map((key) => ({ ...key, v: -key.v })) } : tr,
+      ),
+    );
+    expect(clipByName('mystery')).toBeUndefined();
+  });
+
+  it('every clip it knows has its impulses in time order (bear-view applies them with a cursor)', () => {
+    const names = [...Object.keys(SESSION_CLIPS), ...Object.keys(REACTION_CLIPS), 'flinch', 'petMirrored'];
+    let kicked = 0;
+    for (const name of names) {
+      const c = clipByName(name);
+      expect(c, name).toBeDefined();
+      const imps = c?.impulses ?? [];
+      if (imps.length > 0) kicked++;
+      for (let i = 1; i < imps.length; i++)
+        expect(imps[i]!.t, `${name} kick ${i}`).toBeGreaterThanOrEqual(imps[i - 1]!.t);
+    }
+    expect(kicked, 'the clips with spring kicks').toBe(11);
+  });
+
+  it("with `mouth`, evaluate writes a clip's mouth tracks (giggle's jaw); every other channel is as without it", () => {
+    const s = stepAll(stateIn('Idle'), tickle(11)).s;
+    expect(s.clip).toStrictEqual({ name: 'giggle', start: 11 });
+    const sample = sampleClip(REACTION_CLIPS.giggle, 0.3, createPose());
+    expect(sample[Ch.Jaw]).toBeGreaterThan(0.3);
+    const out = createPose().fill(Number.NaN);
+    evaluate(s, 11.3, out, true);
+    expect(Math.abs(out[Ch.Jaw]! - sample[Ch.Jaw]!)).toBeLessThanOrEqual(1e-6);
+    for (const m of [Ch.MouthW, Ch.MouthRound, Ch.Teeth]) expect(out[m], `channel ${m}`).toBe(0);
+    // Without the flag the mouth channels are never written, and every other channel is the same.
+    const plain = createPose().fill(Number.NaN);
+    for (const [j, m] of MOUTH.entries()) plain[m] = 100 + j;
+    evaluate(s, 11.3, plain);
+    for (const [j, m] of MOUTH.entries()) expect(plain[m]).toBe(100 + j);
+    for (let i = 0; i < CH_COUNT; i++) if (!MOUTH.includes(i)) expect(out[i], `channel ${i}`).toBe(plain[i]);
+    // No clip: no base pose has a mouth, so the mouth channels are 0.
+    expect(mouthOf(withMouth(stateIn('Idle'), 11.3))).toStrictEqual([0, 0, 0, 0]);
+  });
+
+  it("a released squish's pucker eases out over 400 ms like its other tracks", () => {
+    const held = stepAll(stateIn('Idle'), pinch(11)).s;
+    expect(held.clip).toStrictEqual({ name: 'squish', start: 11 });
+    expect(withMouth(held, 11.2)[Ch.MouthRound]).toBe(1);
+    const released = stepAll(held, release(11.5)).s;
+    expect(withMouth(released, 11.5)[Ch.MouthRound]).toBe(1);
+    expect(Math.abs(withMouth(released, 11.7)[Ch.MouthRound]! - easeOut(0.5))).toBeLessThanOrEqual(1e-6);
+    expect(withMouth(released, 11.9)[Ch.MouthRound]).toBe(0);
+  });
+
+  it('a mouth-bearing clip cut by another crossfades its mouth over 100 ms (#240), both ways', () => {
+    const cases = [
+      {
+        label: 'giggle cuts a held squish',
+        before: stepAll(stateIn('Idle'), pinch(11)).s,
+        input: allOver(11.5),
+        at: 11.5,
+      },
+      {
+        label: 'squish cuts a giggle',
+        before: stepAll(stateIn('Idle'), tickle(11)).s,
+        input: pinch(11.3),
+        at: 11.3,
+      },
+    ];
+    for (const { label, before, input, at } of cases) {
+      const after = stepAll(before, input).s;
+      expect(after.prevClip, label).toMatchObject({ name: before.clip?.name, cutAt: at });
+      // At the cut: exactly the outgoing pose, the mouth included.
+      expect(fullDiff(withMouth(after, at), withMouth(before, at)), label).toBeLessThanOrEqual(1e-6);
+      // Midway: the even blend of the incoming and the outgoing clip, on the mouth channels too.
+      const t = at + 0.05;
+      const mid = mouthOf(withMouth(after, t));
+      const inc = mouthOf(withMouth(incoming(after), t));
+      const out = mouthOf(withMouth(outgoing(before, after), t));
+      for (let j = 0; j < MOUTH.length; j++)
+        expect(Math.abs(mid[j]! - (inc[j]! + out[j]!) / 2), `${label}: mouth ${j}`).toBeLessThanOrEqual(1e-6);
+      expect(
+        mid.some((v, j) => Math.abs(v - inc[j]!) > 1e-3),
+        `${label}: the outgoing mouth still shows`,
+      ).toBe(true);
+      // From +100 ms: the incoming clip alone.
+      for (const dt of [0.1, 0.15, 0.3]) {
+        expect(
+          fullDiff(withMouth(after, at + dt), withMouth(incoming(after), at + dt)),
+          `${label} +${dt}`,
+        ).toBeLessThanOrEqual(1e-6);
+      }
+    }
+  });
+
+  it('evaluate with the mouth makes no array allocation, through a cut crossfade too', () => {
+    const s = stepAll(stateIn('Idle'), pinch(11), allOver(11.5)).s;
+    expect(s.prevClip?.name).toBe('squish');
+    const out = createPose();
+    expect(
+      countAllocations(() => {
+        for (let i = 0; i < 1000; i++) evaluate(s, 11.5 + i * 0.0002, out, true);
       }),
     ).toBe(0);
   });

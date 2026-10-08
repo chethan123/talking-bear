@@ -14,14 +14,18 @@
 //   bear's X-A2 frame log (rAF time, mouth clip time, envelope index per drawn frame).
 // - The VAD backend (#51): `setVadBackend` pins the backend of every later arm (specs whose synthetic fixtures
 //   Silero doesn't treat as speech pin 'energy'), and `workerEvents` records the worker's VAD status events.
+// - Interactions (#93): `sfxLog` records every scheduled sfx with the context time its sound ends (`sfx.play`'s
+//   `endCtxTime`), and `regionCenter(id)` gives a hit region's centre in viewport CSS px, from the bear's current
+//   bone matrices (the CDP touch points of the `gestures` spec).
 
 import type { BearView, FrameLogEntry } from './anim/bear-view.ts';
 import { POSES, type PoseName } from './anim/poses.ts';
-import type { Effect, SessionEvent, StateName } from './app/events.ts';
+import type { Effect, SessionEvent, SfxId, StateName } from './app/events.ts';
 import type { LevelEvent, Session } from './app/session.ts';
 import tapUrl from './audio/test-tap.worklet.ts?worker&url';
 import { DEFAULT_VAD_BACKEND } from './audio/constants.ts';
 import type { Engine, OutputTapHost, VadBackend, VadBackendHost } from './audio/engine.ts';
+import type { RegionId } from './input/region-ids.ts';
 import type { Visibility } from './platform/visibility.ts';
 
 export interface TransitionLogEntry {
@@ -44,6 +48,18 @@ export interface EventLogEntry {
 
 /** The worker's VAD status events, which reach the session's level listeners (not the reducer). */
 export type WorkerEvent = Extract<LevelEvent, { t: 'vadReady' | 'vadStats' | 'vadError' }>;
+
+/** One scheduled sfx (`Session.addSfxListener`). */
+export interface SfxLogEntry {
+  /** performance.now() when the effect runner scheduled it, in ms (the clock of `log` and `events`). */
+  t: number;
+  /** The ctx frame then (as `log`'s `frame`), or −1 before there is a context. */
+  frame: number;
+  seq: number;
+  id: SfxId;
+  /** The context time at which its sound ends (`sfx.play`'s `endCtxTime`), s. */
+  endCtxTime: number;
+}
 
 export interface WorkerEventLogEntry {
   /** performance.now() when the level listener got the event, in ms (the clock of `log` and `events`). */
@@ -85,6 +101,13 @@ export interface BearTestApi {
   vadBackend(): VadBackend;
   /** Every `vadReady`, `vadStats` and `vadError` the session's level listeners got, oldest first. */
   workerEvents: WorkerEventLogEntry[];
+  /** Every sfx the effect runner scheduled, oldest first. */
+  sfxLog: SfxLogEntry[];
+  /**
+   * The centre of hit region `id` (its first `REGIONS` entry) in viewport CSS px, from the bear's current bone
+   * matrices. Throws before the bear is mounted, and for `background`.
+   */
+  regionCenter(id: RegionId): { x: number; y: number };
 }
 
 declare global {
@@ -98,7 +121,7 @@ export interface TestHookDeps {
   engine: Pick<Engine, 'context'> & OutputTapHost & VadBackendHost;
   visibility: Visibility;
   /** The bear, once main.ts has mounted it (after the hooks are installed). */
-  bear: () => Pick<BearView, 'showPose' | 'frameLog'> | null;
+  bear: () => Pick<BearView, 'showPose' | 'frameLog' | 'regionCenter'> | null;
 }
 
 /** Default canvas size of `showPose`: the renderer screenshots' 500 × 700 CSS px (#75). */
@@ -159,6 +182,7 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
   const log: TransitionLogEntry[] = [];
   const events: EventLogEntry[] = [];
   const workerEvents: WorkerEventLogEntry[] = [];
+  const sfxLog: SfxLogEntry[] = [];
   /** What setVadBackend last pinned (the engine's own value is private), so specs can see what arms ask for. */
   let backend: VadBackend = DEFAULT_VAD_BACKEND;
 
@@ -186,6 +210,11 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
     if (e.t === 'vadReady' || e.t === 'vadStats' || e.t === 'vadError') {
       workerEvents.push({ t: performance.now(), e });
     }
+  });
+
+  // ---- scheduled sfx (#93) -------------------------------------------------------------------------------------
+  session.addSfxListener((e) => {
+    sfxLog.push({ t: performance.now(), frame: frameNow(), seq: e.seq, id: e.id, endCtxTime: e.endCtxTime });
   });
 
   // ---- output tap --------------------------------------------------------------------------------------------
@@ -264,6 +293,12 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
     },
     vadBackend: () => backend,
     workerEvents,
+    sfxLog,
+    regionCenter(id) {
+      const bear = deps.bear();
+      if (bear === null) throw new Error('regionCenter: the bear is not mounted yet');
+      return bear.regionCenter(id);
+    },
   };
   window.__bearTest = api;
   return api;

@@ -37,10 +37,8 @@ describe('overlay.ts', () => {
     'The microphone switches off when Juni falls asleep.',
     'Continue',
   ] as const;
-  const MIC_HELP = [
-    "Microphone is blocked. To fix it, allow the microphone for this site in Chrome's site settings.",
-    'Try again',
-  ] as const;
+  const MIC_HELP =
+    "Microphone is blocked. To fix it, allow the microphone for this site in Chrome's site settings.";
 
   test.each(SINGLE_TEXT)('%s renders exactly its text', (variant, text) => {
     const show = mountOverlay(root, vi.fn());
@@ -61,15 +59,15 @@ describe('overlay.ts', () => {
     expect(root.innerText).toBe(PARENT.join('\n\n'));
   });
 
-  test('micHelp renders the blocked-mic text and Try again', () => {
+  test('micHelp renders the blocked-mic text and no button (retry lives in settings, #114)', () => {
     const show = mountOverlay(root, vi.fn());
     show('micHelp');
     const sheet = visibleSheet();
     const ps = sheet.querySelectorAll('p');
     expect(ps).toHaveLength(1);
-    expect(ps[0]?.textContent).toBe(MIC_HELP[0]);
-    expect(sheet.querySelector('button')?.textContent).toBe(MIC_HELP[1]);
-    expect(root.innerText).toBe(MIC_HELP.join('\n\n'));
+    expect(ps[0]?.textContent).toBe(MIC_HELP);
+    expect(sheet.querySelector('button')).toBeNull();
+    expect(root.innerText).toBe(MIC_HELP);
   });
 
   test('the exported texts are the specified ones', () => {
@@ -79,8 +77,7 @@ describe('overlay.ts', () => {
       parentLocal: PARENT[1],
       parentMicOff: PARENT[2],
       parentContinue: PARENT[3],
-      micHelp: MIC_HELP[0],
-      micHelpRetry: MIC_HELP[1],
+      micHelp: MIC_HELP,
       micMuted: SINGLE_TEXT[1]![1],
       tooNoisy: SINGLE_TEXT[2]![1],
       error: SINGLE_TEXT[3]![1],
@@ -97,14 +94,18 @@ describe('overlay.ts', () => {
     expect(dispatch.mock.calls).toEqual([[{ t: 'parentContinue' }]]);
   });
 
-  test('Try again dispatches settingsRetry', () => {
+  test('micHelp has no retry: clicking anything in it, and every overlay button, never dispatches settingsRetry', () => {
     const dispatch = vi.fn<(e: SessionEvent) => void>();
     const show = mountOverlay(root, dispatch);
     show('micHelp');
-    const button = visibleSheet().querySelector('button');
-    expect(button?.checkVisibility()).toBe(true);
-    button?.click();
-    expect(dispatch.mock.calls).toEqual([[{ t: 'settingsRetry' }]]);
+    const sheet = visibleSheet();
+    for (const el of [sheet, ...sheet.querySelectorAll<HTMLElement>('*')]) el.click();
+    expect(dispatch).not.toHaveBeenCalled();
+    // The only button left in the overlay is the parent sheet's Continue.
+    const buttons = Array.from(root.querySelectorAll('button'));
+    expect(buttons.map((b) => b.textContent)).toEqual([OVERLAY_TEXT.parentContinue]);
+    for (const b of buttons) b.click();
+    expect(dispatch.mock.calls).toEqual([[{ t: 'parentContinue' }]]);
   });
 
   test('null hides every variant, and switching variants hides the previous one', () => {

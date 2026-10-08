@@ -591,7 +591,7 @@ function onTraceBatch(e: TraceBatch): void {
     const wantHop = hopStartFrame(at, r.rawDb.length);
     const wantSil = sileroStartFrame(at, r.sileroP.length);
     if (!(Math.abs(e.hop0Frame - wantHop) <= FRAME_SLIP)) {
-      fail(r, `trace not contiguous: a batch starts at hop frame ${e.hop0Frame}, expected ${wantHop}`);
+      fail(r, notContiguous(e.hop0Frame, wantHop, r.ctxRate));
       return;
     }
     if (e.sileroP.length === 0 || !(Math.abs(e.sil0Frame - wantSil) <= FRAME_SLIP)) {
@@ -621,6 +621,24 @@ function onTraceBatch(e: TraceBatch): void {
   showValues();
   drawHold(); // the noise-only time left
   drawPlot();
+}
+
+/**
+ * The "not contiguous" failure for a batch that starts at `hop0Frame` where the trace so far ends at `wantHop`. A
+ * later start is a capture jump: when the audio thread stalls for over 0.5 s, the capture worklet re-anchors its
+ * VAD feed at the frame it resumes at (#237), and the DSP worker ends the batch at the gap (#244), so the frames in
+ * between were not delivered to the VAD. An earlier start would be a bug.
+ */
+function notContiguous(hop0Frame: number, wantHop: number, ctxRate: number): string {
+  const gap = hop0Frame - wantHop;
+  if (!(gap > 0)) {
+    return `trace not contiguous: a batch starts at hop frame ${hop0Frame}, expected ${wantHop}`;
+  }
+  const ms = ((gap / ctxRate) * 1000).toFixed(0);
+  return (
+    `trace not contiguous: a capture jump of ${gap} frames (${ms} ms) before hop frame ${hop0Frame} ` +
+    `(an audio-thread stall of over 0.5 s re-anchors the capture; those frames were not delivered to the VAD)`
+  );
 }
 
 /** Capture has started: the first batch passed its check, so holds are accepted from now on. */

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { PWA_MANIFEST } from './src/pwa-manifest.ts';
 
@@ -24,7 +24,29 @@ function readCommonHeaders(): Record<string, string> {
   return common;
 }
 
+// The build id (issue #101): `BEAR_BUILD_ID` names a build, e.g. the update spec's v1 and v2 variants
+// (scripts/build-update-variants.mjs) or the CI images (#108); 'dev' when unset. It is put on <html> as
+// `data-build`, so `document.documentElement.dataset.build` tells which build a page runs (the update spec reads
+// it), and is defined as `__BUILD_ID__` for app code (none reads it yet; a reader declares
+// `declare const __BUILD_ID__: string;` in src/vite-env.d.ts). It goes into HTML, so it is restricted to letters,
+// digits, '.', '_' and '-'.
+const BUILD_ID = process.env.BEAR_BUILD_ID ?? 'dev';
+if (!/^[\w.-]+$/.test(BUILD_ID)) {
+  throw new Error(`BEAR_BUILD_ID must match [A-Za-z0-9_.-]+, got ${JSON.stringify(BUILD_ID)}`);
+}
+
+/** Adds `data-build="<BUILD_ID>"` to index.html's <html> element. */
+function buildIdAttribute(): Plugin {
+  return {
+    name: 'bear-build-id',
+    transformIndexHtml: (html) => html.replace(/<html\b/, `<html data-build="${BUILD_ID}"`),
+  };
+}
+
 export default defineConfig({
+  define: {
+    __BUILD_ID__: JSON.stringify(BUILD_ID),
+  },
   build: {
     assetsInlineLimit: 0,
   },
@@ -35,6 +57,7 @@ export default defineConfig({
     headers: readCommonHeaders(),
   },
   plugins: [
+    buildIdAttribute(),
     // The service worker and the manifest (plan §4.7): generateSW in prompt mode, registered by
     // src/pwa/register.ts through `virtual:pwa-register` (no injected <script>, so nothing inline under the CSP).
     VitePWA({

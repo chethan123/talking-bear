@@ -1,14 +1,36 @@
-// Browser Mode tests for the M3 settings sheet (settings-sheet.ts, issue #66) and its M6 Install and restart
-// buttons (issue #98). styles.css is imported, so the gear's size and corner are the real ones; the store is the
-// real one (in memory) with `set` spied on.
+// Browser Mode tests for the settings sheet (settings-sheet.ts): M3 (issue #66), its M6 Install and restart
+// buttons (issue #98), M8 (issue #113): the gear's 1 s press guard and progress ring, every control, and the
+// focus-trapped dialog, and M8's "For parents" section (issue #114): the mic retry and help, the privacy note, the
+// licences view, and no outbound links with every UI module mounted. styles.css is imported, so the gear's size,
+// corner and ring are the real ones; the store is the real one (in memory) with `set` spied on. Presses use an
+// injected clock, except the real-time 300 / 1100 ms case; pointer and key events are dispatched on the gear, and
+// Tab / Escape go through the real keyboard. The licences view gets the shipped public/licenses.txt through a mocked
+// fetch.
 
-import { afterEach, beforeEach, describe, expect, test, vi, type Mock, type MockInstance } from 'vitest';
-import type { StateName } from '../app/events.ts';
-import { createSettingsStore, DEFAULT_SETTINGS, type SettingsStore } from '../app/settings.ts';
 import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+  type Mock,
+  type MockInstance,
+} from 'vitest';
+import { commands, page, userEvent } from 'vitest/browser';
+import { realClock } from '../app/clock.ts';
+import type { Overlay, SessionEvent, StateName } from '../app/events.ts';
+import { createSettingsStore, DEFAULT_SETTINGS, type SettingsStore } from '../app/settings.ts';
+import { mountDebugOverlay } from './debug-overlay.ts';
+import { mountOverlay } from './overlay.ts';
+import {
+  GEAR_HOLD_MS,
+  GEAR_PRESSING_CLASS,
   mountSettingsSheet,
   SETTINGS_TEXT,
   SHEET_BLOCKED,
+  SLEEP_AFTER_MIN,
   type SettingsSheetDeps,
   type SheetPwa,
 } from './settings-sheet.ts';
@@ -44,7 +66,11 @@ interface Harness {
   store: SettingsStore;
   set: MockInstance<SettingsStore['set']>;
   setQuiet: Mock<(on: boolean) => void>;
+  /** The session's dispatch (the mic retry). */
+  dispatch: Mock<(e: SessionEvent) => void>;
   state: { name: StateName };
+  /** The sheet's clock (ms); a press advances it. */
+  clock: { t: number };
   deps: SettingsSheetDeps;
 }
 
@@ -52,8 +78,18 @@ function harness(): Harness {
   const store = createSettingsStore(null);
   const set = vi.spyOn(store, 'set');
   const setQuiet = vi.fn<(on: boolean) => void>();
+  const dispatch = vi.fn<(e: SessionEvent) => void>();
   const state: { name: StateName } = { name: 'Listening' };
-  return { store, set, setQuiet, state, deps: { store, bus: { setQuiet }, state: () => state.name } };
+  const clock = { t: 1000 };
+  return {
+    store,
+    set,
+    setQuiet,
+    dispatch,
+    state,
+    clock,
+    deps: { store, bus: { setQuiet }, state: () => state.name, dispatch, now: () => clock.t },
+  };
 }
 
 function gear(): HTMLButtonElement {
@@ -62,8 +98,20 @@ function gear(): HTMLButtonElement {
   return b;
 }
 
+function ring(): SVGSVGElement {
+  const r = gear().querySelector<SVGSVGElement>('svg.settings-gear-ring');
+  if (r === null) throw new Error('no ring');
+  return r;
+}
+
+function arc(): SVGCircleElement {
+  const c = ring().querySelector('circle');
+  if (c === null) throw new Error('no ring circle');
+  return c;
+}
+
 function dialog(): HTMLDialogElement {
-  const d = root.querySelector('dialog');
+  const d = root.querySelector<HTMLDialogElement>('dialog.settings-sheet');
   if (d === null) throw new Error('no dialog');
   return d;
 }
@@ -79,6 +127,15 @@ function input(text: string): HTMLInputElement {
   throw new Error(`no input labelled ${text}`);
 }
 
+/** The "Sleep after" select: the one inside the label that starts with its text. */
+function sleepSelect(): HTMLSelectElement {
+  for (const label of root.querySelectorAll('label')) {
+    const s = label.querySelector('select');
+    if (s !== null && label.firstElementChild?.textContent === SETTINGS_TEXT.sleepAfter) return s;
+  }
+  throw new Error('no Sleep after select');
+}
+
 function closeButton(): HTMLButtonElement {
   const b = Array.from(dialog().querySelectorAll('button')).find(
     (x) => x.textContent === SETTINGS_TEXT.close,
@@ -87,11 +144,53 @@ function closeButton(): HTMLButtonElement {
   return b;
 }
 
+/** Dispatches a pointer event of `type` on the gear: by default the primary touch pointer 1 at its centre. */
+function pointer(type: string, init: PointerEventInit = {}): void {
+  const r = gear().getBoundingClientRect();
+  gear().dispatchEvent(
+    new PointerEvent(type, {
+      bubbles: type !== 'pointerleave',
+      cancelable: true,
+      pointerId: 1,
+      pointerType: 'touch',
+      isPrimary: true,
+      button: 0,
+      clientX: r.left + r.width / 2,
+      clientY: r.top + r.height / 2,
+      ...init,
+    }),
+  );
+}
+
+/** A press of `ms` on the harness clock: pointerdown, the clock advances, pointerup. */
+function press(h: Harness, ms: number): void {
+  pointer('pointerdown');
+  h.clock.t += ms;
+  pointer('pointerup');
+}
+
+/** A key held for `ms` on the harness clock, on the gear. */
+function keyPress(h: Harness, key: string, ms: number): void {
+  gear().dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+  h.clock.t += ms;
+  gear().dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, cancelable: true }));
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 const RADIOS = [
   [SETTINGS_TEXT.cub, 'cub'],
   [SETTINGS_TEXT.chipmunk, 'chipmunk'],
   [SETTINGS_TEXT.bigbear, 'bigbear'],
   [SETTINGS_TEXT.custom, 'custom'],
+] as const;
+
+/** The four toggles: label, settings key, default. */
+const TOGGLES = [
+  [SETTINGS_TEXT.quietMode, 'quietMode', true],
+  [SETTINGS_TEXT.gentleMode, 'gentleMode', false],
+  [SETTINGS_TEXT.haptics, 'haptics', true],
+  [SETTINGS_TEXT.noisyRoom, 'noisyRoomNs', false],
 ] as const;
 
 describe('settings sheet', () => {
@@ -109,9 +208,10 @@ describe('settings sheet', () => {
     expect(dialog().open).toBe(false);
   });
 
-  test('the gear opens a modal sheet with the four voices, the custom slider, Quiet mode and Close', () => {
-    mountSettingsSheet(root, harness().deps);
-    gear().click();
+  test('a 1 s press opens a modal sheet with the voices, the slider, the four toggles, Sleep after and Close', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    press(h, GEAR_HOLD_MS);
     const d = dialog();
     expect(d.open).toBe(true);
     expect(d.matches(':modal')).toBe(true);
@@ -123,9 +223,26 @@ describe('settings sheet', () => {
     expect([pitch.type, pitch.min, pitch.max, pitch.step]).toEqual(['range', '0.7', '2.2', '0.05']);
     expect(Number(pitch.value)).toBe(DEFAULT_SETTINGS.customPitch);
     expect(pitch.disabled).toBe(true);
-    const quiet = input(SETTINGS_TEXT.quietMode);
-    expect(quiet.type).toBe('checkbox');
-    expect(quiet.checked).toBe(true); // Quiet mode is on by default
+    // Quiet on, Gentle off, Haptics on, Noisy room off: the defaults (plan §7 M8).
+    for (const [text, , on] of TOGGLES) {
+      const t = input(text);
+      expect([t.type, t.getAttribute('role'), t.checked], text).toEqual(['checkbox', 'switch', on]);
+    }
+    const s = sleepSelect();
+    expect(Array.from(s.options, (o) => [o.value, o.textContent])).toEqual([
+      ['60', '1 min'],
+      ['120', '2 min'],
+      ['180', '3 min'],
+      ['300', '5 min'],
+      ['600', '10 min'],
+    ]);
+    expect(SLEEP_AFTER_MIN).toEqual([1, 2, 3, 5, 10]);
+    expect(s.value).toBe('120'); // 2 min
+    // Every control is a 48 px target.
+    for (const label of d.querySelectorAll('label')) {
+      expect(label.getBoundingClientRect().height, label.textContent ?? '').toBeGreaterThanOrEqual(48);
+    }
+    expect(s.getBoundingClientRect().height).toBeGreaterThanOrEqual(48);
     closeButton().click();
     expect(d.open).toBe(false);
   });
@@ -133,7 +250,7 @@ describe('settings sheet', () => {
   test('selecting Chipmunk calls store.set({ voice: "chipmunk" }); each voice sets its own id', () => {
     const h = harness();
     mountSettingsSheet(root, h.deps);
-    gear().click();
+    press(h, GEAR_HOLD_MS);
     input(SETTINGS_TEXT.chipmunk).click();
     expect(h.set).toHaveBeenCalledTimes(1);
     expect(h.set).toHaveBeenLastCalledWith({ voice: 'chipmunk' });
@@ -148,7 +265,7 @@ describe('settings sheet', () => {
   test('the slider is enabled only for Custom and sets customPitch', () => {
     const h = harness();
     mountSettingsSheet(root, h.deps);
-    gear().click();
+    press(h, GEAR_HOLD_MS);
     const pitch = input(SETTINGS_TEXT.customPitch);
     input(SETTINGS_TEXT.custom).click();
     expect(pitch.disabled).toBe(false);
@@ -163,7 +280,7 @@ describe('settings sheet', () => {
   test('Quiet mode toggles bus.setQuiet and the stored quietMode', () => {
     const h = harness();
     mountSettingsSheet(root, h.deps);
-    gear().click();
+    press(h, GEAR_HOLD_MS);
     const quiet = input(SETTINGS_TEXT.quietMode);
     quiet.click();
     expect(h.setQuiet.mock.calls).toEqual([[false]]);
@@ -175,16 +292,65 @@ describe('settings sheet', () => {
     expect(h.store.get().quietMode).toBe(true);
   });
 
+  test('Gentle mode, Haptics and Noisy room each write their own setting, both ways', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    press(h, GEAR_HOLD_MS);
+    for (const [text, key, on] of TOGGLES.slice(1)) {
+      const t = input(text);
+      t.click();
+      expect(h.set, text).toHaveBeenLastCalledWith({ [key]: !on });
+      expect(h.store.get()[key], text).toBe(!on);
+      t.click();
+      expect(h.set, text).toHaveBeenLastCalledWith({ [key]: on });
+      expect(h.store.get()[key], text).toBe(on);
+    }
+    expect(h.set).toHaveBeenCalledTimes(6);
+    expect(h.setQuiet).not.toHaveBeenCalled();
+  });
+
+  test('Sleep after writes sleepTimeoutSec for every choice', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    press(h, GEAR_HOLD_MS);
+    const s = sleepSelect();
+    for (const min of [10, 1, 3, 5, 2]) {
+      s.value = String(min * 60);
+      s.dispatchEvent(new Event('change', { bubbles: true }));
+      expect(h.set).toHaveBeenLastCalledWith({ sleepTimeoutSec: min * 60 });
+      expect(h.store.get().sleepTimeoutSec).toBe(min * 60);
+    }
+    expect(h.set).toHaveBeenCalledTimes(5);
+  });
+
   test('opening shows the store as it is now', () => {
     const h = harness();
     mountSettingsSheet(root, h.deps);
-    h.store.set({ voice: 'custom', customPitch: 0.9, quietMode: false });
-    gear().click();
+    h.store.set({
+      voice: 'custom',
+      customPitch: 0.9,
+      quietMode: false,
+      gentleMode: true,
+      haptics: false,
+      noisyRoomNs: true,
+      sleepTimeoutSec: 600,
+    });
+    press(h, GEAR_HOLD_MS);
     expect(RADIOS.map(([text]) => input(text).checked)).toEqual([false, false, false, true]);
     const pitch = input(SETTINGS_TEXT.customPitch);
     expect(Number(pitch.value)).toBe(0.9);
     expect(pitch.disabled).toBe(false);
-    expect(input(SETTINGS_TEXT.quietMode).checked).toBe(false);
+    expect(TOGGLES.map(([text]) => input(text).checked)).toEqual([false, true, false, true]);
+    expect(sleepSelect().value).toBe('600');
+  });
+
+  test('a stored sleep timeout that is not a choice selects nothing', () => {
+    const h = harness();
+    const sheet = mountSettingsSheet(root, h.deps);
+    h.store.set({ sleepTimeoutSec: 90 });
+    sheet.open();
+    expect(sleepSelect().selectedIndex).toBe(-1);
+    expect(h.store.get().sleepTimeoutSec).toBe(90);
   });
 
   test('the gear is ignored while Recording, Processing or Playing, and opens the sheet in every other state', () => {
@@ -193,7 +359,10 @@ describe('settings sheet', () => {
       const h = harness();
       h.state.name = name;
       const sheet = mountSettingsSheet(root, h.deps);
-      gear().click();
+      pointer('pointerdown');
+      expect(gear().classList.contains(GEAR_PRESSING_CLASS), name).toBe(!SHEET_BLOCKED.has(name)); // no ring
+      h.clock.t += GEAR_HOLD_MS;
+      pointer('pointerup');
       expect(dialog().open, name).toBe(!SHEET_BLOCKED.has(name));
       expect(sheet.open(), name).toBe(!SHEET_BLOCKED.has(name));
       sheet.close();
@@ -202,16 +371,275 @@ describe('settings sheet', () => {
     }
   });
 
+  test('a press that starts in Listening opens nothing if the bear is Recording at its release', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    pointer('pointerdown');
+    h.state.name = 'Recording';
+    h.clock.t += GEAR_HOLD_MS;
+    pointer('pointerup');
+    expect(dialog().open).toBe(false);
+    expect(gear().classList.contains(GEAR_PRESSING_CLASS)).toBe(false);
+  });
+
   test('no element under the mount root has a style attribute (CSP style-src self)', () => {
     const h = harness();
     mountSettingsSheet(root, h.deps);
     expect(root.querySelectorAll('[style]').length).toBe(0);
-    gear().click();
+    pointer('pointerdown'); // the ring is filling
+    expect(root.querySelectorAll('[style]').length).toBe(0);
+    h.clock.t += GEAR_HOLD_MS;
+    pointer('pointerup');
+    expect(dialog().open).toBe(true);
     input(SETTINGS_TEXT.custom).click();
-    input(SETTINGS_TEXT.quietMode).click();
+    for (const [text] of TOGGLES) input(text).click();
+    const s = sleepSelect();
+    s.value = '300';
+    s.dispatchEvent(new Event('change', { bubbles: true }));
     expect(root.querySelectorAll('[style]').length).toBe(0);
     closeButton().click();
     expect(root.querySelectorAll('[style]').length).toBe(0);
+  });
+});
+
+describe('the 1 s press guard (#113)', () => {
+  test('a 300 ms press does not open the sheet, and a 1100 ms press does (real time, the default clock)', async () => {
+    const h = harness();
+    mountSettingsSheet(root, { ...h.deps, now: undefined });
+    pointer('pointerdown');
+    await sleep(300);
+    pointer('pointerup');
+    expect(dialog().open).toBe(false);
+    pointer('pointerdown');
+    await sleep(1100);
+    expect(dialog().open).toBe(false); // D1: opens at release, never while held
+    pointer('pointerup');
+    expect(dialog().open).toBe(true);
+  });
+
+  test('a click does nothing; a press opens from exactly GEAR_HOLD_MS (1000 ms)', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    expect(GEAR_HOLD_MS).toBe(1000);
+    gear().click();
+    expect(dialog().open).toBe(false);
+    press(h, 999);
+    expect(dialog().open).toBe(false);
+    press(h, 1000);
+    expect(dialog().open).toBe(true);
+  });
+
+  test('the press ends without opening on pointercancel, leaving the gear, a move off it, a second pointer or blur', () => {
+    const cases: [string, () => void][] = [
+      ['pointercancel', () => pointer('pointercancel')],
+      ['pointerleave', () => pointer('pointerleave')],
+      ['move off the gear', () => pointer('pointermove', { clientX: 10, clientY: 300 })],
+      ['second pointer', () => pointer('pointerdown', { pointerId: 2, isPrimary: false })],
+      ['blur', () => gear().dispatchEvent(new FocusEvent('blur'))],
+    ];
+    for (const [name, interrupt] of cases) {
+      const h = harness();
+      mountSettingsSheet(root, h.deps);
+      pointer('pointerdown');
+      expect(gear().classList.contains(GEAR_PRESSING_CLASS), name).toBe(true);
+      h.clock.t += 500;
+      interrupt();
+      expect(gear().classList.contains(GEAR_PRESSING_CLASS), name).toBe(false);
+      h.clock.t += GEAR_HOLD_MS;
+      pointer('pointerup');
+      expect(dialog().open, name).toBe(false);
+      root.replaceChildren();
+    }
+  });
+
+  test('a move within the gear keeps the press; a release off the gear opens nothing', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    const r = gear().getBoundingClientRect();
+    pointer('pointerdown');
+    pointer('pointermove', { clientX: r.left + 4, clientY: r.bottom - 4 });
+    h.clock.t += GEAR_HOLD_MS;
+    pointer('pointerup', { clientX: r.left - 20, clientY: r.top + 20 });
+    expect(dialog().open).toBe(false);
+    pointer('pointerdown');
+    pointer('pointermove', { clientX: r.left + 4, clientY: r.bottom - 4 });
+    h.clock.t += GEAR_HOLD_MS;
+    pointer('pointerup');
+    expect(dialog().open).toBe(true);
+  });
+
+  test('only the primary pointer with the main button starts a press', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    for (const init of [
+      { button: 2, pointerType: 'mouse' },
+      { isPrimary: false, pointerId: 3 },
+    ]) {
+      pointer('pointerdown', init);
+      expect(gear().classList.contains(GEAR_PRESSING_CLASS)).toBe(false);
+      h.clock.t += GEAR_HOLD_MS;
+      pointer('pointerup', init);
+      expect(dialog().open).toBe(false);
+    }
+    pointer('pointerdown', { pointerType: 'mouse' });
+    h.clock.t += GEAR_HOLD_MS;
+    pointer('pointerup', { pointerType: 'mouse' });
+    expect(dialog().open).toBe(true);
+  });
+
+  test('a primary pointerdown restarts a press whose pointerup was lost', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    pointer('pointerdown'); // pointer 1: its pointerup never arrives
+    h.clock.t += 300;
+    pointer('pointerdown', { pointerId: 5 });
+    expect(gear().classList.contains(GEAR_PRESSING_CLASS)).toBe(true);
+    h.clock.t += GEAR_HOLD_MS;
+    pointer('pointerup', { pointerId: 5 });
+    expect(dialog().open).toBe(true);
+  });
+
+  test('the gear tells screen readers to hold it: aria-description "Hold for 1 second"', () => {
+    mountSettingsSheet(root, harness().deps);
+    expect(gear().getAttribute('aria-description')).toBe('Hold for 1 second');
+    expect(SETTINGS_TEXT.holdHint).toBe('Hold for 1 second');
+  });
+
+  test('the ring is hidden at rest and fills over GEAR_HOLD_MS while pressing', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    expect(ring().getAttribute('aria-hidden')).toBe('true');
+    expect(getComputedStyle(ring()).opacity).toBe('0');
+    expect(arc().getAnimations()).toHaveLength(0);
+    pointer('pointerdown');
+    expect(gear().classList.contains(GEAR_PRESSING_CLASS)).toBe(true);
+    expect(getComputedStyle(ring()).opacity).toBe('1');
+    const [fill, ...rest] = arc().getAnimations();
+    expect(rest).toHaveLength(0);
+    if (!(fill instanceof CSSAnimation)) throw new Error('the ring has no CSS animation');
+    expect(fill.animationName).toBe('settings-gear-fill');
+    expect(fill.effect?.getTiming().duration).toBe(GEAR_HOLD_MS);
+    h.clock.t += 400;
+    pointer('pointerup'); // too short: closed, and the ring is gone
+    expect(dialog().open).toBe(false);
+    expect(gear().classList.contains(GEAR_PRESSING_CLASS)).toBe(false);
+    expect(getComputedStyle(ring()).opacity).toBe('0');
+    expect(arc().getAnimations()).toHaveLength(0);
+  });
+
+  test('a held Enter or Space opens after 1 s; a repeat neither restarts nor ends the press; the other activation key cancels it', () => {
+    for (const key of ['Enter', ' ']) {
+      const h = harness();
+      const sheet = mountSettingsSheet(root, h.deps);
+      const keydown = (init: KeyboardEventInit): void => {
+        gear().dispatchEvent(new KeyboardEvent('keydown', init));
+      };
+      keyPress(h, key, 300);
+      expect(dialog().open, key).toBe(false);
+      // A repeat is the same press: it keeps the ring and its start time (600 + 400 ms = 1 s opens).
+      keydown({ key });
+      h.clock.t += 600;
+      keydown({ key, repeat: true });
+      expect(gear().classList.contains(GEAR_PRESSING_CLASS), key).toBe(true);
+      h.clock.t += 400;
+      gear().dispatchEvent(new KeyboardEvent('keyup', { key }));
+      expect(dialog().open, key).toBe(true);
+      sheet.close();
+      // A non-activation key is ignored.
+      keydown({ key });
+      keydown({ key: 'a' });
+      expect(gear().classList.contains(GEAR_PRESSING_CLASS), key).toBe(true);
+      h.clock.t += GEAR_HOLD_MS;
+      gear().dispatchEvent(new KeyboardEvent('keyup', { key }));
+      expect(dialog().open, key).toBe(true);
+      sheet.close();
+      // The other activation key cancels the press.
+      keydown({ key });
+      h.clock.t += 600;
+      keydown({ key: key === ' ' ? 'Enter' : ' ' });
+      expect(gear().classList.contains(GEAR_PRESSING_CLASS), key).toBe(false);
+      h.clock.t += 600;
+      gear().dispatchEvent(new KeyboardEvent('keyup', { key }));
+      expect(dialog().open, key).toBe(false);
+      keyPress(h, key, GEAR_HOLD_MS);
+      expect(dialog().open, key).toBe(true);
+      sheet.close();
+      root.replaceChildren();
+    }
+  });
+
+  test('X-A5: the gear prevents the context menu and takes no touch gestures or selection', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    gear().dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(true);
+    const cs = getComputedStyle(gear());
+    expect(cs.touchAction).toBe('none');
+    expect(cs.userSelect).toBe('none');
+    // Android's long-press contextmenu (≈ 500 ms) neither opens the sheet nor ends a parent's press.
+    const contextmenu = (): void => {
+      gear().dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    };
+    pointer('pointerdown');
+    h.clock.t += 500;
+    contextmenu();
+    expect(dialog().open).toBe(false);
+    expect(gear().classList.contains(GEAR_PRESSING_CLASS)).toBe(true);
+    h.clock.t += 600;
+    contextmenu();
+    expect(dialog().open).toBe(false);
+    pointer('pointerup');
+    expect(dialog().open).toBe(true);
+  });
+});
+
+describe('the dialog (#113)', () => {
+  test('role="dialog", aria-modal="true", labelled by its title; focus starts on Close', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    press(h, GEAR_HOLD_MS);
+    const d = dialog();
+    expect(d.getAttribute('role')).toBe('dialog');
+    expect(d.getAttribute('aria-modal')).toBe('true');
+    expect(document.getElementById(d.getAttribute('aria-labelledby') ?? '')?.textContent).toBe('Settings');
+    expect(document.activeElement).toBe(closeButton());
+  });
+
+  test('Tab from Close wraps to the selected voice, Shift+Tab from the voices wraps to Close', async () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    h.store.set({ voice: 'bigbear' });
+    press(h, GEAR_HOLD_MS);
+    expect(document.activeElement).toBe(closeButton());
+    await userEvent.keyboard('{Tab}');
+    expect(document.activeElement).toBe(input(SETTINGS_TEXT.bigbear));
+    await userEvent.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(document.activeElement).toBe(closeButton());
+    // Tab walks forward through the controls without leaving the dialog.
+    await userEvent.keyboard('{Tab}{Tab}');
+    expect(dialog().contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(closeButton());
+  });
+
+  test('Escape closes the sheet without writing the store', async () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    press(h, GEAR_HOLD_MS);
+    expect(dialog().open).toBe(true);
+    await userEvent.keyboard('{Escape}');
+    expect(dialog().open).toBe(false);
+    expect(h.set).not.toHaveBeenCalled();
+  });
+
+  test('the bear keeps running: the sheet stays open when the bear starts Recording, and Close still closes it', () => {
+    const h = harness();
+    mountSettingsSheet(root, h.deps);
+    press(h, GEAR_HOLD_MS);
+    h.state.name = 'Recording';
+    expect(dialog().open).toBe(true);
+    closeButton().click();
+    expect(dialog().open).toBe(false);
   });
 });
 
@@ -350,5 +778,283 @@ describe('M6 Install and restart (#98)', () => {
     expect(button(SETTINGS_TEXT.install).hidden).toBe(false);
     expect(button(SETTINGS_TEXT.restart).disabled).toBe(false);
     expect(root.querySelectorAll('[style]').length).toBe(0);
+  });
+});
+
+// ---- For parents (#114) ----
+
+/** The shipped licences file (public/licenses.txt; the path is relative to the project root). */
+let FILE = '';
+
+beforeAll(async () => {
+  FILE = await commands.readFile('public/licenses.txt');
+});
+
+/** #114's wording, written out here rather than read from SETTINGS_TEXT. */
+const MIC_HELP_114 =
+  "If the microphone is blocked: open Chrome's menu → Settings → Site settings → Microphone, and allow this site.";
+const PRIVACY_114 =
+  'Talking Bear works entirely on this device. It has no accounts, analytics or tracking, and never sends audio anywhere. What Juni hears stays in memory only until the replay finishes. Settings are stored on this device.';
+
+/** A fetch that answers with the shipped licences file. */
+function licencesFetch() {
+  return vi.fn<(url: string) => Promise<Response>>(async () => new Response(FILE));
+}
+
+function parentsSection(): HTMLElement {
+  const s = dialog().querySelector<HTMLElement>('section.settings-parents');
+  if (s === null) throw new Error('no For parents section');
+  return s;
+}
+
+function licencesView(): HTMLDialogElement {
+  const d = root.querySelector<HTMLDialogElement>('dialog.licences-screen');
+  if (d === null) throw new Error('no licences view');
+  return d;
+}
+
+/** Every `a` / `area` href under the document that does not resolve to this origin. */
+function offOriginHrefs(): string[] {
+  return Array.from(
+    document.querySelectorAll('a[href], area[href]'),
+    (a) => a.getAttribute('href') ?? '',
+  ).filter((href) => new URL(href, document.baseURI).origin !== location.origin);
+}
+
+describe('For parents (#114)', () => {
+  test('the texts are the specified ones; Install keeps its M6 label', () => {
+    expect(SETTINGS_TEXT).toMatchObject({
+      forParents: 'For parents',
+      micRetry: 'Try the microphone again',
+      micHelp: MIC_HELP_114,
+      privacy: PRIVACY_114,
+      licences: 'Open-source licences',
+      install: 'Install',
+      restart: 'New version – restart',
+    });
+  });
+
+  test('the section sits between Sleep after and Close: heading, retry, help, Install, restart, privacy, licences', () => {
+    const f = fakePwa();
+    f.flags.install = true;
+    const sheet = mountSettingsSheet(root, { ...harness().deps, pwa: f.pwa });
+    sheet.open();
+    const section = parentsSection();
+    expect(Array.from(section.children, (el) => [el.tagName, el.textContent])).toEqual([
+      ['H3', 'For parents'],
+      ['BUTTON', 'Try the microphone again'],
+      ['P', MIC_HELP_114],
+      ['BUTTON', 'Install'],
+      ['BUTTON', 'New version – restart'],
+      ['P', PRIVACY_114],
+      ['BUTTON', 'Open-source licences'],
+    ]);
+    const heading = section.querySelector('h3');
+    expect(heading?.id).not.toBe('');
+    expect(section.getAttribute('aria-labelledby')).toBe(heading?.id);
+    expect(section.previousElementSibling?.querySelector('select')).toBe(sleepSelect());
+    expect(section.nextElementSibling).toBe(closeButton());
+    expect(dialog().lastElementChild).toBe(closeButton());
+    for (const b of section.querySelectorAll('button')) {
+      expect(b.type, b.textContent ?? '').toBe('button');
+      expect(b.getBoundingClientRect().height, b.textContent ?? '').toBeGreaterThanOrEqual(48);
+    }
+  });
+
+  test('without the PWA side the section has the heading, retry, help, privacy and licences only', () => {
+    const sheet = mountSettingsSheet(root, harness().deps);
+    sheet.open();
+    expect(Array.from(parentsSection().children, (el) => el.textContent)).toEqual([
+      'For parents',
+      'Try the microphone again',
+      MIC_HELP_114,
+      PRIVACY_114,
+      'Open-source licences',
+    ]);
+  });
+
+  test('"Try the microphone again" closes the sheet, then dispatches settingsRetry exactly once', () => {
+    const h = harness();
+    const openAtDispatch: boolean[] = [];
+    h.dispatch.mockImplementation(() => {
+      openAtDispatch.push(dialog().open);
+    });
+    mountSettingsSheet(root, h.deps);
+    h.state.name = 'MicDenied';
+    press(h, GEAR_HOLD_MS);
+    expect(dialog().open).toBe(true);
+    button(SETTINGS_TEXT.micRetry).click();
+    expect(h.dispatch.mock.calls).toEqual([[{ t: 'settingsRetry' }]]);
+    expect(openAtDispatch).toEqual([false]);
+    expect(dialog().open).toBe(false);
+  });
+
+  test('the retry dispatches settingsRetry in every state: the session decides (it acts only in MicDenied and Asleep)', () => {
+    for (const name of STATES) {
+      const h = harness();
+      const sheet = mountSettingsSheet(root, h.deps);
+      sheet.open(); // in Listening; the bear keeps running while the sheet is open
+      h.state.name = name;
+      button(SETTINGS_TEXT.micRetry).click();
+      expect(h.dispatch.mock.calls, name).toEqual([[{ t: 'settingsRetry' }]]);
+      root.replaceChildren();
+    }
+  });
+
+  test('the help and the privacy note are plain text, worded exactly as #114; the sheet has no links', () => {
+    const sheet = mountSettingsSheet(root, harness().deps);
+    sheet.open();
+    const ps = Array.from(parentsSection().querySelectorAll('p'));
+    expect(ps.map((p) => p.textContent)).toEqual([MIC_HELP_114, PRIVACY_114]);
+    for (const p of ps) expect(p.children).toHaveLength(0);
+    expect(maybeButton('Try the microphone again')?.textContent).toBe('Try the microphone again');
+    expect(maybeButton('Open-source licences')?.textContent).toBe('Open-source licences');
+    expect(root.querySelector('a')).toBeNull();
+  });
+
+  test('"Open-source licences" opens the full-screen licences view over the sheet; Close returns to the sheet', async () => {
+    const fetchMock = licencesFetch();
+    const sheet = mountSettingsSheet(root, { ...harness().deps, fetch: fetchMock });
+    sheet.open();
+    const opener = button(SETTINGS_TEXT.licences);
+    await userEvent.click(opener);
+    const view = licencesView();
+    expect(view.open).toBe(true);
+    expect(view.matches(':modal')).toBe(true);
+    expect(dialog().open).toBe(true);
+    await vi.waitFor(() => {
+      expect(view.querySelector('pre')?.textContent).toBe(FILE);
+    });
+    expect(fetchMock.mock.calls).toEqual([['/licenses.txt']]);
+    expect(document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2)?.closest('dialog')).toBe(
+      view,
+    );
+    const close = Array.from(view.querySelectorAll('button')).find((b) => b.textContent === 'Close');
+    close?.click();
+    expect(view.open).toBe(false);
+    expect(dialog().open).toBe(true);
+    expect(document.activeElement).toBe(opener);
+  });
+
+  test('after a real tap on "Open-source licences", Escape closes only the licences view; a second Escape closes the sheet', async () => {
+    const sheet = mountSettingsSheet(root, { ...harness().deps, fetch: licencesFetch() });
+    sheet.open();
+    const opener = button(SETTINGS_TEXT.licences);
+    await userEvent.click(opener);
+    expect(licencesView().open).toBe(true);
+    await userEvent.keyboard('{Escape}');
+    expect(licencesView().open).toBe(false);
+    expect(dialog().open).toBe(true);
+    expect(document.activeElement).toBe(opener);
+    await userEvent.keyboard('{Escape}');
+    expect(dialog().open).toBe(false);
+  });
+
+  test('in MicDenied with the mic help shown, the gear is on top, a 1 s press opens the sheet, and the retry dispatches', async () => {
+    try {
+      for (const [width, height] of [
+        [414, 896],
+        [320, 568],
+      ] as const) {
+        await page.viewport(width, height);
+        const at = `${width} × ${height}`;
+        const h = harness();
+        h.state.name = 'MicDenied';
+        const show = mountOverlay(root, vi.fn()); // mounted before the sheet, as in main.ts
+        show('micHelp');
+        mountSettingsSheet(root, h.deps);
+        const help = Array.from(root.querySelectorAll<HTMLElement>('.overlay section')).find(
+          (x) => !x.hidden,
+        );
+        expect(help?.checkVisibility(), at).toBe(true);
+        const r = gear().getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        expect(hit !== null && gear().contains(hit), at).toBe(true);
+        press(h, GEAR_HOLD_MS);
+        expect(dialog().open, at).toBe(true);
+        button(SETTINGS_TEXT.micRetry).click();
+        expect(h.dispatch.mock.calls, at).toEqual([[{ t: 'settingsRetry' }]]);
+        root.replaceChildren();
+      }
+    } finally {
+      await page.viewport(414, 896); // the default tester viewport
+    }
+  });
+
+  test('no outbound links: with every UI module mounted and every view shown, nothing links off the origin', async () => {
+    const openSpy = vi.spyOn(window, 'open');
+    const h = harness();
+    const f = fakePwa();
+    f.flags.install = true;
+    f.flags.ready = true;
+    const showOverlay = mountOverlay(root, h.dispatch);
+    const sheet = mountSettingsSheet(root, { ...h.deps, pwa: f.pwa, fetch: licencesFetch() });
+    const debug = mountDebugOverlay(root, { frameStats: (out) => out, clock: realClock });
+    try {
+      sheet.open();
+      expect(button(SETTINGS_TEXT.install).hidden).toBe(false);
+      expect(button(SETTINGS_TEXT.restart).disabled).toBe(false);
+      button(SETTINGS_TEXT.install).click();
+      button(SETTINGS_TEXT.restart).click();
+      await userEvent.click(button(SETTINGS_TEXT.licences));
+      await vi.waitFor(() => {
+        expect(licencesView().querySelector('pre')?.textContent).toBe(FILE);
+      });
+      expect(FILE).toContain('https://'); // the file's URLs are on screen, as text
+      const overlays: Overlay[] = [
+        'tapToWake',
+        'parentPermission',
+        'micHelp',
+        'micMuted',
+        'tooNoisy',
+        'error',
+        null,
+      ];
+      for (const o of overlays) {
+        showOverlay(o);
+        expect(document.querySelectorAll('a[href^="http"]').length, String(o)).toBe(0);
+        expect(document.querySelectorAll('[href^="//"]').length, String(o)).toBe(0);
+        expect(document.querySelectorAll('[href^="mailto:"]').length, String(o)).toBe(0);
+        expect(offOriginHrefs(), String(o)).toEqual([]);
+      }
+      expect(root.querySelector('a')).toBeNull();
+      licencesView().close();
+      button(SETTINGS_TEXT.micRetry).click();
+      showOverlay('parentPermission');
+      for (const b of root.querySelectorAll<HTMLButtonElement>('.overlay button')) b.click();
+      expect(openSpy).not.toHaveBeenCalled();
+    } finally {
+      debug.dispose();
+      openSpy.mockRestore();
+    }
+  });
+
+  test('at 414 × 896 the sheet opens at the top, voices first, with focus on Close; the rest scrolls', async () => {
+    await page.viewport(414, 896);
+    const h = harness();
+    const f = fakePwa();
+    f.flags.install = true;
+    f.flags.ready = true;
+    const sheet = mountSettingsSheet(root, { ...h.deps, pwa: f.pwa });
+    press(h, GEAR_HOLD_MS);
+    const d = dialog();
+    expect(document.activeElement).toBe(closeButton());
+    expect(d.scrollTop).toBe(0);
+    const box = d.getBoundingClientRect();
+    const legend = d.querySelector('legend');
+    if (legend === null) throw new Error('no Voice legend');
+    expect(legend.textContent).toBe(SETTINGS_TEXT.voice);
+    const r = legend.getBoundingClientRect();
+    expect(r.top).toBeGreaterThanOrEqual(box.top);
+    expect(r.bottom).toBeLessThanOrEqual(box.bottom);
+    expect(d.scrollHeight).toBeGreaterThan(d.clientHeight);
+    expect(getComputedStyle(d).overflowY).toBe('auto');
+    // Reopened after scrolling down, it starts at the top again.
+    d.scrollTop = d.scrollHeight;
+    expect(d.scrollTop).toBeGreaterThan(0);
+    sheet.close();
+    sheet.open();
+    expect(d.scrollTop).toBe(0);
+    expect(document.activeElement).toBe(closeButton());
   });
 });

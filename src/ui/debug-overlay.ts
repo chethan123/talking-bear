@@ -4,6 +4,9 @@
 //   current fps, read from the bear's frame loop four times a second;
 // - the storage line (#98, plan §4.7 "Offline guarantees"): `navigator.storage.persisted()` and `estimate()`,
 //   read every 5 s;
+// - the device lines (#93, for the owner checks of #95, #123 and #120): the haptics log's latest `vibrate` line,
+//   the audio context's `state` (rewritten on every `statechange`), the mic track's mute / unmute / ended events
+//   with their times, and the audio-input labels of `enumerateDevices()` (refreshed on `devicechange`);
 // - the VAD section (#56, plan §7 M2 "probability trace, floor and per-frame timings"): a canvas plot of the last
 //   10 s (Silero p with its two thresholds, band dB and floor dB, the energy-gate bar, segment markers) and four
 //   lines (state and epoch, backend and vadReady, Silero inference p95 and max, the context's rate and output
@@ -48,6 +51,8 @@ export interface DebugOverlayDeps {
   clock: Pick<Clock, 'setTimeout' | 'clearTimeout'>;
   /** Storage persistence and usage (#98); without it there is no storage line. */
   storage?: Pick<StorageApi, 'persisted' | 'estimate'>;
+  /** The device lines (#93); without it there are none. */
+  device?: DebugDeviceDeps;
   /** The VAD section (#56): the plot and the VAD lines; without it there are none. */
   vad?: DebugVadDeps;
 }
@@ -124,20 +129,199 @@ export function mountDebugOverlay(root: HTMLElement, deps: DebugOverlayDeps): De
     scheduleStorage();
   }
 
+  // ---- device lines (#93) ----
+  const device = deps.device === undefined ? null : mountDeviceSection(box, deps.device, deps.clock);
+
   // ---- VAD section (#56) ----
   const vad = deps.vad === undefined ? null : mountVadSection(root, box, deps.vad, deps.clock);
 
   return {
     refresh() {
       refresh();
+      device?.refresh();
       vad?.refresh();
     },
     dispose() {
       live = false;
       deps.clock.clearTimeout(timer);
       if (storageTimer !== null) deps.clock.clearTimeout(storageTimer);
+      device?.dispose();
       vad?.dispose();
       box.remove();
+    },
+  };
+}
+
+// ---- the device lines (#93) -----------------------------------------------------------------------------------
+
+/** How many mic-track events the track line shows (the newest). */
+export const DEBUG_TRACK_EVENTS = 4;
+
+/** The audio context's state and its `statechange` event (an AudioContext). */
+export interface DebugStateContext {
+  readonly state: AudioContextState;
+  addEventListener(type: 'statechange', cb: () => void): void;
+  removeEventListener(type: 'statechange', cb: () => void): void;
+}
+
+/** `navigator.mediaDevices`: the device list and its `devicechange` event. */
+export interface DebugMediaDevices {
+  enumerateDevices(): Promise<MediaDeviceInfo[]>;
+  addEventListener(type: 'devicechange', cb: () => void): void;
+  removeEventListener(type: 'devicechange', cb: () => void): void;
+}
+
+export interface DebugDeviceDeps {
+  /** The haptics log's latest line (`createHaptics`'s `log`: each `vibrate` call and its result), or null. */
+  lastVibrate(): string | null;
+  /** The engine's audio context, once it exists (it is created at the first wake). */
+  engine: { context(): DebugStateContext | null };
+  /** The mic track's events arrive as session events: `trackMuted`, `trackUnmuted`, `trackEnded`. */
+  session: Pick<Session, 'addTransitionListener'>;
+  /** `navigator.mediaDevices`, or null where it is missing (an insecure context). */
+  mediaDevices: DebugMediaDevices | null;
+  /** Milliseconds on the page clock (`performance.now()` in the app): the track events' times. */
+  now(): number;
+}
+
+/** A mic-track event of the track line. */
+export interface TrackEvent {
+  kind: 'mute' | 'unmute' | 'ended';
+  /** Page time, ms. */
+  t: number;
+}
+
+/** The haptics log's latest line as it is ("vibrate([12]) = true; immediate; …"); "vibrate –" before any. */
+export function formatVibrate(line: string | null): string {
+  return line ?? 'vibrate –';
+}
+
+/** "ctx state running"; a dash before there is a context. */
+export function formatCtxState(state: AudioContextState | null): string {
+  return `ctx state ${state ?? '–'}`;
+}
+
+/** "track mute 12.3 s · unmute 15.0 s" (page time, s); "track –" before any. */
+export function formatTrackEvents(events: readonly TrackEvent[]): string {
+  if (events.length === 0) return 'track –';
+  return `track ${events.map((e) => `${e.kind} ${(e.t / 1000).toFixed(1)} s`).join(' · ')}`;
+}
+
+/** "inputs Speakerphone · Headset earpiece"; "(no label)" for an empty one, "(none)" for none, "–" if unknown. */
+export function formatInputs(labels: readonly string[] | null): string {
+  if (labels === null) return 'inputs –';
+  if (labels.length === 0) return 'inputs (none)';
+  return `inputs ${labels.map((l) => (l === '' ? '(no label)' : l)).join(' · ')}`;
+}
+
+/**
+ * The device lines. The text tick (every DEBUG_REFRESH_MS) re-reads the vibrate line and moves the `statechange`
+ * listener to the engine's current context (it exists from the first wake on); the state line itself is rewritten
+ * by every `statechange`. Mic-track events come from the transition listeners, and the inputs are enumerated at
+ * mount, on every `devicechange` and on `micGranted` (labels appear once the mic is granted).
+ */
+function mountDeviceSection(
+  box: HTMLElement,
+  deps: DebugDeviceDeps,
+  clock: Pick<Clock, 'setTimeout' | 'clearTimeout'>,
+): { refresh(): void; dispose(): void } {
+  const line = (name: string): HTMLParagraphElement => {
+    const p = document.createElement('p');
+    p.className = 'debug-line';
+    p.dataset.line = name;
+    box.append(p);
+    return p;
+  };
+  const vibrateLine = line('vibrate');
+  const ctxLine = line('ctxState');
+  const trackLine = line('track');
+  const inputsLine = line('inputs');
+  let live = true;
+  let timer = 0;
+
+  // ---- the context's state ----
+  let watched: DebugStateContext | null = null;
+  const onState = (): void => {
+    ctxLine.textContent = formatCtxState(watched === null ? null : watched.state);
+  };
+  function watch(): void {
+    const ctx = deps.engine.context();
+    if (ctx === watched) return;
+    watched?.removeEventListener('statechange', onState);
+    watched = ctx;
+    watched?.addEventListener('statechange', onState);
+    onState();
+  }
+
+  // ---- the audio inputs ----
+  const media = deps.mediaDevices;
+  /** Bumped by every enumeration: only the newest one writes the line. */
+  let inputsGen = 0;
+  async function refreshInputs(): Promise<void> {
+    if (media === null) return;
+    const gen = ++inputsGen;
+    let labels: string[] | null = null;
+    try {
+      const devices = await media.enumerateDevices();
+      labels = devices.filter((d) => d.kind === 'audioinput').map((d) => d.label);
+    } catch {
+      labels = null;
+    }
+    if (live && gen === inputsGen) inputsLine.textContent = formatInputs(labels);
+  }
+  const onDeviceChange = (): void => {
+    void refreshInputs();
+  };
+  media?.addEventListener('devicechange', onDeviceChange);
+
+  // ---- the mic track ----
+  const track: TrackEvent[] = [];
+  const offTransition = deps.session.addTransitionListener((_from, _to, e) => {
+    const kind =
+      e.t === 'trackMuted'
+        ? 'mute'
+        : e.t === 'trackUnmuted'
+          ? 'unmute'
+          : e.t === 'trackEnded'
+            ? 'ended'
+            : null;
+    if (kind !== null) {
+      track.push({ kind, t: deps.now() });
+      if (track.length > DEBUG_TRACK_EVENTS) track.shift();
+      trackLine.textContent = formatTrackEvents(track);
+    } else if (e.t === 'micGranted') {
+      void refreshInputs();
+    }
+  });
+
+  function refresh(): void {
+    vibrateLine.textContent = formatVibrate(deps.lastVibrate());
+    watch();
+  }
+
+  // Each tick reschedules the same function: no closure per tick.
+  function tick(): void {
+    if (!live) return;
+    refresh();
+    timer = clock.setTimeout(tick, DEBUG_REFRESH_MS);
+  }
+
+  ctxLine.textContent = formatCtxState(null);
+  trackLine.textContent = formatTrackEvents(track);
+  inputsLine.textContent = formatInputs(null);
+  refresh();
+  void refreshInputs();
+  timer = clock.setTimeout(tick, DEBUG_REFRESH_MS);
+
+  return {
+    refresh,
+    dispose() {
+      live = false;
+      clock.clearTimeout(timer);
+      offTransition();
+      watched?.removeEventListener('statechange', onState);
+      watched = null;
+      media?.removeEventListener('devicechange', onDeviceChange);
     },
   };
 }
@@ -291,7 +475,8 @@ class TimedRing {
 /** The VAD plot: its data rings and its drawing. */
 export interface VadPlot {
   /** Appends a trace batch at context rate `rate`: per hop the band dB and the replayed energy gate, per Silero
-   *  frame its p. */
+   *  frame its p. Hop i is at ctx frame hop0Frame + i hops and Silero frame j at sil0Frame + j VAD frames, its own
+   *  frame: the DSP worker ends a batch at a capture gap (vad-core.ts `captureGap`, #244), so no batch spans one. */
   trace(b: TraceBatch, rate: number): void;
   /** Appends a `level` event's floor: the energy gate's floor after the hop at ctx frame `frame` (NaN while
    *  uninitialised). */
@@ -502,7 +687,7 @@ class VadPlotImpl implements VadPlot {
     }
     const band = b.bandDb;
     for (let i = 0; i < band.length; i++) {
-      const f = b.hop0Frame + i * hop;
+      const f = b.hop0Frame + i * hop; // the hop's own frame: a batch never spans a capture gap (#244)
       geo[G_LIMIT] = f - hop / 2;
       this.sync(epoch);
       const db = band[i]!;

@@ -2,9 +2,12 @@
 // sfx scheduler, the wake lock, the injected clock and the UI callbacks. The session (session.ts) owns the loop and
 // calls `run` for each effect in order; events an effect produces go back through `io.dispatch`, which queues them
 // while a dispatch is running. Named timers use the injected `Clock` only, never the global timers.
+//
+// Noisy room (plan §4.1.1, §7 M8, #113): each `openMic` reads the settings, and with `noisyRoomNs` on passes
+// `NOISY_ROOM_CONSTRAINTS` as the engine's `extra`, so a change applies at the next mic open.
 
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
-import type { Player, SessionDeps, Sfx } from './session.ts';
+import type { Player, SessionDeps, Sfx, SfxScheduled } from './session.ts';
 
 /** The parts of the session's dependencies that effects use. */
 export type EffectDeps = Pick<
@@ -18,7 +21,13 @@ export type EffectDeps = Pick<
   | 'onPlayStarted'
   | 'onUi'
   | 'onApplyUpdate'
+  | 'settings'
 >;
+
+/** The noisy-room toggle's `extra` for `engine.openMic`: software NS only, nothing else changes (plan §4.1.1). */
+export const NOISY_ROOM_CONSTRAINTS: Readonly<MediaTrackConstraints> = Object.freeze({
+  noiseSuppression: true,
+});
 
 /** How effects talk back to the session. */
 export interface EffectIo {
@@ -26,6 +35,8 @@ export interface EffectIo {
   dispatch(e: SessionEvent): void;
   /** The session's current state (already the new state while a transition's effects run). */
   state(): SessionState;
+  /** An `sfx` effect was scheduled: its seq, id and the context time its sound ends (`sfx.play`'s `endCtxTime`). */
+  sfxScheduled?(e: SfxScheduled): void;
 }
 
 export interface EffectRunner {
@@ -159,7 +170,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
       return;
     }
     try {
-      s.play(fx.id);
+      const { endCtxTime } = s.play(fx.id);
+      io.sfxScheduled?.({ seq: fx.seq, id: fx.id, endCtxTime });
     } catch (err) {
       console.error('effects: sfx failed', err); // earlier sfx may still be audible: wait for them below
     }
@@ -205,7 +217,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
   function exec(fx: Effect): void {
     switch (fx.k) {
       case 'openMic':
-        engine.openMic(fx.req);
+        if (deps.settings?.().noisyRoomNs === true) engine.openMic(fx.req, NOISY_ROOM_CONSTRAINTS);
+        else engine.openMic(fx.req);
         return;
       case 'closeMic':
         engine.closeMic();

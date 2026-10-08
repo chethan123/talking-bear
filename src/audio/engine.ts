@@ -63,7 +63,11 @@ export type EngineEvent =
 export interface Engine {
   resume(): Promise<void>;
   suspend(): Promise<void>;
-  openMic(req: number): void;
+  /**
+   * Opens the mic for request `req` with the plan §4.1.1 constraints (all processing off). `extra` is merged over
+   * them: the settings' noisy-room toggle passes `{ noiseSuppression: true }` (software NS only, §4.1.1).
+   */
+  openMic(req: number, extra?: MediaTrackConstraints): void;
   closeMic(): void;
   arm(epoch: number, restoreFloorDb?: number): void;
   disarm(epoch: number): void;
@@ -562,8 +566,8 @@ export function createEngine(opts: {
   const api: Engine & OutputTapHost & QuietHost & TraceHost & VadBackendHost = {
     resume,
     suspend,
-    openMic(req: number): void {
-      void mic.open(req).then(onMicResult);
+    openMic(req: number, extra?: MediaTrackConstraints): void {
+      void mic.open(req, extra).then(onMicResult);
     },
     closeMic(): void {
       closeMicStream();

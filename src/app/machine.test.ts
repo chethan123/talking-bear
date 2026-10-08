@@ -995,7 +995,7 @@ describe('clarifications C1–C12', () => {
   it('C3–C12: events owned by specific rows are ignored everywhere else (plan decision D20)', () => {
     const handledIn: Partial<Record<EventType, StateName[]>> = {
       parentContinue: ['NeedsParent'],
-      settingsRetry: ['MicDenied'],
+      settingsRetry: ['Asleep', 'MicDenied'],
       micGranted: ['Waking'],
       micDenied: ['Waking'],
       noDevice: ['Waking'],
@@ -1198,6 +1198,107 @@ describe('plan decisions', () => {
       expect(r.state.name).toBe('Listening');
       expect(r.effects.find((f) => f.k === 'arm')).toStrictEqual({ k: 'arm', epoch: r.state.epoch });
     }
+  });
+});
+
+// ---- #266: "Try the microphone again" from Asleep (the sleep timer fired while the settings sheet was open) ----
+describe("#266: settingsRetry from Asleep (the parent's retry wakes as the tap does)", () => {
+  it('Asleep + settingsRetry gives the same state and effects as Asleep + tapBear, for every permission', () => {
+    for (const permission of ['granted', 'prompt', 'denied'] as const) {
+      for (const v of variants('Asleep')) {
+        const s: SessionState = { ...v, permission };
+        const tap = run(s, { t: 'tapBear' });
+        const retry = run(s, { t: 'settingsRetry' });
+        expect(retry.state, permission).toStrictEqual(tap.state);
+        expect(retry.effects, permission).toStrictEqual(tap.effects);
+        expect(retry.state, permission).not.toBe(s); // not ignored
+      }
+    }
+  });
+
+  it('Asleep + settingsRetry: granted → Waking (row 1, the normal wake), prompt → NeedsParent (row 2), denied → MicDenied (row 3)', () => {
+    expectStep(
+      stateIn('Asleep'),
+      { t: 'settingsRetry' },
+      'Waking',
+      [RESUME, anim('wake'), ...wakingEntry(REQ + 1), wakeLock(true), ui(null)],
+      { micReq: REQ + 1, micGranted: false },
+    );
+    expectStep(stateIn('Asleep', { permission: 'prompt' }), { t: 'settingsRetry' }, 'NeedsParent', [
+      RESUME,
+      SLEEP_T,
+      wakeLock(true),
+      ui('parentPermission'),
+    ]);
+    expectStep(stateIn('Asleep', { permission: 'denied' }), { t: 'settingsRetry' }, 'MicDenied', [
+      RESUME,
+      anim('wake'),
+      SLEEP_T,
+      ui('micHelp'),
+    ]);
+  });
+
+  it('MicDenied + settingsRetry is unchanged: Waking for every permission (row 10)', () => {
+    for (const permission of ['denied', 'prompt', 'granted'] as const) {
+      expectStep(
+        stateIn('MicDenied', { permission }),
+        { t: 'settingsRetry' },
+        'Waking',
+        [cancel('sleep'), RESUME, anim('wake'), ...wakingEntry(REQ + 1), wakeLock(true), ui(null)],
+        { micReq: REQ + 1, micGranted: false },
+      );
+    }
+  });
+
+  it('every other state still ignores settingsRetry', () => {
+    const ignoring = STATES.filter((n) => TABLE[n].settingsRetry === 'ignore');
+    expect(ignoring).toStrictEqual([
+      'NeedsParent',
+      'Waking',
+      'Listening',
+      'Recording',
+      'Processing',
+      'Playing',
+      'SfxGated',
+      'Cooldown',
+      'Paused',
+      'Error',
+    ]);
+    for (const name of ignoring) for (const s of variants(name)) expectIgnored(s, { t: 'settingsRetry' });
+  });
+
+  it('the #266 sequence: MicDenied, the sleep timer fires while the sheet is open, then the parent retries', () => {
+    const denied = run(stateIn('Waking'), { t: 'micDenied', req: REQ }).state; // row 8
+    expect(denied).toMatchObject({ name: 'MicDenied', permission: 'denied' });
+    const asleep = run(denied, tmr('sleep')).state; // row 12, while the modal sheet blocks every tap
+    expect(asleep).toMatchObject({ name: 'Asleep', permission: 'denied' });
+
+    // (a) The parent allowed the mic in site settings (the permission module reports it): the retry wakes.
+    const allowed = run(asleep, { t: 'permissionChanged', state: 'granted' }).state;
+    expect(allowed).toMatchObject({ name: 'Asleep', permission: 'granted' });
+    let r = run(allowed, { t: 'settingsRetry' });
+    expect(r.state.name).toBe('Waking');
+    expect(r.effects).toContainEqual(openMic(allowed.micReq + 1));
+    r = run(r.state, { t: 'ctxRunning', sampleRate: 48_000 });
+    r = run(r.state, { t: 'micGranted', req: r.state.micReq });
+    expect(r.state.name).toBe('Listening');
+    expect(r.effects.some((f) => f.k === 'arm')).toBe(true);
+
+    // (b) The parent reset it to "ask": the parent sheet, whose Continue puts Chrome's prompt up (row 4).
+    r = run(run(asleep, { t: 'permissionChanged', state: 'prompt' }).state, { t: 'settingsRetry' });
+    expect(r.state.name).toBe('NeedsParent');
+    expect(r.effects.some((f) => f.k === 'openMic')).toBe(false);
+    r = run(r.state, { t: 'parentContinue' });
+    expect(r.state.name).toBe('Waking');
+    expect(r.effects).toContainEqual(openMic(asleep.micReq + 1));
+
+    // (c) Still denied: MicDenied again, as after a tap (row 3); a second retry there runs row 10.
+    r = run(asleep, { t: 'settingsRetry' });
+    expect(r.state.name).toBe('MicDenied');
+    expect(r.effects.some((f) => f.k === 'openMic')).toBe(false);
+    r = run(r.state, { t: 'settingsRetry' });
+    expect(r.state.name).toBe('Waking');
+    expect(r.effects).toContainEqual(openMic(asleep.micReq + 1));
   });
 });
 

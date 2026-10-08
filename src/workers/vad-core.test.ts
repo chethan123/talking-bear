@@ -1,8 +1,8 @@
 // VadCore driven by the synthetic fixtures: the energy backend (M1) and its voicing rule, the Silero backend on
 // the shipped weights (fallback, late model, failures, pre-gate, LSTM reset, vadStats), the allocation meters,
-// and a smoke test of the worker glue. Fixtures are 48 kHz; like the capture worklet, the test decimates them
-// to 16 kHz and feeds 512-sample frames tagged with the ctx frame of their first sample (ctxRate 48000, so
-// frame i starts at i·512·3).
+// capture gaps (#244), and a smoke test of the worker glue. Fixtures are 48 kHz; like the capture worklet, the
+// test decimates them to 16 kHz and feeds 512-sample frames tagged with the ctx frame of their first sample
+// (ctxRate 48000, so frame i starts at i·512·3).
 
 import { readFileSync } from 'node:fs';
 import { GCProfiler, setFlagsFromString } from 'node:v8';
@@ -15,10 +15,12 @@ import {
   ENERGY_HOP,
   PREGATE_ENABLED,
   PREGATE_WARMUP_FRAMES,
+  PREROLL_MS,
   PROXIMITY_DB,
+  TAIL_MS,
 } from '../audio/constants.ts';
 import type { WorkerToMain } from '../audio/messages.ts';
-import { createGateFilter, frameDb } from '../dsp/energy-gate.ts';
+import { DEFAULT_ENERGY_PARAMS, createGateFilter, frameDb } from '../dsp/energy-gate.ts';
 import { activeLevelDb } from '../dsp/proximity.ts';
 import { resampleOffline } from '../dsp/resample.ts';
 import type { SegEvent } from '../dsp/segmenter.ts';
@@ -28,6 +30,7 @@ import { PRESETS } from '../dsp/types.ts';
 import { processVoice } from '../dsp/voice.ts';
 import { createVoicing } from '../dsp/voicing.ts';
 import {
+  CAPTURE_GAP_SLACK,
   LEVEL_EVERY_HOPS,
   MIN_VOICED_MS,
   PREGATE_HOLD_FRAMES,
@@ -582,26 +585,35 @@ describe('VadCore Silero backend (shipped weights)', () => {
   });
 
   it("5e': the hop that initialises the floor after digital silence opens the pre-gate", () => {
-    // 16 kHz frames built directly: 70 zero frames, 32 frames of −20 dBFS noise starting on a hop boundary
-    // (70 · 512 = 224 · 160), 50 zero frames. Without the rule the floor would initialise at the noise level and
-    // the gate would never open, so Silero would never see the noise. The proximity gate is off (X = −∞): the
-    // floor initialises at the burst's own level, so with the default X the segment would end as a misfire.
-    const rng = mulberry32(51);
-    const a = Math.sqrt(3) * 0.1;
-    const frames = Array.from({ length: 152 }, (_, k) =>
-      k >= 70 && k < 102
-        ? Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a)
-        : new Float32Array(FRAME),
-    );
+    // 16 kHz frames built directly: 70 zero frames, 32 frames of noise starting on a hop boundary
+    // (70 · 512 = 224 · 160), 50 zero frames. At −37 dBFS the burst is ≈ −41.7 dBFS on the gate path, under
+    // initFloorCapDb (#146), so the floor initialises at the burst's own level: without the rule the gate would
+    // never open, so Silero would never see the noise. The proximity gate is off (X = −∞): with the default X the
+    // segment would end as a misfire.
+    const seed = 51; // every burst draws the same noise
+    const burst = (rmsDb: number): Float32Array[] => {
+      const rng = mulberry32(seed);
+      const a = Math.sqrt(3) * 10 ** (rmsDb / 20);
+      return Array.from({ length: 152 }, (_, k) =>
+        k >= 70 && k < 102
+          ? Float32Array.from({ length: FRAME }, () => (2 * rng() - 1) * a)
+          : new Float32Array(FRAME),
+      );
+    };
+    const frames = burst(-37);
     const off = scriptedModel(0.9, 0.1);
     const on = scriptedModel(0.9, 0.1);
     const r0 = runSilero(frames, off, false, Number.NEGATIVE_INFINITY);
     const r1 = runSilero(frames, on, true, Number.NEGATIVE_INFINITY);
+    // The floor was learned from the burst, not set by the cap.
+    expect(ofType(r0.msgs, 'floorSnapshot')[0]!.floorDb).toBeLessThan(DEFAULT_ENERGY_PARAMS.initFloorCapDb);
     expect(segs(r1.msgs)).toEqual(segs(r0.msgs));
     expect(kinds(r0.msgs)).toEqual(['start', 'end']);
     expect(on.calls).toBeLessThan(off.calls);
     // Default X: the floor initialised on the burst's own first hop (D7 edge).
     expect(kinds(runSilero(frames, scriptedModel(0.9, 0.1), false).msgs)).toEqual(['start', 'misfire']);
+    // #146: a −20 dBFS burst is above the cap, so its floor starts at initFloorCapDb and it passes the default X.
+    expect(kinds(runSilero(burst(-20), scriptedModel(0.9, 0.1), false).msgs)).toEqual(['start', 'end']);
   });
 
   it('5f: reset empties the pre-gate ring: no frame of an earlier epoch is ever replayed', () => {
@@ -995,18 +1007,24 @@ function forceGc(): void {
   exposedGc();
 }
 
+/** One heap reading: the `heapUsed` growth in bytes, and whether any GC ran while it was measured. */
+interface HeapReading {
+  bytes: number;
+  gc: boolean;
+}
+
 /**
  * `heapUsed` growth in bytes over `fn`, measured from a freshly collected heap. If any GC ran during `fn`,
- * the reading is meaningless (a scavenge frees the garbage it should count), so it returns +Infinity.
+ * the reading is meaningless (a scavenge frees the garbage it should count), so it is flagged `gc`.
  */
-function heapGrowth(fn: () => void): number {
+function heapGrowth(fn: () => void): HeapReading {
   forceGc();
   const profiler = new GCProfiler();
   profiler.start();
   const before = process.memoryUsage().heapUsed;
   fn();
-  const growth = process.memoryUsage().heapUsed - before;
-  return profiler.stop().statistics.length > 0 ? Number.POSITIVE_INFINITY : growth;
+  const bytes = process.memoryUsage().heapUsed - before;
+  return { bytes, gc: profiler.stop().statistics.length > 0 };
 }
 
 /** The one `post` of every core in the allocation tests, so the call site sees a single closure. */
@@ -1039,54 +1057,174 @@ function heapRunner(model: SileroModel, pregate: boolean): (n: number) => void {
   };
 }
 
-/** The smallest finite growth over up to `runs` runs, stopping early once `done(best)`. */
-function bestGrowth(run: () => void, done: (best: number) => boolean = () => false, runs = 20): number {
-  let best = Number.POSITIVE_INFINITY;
-  for (let trial = 0; trial < runs && !(Number.isFinite(best) && done(best)); trial++) {
-    best = Math.min(best, heapGrowth(run));
+/** Zero-model readings per zero level. */
+const ZERO_READINGS = 5;
+/**
+ * Two zero levels agree when they differ by at most this, in bytes per 1000 frames (4 B per frame, a quarter of one
+ * boxed double): the levels of one tier state differ by at most about 1 600 B, and a tier step moves them by 5 000 B
+ * or more. For comparisons it is only the tolerance within which one corroborates another.
+ */
+const AGREE = 4096;
+/** Real-model readings at most; two usually suffice. Each costs about 1.1 s, or about 13 s under v8 coverage. */
+const MAX_REAL_READINGS = 4;
+
+/** A reading as the report shows it. */
+function shown(r: HeapReading): string {
+  return r.gc ? `${r.bytes} (GC)` : String(r.bytes);
+}
+
+/** The median of the GC-free readings, or NaN if fewer than 3 are GC-free. */
+function gcFreeMedian(readings: HeapReading[]): number {
+  const free = readings
+    .filter((r) => !r.gc)
+    .map((r) => r.bytes)
+    .toSorted((a, b) => a - b);
+  if (free.length < 3) return Number.NaN;
+  const m = free.length >> 1;
+  return free.length % 2 === 1 ? free[m]! : (free[m - 1]! + free[m]!) / 2;
+}
+
+/** The smallest of `values` that another one of them agrees with (within AGREE), or NaN if none does. */
+function smallestCorroborated(values: number[]): number {
+  let best = Number.NaN;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i]!;
+    const agreed = values.some((w, j) => j !== i && Math.abs(v - w) <= AGREE);
+    if (agreed && (Number.isNaN(best) || v < best)) best = v;
   }
-  expect(Number.isFinite(best)).toBe(true);
   return best;
 }
 
-/** The lower quartile of the finite growths over `runs` runs: a rare reading far below the rest (seen
- *  under v8 coverage with the path already optimised) can't become the baseline. */
-function lowGrowth(run: () => void, runs = 20): number {
-  const finite: number[] = [];
-  for (let trial = 0; trial < runs; trial++) {
-    const g = heapGrowth(run);
-    if (Number.isFinite(g)) finite.push(g);
+/** How much more the heap grows per 1000 frames of a model than of the zero model, and every reading behind it. */
+interface Comparison {
+  excess: number;
+  report: string;
+}
+
+/** A real-model reading, and the zero readings taken right after it. */
+interface RealStep {
+  reading: HeapReading;
+  after: HeapReading[];
+}
+
+/** What selectExcess makes of the readings so far. */
+interface Selection extends Comparison {
+  /** Comparisons made (0: the measurement proves nothing). */
+  comparisons: number;
+  /** Real readings it used: the steps after it stopped are ignored. */
+  used: number;
+  /** True once two comparisons agree, or MAX_REAL_READINGS were used: no more real readings are needed. */
+  stopped: boolean;
+}
+
+/** A zero level's line in the report. */
+function zeroLine(label: string, readings: HeapReading[]): string {
+  return `${label}: ${readings.map(shown).join(', ')}; level ${gcFreeMedian(readings)}`;
+}
+
+/**
+ * The selection rule of growthOverZero, over recorded readings, so that recorded sequences can test it: the
+ * settling zero readings (reported, unused), the first zero level, then each real reading with the zero level after
+ * it. A real reading is compared only when it is GC-free and the zero levels just before and just after it agree
+ * within AGREE; the comparison is the reading minus the lower of the two levels, and one below −AGREE is impossible
+ * (heapUsed fell without a GC), so it is left out. The excess is the smallest comparison that another one agrees
+ * with (within AGREE), or the smallest if none agree; it stops at the first agreeing pair or at MAX_REAL_READINGS.
+ */
+function selectExcess(settling: HeapReading[], first: HeapReading[], steps: RealStep[]): Selection {
+  const lines = [zeroLine('zero, settling (unused)', settling), zeroLine('zero', first)];
+  let before = gcFreeMedian(first);
+  const compared: number[] = [];
+  let used = 0;
+  for (const { reading, after } of steps) {
+    if (used === MAX_REAL_READINGS || !Number.isNaN(smallestCorroborated(compared))) break;
+    used++;
+    const level = gcFreeMedian(after);
+    let note = 'not compared (a GC, or the zero level moved)';
+    if (!reading.gc && Math.abs(level - before) <= AGREE) {
+      const d = reading.bytes - Math.min(before, level);
+      if (d < -AGREE) {
+        note = 'not compared (heap fell without a GC)';
+      } else {
+        compared.push(d);
+        note = `excess ${d}`;
+      }
+    }
+    lines.push(`real ${used}: ${shown(reading)}; ${note}`, zeroLine('zero', after));
+    before = level;
   }
-  expect(finite.length).toBeGreaterThanOrEqual(10);
-  finite.sort((a, b) => a - b);
-  return finite[Math.floor(finite.length / 4)]!;
+  const corroborated = smallestCorroborated(compared);
+  const excess = Number.isNaN(corroborated) ? Math.min(...compared) : corroborated;
+  const how = Number.isNaN(corroborated)
+    ? 'the smallest comparison: none agree'
+    : 'the smallest comparison another agrees with';
+  const last =
+    compared.length === 0
+      ? 'no comparison could be made (every real reading had a GC, or the zero level moved around it)'
+      : `excess ${excess} B per 1000 frames, ${how}`;
+  return {
+    excess,
+    report: [...lines, last].join('\n'),
+    comparisons: compared.length,
+    used,
+    stopped: used === MAX_REAL_READINGS || !Number.isNaN(corroborated),
+  };
+}
+
+/** GC-free readings of `bytes` (for selectExcess's tests). */
+function gcFreeReadings(...bytes: number[]): HeapReading[] {
+  return bytes.map((b) => ({ bytes: b, gc: false }));
+}
+
+/** A reading of `bytes` during which a GC ran (for selectExcess's tests). */
+function gcReading(bytes: number): HeapReading {
+  return { bytes, gc: true };
+}
+
+/** A real reading (GC-free if given as bytes) and the zero readings after it (for selectExcess's tests). */
+function realStep(reading: number | HeapReading, after: HeapReading[]): RealStep {
+  return { reading: typeof reading === 'number' ? { bytes: reading, gc: false } : reading, after };
 }
 
 /**
  * How much more the heap grows over 1000 frames of `model` than over 1000 frames of a zero model, on the
- * Silero path with the given pre-gate, once V8 has optimised that path: `model`'s best growth over up to 5
- * runs (they stop once `done(excess)`) minus the lower quartile of the zero model's 20 readings.
+ * Silero path with the given pre-gate, with both measured in the same optimisation state.
  *
- * Both cores share VadCore's per-frame path. It runs once per frame, so V8 needs about 11 000 frames to
- * optimise it with TurboFan, with or without coverage; below TurboFan it boxes doubles, about 200 B per frame
- * of a real model more than an optimised zero model. A path optimised on the zero model alone is deoptimised
- * once `model` and its non-zero p reach it, and re-tiers only after another 11 000 frames of `model`: about
- * 2 minutes under v8 coverage. So `model` runs first, and its own loops tier up meanwhile; then the cheap
- * zero model takes the shared path to TurboFan with both models in its feedback, and every measured run
- * starts in that steady state.
+ * Both cores share VadCore's per-frame path. It runs once per frame, so V8 needs about 11 000 frames to optimise
+ * it with TurboFan; a path optimised on the zero model alone is deoptimised once `model` reaches it (#204). So
+ * `model` runs first, and its own loops tier up meanwhile; then the cheap zero model takes the shared path to
+ * TurboFan with both models in its feedback.
+ *
+ * V8 compiles on background threads, so under CPU load later tier-ups of the shared path still land during the
+ * measurement and move both models' growth together (#226: the zero level stepped from 22 680 to 424 B, or from
+ * 158 168 to 134 856 B, after the warm-up). So each real reading is compared only with the zero levels just before
+ * and just after it (each the median of 5 zero readings), and only when those two levels agree within AGREE: no
+ * shared tier-up larger than AGREE is visible between the two levels. A comparison below −AGREE is impossible (the
+ * real path allocates at least what the zero path does, plus the boxed p), so it means heapUsed fell without a GC
+ * during the real reading, and it is left out. The excess is the smallest comparison that another one agrees with
+ * (within AGREE): a per-frame allocation in VadCore or the model shows in every comparison, V8's compiled variants
+ * of the real path differ by whole boxed doubles (16 B per frame), and a lone reading far from the others (the
+ * first run after a tier-up, say) can't decide alone. Real readings stop as soon as two comparisons agree, after at
+ * most MAX_REAL_READINGS; then, if none agree, the excess is the smallest comparison. It fails if no comparison
+ * could be made. selectExcess holds that rule.
  */
-function growthOverZero(model: SileroModel, pregate: boolean, done: (excess: number) => boolean): number {
+function growthOverZero(model: SileroModel, pregate: boolean): Comparison {
   const real = heapRunner(model, pregate);
   const zero = heapRunner(zeroModel(), pregate);
   real(400);
   zero(50_000); // about 1.5 s, 3.5 s under coverage: well past the 11 000 frames TurboFan needs
-  const base = lowGrowth(() => zero(1000));
-  const best = bestGrowth(
-    () => real(1000),
-    (b) => done(b - base),
-    5,
-  );
-  return best - base;
+  const zeroReadings = (): HeapReading[] =>
+    Array.from({ length: ZERO_READINGS }, () => heapGrowth(() => zero(1000)));
+  const settling = zeroReadings();
+  const first = zeroReadings();
+  const steps: RealStep[] = [];
+  let selection = selectExcess(settling, first, steps);
+  while (!selection.stopped) {
+    const reading = heapGrowth(() => real(1000));
+    steps.push({ reading, after: zeroReadings() });
+    selection = selectExcess(settling, first, steps);
+  }
+  expect(selection.comparisons, selection.report).toBeGreaterThan(0);
+  return { excess: selection.excess, report: selection.report };
 }
 
 describe('no allocation on the per-frame path', () => {
@@ -1113,7 +1251,8 @@ describe('no allocation on the per-frame path', () => {
     'the Silero path (pregate %s) grows the heap < 64 KB per 1000 frames more than a zero model',
     { timeout: 120_000 },
     (pregate) => {
-      expect(growthOverZero(createSilero(W), pregate, (excess) => excess < LIMIT)).toBeLessThan(LIMIT);
+      const { excess, report } = growthOverZero(createSilero(W), pregate);
+      expect(excess, report).toBeLessThan(LIMIT);
     },
   );
 
@@ -1125,10 +1264,110 @@ describe('no allocation on the per-frame path', () => {
     leaky.onProcess = (x) => {
       kept[leaky.calls % 1000] = x.subarray(1);
     };
-    // Retry until a run is GC-free: +Infinity alone would pass the bound without proving anything.
-    const leak = growthOverZero(leaky, false, () => true);
+    // growthOverZero fails unless a GC-free real reading was compared, so the leak can't pass on no evidence.
+    const leak = growthOverZero(leaky, false);
     expect(kept.every((v) => v !== undefined)).toBe(true);
-    expect(leak).toBeGreaterThanOrEqual(LIMIT);
+    expect(leak.excess, leak.report).toBeGreaterThanOrEqual(LIMIT);
+  });
+
+  describe('selectExcess, on readings recorded on #226', () => {
+    const settling = gcFreeReadings(28704, 26936, 27584, 28144, 27600);
+
+    it('rejects a real reading whose zero levels straddle a tier step, and takes later ones (NC-n1 under load)', () => {
+      const s = selectExcess(settling, gcFreeReadings(26704, 22680, 22680, 22800, 22680), [
+        realStep(94936, gcFreeReadings(22680, 22680, 22680, 22736, 22680)),
+        realStep(94680, gcFreeReadings(22680, 6192, 22064, 480, 424)),
+        realStep(72424, gcFreeReadings(424, 424, 424, 480, 424)),
+        realStep(72480, gcFreeReadings(424, 424, 480, 424, 424)),
+      ]);
+      expect(s.report.split('\n').slice(2), s.report).toEqual([
+        'real 1: 94936; excess 72256',
+        'zero: 22680, 22680, 22680, 22736, 22680; level 22680',
+        'real 2: 94680; not compared (a GC, or the zero level moved)',
+        'zero: 22680, 6192, 22064, 480, 424; level 6192',
+        'real 3: 72424; not compared (a GC, or the zero level moved)',
+        'zero: 424, 424, 424, 480, 424; level 424',
+        'real 4: 72480; excess 72056',
+        'zero: 424, 424, 480, 424, 424; level 424',
+        'excess 72056 B per 1000 frames, the smallest comparison another agrees with',
+      ]);
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([72056, 2, 4, true]);
+    });
+
+    it('leaves out a GC-free fall of heapUsed (a comparison below −AGREE), then takes the agreeing pair', () => {
+      const s = selectExcess(
+        gcFreeReadings(163576, 167816, 145952, 145912, 145952),
+        gcFreeReadings(145952, 145856, 145952, 146008, 151816),
+        [
+          realStep(34368, gcFreeReadings(170704, 145952, 145856, 146008, 145952)),
+          realStep(161856, gcFreeReadings(145856, 145952, 145952, 145912, 145952)),
+          realStep(161952, gcFreeReadings(145952, 145856, 145952, 146008, 145856)),
+        ],
+      );
+      expect(s.report).toContain('real 1: 34368; not compared (heap fell without a GC)');
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([15904, 2, 3, true]);
+    });
+
+    it('takes the smallest comparison when none agree after MAX_REAL_READINGS', () => {
+      const level = gcFreeReadings(424, 424, 424, 480, 424);
+      const s = selectExcess(settling, level, [
+        realStep(32424, level),
+        realStep(48728, level),
+        realStep(gcReading(16480), level),
+        realStep(gcReading(16424), level),
+      ]);
+      expect(s.report).toContain('real 3: 16480 (GC); not compared (a GC, or the zero level moved)');
+      expect(s.report).toContain('excess 32000 B per 1000 frames, the smallest comparison: none agree');
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([32000, 2, 4, true]);
+    });
+
+    it('takes the smaller of an agreeing pair, never a lone low reading, and subtracts the lower level', () => {
+      const s = selectExcess(settling, gcFreeReadings(22680, 22680, 22680, 22736, 22680), [
+        realStep(26920, gcFreeReadings(22680, 22680, 22680, 22736, 22680)),
+        realStep(94680, gcFreeReadings(22736, 22736, 22680, 22736, 22800)),
+        realStep(94736, gcFreeReadings(22680, 22680, 22680, 22736, 22680)),
+      ]);
+      expect(s.report).toContain('real 2: 94680; excess 72000');
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([72000, 3, 3, true]);
+    });
+
+    it('agrees within AGREE: a 3 104 B pair at the 2-boxed-double level is enough to stop', () => {
+      const level = gcFreeReadings(158168, 158072, 158168, 158224, 158168);
+      const s = selectExcess(settling, level, [
+        realStep(190424, level),
+        realStep(193528, level),
+        realStep(150856, level),
+      ]);
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([32256, 2, 2, true]);
+    });
+
+    it('makes no comparison when every real reading had a GC, and says so', () => {
+      const level = gcFreeReadings(22680, 22680, 22680, 22736, 22680);
+      const s = selectExcess(settling, level, [
+        realStep(gcReading(38936), level),
+        realStep(gcReading(38680), level),
+        realStep(gcReading(38680), level),
+        realStep(gcReading(38736), level),
+        realStep(38680, level),
+      ]);
+      expect(s.report.split('\n').at(-1)).toBe(
+        'no comparison could be made (every real reading had a GC, or the zero level moved around it)',
+      );
+      expect([s.comparisons, s.used, s.stopped]).toEqual([0, 4, true]);
+    });
+
+    it('keeps reading until two comparisons agree: only the 3rd and 4th do here', () => {
+      const level = gcFreeReadings(424, 424, 480, 424, 424);
+      const steps = [
+        realStep(48728, level),
+        realStep(32728, level),
+        realStep(16480, level),
+        realStep(16424, level),
+      ];
+      expect(selectExcess(settling, level, steps.slice(0, 3)).stopped).toBe(false);
+      const s = selectExcess(settling, level, steps);
+      expect([s.excess, s.comparisons, s.used, s.stopped]).toEqual([16000, 4, 4, true]);
+    });
   });
 });
 
@@ -1497,6 +1736,304 @@ describe('VadCore feature trace (setTrace)', () => {
   );
 });
 
+// ---- Capture gaps (#244) ----
+
+/** The re-anchor of the tests: a 2 s audio-thread stall, in ctx frames. */
+const GAP = 2 * CTX_RATE;
+/** Ctx frames per 10 ms hop. */
+const HOP_CTX = ENERGY_HOP * 3;
+/** The session's pre-roll and tail in ctx frames (machine.ts `endOfSpeech`). */
+const PREROLL_CTX = (PREROLL_MS / 1000) * CTX_RATE;
+const TAIL_CTX = (TAIL_MS / 1000) * CTX_RATE;
+
+/**
+ * Feeds `frames` as the worklet tags them across a re-anchor: frame k at k·512·3 before frame `cut`, and `jump`
+ * ctx frames later from frame `cut` on.
+ */
+function feedWithGap(run: Run, epoch: number, frames: Float32Array[], cut: number, jump = GAP): void {
+  frames.forEach((f, k) => run.core.frame(epoch, k * SILERO_GRID + (k < cut ? 0 : jump), f));
+}
+
+/** The [fromFrame, toFrame] the session would take for each start → end pair of `evs` (machine.ts
+ *  `endOfSpeech`: PREROLL_CTX before the onset, clamped to the epoch's first frame 0, to TAIL_CTX after
+ *  lastSpeechFrame). */
+function takesOf(evs: SegEvent[]): [number, number][] {
+  const out: [number, number][] = [];
+  let onset: number | null = null;
+  for (const ev of evs) {
+    if (ev.kind === 'start') {
+      onset = ev.frame;
+      continue;
+    }
+    if (ev.kind === 'end' && onset !== null) {
+      out.push([Math.max(0, onset - PREROLL_CTX), ev.lastSpeechFrame + TAIL_CTX]);
+    }
+    onset = null;
+  }
+  return out;
+}
+
+/** Index in `msgs` of the first `level` at or after ctx frame `frame`: the first message about audio there. */
+function firstLevelAt(msgs: WorkerToMain[], frame: number): number {
+  return msgs.findIndex((m) => m.t === 'level' && m.frame >= frame);
+}
+
+/** Index in `msgs` of the n-th `seg` message (n = 0: the first). */
+function segIndex(msgs: WorkerToMain[], n: number): number {
+  const at = msgs.flatMap((m, i) => (m.t === 'seg' ? [i] : []));
+  return at[n] ?? -1;
+}
+
+/** Each batch's hops mapped linearly from its hop0Frame (480 frames apart), all batches joined. */
+function linearHopFrames(batches: TraceBatch[]): number[] {
+  return batches.flatMap((b) => Array.from(b.rawDb, (_, i) => b.hop0Frame + i * HOP_CTX));
+}
+
+/** Hop frames h·480 for h in [0, pre), then gapEnd + m·480 for m in [0, post). */
+function hopGrid(pre: number, gapEnd: number, post: number): number[] {
+  return [
+    ...Array.from({ length: pre }, (_, h) => h * HOP_CTX),
+    ...Array.from({ length: post }, (_, m) => gapEnd + m * HOP_CTX),
+  ];
+}
+
+describe('VadCore capture gaps (#244)', () => {
+  it('energy: a 2 s re-anchor mid-vowel ends the segment at the gap, and no take spans the gap', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 55; // frame 55 starts at 1.76 s, mid-vowel (1.0–2.5 s): exactly 176 hops before it
+    const gapStart = cut * SILERO_GRID; // the first ctx frame the stall swallowed
+    const gapEnd = gapStart + GAP; // the re-anchor: the frames resume here
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    feedWithGap(run, 1, frames, cut);
+    const evs = segs(run.msgs);
+    // No take reaches across the gap: each lies before it (its tail may reach TAIL_CTX into it) or after it
+    // (its pre-roll may reach PREROLL_CTX back into it).
+    const takes = takesOf(evs);
+    expect(takes.length).toBeGreaterThan(0);
+    for (const [from, to] of takes) {
+      expect(to <= gapStart + TAIL_CTX || from >= gapEnd - PREROLL_CTX, `take [${from}, ${to}]`).toBe(true);
+    }
+    // The segment ends at its last hop before the gap, before any message about the audio after it.
+    const lastHop = (176 - 1) * HOP_CTX;
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'end', 'start', 'end']);
+    expect(evs[1]).toEqual({ kind: 'end', frame: lastHop, lastSpeechFrame: lastHop, reason: 'silence' });
+    expect(segIndex(run.msgs, 1)).toBeLessThan(firstLevelAt(run.msgs, gapEnd));
+    expect(takes[0]![1]).toBe(lastHop + TAIL_CTX);
+    // The vowel after the gap is a segment of its own, from the re-anchor on.
+    expect(evs[2]!.frame).toBeGreaterThanOrEqual(gapEnd);
+    expect(takes[1]![0]).toBeGreaterThanOrEqual(gapEnd - PREROLL_CTX);
+  });
+
+  it('Silero: the segment ends at its last frame before the gap, after the proximity gate', () => {
+    const cut = LEAD + 15;
+    const frames = burstFrames(74, -50, 12, LEAD, BURST, TAIL);
+    const run = (x: number): Run => {
+      const r = newCore();
+      r.core.setModel(burstModel(LEAD, LEAD + BURST));
+      r.core.reset(1, 'silero', undefined, false, x);
+      feedWithGap(r, 1, frames, cut);
+      return r;
+    };
+    const pass = run(6);
+    const evs = segs(pass.msgs);
+    const lastBefore = (cut - 1) * SILERO_GRID;
+    expect(evs).toEqual([
+      { kind: 'start', frame: LEAD * SILERO_GRID },
+      { kind: 'end', frame: lastBefore, lastSpeechFrame: lastBefore, reason: 'silence' },
+      { kind: 'start', frame: cut * SILERO_GRID + GAP },
+      {
+        kind: 'end',
+        frame: evs[3]?.frame,
+        lastSpeechFrame: (LEAD + BURST - 1) * SILERO_GRID + GAP,
+        reason: 'silence',
+      },
+    ]);
+    expect(segIndex(pass.msgs, 1)).toBeLessThan(firstLevelAt(pass.msgs, cut * SILERO_GRID + GAP));
+    // X = 15 (the burst is 12 dB above the floor): the same messages, with both ends misfires at their frames.
+    const fail = run(15);
+    expect(fail.msgs).toEqual(
+      pass.msgs.map((m) =>
+        m.t === 'seg' && m.ev.kind === 'end'
+          ? { t: 'seg', epoch: 1, ev: { kind: 'misfire', frame: m.ev.frame } }
+          : m,
+      ),
+    );
+  });
+
+  it('a segment cut short by the gap is a misfire: under the minimum speech (Silero), or unvoiced (energy)', () => {
+    // Silero: the burst starts 2 frames (64 ms < 150 ms) before the gap.
+    const cut = LEAD + 2;
+    const silero = newCore();
+    silero.core.setModel(burstModel(LEAD, LEAD + BURST));
+    silero.core.reset(1, 'silero', undefined, false, 6);
+    feedWithGap(silero, 1, burstFrames(75, -50, 12, LEAD, BURST, TAIL), cut);
+    expect(segs(silero.msgs).slice(0, 3)).toEqual([
+      { kind: 'start', frame: LEAD * SILERO_GRID },
+      { kind: 'misfire', frame: (cut - 1) * SILERO_GRID },
+      { kind: 'start', frame: cut * SILERO_GRID + GAP },
+    ]);
+    // Energy: a 600 ms white-noise burst at −20 dBFS (never voiced), cut 300 ms in.
+    const x = concat48(whiteNoise48(41, 1.0, -70), whiteNoise48(42, 0.6, -20), whiteNoise48(43, 1.0, -70));
+    const energy = newCore();
+    energy.core.reset(1, 'energy');
+    const noiseCut = Math.round((1.3 * 16000) / FRAME);
+    feedWithGap(energy, 1, frames16k(x), noiseCut);
+    const evs = segs(energy.msgs);
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'misfire', 'start', 'misfire']);
+    expect(evs[1]!.frame).toBeLessThan(noiseCut * SILERO_GRID);
+    expect(evs[2]!.frame).toBeGreaterThanOrEqual(noiseCut * SILERO_GRID + GAP);
+  });
+
+  it('a gap while idle posts nothing: the events after it are the gapless run’s, shifted by the gap', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 20; // 0.64 s, before the vowel; 20 frames are exactly 64 hops
+    const gapless = newCore();
+    gapless.core.reset(1, 'energy');
+    feed(gapless, 1, frames);
+    const gapped = newCore();
+    gapped.core.reset(1, 'energy');
+    feedWithGap(gapped, 1, frames, cut);
+    const shifted = segs(gapless.msgs).map((ev) => ({ ...ev, frame: ev.frame + GAP }));
+    const evs = segs(gapped.msgs);
+    expect(evs.map((e) => e.kind)).toEqual(['start', 'end']);
+    expect(evs).toEqual(
+      shifted.map((ev) => (ev.kind === 'end' ? { ...ev, lastSpeechFrame: ev.lastSpeechFrame + GAP } : ev)),
+    );
+  });
+
+  it('tags within CAPTURE_GAP_SLACK (128) of the expected frame are no gap; one more frame either way is', () => {
+    expect(CAPTURE_GAP_SLACK).toBe(128);
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 55;
+    const kindsWith = (jump: number): string[] => {
+      const run = newCore();
+      run.core.reset(1, 'energy');
+      feedWithGap(run, 1, frames, cut, jump);
+      return kinds(run.msgs);
+    };
+    expect(kindsWith(CAPTURE_GAP_SLACK)).toEqual(['start', 'end']);
+    expect(kindsWith(-CAPTURE_GAP_SLACK)).toEqual(['start', 'end']);
+    expect(kindsWith(CAPTURE_GAP_SLACK + 1)).toEqual(['start', 'end', 'start', 'end']);
+    expect(kindsWith(-CAPTURE_GAP_SLACK - 1)).toEqual(['start', 'end', 'start', 'end']);
+    // The worklet's rounded tags at 44.1 kHz (1411.2 frames apart) are no gap either.
+    const run = newCore(44100);
+    run.core.reset(1, 'energy');
+    frames.forEach((f, k) => run.core.frame(1, tag441(k), f));
+    expect(kinds(run.msgs)).toEqual(['start', 'end']);
+  });
+
+  it('no hop straddles the gap: the partial hop is dropped, and the hops after it start at the re-anchor', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 56; // 56 · 512 samples: 179 hops and 32 samples of the 180th
+    const gapEnd = cut * SILERO_GRID + GAP;
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    run.core.setTrace(true);
+    feedWithGap(run, 1, frames, cut);
+    run.core.setTrace(false);
+    const post = Math.floor(((frames.length - cut) * FRAME) / ENERGY_HOP);
+    expect(linearHopFrames(traceBatches(run.msgs))).toEqual(hopGrid(179, gapEnd, post));
+    for (const m of levels(run.msgs)) {
+      const offset = m.frame < gapEnd ? m.frame : m.frame - gapEnd;
+      expect(offset % HOP_CTX, `level at ${m.frame}`).toBe(0);
+    }
+  });
+
+  it('the trace batch ends at the gap, so every batch follows on from its hop0Frame and sil0Frame', () => {
+    const frames = vowel3s();
+    const cut = 10; // 32 hops: a batch closes at the end of frame 7, and 7 hops (2 Silero frames) are held
+    const gapEnd = cut * SILERO_GRID + GAP;
+    const post = Math.floor(((frames.length - cut) * FRAME) / ENERGY_HOP);
+    // Energy: the 7 held hops are posted as a batch of their own.
+    const energy = newCore();
+    energy.core.reset(1, 'energy');
+    energy.core.setTrace(true);
+    feedWithGap(energy, 1, frames, cut);
+    energy.core.setTrace(false);
+    let batches = traceBatches(energy.msgs);
+    expect(shapes(batches.slice(0, 3))).toEqual([
+      [1, 25, 0],
+      [1, 7, 0],
+      [1, 25, 0],
+    ]);
+    expect(batches[2]!.hop0Frame).toBe(gapEnd);
+    expect(linearHopFrames(batches)).toEqual(hopGrid(32, gapEnd, post));
+    // Silero: the same, with the held frames' Silero values, which then also follow on from sil0Frame.
+    const silero = newCore();
+    silero.core.setModel(zeroModel());
+    silero.core.reset(1, 'silero');
+    silero.core.setTrace(true);
+    feedWithGap(silero, 1, frames, cut);
+    silero.core.setTrace(false);
+    batches = traceBatches(silero.msgs);
+    expect(shapes(batches.slice(0, 3))).toEqual([
+      [1, 25, 8],
+      [1, 7, 2],
+      [1, 25, 8],
+    ]);
+    expect([batches[1]!.hop0Frame, batches[1]!.sil0Frame]).toEqual([25 * HOP_CTX, 8 * SILERO_GRID]);
+    expect([batches[2]!.hop0Frame, batches[2]!.sil0Frame]).toEqual([gapEnd, gapEnd]);
+    expect(linearHopFrames(batches)).toEqual(hopGrid(32, gapEnd, post));
+    const silFrames = batches.flatMap((b) => Array.from(b.sileroP, (_, j) => b.sil0Frame + j * SILERO_GRID));
+    expect(silFrames).toEqual(frames.map((_, k) => k * SILERO_GRID + (k < cut ? 0 : GAP)));
+  });
+
+  it('on Silero, hops held without a Silero value at the gap are dropped: no batch has hops but no p', () => {
+    const frames = vowel3s();
+    const cut = 16; // 51 hops: batches close at the ends of frames 7 and 15, and hop 50 is left over
+    const gapEnd = cut * SILERO_GRID + GAP;
+    const run = newCore();
+    run.core.setModel(zeroModel());
+    run.core.reset(1, 'silero');
+    run.core.setTrace(true);
+    feedWithGap(run, 1, frames, cut);
+    run.core.setTrace(false);
+    const batches = traceBatches(run.msgs);
+    expect(shapes(batches.slice(0, 3))).toEqual([
+      [1, 25, 8],
+      [1, 25, 8],
+      [1, 25, 8],
+    ]);
+    expect(batches.every((b) => b.sileroP.length > 0)).toBe(true);
+    const post = Math.floor(((frames.length - cut) * FRAME) / ENERGY_HOP);
+    expect(linearHopFrames(batches)).toEqual(hopGrid(50, gapEnd, post));
+  });
+
+  it('the voicing window restarts from zeros at the gap: the trace voicing equals a reference zeroed there', () => {
+    const frames = frames16k(fixture('vowel_f0-140'));
+    const cut = 55; // mid-vowel, and exactly 176 hops before it: no partial hop is dropped
+    const run = newCore();
+    run.core.reset(1, 'energy');
+    run.core.setTrace(true);
+    feedWithGap(run, 1, frames, cut);
+    run.core.setTrace(false);
+    // The reference, as referenceStreams computes it: the gate filter runs on across the gap (it carries on),
+    // and the 512-sample voicing window is zeroed just before hop 176, the first after the gap.
+    const firstAfter = (cut * FRAME) / ENERGY_HOP;
+    expect(firstAfter).toBe(176);
+    const band = new Float32Array(frames.length * FRAME);
+    const gate = createGateFilter(16000);
+    frames.forEach((f, k) => gate.process(f, band.subarray(k * FRAME, (k + 1) * FRAME)));
+    const voicingWith = (zeroAt: number): Float32Array => {
+      const scorer = createVoicing(16000);
+      const win = new Float32Array(512);
+      const out = new Float32Array(Math.floor(band.length / ENERGY_HOP));
+      for (let j = 0; j < out.length; j++) {
+        if (j === zeroAt) win.fill(0);
+        win.copyWithin(0, ENERGY_HOP);
+        win.set(band.subarray(j * ENERGY_HOP, (j + 1) * ENERGY_HOP), win.length - ENERGY_HOP);
+        out[j] = scorer.score(win);
+      }
+      return out;
+    };
+    const reference = voicingWith(firstAfter);
+    // The reset shows here: a window carried over the gap scores the first hop after it differently.
+    expect(voicingWith(-1)[firstAfter]).not.toBe(reference[firstAfter]);
+    expect(joined(traceBatches(run.msgs), 'voicing')).toEqual(reference);
+  });
+});
+
 // ---- Worker glue (dsp.worker.ts) with a fake `self` and a fake MessagePort ----
 
 type Listener = (e: { data: unknown }) => void;
@@ -1532,6 +2069,12 @@ class FakePort extends FakeTarget {
     this.closed = true;
   }
 }
+
+/** The weights-load failures among `msgs`. */
+const loadFailures = (msgs: WorkerToMain[]): Extract<WorkerToMain, { t: 'error' }>[] =>
+  ofType(msgs, 'error').filter((m) => m.message.startsWith('silero weights failed to load: '));
+/** Resolves after the pending microtasks: a load that settled has posted its result by then. */
+const nextTask = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
 describe('dsp.worker glue', () => {
   let self: FakeSelf;
@@ -1650,7 +2193,7 @@ describe('dsp.worker glue', () => {
     ['a rejected fetch', (): Promise<Response> => Promise.reject(new TypeError('network down'))],
     ['an HTTP 404', (): Promise<Response> => Promise.resolve(new Response(null, { status: 404 }))],
   ])(
-    '%s posts error{vad} and no vadReady; Silero epochs run on energy; the next init retries',
+    '%s posts error{vad} and no vadReady; Silero epochs run on energy; the next init and Silero re-arm retry',
     async (_name, impl) => {
       fetchStub.mockImplementation(impl);
       self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
@@ -1665,12 +2208,15 @@ describe('dsp.worker glue', () => {
       expect(fetchStub).toHaveBeenCalledTimes(2);
       await vi.waitFor(() => expect(ofType(sent(), 'error')).toHaveLength(1));
       self.posted.length = 0;
-      self.dispatch({ t: 'reset', epoch: 3, vad: 'silero' });
+      self.dispatch({ t: 'reset', epoch: 3, vad: 'silero' }); // retries the load too (#251)
+      expect(fetchStub).toHaveBeenCalledTimes(3);
       expect(sent()).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
       frames16k(fixture('vowel_f0-140')).forEach((pcm16k, i) =>
         port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
       );
       expect(segs(sent())).toEqual(segs(runFixture('vowel_f0-140').msgs));
+      await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(1));
+      expect(ofType(sent(), 'vadReady')).toEqual([]);
     },
   );
 
@@ -1699,6 +2245,141 @@ describe('dsp.worker glue', () => {
     expect(evs.map((e) => e.kind)).toEqual(['start', 'end']);
     for (const e of evs) expect(e.frame % SILERO_GRID).toBe(0);
     expect(ofType(sent(), 'error')).toHaveLength(1); // only the not-ready one
+  });
+
+  // #251: a failed load is retried by the next epoch that asks for Silero while no model is set.
+  it('a failed first load (HTTP 500) is retried by the next Silero re-arm: vadReady once, the next epoch on Silero', async () => {
+    fetchStub
+      .mockImplementationOnce(() => Promise.resolve(new Response(null, { status: 500 })))
+      .mockImplementation(() => Promise.resolve(new Response(weightsBuffer())));
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
+    await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(1));
+    expect(loadFailures(sent())[0]).toEqual({
+      t: 'error',
+      where: 'vad',
+      message: 'silero weights failed to load: HTTP 500',
+    });
+    await nextTask();
+    expect(fetchStub).toHaveBeenCalledTimes(1); // the failure alone never retries
+    let mark = self.posted.length;
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', pregate: false });
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(sent().slice(mark)).toEqual([{ t: 'error', where: 'vad', message: SILERO_NOT_READY_MESSAGE }]);
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    expect(ofType(sent(), 'vadReady')).toEqual([{ t: 'vadReady', backend: 'silero' }]);
+    mark = self.posted.length;
+    self.dispatch({ t: 'reset', epoch: 3, vad: 'silero', pregate: false });
+    const frames = frames16k(fixture('vowel_f0-140'));
+    frames.forEach((pcm16k, i) =>
+      port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
+    );
+    const run = sent().slice(mark);
+    expect(ofType(run, 'error')).toEqual([]); // no SILERO_NOT_READY_MESSAGE: the epoch asked for Silero and got it
+    const silero = segs(runSilero(frames, createSilero(W)).msgs);
+    expect(silero).not.toEqual(segs(runFixture('vowel_f0-140').msgs)); // the check tells the backends apart
+    expect(segs(run)).toEqual(silero);
+    await nextTask();
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(ofType(sent(), 'vadReady')).toHaveLength(1);
+  });
+
+  it('repeated failures never put two fetches in flight; only a Silero re-arm retries', async () => {
+    /** Settles every fetch, in call order: with a response, or rejected with an error. */
+    const settles: ((outcome: Response | Error) => void)[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    fetchStub.mockImplementation(() => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise<Response>((resolve, reject) => {
+        settles.push((outcome) => {
+          inFlight--;
+          if (outcome instanceof Error) reject(outcome);
+          else resolve(outcome);
+        });
+      });
+    });
+    /** Fails fetch k, and waits until its failure is posted and every microtask after it has run. */
+    const fail = async (k: number, outcome: Response | Error): Promise<void> => {
+      settles[k]!(outcome);
+      await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(k + 1));
+      await nextTask();
+    };
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() }); // fetch 1
+    self.dispatch({ t: 'reset', epoch: 1, vad: 'silero' });
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero' });
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    await fail(0, new Response(null, { status: 500 }));
+    expect(fetchStub).toHaveBeenCalledTimes(1); // the failure alone never retries
+    self.dispatch({ t: 'reset', epoch: 3, vad: 'energy' }); // an energy listen doesn't want the model
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    self.dispatch({ t: 'reset', epoch: 4, vad: 'silero' }); // fetch 2
+    self.dispatch({ t: 'reset', epoch: 5, vad: 'silero' });
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    await fail(1, new TypeError('network down'));
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    self.dispatch({ t: 'reset', epoch: 6, vad: 'silero' }); // fetch 3
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+    await fail(2, new Response(null, { status: 500 }));
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+    expect(maxInFlight).toBe(1);
+    expect(loadFailures(sent()).map((m) => m.message)).toEqual([
+      'silero weights failed to load: HTTP 500',
+      'silero weights failed to load: network down',
+      'silero weights failed to load: HTTP 500',
+    ]);
+    expect(ofType(sent(), 'error').filter((m) => m.message === SILERO_NOT_READY_MESSAGE)).toHaveLength(5);
+    expect(ofType(sent(), 'vadReady')).toEqual([]);
+  });
+
+  it('a successful first load is never fetched again: Silero and energy re-arms and a later init reuse it', async () => {
+    fetchStub.mockImplementation(() => Promise.resolve(new Response(weightsBuffer())));
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    for (let epoch = 1; epoch <= 4; epoch++) {
+      self.dispatch({ t: 'reset', epoch, vad: epoch % 2 === 1 ? 'silero' : 'energy' });
+    }
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    self.dispatch({ t: 'reset', epoch: 5, vad: 'silero' });
+    await nextTask();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(ofType(sent(), 'error')).toEqual([]);
+    expect(ofType(sent(), 'vadReady')).toHaveLength(2); // the load's, and the later init's attach
+  });
+
+  it('a retry still in flight when a later init arrives attaches to the new core, not the old one', async () => {
+    let settle: ((r: Response) => void) | undefined;
+    fetchStub
+      .mockImplementationOnce(() => Promise.resolve(new Response(null, { status: 500 })))
+      .mockImplementation(
+        () =>
+          new Promise<Response>((r) => {
+            settle = r;
+          }),
+      );
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port: new FakePort() });
+    await vi.waitFor(() => expect(loadFailures(sent())).toHaveLength(1));
+    self.dispatch({ t: 'reset', epoch: 2, vad: 'silero', pregate: false }); // the retry: fetch 2, pending
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    const port = new FakePort();
+    self.dispatch({ t: 'init', ctxRate: CTX_RATE, port }); // a load is in flight: no third fetch
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(ofType(sent(), 'vadReady')).toEqual([]);
+    if (settle === undefined) throw new Error('the retry did not fetch');
+    settle(new Response(weightsBuffer()));
+    await vi.waitFor(() => expect(ofType(sent(), 'vadReady')).toHaveLength(1));
+    const mark = self.posted.length;
+    self.dispatch({ t: 'reset', epoch: 3, vad: 'silero', pregate: false });
+    const frames = frames16k(fixture('vowel_f0-140'));
+    frames.forEach((pcm16k, i) =>
+      port.dispatch({ t: 'frame', epoch: 3, firstFrame: i * SILERO_GRID, pcm16k }),
+    );
+    const run = sent().slice(mark);
+    expect(ofType(run, 'error')).toEqual([]); // the new core has the model
+    expect(segs(run)).toEqual(segs(runSilero(frames, createSilero(W)).msgs));
+    expect(fetchStub).toHaveBeenCalledTimes(2);
   });
 
   it('reset forwards restoreFloorDb, pregate and proximityDb to the VadCore', async () => {

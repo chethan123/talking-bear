@@ -220,7 +220,8 @@ const BOTH: FixtureTarget[] = ['test', 'e2e'];
 const seconds = (s: number): number => Math.round(s * SAMPLE_RATE);
 
 const FIXTURE_SPECS: FixtureSpec[] = [
-  { name: 'silence_2s', targets: TEST, build: () => ({ sound: new Float64Array(seconds(2)) }) },
+  // The e2e copy is the silent fake mic of the `gestures` and `sfx-gating` specs (#93).
+  { name: 'silence_2s', targets: BOTH, build: () => ({ sound: new Float64Array(seconds(2)) }) },
   {
     name: 'noise_white_-60dbfs_3s',
     targets: TEST,
