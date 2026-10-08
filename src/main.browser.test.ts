@@ -133,23 +133,23 @@ describe('mountDebugOverlayWhenLoaded', () => {
   });
 });
 
-describe('boot: the updateReady relay (#277)', () => {
-  /** Boots into a fresh root and resolves with the session once `boot` has finished. */
-  async function bootSession(): Promise<Session> {
-    const root = document.createElement('div');
-    document.body.append(root);
-    roots.push(root);
-    const got: { session?: Session } = {};
-    await boot(root, {
-      debug: false,
-      onSession: (s) => {
-        got.session = s;
-      },
-    });
-    if (got.session === undefined) throw new Error('test: boot created no session');
-    return got.session;
-  }
+/** Boots into a fresh root and resolves with the session once `boot` has finished. */
+async function bootSession(): Promise<Session> {
+  const root = document.createElement('div');
+  document.body.append(root);
+  roots.push(root);
+  const got: { session?: Session } = {};
+  await boot(root, {
+    debug: false,
+    onSession: (s) => {
+      got.session = s;
+    },
+  });
+  if (got.session === undefined) throw new Error('test: boot created no session');
+  return got.session;
+}
 
+describe('boot: the updateReady relay (#277)', () => {
   test('an update another tab activated before the session existed is caught up with its flag', async () => {
     h.pwaReady = true;
     h.pwaActivated = true;

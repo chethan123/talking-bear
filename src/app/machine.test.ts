@@ -1213,7 +1213,9 @@ describe("#266: settingsRetry from Asleep (the parent's retry wakes as the tap d
         const retry = run(s, { t: 'settingsRetry' });
         expect(retry.state, permission).toStrictEqual(tap.state);
         expect(retry.effects, permission).toStrictEqual(tap.effects);
-        expect(retry.state, permission).not.toBe(s); // not ignored
+        // Not ignored: a wake, or (#277, another tab's update) only the reload, which keeps the state object.
+        if (s.updateActivated) expect(retry.effects, permission).toStrictEqual([{ k: 'applyUpdate' }]);
+        else expect(retry.state, permission).not.toBe(s);
       }
     }
   });
@@ -1304,12 +1306,15 @@ describe("#266: settingsRetry from Asleep (the parent's retry wakes as the tap d
   });
 });
 
+/** #277: a state in which another tab activated the update (both flags set). */
+function flagged(name: StateName, over: Partial<SessionState> = {}): SessionState {
+  return stateIn(name, { updateReady: true, updateActivated: true, ...over });
+}
+
 // ---- #277: a visible Asleep page another tab updated reloads at its next wake (row 3c) ---------------------------
 describe('#277: an Asleep wake after another tab activated the update reloads instead', () => {
   const PERMISSIONS = ['granted', 'prompt', 'denied'] as const;
   const APPLY: Effect[] = [{ k: 'applyUpdate' }];
-  const flagged = (name: StateName, over: Partial<SessionState> = {}): SessionState =>
-    stateIn(name, { updateReady: true, updateActivated: true, ...over });
 
   it('updateReady{activated} sets both flags in every state; a later plain updateReady keeps the flag', () => {
     for (const name of STATES) {

@@ -434,7 +434,7 @@ describe('session reducer properties (plan §4.9.1)', () => {
           if (a.effects.length > 0 || !a.state.updateActivated || !a.state.updateReady) {
             fail(
               sim,
-              `P11: updateReady{activated} in ${s.name} gave ${fmt(a.state)} [${a.effects.length} fx]`,
+              `P11: updateReady{activated} in ${s.name} emitted ${a.effects.length} effects or set no flag`,
             );
           }
           const b = reduce(s, { t: 'updateReady' });
@@ -451,15 +451,16 @@ describe('session reducer properties (plan §4.9.1)', () => {
               }
               continue;
             }
-            try {
-              expect(x.effects).toStrictEqual(y.effects);
-              expect({ ...x.state, updateActivated: false }).toStrictEqual({
-                ...y.state,
-                updateActivated: false,
-              });
-            } catch (err) {
-              fail(sim, `P11: the flag changed ${fmt(e)} in ${s.name}: ${String(err)}`);
+            // Cheap comparisons (this runs for every reachable state): effects by value, states key by key.
+            if (JSON.stringify(x.effects) !== JSON.stringify(y.effects)) {
+              fail(sim, `P11: the flag changed the effects of ${fmt(e)} in ${s.name}`);
             }
+            const changed = changedKeys(
+              { ...x.state, updateActivated: false },
+              { ...y.state, updateActivated: false },
+            );
+            if (changed.length > 0)
+              fail(sim, `P11: the flag changed [${changed.join(', ')}] on ${fmt(e)} in ${s.name}`);
           }
         },
       );
