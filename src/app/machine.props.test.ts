@@ -21,7 +21,7 @@ import { GATED, MIC_OPEN, TABLE, reduce } from './machine.ts';
 /** At least 300 runs per property, each a sequence of up to 400 steps (issue #29). */
 const RUNS = 300;
 const MAX_STEPS = 400;
-/** The random draws one step may use: a step needs at most 10 (any further draw reads as 0). */
+/** The random draws one step may use: a step needs at most 11 (any further draw reads as 0). */
 const DRAWS_PER_STEP = 12;
 
 /**
@@ -34,6 +34,8 @@ const LIVENESS_BOUND_MS =
 /** A safety net against a livelock that never advances time. */
 const MAX_LIVENESS_STEPS = 10_000;
 const TERMINAL: ReadonlySet<StateName> = new Set<StateName>(['Asleep', 'Paused']);
+/** #116: a noisy walk starts at the top boost with two noisy caps, one cap short of hold-to-talk. */
+const NOISY_START: Partial<SessionState> = { marginBoostDb: 6, noisyCaps: 2 };
 
 /** One step's draws: integers that read as uniform numbers in [0, 1) and shrink towards 0 (deliver). */
 const stepArb = fc.array(fc.integer({ min: 0, max: 0xffff }), {
@@ -51,6 +53,8 @@ const walkFields = {
     { weight: 1, arbitrary: fc.constantFrom<MicMode>('denied', 'noDevice') },
   ),
   steps: fc.array(stepArb, { minLength: 1, maxLength: MAX_STEPS, size: 'max' }),
+  /** #116: a noisy room: every take is capped with a low voiced ratio, starting one cap short of hold-to-talk. */
+  noisy: fc.boolean(),
 };
 const walkArb = fc.record(walkFields);
 type Walk = (typeof walkArb extends fc.Arbitrary<infer W> ? W : never) & { lossRate?: number };
@@ -120,7 +124,14 @@ function runWalk(
   onTransition: (t: Transition, sim: SessionSim) => void,
   onState: (sim: SessionSim) => void = () => {},
 ): SessionSim {
-  const sim = new SessionSim({ permission: w.permission, mic: w.mic, lossRate: w.lossRate });
+  const sim = new SessionSim({
+    permission: w.permission,
+    mic: w.mic,
+    lossRate: w.lossRate,
+    noisy: w.noisy,
+    // The reset happens only on entering Asleep, so the first noisy cap before the first nap enters hold mode.
+    ...(w.noisy ? { initial: NOISY_START } : {}),
+  });
   onState(sim);
   for (const tape of w.steps) {
     const t = sim.step(tapeRng(tape), true);
@@ -467,5 +478,73 @@ describe('session reducer properties (plan §4.9.1)', () => {
     });
     expect([...probedIn].toSorted()).toEqual(Object.keys(TABLE).toSorted());
     expect(asleepReloads).toBeGreaterThan(0);
+  });
+
+  it('12: in hold-to-talk mode, seg events never change the state; its recording timer is the capped take (#116)', () => {
+    let entered = 0; // walks that entered hold-to-talk mode
+    let holdSegs = 0; // seg events a walk delivered or injected in hold-to-talk mode
+    let holdStates = 0; // reachable hold-mode states probed
+    let capProbes = 0; // hold-mode Recording states probed with timer recording
+    property((w) => {
+      let enteredThisWalk = false;
+      runWalk(
+        w,
+        (t, sim) => {
+          if (!t.prev.holdToTalk && t.next.holdToTalk) enteredThisWalk = true;
+          if (t.event.t !== 'seg' || !t.prev.holdToTalk) return;
+          holdSegs++;
+          if (t.next !== t.prev || t.effects.length > 0) {
+            fail(sim, `P12: ${fmt(t.event)} changed ${t.prev.name} in hold-to-talk mode`);
+          }
+        },
+        (sim) => {
+          const s = sim.state;
+          if (!s.holdToTalk) return;
+          holdStates++;
+          const frame = sim.nowFrame();
+          const probes: SessionEvent[] = [
+            { t: 'seg', epoch: s.epoch, ev: { kind: 'start', frame } },
+            {
+              t: 'seg',
+              epoch: s.epoch,
+              ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'silence', voicedRatio: 0.9 },
+            },
+            {
+              t: 'seg',
+              epoch: s.epoch,
+              ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'maxLength', voicedRatio: 0.1 },
+            },
+            { t: 'seg', epoch: s.epoch, ev: { kind: 'misfire', frame } },
+            ...sim.staleVariants().filter((e) => e.t === 'seg'),
+          ];
+          for (const e of probes) {
+            const out = reduce(s, e);
+            if (out.state !== s || out.effects.length > 0) {
+              fail(sim, `P12: ${fmt(e)} changed ${s.name} in hold-to-talk mode (probe)`);
+            }
+          }
+          if (s.name !== 'Recording' || s.onsetFrame === null) return;
+          capProbes++;
+          const out = reduce(s, { t: 'timer', name: 'recording' });
+          const take = out.effects.find((fx) => fx.k === 'take');
+          const cap = Math.round((cfg.maxUtteranceMs / 1000) * s.sampleRate);
+          const tail = Math.round((cfg.tailMs / 1000) * s.sampleRate);
+          if (
+            out.state.name !== 'Processing' ||
+            take === undefined ||
+            take.toFrame !== s.onsetFrame + cap + tail ||
+            out.effects.some((fx) => fx.k === 'restartWorker')
+          ) {
+            fail(sim, `P12: timer recording in hold-mode Recording gave ${out.state.name} [${out.effects.map((fx) => fx.k).join(', ')}]`);
+          }
+        },
+      );
+      if (enteredThisWalk) entered++;
+    });
+    console.log(`P12: ${entered} walks entered hold-to-talk mode, ${holdSegs} hold-mode seg transitions, ${holdStates} hold-mode states probed, ${capProbes} hold-mode Recording cap probes`);
+    expect(entered).toBeGreaterThan(0);
+    expect(holdSegs).toBeGreaterThan(0);
+    expect(holdStates).toBeGreaterThan(0);
+    expect(capProbes).toBeGreaterThan(0);
   });
 });
