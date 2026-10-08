@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { POSES } from '../src/anim/poses.ts';
 import { noCspViolationsAfterEach, openApp } from './helpers/app';
 
@@ -12,20 +12,41 @@ import { noCspViolationsAfterEach, openApp } from './helpers/app';
 // Baselines: e2e/screenshots.spec.ts-snapshots/<pose>-chromium-linux.png, generated on Linux with
 // `pnpm e2e e2e/screenshots.spec.ts --update-snapshots`. A Playwright or Chromium bump is expected to change
 // pixels: regenerate them, never raise maxDiffPixelRatio.
+//
+// `asleep-overlay` (#115) is a full-page screenshot, because the tap-to-wake paw is a DOM overlay, not canvas content:
+// reduced motion keeps the paw static, and showPose freezes the canvas. Its baseline also holds the settings gear,
+// whose "⚙" is a system-font glyph, so it depends on the image's fonts: regenerate it on the CI image if the fonts
+// differ (`--update-snapshots=missing` after deleting it), and never raise maxDiffPixelRatio.
 noCspViolationsAfterEach();
+
+/** Freezes the canvas on pose `name` through `__bearTest.showPose` (the loop stops for good). */
+async function showPose(page: Page, name: string): Promise<void> {
+  await page.evaluate((pose) => {
+    const hooks: unknown = window.__bearTest;
+    const show: unknown = typeof hooks === 'object' && hooks !== null ? Reflect.get(hooks, 'showPose') : null;
+    if (typeof show !== 'function') throw new Error('window.__bearTest.showPose is missing');
+    Reflect.apply(show, hooks, [pose]);
+  }, name);
+}
 
 for (const name of Object.keys(POSES)) {
   test(`pose ${name}`, async ({ page }) => {
     await openApp(page);
     await page.clock.install({ time: 0 });
     await page.clock.pauseAt(1000);
-    await page.evaluate((pose) => {
-      const hooks: unknown = window.__bearTest;
-      const showPose: unknown =
-        typeof hooks === 'object' && hooks !== null ? Reflect.get(hooks, 'showPose') : null;
-      if (typeof showPose !== 'function') throw new Error('window.__bearTest.showPose is missing');
-      Reflect.apply(showPose, hooks, [pose]);
-    }, name);
+    await showPose(page, name);
     await expect(page.locator('canvas.stage')).toHaveScreenshot(`${name}.png`, { maxDiffPixelRatio: 0.001 });
   });
 }
+
+test('asleep-overlay', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await openApp(page); // waits for data-state="Asleep"
+  const paw = page.locator('.overlay .overlay-paw');
+  await expect(paw).toBeVisible();
+  expect(await paw.evaluate((el) => el.getAnimations().length)).toBe(0); // static under reduced motion
+  await page.clock.install({ time: 0 });
+  await page.clock.pauseAt(1000);
+  await showPose(page, 'asleep');
+  await expect(page).toHaveScreenshot('asleep-overlay.png', { maxDiffPixelRatio: 0.001 });
+});

@@ -11,7 +11,7 @@ import type { Reaction } from '../reactions/table.ts';
 import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
-import { REACTION_CLIPS } from './clips/reactions.ts';
+import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
 import {
   clipByName,
@@ -2127,7 +2127,7 @@ describe('#91 property: random gesture and session sequences', () => {
     (now) => gest('hug', 'belly', 'hug', now),
     (now) => gest('giggle', 'belly', 'allOver', now),
   ];
-  type Kind = AnimKind | 'tick' | 'gesture' | 'release' | 'releaseOf' | 'gentleOn' | 'gentleOff';
+  type Kind = AnimKind | 'tick' | 'gesture' | 'release' | 'releaseOf' | 'gentleOn' | 'gentleOff' | 'clip';
   const STEP = fc.record({
     kind: fc.constantFrom<Kind>(
       ...KINDS,
@@ -2142,6 +2142,7 @@ describe('#91 property: random gesture and session sequences', () => {
       'releaseOf',
       'gentleOn',
       'gentleOff',
+      'clip', // #115
     ),
     g: fc.integer({ min: 0, max: GESTURES.length - 1 }),
     dirX: fc.constantFrom<-1 | 1>(-1, 1),
@@ -2150,6 +2151,7 @@ describe('#91 property: random gesture and session sequences', () => {
   const KNOWN_CLIPS = new Set([
     ...Object.keys(SESSION_CLIPS),
     ...Object.keys(REACTION_CLIPS),
+    ...Object.keys(MIME_CLIPS),
     'flinch',
     'petMirrored',
   ]);
@@ -2171,6 +2173,8 @@ describe('#91 property: random gesture and session sequences', () => {
         return gentle(true);
       case 'gentleOff':
         return gentle(false);
+      case 'clip': // #115: the mime, or a clip with a gentle variant
+        return { k: 'clip', name: g % 2 === 0 ? 'cuppedEar' : 'sneeze', now };
       default:
         return anim(SAMPLES[kind], now);
     }
@@ -2237,8 +2241,9 @@ describe('#91 property: random gesture and session sequences', () => {
           }
           expectNoWorseSecondCut(prev, r, now);
           if (prev.name === 'Asleep' || prev.name === 'Waking') {
-            if (i.k === 'gesture' || i.k === 'release') expect(r).toBe(prev);
+            if (i.k === 'gesture' || i.k === 'release' || i.k === 'clip') expect(r).toBe(prev);
           }
+          if (i.k === 'clip') expect(out).toStrictEqual([]); // #115: a clip input outputs nothing
           for (const o of out) {
             if (o.k === 'toSession') {
               const t = REACTIONS[o.ev.name];
@@ -2261,6 +2266,144 @@ describe('#91 property: random gesture and session sequences', () => {
 
 /** A held pet (its clip is `sustained`): nothing is due on any tick. */
 const heldPet = (): DirectorState => stepAll(stateIn('Idle'), petStroke(11)).s;
+
+// ==== #115: the clip input =========================================================================================
+/** A `{k:'clip'}` input for clip `name` at `now`. */
+const clipIn = (name: string, now: number): DirInput => ({ k: 'clip', name, now });
+/** The cupped ear's length (s). */
+const CUP_S = MIME_CLIPS.cuppedEar.duration;
+
+describe('#115: the clip input', () => {
+  it('Validation 4: in Idle, {k:"clip", name:"cuppedEar"} plays cuppedEar and outputs nothing, then ends in Idle', () => {
+    const r = directorStep(stateIn('Idle'), clipIn('cuppedEar', 11));
+    expect(r.out).toStrictEqual([]);
+    expect(r.state.name).toBe('Reacting');
+    expect(r.state.clip).toStrictEqual({ name: 'cuppedEar', start: 11 });
+    expect(r.state.reaction?.r).toStrictEqual({
+      name: 'cuppedEar',
+      priority: 2,
+      sfx: null,
+      clip: 'cuppedEar',
+      sustained: false,
+    });
+    expect([r.state.reaction?.region, r.state.reaction?.gesture]).toStrictEqual([null, null]);
+    const d = drive(stateIn('Idle'), [clipIn('cuppedEar', 11)], 11 + CUP_S + 0.1);
+    expect(d.out).toStrictEqual([]);
+    const last = d.states.filter((x) => x.s.clip?.name === 'cuppedEar').at(-1);
+    expect(last?.at).toBeLessThan(11 + CUP_S);
+    expect(d.s.name).toBe('Idle');
+    expect(d.s.clip).toBeNull();
+    expect(d.s.reaction).toBeNull();
+  });
+
+  it('has no cooldown and is not counted: a second clip 100 ms later restarts it, cooldowns and repeats untouched', () => {
+    const idle = stateIn('Idle');
+    const one = directorStep(idle, clipIn('cuppedEar', 11)).state;
+    const two = directorStep(one, clipIn('cuppedEar', 11.1));
+    expect(two.out).toStrictEqual([]);
+    expect(two.state.clip).toStrictEqual({ name: 'cuppedEar', start: 11.1 });
+    expect(two.state.cooldowns).toBe(idle.cooldowns);
+    expect(two.state.repeats).toBe(idle.repeats);
+    // A gesture's cooldown on (nose, tap) doesn't stop a clip either.
+    const sneezed = stepAll(idle, noseTap(11)).s;
+    const after = directorStep(sneezed, clipIn('sneeze', 11.2));
+    expect(after.state.clip).toStrictEqual({ name: 'sneeze', start: 11.2 });
+    expect(after.state.cooldowns).toBe(sneezed.cooldowns);
+    expect(after.out).toStrictEqual([]);
+  });
+
+  it('Gentle: a clip with a <name>Gentle variant plays it; cuppedEar has none and plays itself', () => {
+    const g = run(stateIn('Idle'), gentle(true));
+    expect(directorReduce(g, clipIn('sneeze', 11)).clip?.name).toBe('sneezeGentle');
+    expect(directorReduce(g, clipIn('cuppedEar', 11)).clip?.name).toBe('cuppedEar');
+    expect(directorReduce(stateIn('Idle'), clipIn('sneeze', 11)).clip?.name).toBe('sneeze');
+  });
+
+  it('is queued behind a held P3 (no output) and starts at its end within 500 ms; dropped when later', () => {
+    const held = stepAll(stateIn('Idle'), gest('noseWrinkle', 'nose', 'longPress', 11)).s;
+    const q = directorStep(held, clipIn('cuppedEar', 11.2));
+    expect(q.out).toStrictEqual([]);
+    expect(q.state.clip?.name).toBe('noseWrinkle');
+    expect(q.state.queued).toMatchObject({
+      r: { name: 'cuppedEar', priority: 2 },
+      region: null,
+      gesture: null,
+    });
+    // Released at 11.25: it ends at 11.65, inside the 500 ms (queued at 11.2 → until 11.7).
+    const soon = drive(q.state, [releaseOf('nose', 'longPress', 11.25)], 11.7);
+    expect(soon.out).toStrictEqual([]);
+    const started = soon.states.find((x) => x.s.clip?.name === 'cuppedEar');
+    expect(started?.at).toBeCloseTo(11.65, 2);
+    expect(started?.s.reaction?.r.name).toBe('cuppedEar');
+    // Released at 11.4: it ends at 11.8, after the queued clip's 500 ms: dropped, never played.
+    const late = drive(q.state, [releaseOf('nose', 'longPress', 11.4)], 12.5);
+    expect(late.states.some((x) => x.s.clip?.name === 'cuppedEar')).toBe(false);
+    expect(late.s.queued).toBeNull();
+  });
+
+  it('interrupts a P2 or a P1, and a P3 gesture interrupts it with only its own outputs', () => {
+    const waving = stepAll(stateIn('Idle'), gest('pawWaveL', 'pawL', 'tap', 11)).s;
+    const over = directorStep(waving, clipIn('cuppedEar', 11.3));
+    expect(over.out).toStrictEqual([]);
+    expect(over.state.clip?.name).toBe('cuppedEar');
+    expect(over.state.reaction?.r.name).toBe('cuppedEar');
+    const p1: Reaction = { name: 'nudge', priority: 1, sfx: null, clip: 'earTwitch', sustained: false };
+    const nudged = stepAll(stateIn('Idle'), gest(p1, 'earL', 'tap', 11)).s;
+    expect(directorReduce(nudged, clipIn('cuppedEar', 11.1)).clip?.name).toBe('cuppedEar');
+    const cupped = directorReduce(stateIn('Idle'), clipIn('cuppedEar', 11));
+    const squished = stepAll(cupped, gest('squish', 'cheekL', 'pinch', 11.5));
+    expect(squished.s.clip?.name).toBe('squish');
+    expect(squished.out).toStrictEqual([
+      { k: 'toSession', ev: { t: 'reaction', name: 'squish', priority: 3, sfx: null } },
+    ]);
+  });
+
+  it('gates: Asleep and Waking ignore it, Dozing moves to Idle first, an unknown name or a non-finite time changes nothing', () => {
+    for (const name of ['Asleep', 'Waking'] as const) {
+      const s = stateIn(name);
+      expect(directorReduce(s, clipIn('cuppedEar', 10.5)), name).toBe(s);
+      expect(directorStep(s, clipIn('cuppedEar', 10.5)).out, name).toStrictEqual([]);
+    }
+    const dozing = stateIn('Dozing');
+    const woke = directorReduce(dozing, clipIn('cuppedEar', 11));
+    expect(woke.name).toBe('Reacting');
+    expect(woke.base).toBe('idle');
+    expect(woke.prevBase).toBe('dozing');
+    expect(woke.clip?.name).toBe('cuppedEar');
+    const idle = stateIn('Idle');
+    expect(directorReduce(idle, clipIn('mystery', 11))).toBe(idle);
+    for (const t of [Number.NaN, Number.POSITIVE_INFINITY])
+      expect(directorReduce(idle, clipIn('cuppedEar', t))).toBe(idle);
+  });
+
+  it('Talking: a flinch on a free clip slot, nothing on a busy one, no output, still Talking', () => {
+    const talking = stateIn('Talking');
+    const r = directorStep(talking, clipIn('cuppedEar', 11));
+    expect(r.out).toStrictEqual([]);
+    expect(r.state.name).toBe('Talking');
+    expect(r.state.clip).toStrictEqual({ name: 'flinch', start: 11 });
+    expect(r.state.reaction).toBeNull();
+    expect(directorReduce(r.state, clipIn('cuppedEar', 11.05))).toBe(r.state);
+  });
+
+  it('Attentive: it plays additively and the state stays Attentive', () => {
+    const s = directorReduce(stateIn('Attentive'), clipIn('cuppedEar', 11));
+    expect(s.name).toBe('Attentive');
+    expect(s.base).toBe('attentive');
+    expect(s.clip?.name).toBe('cuppedEar');
+    expect(s.reaction?.r.name).toBe('cuppedEar');
+  });
+
+  it('a release, with or without an identity, never ends a clip reaction', () => {
+    const s = directorReduce(stateIn('Idle'), clipIn('cuppedEar', 11));
+    expect(directorReduce(s, release(11.2))).toBe(s);
+    expect(directorReduce(s, releaseOf('earL', 'longPress', 11.2))).toBe(s);
+  });
+
+  it('clipByName knows the mime', () => {
+    expect(clipByName('cuppedEar')).toBe(MIME_CLIPS.cuppedEar);
+  });
+});
 
 describe('#91 allocation: quiet ticks and the release ease-out', () => {
   it('10 000 ticks while a reaction is held: the same state, and directorStep the same frozen result', () => {
@@ -2609,7 +2752,13 @@ describe('#221: clipByName and the mouth channels through evaluate', () => {
   });
 
   it('every clip it knows has its impulses in time order (bear-view applies them with a cursor)', () => {
-    const names = [...Object.keys(SESSION_CLIPS), ...Object.keys(REACTION_CLIPS), 'flinch', 'petMirrored'];
+    const names = [
+      ...Object.keys(SESSION_CLIPS),
+      ...Object.keys(REACTION_CLIPS),
+      ...Object.keys(MIME_CLIPS),
+      'flinch',
+      'petMirrored',
+    ];
     let kicked = 0;
     for (const name of names) {
       const c = clipByName(name);

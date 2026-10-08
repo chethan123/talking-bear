@@ -1,24 +1,25 @@
-// The M1 text overlays (plan §7 M1 UI, §4.5 parent sheet): tap-to-wake, the parent-permission sheet, the
-// mic-denied help, the mic-muted and too-noisy badges, and the error hint. Development text only: M8 replaces it
-// with the kid-first, text-free UI. The mic-denied help has no button: a child's tap never retries the mic, and
-// retrying lives behind the settings long-press, in the sheet's "For parents" section (plan §4.5, #114).
+// The overlays (plan §4.5, §7 M1, M8; issue #115): kid-first and text-free (Q3). A child can't read, so every
+// child-facing variant is an icon and the bear's body language says the rest: tap-to-wake is a pulsing paw over the
+// sleeping bear, the mic-denied help a blocked-mic icon (the bear mimes a cupped ear, bear-view.ts), the mic-muted and
+// too-noisy badges small icons, and the error a "tap to retry" circular arrow. The parent-permission sheet is the
+// only text here (plan §4.5), and the settings sheet the only other text screen. The mic-denied help has no button:
+// a child's tap never retries the mic, and retrying lives behind the settings long-press, in the sheet's "For
+// parents" section (plan §4.5, #114).
 //
-// CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/textContent only,
-// never HTML strings, and nothing sets a `style` attribute. Every variant is built once at mount and toggled
-// with the `hidden` attribute.
+// CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/createElementNS and
+// textContent only, never HTML strings, and nothing sets a `style` attribute; the paw's pulse is a styles.css
+// @keyframes animation that `prefers-reduced-motion: reduce` turns off. Every variant is built once at mount and
+// toggled with the `hidden` attribute.
 
 import type { Overlay, SessionEvent } from '../app/events.ts';
+import { icon, type IconName } from './icons.ts';
 
+/** The parent-permission sheet's text: the only text among the overlays (plan §4.5). */
 export const OVERLAY_TEXT = {
-  tapToWake: 'Tap Juni to wake up',
   parentTitle: 'Before Juni can listen',
   parentLocal: 'Juni only listens on this device. Nothing you say is sent anywhere.',
   parentMicOff: 'The microphone switches off when Juni falls asleep.',
   parentContinue: 'Continue',
-  micHelp: "Microphone is blocked. To fix it, allow the microphone for this site in Chrome's site settings.",
-  micMuted: 'Mic muted',
-  tooNoisy: 'Too noisy',
-  error: 'Something went wrong. Tap to try again.',
 } as const;
 
 type View = Exclude<Overlay, null>;
@@ -34,6 +35,17 @@ function element<K extends keyof HTMLElementTagNameMap>(
   return el;
 }
 
+/** An icon-only variant: `tag.className` holding icon `name`, with no text. */
+function iconView<K extends 'div' | 'section'>(
+  tag: K,
+  className: string,
+  name: IconName,
+): HTMLElementTagNameMap[K] {
+  const el = element(tag, className);
+  el.append(icon(name));
+  return el;
+}
+
 function button(text: string, onClick: () => void): HTMLButtonElement {
   const b = element('button', 'sheet-button', text);
   b.type = 'button';
@@ -45,8 +57,9 @@ function button(text: string, onClick: () => void): HTMLButtonElement {
  * Mounts every overlay variant (all hidden) into `root` and returns `show`: `show(o)` makes variant `o` the only
  * visible one, and `show(null)` hides them all. The parent sheet's Continue dispatches `parentContinue`; nothing
  * here dispatches `settingsRetry` (the settings sheet does, #114).
- * The non-interactive variants let pointer events through to the canvas below (styles.css), so "Tap Juni…" and
- * "Tap to try again" reach it.
+ * The icon variants are not interactive and let pointer events through to the canvas below (styles.css), so a tap
+ * on the paw or the retry arrow reaches the bear. The paw, mic-help and retry icons sit at the bottom centre, over
+ * the bear's body; the mic-muted and too-noisy badges at the top centre. The mic help stays a `section`.
  */
 export function mountOverlay(root: HTMLElement, dispatch: (e: SessionEvent) => void): (o: Overlay) => void {
   const layer = element('div', 'overlay');
@@ -59,16 +72,13 @@ export function mountOverlay(root: HTMLElement, dispatch: (e: SessionEvent) => v
     button(OVERLAY_TEXT.parentContinue, () => dispatch({ t: 'parentContinue' })),
   );
 
-  const micHelp = element('section', 'sheet');
-  micHelp.append(element('p', null, OVERLAY_TEXT.micHelp));
-
   const views: Record<View, HTMLElement> = {
-    tapToWake: element('p', 'overlay-hint', OVERLAY_TEXT.tapToWake),
+    tapToWake: iconView('div', 'overlay-icon overlay-paw', 'paw'),
     parentPermission: parent,
-    micHelp,
-    micMuted: element('p', 'badge', OVERLAY_TEXT.micMuted),
-    tooNoisy: element('p', 'badge', OVERLAY_TEXT.tooNoisy),
-    error: element('p', 'overlay-hint', OVERLAY_TEXT.error),
+    micHelp: iconView('section', 'overlay-icon', 'micBlocked'),
+    micMuted: iconView('div', 'overlay-badge', 'micMuted'),
+    tooNoisy: iconView('div', 'overlay-badge', 'noise'),
+    error: iconView('div', 'overlay-icon', 'retry'),
   };
   const all = Object.values(views);
   for (const view of all) {

@@ -24,6 +24,8 @@ import {
   FRAME_LOG_SIZE,
   latencyFromQuery,
   LOOK_HOLD_S,
+  MIC_DENIED_MIME,
+  MIC_DENIED_MIME_S,
   mountBearView,
   REDUCED_MOTION_MIN_ZETA,
   REDUCED_MOTION_SCALE,
@@ -32,7 +34,8 @@ import {
 } from './bear-view.ts';
 import { sampleClip } from './clip.ts';
 import type { Clip } from './clip.ts';
-import { REACTION_CLIPS } from './clips/reactions.ts';
+import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
+import { SESSION_CLIPS } from './clips/session.ts';
 import { DISPLAY_LATENCY_MS } from './constants.ts';
 import { evaluate } from './director.ts';
 import { EAR_SPRING, GAZE_SPRING } from './layers/index.ts';
@@ -1883,5 +1886,144 @@ describe('allocation smoke', () => {
     });
     expect(kept).toHaveLength(FRAMES);
     expect(leak).toBeGreaterThanOrEqual(BOUND);
+  });
+});
+
+// ---- #115: the cupped-ear mime in MicDenied ------------------------------------------------------------------------
+
+/** Runs `seconds` of 60 Hz frames, calling `each` after every frame with the director's state. */
+function runFor(
+  h: Harness,
+  seconds: number,
+  each: (d: ReturnType<BearView['director']>) => void = () => {},
+): void {
+  const n = Math.round((seconds * 1000) / VSYNC);
+  for (let i = 0; i < n; i++) {
+    h.run(1);
+    each(h.view.director());
+  }
+}
+
+/** The start times (s) of every cuppedEar clip the director played over `seconds` of frames. */
+function mimeStarts(
+  h: Harness,
+  seconds: number,
+  each?: (d: ReturnType<BearView['director']>) => void,
+): number[] {
+  const starts = new Set<number>();
+  runFor(h, seconds, (d) => {
+    if (d.clip?.name === 'cuppedEar') starts.add(d.clip.start);
+    each?.(d);
+  });
+  return [...starts];
+}
+
+describe('#115: the cupped-ear mime in MicDenied', () => {
+  const CUP_S = MIME_CLIPS.cuppedEar.duration;
+  /** One drawn frame's slack (s): the mime starts on the first substep at or after it is due. */
+  const SLACK = 0.05;
+
+  test('the mime is the cuppedEar clip, every 10 s', () => {
+    expect(MIC_DENIED_MIME).toBe('cuppedEar');
+    expect(MIC_DENIED_MIME_S).toBe(10);
+  });
+
+  test('entering from Asleep: it waits out the wake clip, then plays at once and every 10 s; nothing reaches the session', () => {
+    const h = harness();
+    h.session.state = 'MicDenied';
+    h.anim({ e: 'wake' }); // rows 2–3: Asleep → MicDenied wakes the bear
+    const t0 = h.clock.t / 1000;
+    const starts = mimeStarts(h, 25, (d) => {
+      if (d.name === 'Waking') expect(d.clip?.name).toBe('wake');
+    });
+    const wakeEnd = t0 + SESSION_CLIPS.wake.duration;
+    expect(starts).toHaveLength(3);
+    expect(starts[0]).toBeGreaterThanOrEqual(wakeEnd);
+    expect(starts[0]).toBeLessThan(wakeEnd + SLACK);
+    for (let i = 1; i < starts.length; i++) {
+      expect(starts[i]! - starts[i - 1]!).toBeGreaterThanOrEqual(MIC_DENIED_MIME_S);
+      expect(starts[i]! - starts[i - 1]!).toBeLessThan(MIC_DENIED_MIME_S + SLACK);
+    }
+    expect(h.dispatch).not.toHaveBeenCalled();
+  });
+
+  test('it plays as a reaction: Reacting with the cupped ear, then Idle', () => {
+    const h = harness();
+    h.session.state = 'MicDenied';
+    toIdle(h);
+    h.run(3); // the first frame after mount only starts the stepper
+    const d = h.view.director();
+    expect(d.name).toBe('Reacting');
+    expect(d.clip?.name).toBe('cuppedEar');
+    expect(d.reaction?.r.priority).toBe(2);
+    runFor(h, CUP_S + 0.1);
+    expect(h.view.director().name).toBe('Idle');
+    expect(h.view.director().clip).toBeNull();
+  });
+
+  test("it never cuts a session clip: MicDenied's shrug plays out first", () => {
+    const h = harness();
+    toIdle(h);
+    h.run(5);
+    h.session.state = 'MicDenied';
+    h.anim({ e: 'shrug' }); // rows 8–9: Waking → MicDenied shrugs
+    const shrug = h.view.director().clip;
+    expect(shrug?.name).toBe('shrug');
+    const end = shrug!.start + SESSION_CLIPS.shrug.duration;
+    const starts = mimeStarts(h, 3, (d) => {
+      if (h.clock.t / 1000 < end) expect(d.clip?.name).toBe('shrug');
+    });
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toBeGreaterThanOrEqual(end);
+    expect(starts[0]).toBeLessThan(end + SLACK);
+  });
+
+  test('leaving MicDenied stops it, and re-entering plays it at once', () => {
+    const h = harness();
+    h.session.state = 'MicDenied';
+    toIdle(h);
+    expect(mimeStarts(h, CUP_S + 0.2)).toHaveLength(1);
+    expect(h.view.director().clip).toBeNull();
+    h.session.state = 'Listening'; // no anim event
+    runFor(h, 30, (d) => expect(d.clip?.name).not.toBe('cuppedEar'));
+    h.session.state = 'MicDenied';
+    h.run(1);
+    expect(h.view.director().clip?.name).toBe('cuppedEar');
+  });
+
+  test('to Asleep: no mime while asleep', () => {
+    const h = harness();
+    h.session.state = 'MicDenied';
+    toIdle(h);
+    runFor(h, CUP_S + 0.2);
+    h.anim({ e: 'sleep' });
+    h.session.state = 'Asleep';
+    runFor(h, 30, (d) => expect(d.clip?.name).not.toBe('cuppedEar'));
+  });
+
+  test('never outside MicDenied: 30 s in Listening', () => {
+    const h = awake();
+    runFor(h, 30, (d) => expect(d.clip?.name).not.toBe('cuppedEar'));
+  });
+
+  test('in Dozing the next mime wakes the bear: Dozing → Reacting → Idle', () => {
+    const h = harness();
+    h.session.state = 'MicDenied';
+    toIdle(h);
+    const first = mimeStarts(h, CUP_S + 0.2);
+    expect(first).toHaveLength(1);
+    h.anim({ e: 'doze' });
+    expect(h.view.director().name).toBe('Dozing');
+    const next = first[0]! + MIC_DENIED_MIME_S;
+    const starts = mimeStarts(h, MIC_DENIED_MIME_S, (d) => {
+      if (h.clock.t / 1000 < next) expect(d.name).toBe('Dozing');
+    });
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toBeGreaterThanOrEqual(next);
+    expect(starts[0]).toBeLessThan(next + SLACK);
+    // Played to its end, the bear stays awake in Idle.
+    const rest = starts[0]! + CUP_S + 0.1 - h.clock.t / 1000;
+    if (rest > 0) runFor(h, rest);
+    expect(h.view.director().name).toBe('Idle');
   });
 });
