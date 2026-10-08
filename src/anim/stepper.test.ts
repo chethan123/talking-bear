@@ -2,7 +2,7 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import { Ch, createPose, lerpPose } from './pose.ts';
-import { MAX_FRAME_DT, MAX_SUBSTEPS, SUBSTEP, Stepper } from './stepper.ts';
+import { IO_ALPHA, IO_FRAME_DT, MAX_FRAME_DT, MAX_SUBSTEPS, SUBSTEP, Stepper } from './stepper.ts';
 
 interface Frame {
   substeps: number;
@@ -197,6 +197,38 @@ describe('Stepper.advance', () => {
         });
         expectNonDecreasing(run.rendered);
         expectNonDecreasing(run.renderedPose);
+      }),
+      { numRuns: 500, seed: 0x7063 },
+    );
+  });
+});
+
+describe('Stepper.run', () => {
+  it('run(step) with io[IO_FRAME_DT] = dt matches advance(dt, step) bit for bit, frame after frame', () => {
+    const special = fc.constantFrom(
+      -1,
+      -0,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      0,
+      1,
+    );
+    fc.assert(
+      fc.property(fc.array(fc.oneof(frameDt, special), { minLength: 1, maxLength: 200 }), (frames) => {
+        const viaAdvance = new Stepper();
+        const viaRun = new Stepper();
+        for (const dt of frames) {
+          const a = frame(viaAdvance, dt);
+          let substeps = 0;
+          viaRun.io[IO_FRAME_DT] = dt;
+          viaRun.run((h) => {
+            expect(h).toBe(SUBSTEP);
+            substeps++;
+          });
+          expect(substeps).toBe(a.substeps);
+          expect(Object.is(viaRun.io[IO_ALPHA], a.alpha)).toBe(true);
+        }
       }),
       { numRuns: 500, seed: 0x7063 },
     );
