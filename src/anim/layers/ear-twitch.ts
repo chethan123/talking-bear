@@ -10,12 +10,27 @@
  * later. (The explicit damping term takes part of the kick in the first step, so the same impulse peaks
  * lower at coarser steps: ≈ 9.4° at 1/60 s.)
  *
- * The layer adds `w·pos` of its two springs to `EarRotL`/`EarRotR`, w = `ctx.weights.ears`; the springs rest
- * at target 0, which the layer never changes.
+ * **Orientation toward a background touch** (plan §4.6.4 "Background: gaze to the point; ears orient", #255): the
+ * ear layer also reads `ctx.lookAt`, as the gaze does. While it is set (and finite), both ears turn toward the point's
+ * side by the same angle, `EAR_ORIENT_MAX · clamp((lookAt.x − EYES_CENTER.x) / LOOK_SATURATE, −1, 1)`: the horizontal
+ * offset from the head's centre line, saturating at the gaze's distance, so a point left of the head turns both ears
+ * counter-clockwise (tips left, −) and a point right of it clockwise (+); the vertical offset is ignored. A point
+ * with a non-finite coordinate counts as unset. The orientation eases toward that target, and back to 0 once
+ * `lookAt` clears, with the gaze iris's exponential step, time constant `EAR_ORIENT_TAU` (95 % in 150 ms, frame-rate
+ * independent, no overshoot, so `EAR_ORIENT_MAX` is a hard bound). It is no spring: the ear springs, their twitches
+ * and the reaction clips' kicks on them are exactly as without a touch, and the clips' own ear keys are added by the
+ * director's pose, so all of them play on top of the orientation. While `lookAt` has never been set the
+ * orientation stays +0, and the ear channels are bit for bit what they were before #255 (unless the incoming channel
+ * is −0: `pos + 0` maps a −0 spring position to +0; the app's layer buffer is +0-filled).
+ *
+ * The layer adds `w·(pos + orientation)` for each ear to `EarRotL`/`EarRotR`, w = `ctx.weights.ears` (0 while
+ * Asleep, so the orientation is scaled and ramped like the twitch); the springs rest at target 0, which the layer
+ * never changes.
  */
 import { uniform } from '../rng.ts';
 import { Ch } from '../pose.ts';
 import type { Pose } from '../pose.ts';
+import { EYES_CENTER, LOOK_SATURATE } from './gaze.ts';
 import type { AnimContext, Layer } from './index.ts';
 
 /** Spring constants of the ear springs; the bank's owner configures both indices with them. */
@@ -28,6 +43,13 @@ export const EAR_TWITCH_MAX = 15;
  * Size of a twitch's velocity impulse, in rad/s (`EarRotR` gets +, `EarRotL` −): a ≈ 12° flick at 1/120 s.
  */
 export const EAR_TWITCH_DV = 15.1;
+/**
+ * Largest turn of the ears toward a `ctx.lookAt` point, in radians (8°). Both ear pivots lie inside the head and
+ * inside their own ear, which is drawn behind the head, so no angle can detach an ear (#255).
+ */
+export const EAR_ORIENT_MAX = (8 * Math.PI) / 180;
+/** Time constant of the ears easing toward their orientation and back after `lookAt` clears, in seconds. */
+export const EAR_ORIENT_TAU = 0.05;
 
 /** SpringBank indices of the ear springs. */
 export interface EarTwitchSprings {
@@ -54,13 +76,17 @@ function checkIndex(i: number, name: string): void {
 const WAIT = 0;
 /** Seconds since the latest twitch's scheduled time. */
 const SINCE = 1;
+/** The ears' current orientation toward `ctx.lookAt`, in radians (+0 at rest). */
+const ORIENT = 2;
+/** The orientation's target this update, in radians. */
+const TARGET = 3;
 
 class EarTwitch implements EarTwitchLayer {
   readonly #earL: number;
   readonly #earR: number;
   #primed = false;
   /** The doubles kept between updates, by slot. */
-  readonly #s = new Float64Array(2);
+  readonly #s = new Float64Array(4);
   #count = 0;
   #right = 0;
 
@@ -108,9 +134,25 @@ class EarTwitch implements EarTwitchLayer {
         springs.impulse(this.#earL, -EAR_TWITCH_DV);
       }
     }
+    // The orientation toward a background touch (#255). Its doubles stay in slots, finite is tested as `v − v === 0`
+    // and the clamp assigns literals: no double crosses a call or a `?:` with an imported constant (#229).
+    s[TARGET] = 0;
+    const look = ctx.lookAt;
+    if (look != null) {
+      const lx = look.x;
+      const ly = look.y;
+      if (lx - lx === 0 && ly - ly === 0) {
+        let u = (lx - EYES_CENTER.x) / LOOK_SATURATE;
+        if (u > 1) u = 1;
+        else if (u < -1) u = -1;
+        s[TARGET] = EAR_ORIENT_MAX * u;
+      }
+    }
+    s[ORIENT] = s[ORIENT]! + (s[TARGET] - s[ORIENT]!) * (1 - Math.exp(-dt / EAR_ORIENT_TAU));
+    const o = s[ORIENT];
     const w = ctx.weights.ears;
-    pose[Ch.EarRotL] = pose[Ch.EarRotL]! + w * springs.pos[this.#earL]!;
-    pose[Ch.EarRotR] = pose[Ch.EarRotR]! + w * springs.pos[this.#earR]!;
+    pose[Ch.EarRotL] = pose[Ch.EarRotL]! + w * (springs.pos[this.#earL]! + o);
+    pose[Ch.EarRotR] = pose[Ch.EarRotR]! + w * (springs.pos[this.#earR]! + o);
   }
 }
 
