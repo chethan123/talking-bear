@@ -33,30 +33,39 @@ function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
+// Slots of the mood's doubles.
+const JOY = 0;
+const ANNOY = 1;
+
 class Mood implements MoodLayer {
-  #joy = 0;
-  #annoy = 0;
+  /**
+   * `joy` and `annoy`, by slot (`JOY`, `ANNOY`): a `Float64Array`, not class fields, because V8's mid tier boxes a
+   * double written to a class field as a new heap number on every write, every substep once a mood is bumped (#229).
+   */
+  readonly #s = new Float64Array(2);
 
   get joy(): number {
-    return this.#joy;
+    return this.#s[JOY]!;
   }
 
   get annoy(): number {
-    return this.#annoy;
+    return this.#s[ANNOY]!;
   }
 
   bump(kind: MoodKind, amount: number): void {
     if (!Number.isFinite(amount)) throw new RangeError('amount must be finite');
-    if (kind === 'joy') this.#joy = clamp01(this.#joy + amount);
-    else this.#annoy = clamp01(this.#annoy + amount);
+    const s = this.#s;
+    if (kind === 'joy') s[JOY] = clamp01(s[JOY]! + amount);
+    else s[ANNOY] = clamp01(s[ANNOY]! + amount);
   }
 
   update(dt: number, pose: Pose): void {
+    const s = this.#s;
     const decay = Math.exp(-dt / MOOD_TAU);
-    this.#joy *= decay;
-    this.#annoy *= decay;
-    const brow = MOOD_BROW * this.#annoy;
-    pose[Ch.Blush] = pose[Ch.Blush]! + MOOD_BLUSH * this.#joy;
+    s[JOY] = s[JOY]! * decay;
+    s[ANNOY] = s[ANNOY]! * decay;
+    const brow = MOOD_BROW * s[ANNOY];
+    pose[Ch.Blush] = pose[Ch.Blush]! + MOOD_BLUSH * s[JOY];
     pose[Ch.BrowL] = pose[Ch.BrowL]! + brow;
     pose[Ch.BrowR] = pose[Ch.BrowR]! + brow;
   }

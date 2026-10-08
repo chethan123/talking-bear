@@ -196,6 +196,14 @@ export class MouthLayer {
     return this.#s[CLIP_TIME]!;
   }
 
+  /**
+   * Copies `clipTime` into `out[i]`: a reader that runs every frame gets it without the getter's double return,
+   * which V8's mid tier boxes as a new heap number (#229).
+   */
+  readClipTime(out: Float64Array, i: number): void {
+    out[i] = this.#s[CLIP_TIME]!;
+  }
+
   /** `envelopeIndex` at the last `update`'s clip time; −1 outside the clip and without a clip. */
   get envIndex(): number {
     return this.#envIndex;

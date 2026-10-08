@@ -76,10 +76,13 @@
  * returns `directorStep`'s shared frozen result (no outputs, nothing to route); `adapter.tick()` returns at once
  * with no pointer down; the hit-test bone matrices are only marked stale per frame and recomputed on the next
  * pointer sample. Director transitions (events, gestures, a clip's end) allocate a new director state and their
- * outputs; that is per event, not per frame. Not free yet: once a reaction has bumped the mood, `mood.ts` boxes
- * ≈ 48 B per frame until it decays, which #229 fixes (`mood.ts` is outside #93). The reaction clips' parts (#221)
- * are preallocated too: the springs' previous positions, the clip's mouth, and the kick cursor, an index into the
- * clip's own `impulses`.
+ * outputs; that is per event, not per frame. The reaction clips' parts (#221) are preallocated too: the springs'
+ * previous positions, the clip's mouth, and the kick cursor, an index into the clip's own `impulses`.
+ * No per-frame double crosses a call V8 may leave un-inlined, since V8 boxes those as new heap numbers (#229): the
+ * director clock and alpha reach `compose` and `evaluateFrom` through `T`, the mouth's clip time reaches the frame
+ * log through `readClipTime`, and `minFrameMs` returns precomputed constants. Left per event: a firing kick
+ * (`springs.impulse`) and the layers' random draws. `mouthCloseScale(now, …)` takes and returns a double; V8 inlines
+ * it into `compose`, so it measures 0.
  */
 import type { AnimEvent, SessionEvent, StateName } from '../app/events.ts';
 import { AWAKE } from '../app/machine.ts';
@@ -98,7 +101,7 @@ import {
   clipByName,
   directorReduce,
   directorStep,
-  evaluate,
+  evaluateFrom,
   initialDirector,
   mouthCloseScale,
 } from './director.ts';
@@ -106,7 +109,7 @@ import type { DirectorState, DirInput, DirOut, GestureInput } from './director.t
 import { createBlink, createBreathing, createEarTwitch, createGaze, createMood } from './layers/index.ts';
 import type { AnimContext, LayerWeights, LookAt } from './layers/index.ts';
 import { MouthLayer } from './layers/mouth.ts';
-import { ASLEEP_FPS, createFrameLoop, IDLE_FPS } from './loop.ts';
+import { ASLEEP_FPS, createFrameLoop, FRAME_ALPHA, IDLE_FPS } from './loop.ts';
 import type { FrameStats } from './loop.ts';
 import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
@@ -138,6 +141,12 @@ export const FRAME_LOG_SIZE = 600;
 export const LOOK_HOLD_S = 2;
 /** The X-A2 override `?L=<ms>` is clamped to this range. */
 export const LATENCY_OVERRIDE_MAX_MS = 200;
+/**
+ * `minFrameMs` while throttled, ms, computed once: returning `1000 / IDLE_FPS` computed per call boxed a new heap
+ * number on every rAF at Idle (#229).
+ */
+const IDLE_FRAME_MS = 1000 / IDLE_FPS;
+const ASLEEP_FRAME_MS = 1000 / ASLEEP_FPS;
 /** Default seed of the layers' RNG; main.ts passes a random one. */
 const DEFAULT_SEED = 0x5eed;
 /** The mouth channels: the mouth layer's while a replay's mouth runs, a clip's otherwise (#221). */
@@ -451,11 +460,18 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     mood.update(dt, curLayers, ctx);
   }
 
-  /** Writes the frame's pose at director time `now` with layer interpolation `alpha` into `pose`. */
-  function compose(now: number, alpha: number): void {
-    evaluate(dir, now, pose, true);
+  /**
+   * Writes the frame's pose at director time `T[NOW]` with layer interpolation `T[ALPHA]` into `pose`. Neither
+   * double crosses a call: `compose` reads both from their slots, and `evaluateFrom` reads the clock slot itself.
+   * V8 inlines neither `compose` nor `evaluate`, and boxes a double passed to a call it doesn't inline as a new heap
+   * number (#229).
+   */
+  function compose(): void {
+    const now = T[NOW]!;
+    const alpha = T[ALPHA]!;
+    evaluateFrom(dir, T, NOW, pose, true);
     if (reduced && dir.clip !== null) {
-      evaluate(withoutClip(dir), now, noClipPose);
+      evaluateFrom(withoutClip(dir), T, NOW, noClipPose);
       const base = noClipPose[Ch.HeadRot]!;
       pose[Ch.HeadRot] = base + (pose[Ch.HeadRot]! - base) * REDUCED_MOTION_SCALE;
     }
@@ -506,7 +522,9 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   function logFrame(t: number): void {
     const slot = logged % FRAME_LOG_SIZE;
     logT[slot] = t;
-    logClip[slot] = mouthId === -1 ? Number.NaN : mouth.clipTime;
+    // The clip time is copied slot to slot (`readClipTime`): the `clipTime` getter's double return is boxed (#229).
+    if (mouthId === -1) logClip[slot] = Number.NaN;
+    else mouth.readClipTime(logClip, slot);
     logIndex[slot] = mouthId === -1 ? -1 : mouth.envIndex;
     logged++;
   }
@@ -515,14 +533,16 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     {
       beginFrame(t) {
         T[FRAME_T] = t;
-        advanceNow(t / 1000);
+        // advanceNow(t / 1000), written out: a call V8 doesn't inline boxes its double argument and return (#229).
+        const sec = t / 1000;
+        if (sec > T[NOW]!) T[NOW] = sec;
         if (ctx.lookAt !== null && T[NOW]! >= T[LOOK_UNTIL]!) ctx.lookAt = null;
         adapter.tick();
       },
       substep,
-      draw(t, alpha) {
-        T[ALPHA] = alpha;
-        compose(T[NOW]!, alpha);
+      draw(t, frame) {
+        T[ALPHA] = frame[FRAME_ALPHA]!;
+        compose();
         bonesStale = true;
         render(g, rig, pose, view);
         logFrame(t);
@@ -537,8 +557,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
           layersMoving() ||
           weightsRamping();
         if (moving) return 0;
-        if (s.name === 'Asleep') return 1000 / ASLEEP_FPS;
-        if (s.name === 'Idle' || s.name === 'Dozing') return 1000 / IDLE_FPS;
+        if (s.name === 'Asleep') return ASLEEP_FRAME_MS;
+        if (s.name === 'Idle' || s.name === 'Dozing') return IDLE_FRAME_MS;
         return 0;
       },
     },
@@ -555,7 +575,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   function redraw(): void {
     const t = deps.now();
     T[FRAME_T] = t;
-    compose(advanceNow(t / 1000), T[ALPHA]!);
+    advanceNow(t / 1000);
+    compose();
     bonesStale = true;
     render(g, rig, pose, view);
   }
