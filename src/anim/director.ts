@@ -60,6 +60,15 @@
  *   it also drops a queued sustained reaction of that gesture.
  * - **Gentle:** gentle clips play, and an escalation target without a gentle clip is skipped.
  * Accepted reactions output `toSession` (for `session.dispatch`), `haptic` and `mood`.
+ *
+ * **Clip input** (`{k:'clip', name}`, #115): the app asks for a clip by name. It plays like an accepted P2 reaction:
+ * - the same gates (ignored in Asleep and Waking; Dozing moves to Idle first), interruption and queue rules (it
+ *   interrupts a P1/P2 and is queued behind a P3/P4), and in Talking the P2 flinch;
+ * - its `<name>Gentle` clip when `gentle` is on and one exists;
+ * - no cooldown, no repeat count and no outputs (`toSession`, `haptic`, `mood`): its reaction has no gesture
+ *   (`region` and `gesture` null), which `start` treats as quiet;
+ * - a name the director doesn't know is ignored.
+ * bear-view sends `cuppedEar` (a mime, `MIME_CLIPS`) in MicDenied; #117 reuses it for `tooLoud`.
  */
 import type { AnimEvent, Priority, SessionEvent, SfxId } from '../app/events.ts';
 import type { Gesture } from '../input/recognizer.ts';
@@ -70,7 +79,7 @@ import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
 import type { Clip } from './clip.ts';
-import { REACTION_CLIPS } from './clips/reactions.ts';
+import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
 import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
@@ -97,16 +106,20 @@ export interface ActiveReaction {
   sfxAt: number;
   /** When it was released (s); null while held, and always for a one-shot. */
   release: number | null;
-  /** The gesture that started it: a `release` with an identity ends only its own reaction. */
-  region: RegionId;
-  gesture: GestureKind;
+  /**
+   * The gesture that started it: a `release` with an identity ends only its own reaction. Both null for a `clip`
+   * input's reaction (#115), which no gesture started.
+   */
+  region: RegionId | null;
+  gesture: GestureKind | null;
 }
 
 /** The queued reaction (queue length 1). */
 export interface QueuedReaction {
   r: Reaction;
-  region: RegionId;
-  gesture: GestureKind;
+  /** The gesture that queued it; both null for a `clip` input (#115). */
+  region: RegionId | null;
+  gesture: GestureKind | null;
   dirX: -1 | 1 | null;
   /** When it was queued (s); it is dropped if it hasn't started by `at` + 500 ms. */
   at: number;
@@ -183,11 +196,22 @@ export interface ReleaseInput {
   gesture?: GestureKind;
 }
 
+/**
+ * A clip asked for by name (#115): plays like an accepted P2 reaction, with no cooldown and no outputs (see the
+ * module comment). bear-view sends `cuppedEar` in MicDenied.
+ */
+export interface ClipInput {
+  k: 'clip';
+  name: string;
+  now: number;
+}
+
 export type DirInput =
   | { k: 'anim'; ev: AnimEvent; now: number }
   | { k: 'tick'; now: number }
   | GestureInput
   | ReleaseInput
+  | ClipInput
   | { k: 'setGentle'; on: boolean };
 
 /** What a step outputs: a reaction for `session.dispatch`, a haptic pattern, a mood bump. */
@@ -219,6 +243,8 @@ const REPEAT_COUNT = 3;
 const REPEAT_WITHIN_MS = 4000;
 /** Below this priority a reaction while Talking is a flinch only (session row 31). */
 const STOPS_PLAYBACK = 3;
+/** A `clip` input plays like an accepted reaction of this priority (#115). */
+const CLIP_PRIORITY = 2;
 
 /** The base pose of each state (#79 "Base mapping"; Reacting and Sustained are Idle's, #91). */
 const BASE_OF: { readonly [S in DirState]: BaseName } = {
@@ -264,16 +290,17 @@ const PET_MIRRORED: Clip = mirrored(REACTION_CLIPS.pet);
 /** The clips with a mirrored variant, by name: played for a stroke with `dirX` −1. */
 const MIRRORED: ReadonlyMap<string, string> = new Map([[REACTION_CLIPS.pet.name, PET_MIRRORED.name]]);
 
-/** The clips the director plays, by name: session, reaction, the flinch and the mirrored pet. */
+/** The clips the director plays, by name: session, reaction and mime (#115), the flinch and the mirrored pet. */
 const CLIPS: ReadonlyMap<string, Clip> = new Map<string, Clip>([
   ...Object.entries(SESSION_CLIPS),
   ...Object.entries(REACTION_CLIPS),
+  ...Object.entries(MIME_CLIPS),
   [FLINCH.name, FLINCH],
   [PET_MIRRORED.name, PET_MIRRORED],
 ]);
 
 /**
- * The clip the director plays under `name` (a `clip.name` or `prevClip.name`): a session or reaction clip, the
+ * The clip the director plays under `name` (a `clip.name` or `prevClip.name`): a session, reaction or mime clip, the
  * flinch or the mirrored pet; undefined for a name it doesn't know. bear-view applies its `impulses` (#221).
  */
 export function clipByName(name: string): Clip | undefined {
@@ -651,25 +678,27 @@ function isOver(s: DirectorState, a: ActiveReaction, now: number): boolean {
 /**
  * Starts `r` at `now`: outputs it (unless the session already has it), starts its cooldown, counts it, and
  * plays its clip. From the Idle family it becomes the base (Reacting/Sustained); in Attentive and Thinking it
- * is additive.
+ * is additive. A `clip` input's reaction (#115: no gesture, `region` and `gesture` null) is quiet like an announced
+ * one: no outputs, no cooldown, not counted.
  */
 function start(
   s: DirectorState,
   r: Reaction,
-  region: RegionId,
-  gesture: GestureKind,
+  region: RegionId | null,
+  gesture: GestureKind | null,
   dirX: -1 | 1 | null,
   now: number,
   out: Out,
   announced: boolean,
 ): DirectorState {
-  if (!announced) accept(out, r, r.sfx);
+  const quiet = announced || region === null || gesture === null;
+  if (!quiet) accept(out, r, r.sfx);
   const clipName = clipFor(r, s.gentle, dirX);
   const clip = { name: clipName, start: now };
   const next: DirectorState = {
     ...s,
-    cooldowns: announced ? s.cooldowns : withCooldown(s.cooldowns, region, gesture, r.priority, now),
-    repeats: announced ? s.repeats : withRepeat(s.repeats, r, now),
+    cooldowns: quiet ? s.cooldowns : withCooldown(s.cooldowns, region, gesture, r.priority, now),
+    repeats: quiet ? s.repeats : withRepeat(s.repeats, r, now),
     reaction: {
       r,
       clip: clipName,
@@ -779,6 +808,33 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
   return start(st, r, i.region, i.gesture, dirX, now, out, false);
 }
 
+/** The reaction a `clip` input plays (#115): P2, one-shot, silent; with its `<name>Gentle` clip when there is one. */
+function clipReaction(name: string): Reaction {
+  const r: Reaction = { name, priority: CLIP_PRIORITY, sfx: null, clip: name, sustained: false };
+  const gentle = `${name}Gentle`;
+  if (CLIPS.has(gentle)) r.gentleClip = gentle;
+  return r;
+}
+
+/**
+ * A `clip` input (#115; the module comment has the rules): gated like a gesture, then a flinch while Talking, queued
+ * behind a higher priority, otherwise started; `start` keeps it quiet (no gesture), so nothing reaches `out`.
+ */
+function onClip(s0: DirectorState, i: ClipInput, out: Out): DirectorState {
+  if (s0.name === 'Asleep' || s0.name === 'Waking' || !CLIPS.has(i.name)) return s0;
+  const now = i.now;
+  const s = s0.name === 'Dozing' ? enter(s0, 'Idle', now) : s0;
+  if (s.name === 'Talking') {
+    const free = s.clip === null || now >= clipEnd(s, s.clip);
+    return free ? { ...s, clip: { name: FLINCH.name, start: now } } : s;
+  }
+  const r = clipReaction(i.name);
+  const live = s.reaction !== null && !isOver(s, s.reaction, now) ? s.reaction : null;
+  if (live !== null && r.priority < live.r.priority)
+    return { ...s, queued: { r, region: null, gesture: null, dirX: null, at: now, announced: false } };
+  return start(s, r, null, null, null, now, out, false);
+}
+
 /**
  * The end of a sustained gesture (#91 plan Decision 16): it releases the held reaction that gesture started,
  * which outputs `sfxOnRelease` (not while Talking: it would stop the replay) and eases out over 400 ms, and it
@@ -844,11 +900,11 @@ function tick(s: DirectorState, i: { readonly now: number }, out: Out): Director
 
 /**
  * One step of the director. Pure: it never mutates `s`, and returns `s` itself when nothing changes. A tick,
- * gesture or release at a non-finite time changes nothing (a NaN release would otherwise never end; `tick`
+ * gesture, release or clip at a non-finite time changes nothing (a NaN release would otherwise never end; `tick`
  * checks its own).
  */
 function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
-  if ((i.k === 'gesture' || i.k === 'release') && i.now - i.now !== 0) return s;
+  if ((i.k === 'gesture' || i.k === 'release' || i.k === 'clip') && i.now - i.now !== 0) return s;
   switch (i.k) {
     case 'tick':
       return tick(s, i, out);
@@ -861,6 +917,8 @@ function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
       return onGesture(s, i, out);
     case 'release':
       return release(s, i, out);
+    case 'clip':
+      return onClip(s, i, out);
     case 'setGentle':
       return s.gentle === i.on ? s : { ...s, gentle: i.on };
     default:
