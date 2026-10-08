@@ -482,6 +482,8 @@ describe('lab/vad-live capture jumps (#268)', () => {
     step(page, 'Listening', 'Recording', segStart(1, f));
     f = levels(page, 1, f + 1440, 5);
     step(page, 'Recording', 'Listening', segMisfire(1, f), arm(2)); // the gap misfire re-arms at once
+    // The real order: the worker posts the gap misfire, then the first post-gap level (still epoch 1); the session
+    // runs the misfire's transition, with its re-arm, before that level reaches the page.
     const after = f + 1440 + 48_000; // the first level after a 1 s re-anchor
     level(page, 1, after);
     levels(page, 2, after + 2880, 3);
@@ -508,7 +510,7 @@ describe('lab/vad-live capture jumps (#268)', () => {
     level(page, 1, 900_000);
     level(page, 1, 1_000_000); // a jump while listening: the first level after it is at frame 1 000 000
     expect(quiet().captureJumps).toBe(1);
-    step(page, 'Listening', 'Listening', { t: 'ctxRunning', sampleRate: 48_000 }, arm(2)); // the frames restart
+    step(page, 'Listening', 'Listening', { t: 'ctxRunning', sampleRate: 48_000 }); // the frames restart (no re-arm)
     levels(page, 2, 30_000, 10);
     step(page, 'Listening', 'Recording', segStart(2, 50_000));
     expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1 });
@@ -550,6 +552,17 @@ describe('lab/vad-live capture jumps (#268)', () => {
     step(page, 'Listening', 'Waking', { t: 'inputsChanged' }, [{ k: 'closeMic' }, { k: 'reselectInput' }]); // row 40
     step(page, 'Waking', 'Listening', { t: 'micGranted', req: 2 }, arm(2));
     step(page, 'Listening', 'Recording', segStart(2, 1_007_200));
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1 });
+    expect(button('Hit').disabled).toBe(false);
+  });
+
+  test('a re-arm forgets the latest jump: after an unmute, an onset within 300 ms counts', async () => {
+    const page = await livePage();
+    level(page, 1, 900_000);
+    level(page, 1, 1_000_000); // a jump while listening, counted
+    expect(quiet().captureJumps).toBe(1);
+    step(page, 'Listening', 'Listening', { t: 'trackUnmuted' }, arm(2)); // row 19: re-enter Listening after a mute
+    step(page, 'Listening', 'Recording', segStart(2, 1_007_200)); // 150 ms after the first level after the jump
     expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1 });
     expect(button('Hit').disabled).toBe(false);
   });

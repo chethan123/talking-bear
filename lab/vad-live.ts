@@ -40,9 +40,12 @@
 // segment ended: the worker posts a gap end just before the first level after the gap), or if its pre-roll reaches
 // back over the latest jump on the ctx timeline, in any epoch (onset − PREROLL_MS before the first level after the
 // jump). The latter is also the rest of a phrase cut as a misfire: the misfire re-arms at once, and the phrase goes on
-// as a new take in the new epoch. Only a jump seen while `tallying()` is remembered for this. A new AudioContext
-// (`ctxRunning`) restarts the frame count and forgets the jump, and so does an input reselection (the `reselectInput`
-// effect): a stall around a device switch belongs to the old input, not to the new input's first phrase.
+// as a new take in the new epoch. Only a jump seen while `tallying()` is remembered for this, and only for the current
+// arm cycle: every `arm` effect forgets it, as does a new AudioContext (`ctxRunning`, which restarts the frame count).
+// The misfire's remainder is still caught, because the worker posts the gap misfire before the first post-gap level,
+// and the session runs the misfire's transition (with its `arm`) before that level reaches this page: the jump is
+// seen, and remembered, after the re-arm. A take armed later, after an unmute or an input reselection, is clamped to
+// its own arm frame and can't reach an earlier gap.
 //
 // Layout: all of the app's layers are position: fixed, so the app root gets a height and `contain: strict`, which
 // makes it their containing block, and the tally panel follows it. The rules come from a constructed stylesheet
@@ -168,8 +171,8 @@ let sampleRate: number | null = null;
 let levelEpoch: number | null = null;
 let levelFrame = 0;
 /**
- * The ctx frame of the first level after the latest capture jump seen while tallying (null: none since the context
- * last started running or the input was last reselected).
+ * The ctx frame of the first level after the latest capture jump seen while tallying (null: none since the latest
+ * `arm` effect or `ctxRunning`).
  */
 let jumpFrame: number | null = null;
 /** The latest armed take can still be excluded by a capture jump (#268): see the header. */
@@ -434,8 +437,8 @@ boot(appRoot, {
       if (TAKE_ENDS.has(to)) takeArmed = false;
       // The `arm` effect (the worker's `reset`) starts a listen; a Listening → Listening stay has none.
       for (const fx of effects) {
-        if (fx.k === 'reselectInput') jumpFrame = null; // a new input: an earlier stall can't reach its phrases
         if (fx.k !== 'arm') continue;
+        jumpFrame = null; // a new arm cycle: its takes can't reach back before its arm frame
         cleanArm = tallying();
         if (cleanArm && !cleanEpochSeen) {
           cleanEpochSeen = true;
