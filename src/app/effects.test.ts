@@ -180,47 +180,53 @@ describe('onPlayStarted (#81)', () => {
   });
 });
 
+/** A runner whose session sits in `state` (mutable through the returned object), with a FakeClock. */
+function harness(initial: Partial<SessionState> = {}): {
+  runner: EffectRunner;
+  clock: FakeClock;
+  floors: number[];
+  times: number[];
+  set(p: Partial<SessionState>): void;
+} {
+  const clock = new FakeClock();
+  const floors: number[] = [];
+  const times: number[] = [];
+  let state: SessionState = { ...initialSessionState('granted'), name: 'Listening', epoch: 4, ...initial };
+  const { engine } = fakeEngine(null);
+  const runner = createEffectRunner(deps(engine, fakePlayer(0), { clock }), {
+    dispatch: (e) => {
+      if (e.t !== 'noiseFloor') throw new Error(`unexpected ${e.t}`);
+      floors.push(e.floorDb);
+      times.push(clock.now());
+    },
+    state: () => state,
+  });
+  return {
+    runner,
+    clock,
+    floors,
+    times,
+    set: (p) => {
+      state = { ...state, ...p };
+    },
+  };
+}
+
+/** Feeds `n` levels 30 ms apart (the worker's ≈ 33 Hz), the clock advancing before each but the first. */
+function feedLevels(
+  h: ReturnType<typeof harness>,
+  n: number,
+  db: (i: number) => number,
+  floorDb = -60,
+  epoch = 4,
+) {
+  for (let i = 0; i < n; i++) {
+    if (i > 0) h.clock.advance(30);
+    h.runner.level({ epoch, db: db(i), floorDb });
+  }
+}
+
 describe('noise floor estimate (#116)', () => {
-  /** A runner whose session sits in `state` (mutable through the returned object), with a FakeClock. */
-  function harness(initial: Partial<SessionState> = {}): {
-    runner: EffectRunner;
-    clock: FakeClock;
-    floors: number[];
-    times: number[];
-    set(p: Partial<SessionState>): void;
-  } {
-    const clock = new FakeClock();
-    const floors: number[] = [];
-    const times: number[] = [];
-    let state: SessionState = { ...initialSessionState('granted'), name: 'Listening', epoch: 4, ...initial };
-    const { engine } = fakeEngine(null);
-    const runner = createEffectRunner(deps(engine, fakePlayer(0), { clock }), {
-      dispatch: (e) => {
-        if (e.t !== 'noiseFloor') throw new Error(`unexpected ${e.t}`);
-        floors.push(e.floorDb);
-        times.push(clock.now());
-      },
-      state: () => state,
-    });
-    return {
-      runner,
-      clock,
-      floors,
-      times,
-      set: (p) => {
-        state = { ...state, ...p };
-      },
-    };
-  }
-
-  /** Feeds `n` levels 30 ms apart (the worker's ≈ 33 Hz), the clock advancing before each but the first. */
-  function feedLevels(h: ReturnType<typeof harness>, n: number, db: (i: number) => number, floorDb = -60, epoch = 4) {
-    for (let i = 0; i < n; i++) {
-      if (i > 0) h.clock.advance(30);
-      h.runner.level({ epoch, db: db(i), floorDb });
-    }
-  }
-
   it('dispatches nothing before a window spans 1 s, then max(window minimum, gate floor) once', () => {
     expect(NOISE_FLOOR_WINDOW_MS).toBe(1000);
     const h = harness();

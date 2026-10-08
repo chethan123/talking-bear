@@ -213,7 +213,16 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     applyMotion();
   });
 
-  showOverlay = mountOverlay(app, (e) => s.dispatch(e));
+  // The hold-to-talk button (#116) stamps its holdStart / holdEnd with the context's frame clock, the capture
+  // worklet's `currentFrame` domain the takes are cut in (plan §3.1); before the context exists it does nothing.
+  showOverlay = mountOverlay(
+    app,
+    (e) => s.dispatch(e),
+    () => {
+      const ctx = engine.context();
+      return ctx === null ? null : Math.round(ctx.currentTime * ctx.sampleRate);
+    },
+  );
   sheet = mountSettingsSheet(app, {
     store: settings,
     bus: { setQuiet: (on) => engine.setQuiet(on) },

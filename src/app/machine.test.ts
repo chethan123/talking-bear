@@ -832,7 +832,7 @@ describe('clarifications C1–C12', () => {
                 : name === 'Recording' && holdToTalk
                   ? 'holdToTalk'
                   : expected[name];
-            expect(overlayFor({ name, micMuted, tooNoisy, holdToTalk }), `${name}`).toBe(want);
+            expect(overlayFor({ name, micMuted, tooNoisy, holdToTalk }), name).toBe(want);
           }
         }
       }
@@ -1444,28 +1444,29 @@ describe('#277: an Asleep wake after another tab activated the update reloads in
 });
 
 // ---- #116: noisy room (too-noisy hint, margin raises) and hold-to-talk ---------------------------------------
+/** #116: a current seg end of Recording (lastSpeechFrame 190 000), with or without a voiced ratio. */
+const end116 = (reason: 'silence' | 'maxLength', voicedRatio?: number): SessionEvent =>
+  seg(
+    EPOCH,
+    voicedRatio === undefined
+      ? { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason }
+      : { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason, voicedRatio },
+  );
+/** Row 20's effects from Recording (onset 144 000, armFrame 96 000, 48 kHz) for a take to `toFrame`. */
+const takeFx116 = (toFrame: number, ui0: Effect[] = []): Effect[] => [
+  cancel('recording'),
+  { k: 'take', epoch: EPOCH, id: TAKE + 1, fromFrame: 129_600, toFrame },
+  anim('thinking'),
+  disarm(EPOCH),
+  PROCESSING_T,
+  ...ui0,
+];
+
 describe('#116: noisy room and hold-to-talk', () => {
   /** Hold-to-talk mode at the top boost, in a noisy room. */
   const HOLD = { holdToTalk: true, tooNoisy: true, marginBoostDb: 6, noisyCaps: 3 } as const;
   /** Hold-mode Recording entry: the timer is the cap itself (ORCH-NOTE on #116). */
   const RECORDING_CAP_T = timer('recording', 10_000);
-  const end = (reason: 'silence' | 'maxLength', voicedRatio?: number): SessionEvent =>
-    seg(
-      EPOCH,
-      voicedRatio === undefined
-        ? { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason }
-        : { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason, voicedRatio },
-    );
-  /** Row 20's effects from Recording (onset 144 000, armFrame 96 000, 48 kHz) for a take to `toFrame`. */
-  const takeFx = (toFrame: number, ui0: Effect[] = []): Effect[] => [
-    cancel('recording'),
-    { k: 'take', epoch: EPOCH, id: TAKE + 1, fromFrame: 129_600, toFrame },
-    anim('thinking'),
-    disarm(EPOCH),
-    PROCESSING_T,
-    ...ui0,
-  ];
-
   it('row 18b: noiseFloor sets tooNoisy above −35 dBFS; Listening shows the badge', () => {
     const quiet = stateIn('Listening');
     expectStep(quiet, { t: 'noiseFloor', floorDb: -20 }, 'Listening', [ui('tooNoisy')], { tooNoisy: true });
@@ -1489,19 +1490,19 @@ describe('#116: noisy room and hold-to-talk', () => {
   it('row 20: the noisy counter counts capped ends with a voiced ratio below 0.3; any other end resets it', () => {
     const s = stateIn('Recording', { noisyCaps: 1 });
     const capsAfter = (e: SessionEvent): number => run(s, e).state.noisyCaps;
-    expect(capsAfter(end('maxLength', 0.29))).toBe(2);
-    expect(capsAfter(end('maxLength', 0))).toBe(2);
-    expect(capsAfter(end('maxLength', 0.3))).toBe(0);
-    expect(capsAfter(end('silence', 0.1))).toBe(0);
-    expect(capsAfter(end('maxLength', Number.NaN))).toBe(0);
-    expect(capsAfter(end('maxLength'))).toBe(0); // unknown ratio
+    expect(capsAfter(end116('maxLength', 0.29))).toBe(2);
+    expect(capsAfter(end116('maxLength', 0))).toBe(2);
+    expect(capsAfter(end116('maxLength', 0.3))).toBe(0);
+    expect(capsAfter(end116('silence', 0.1))).toBe(0);
+    expect(capsAfter(end116('maxLength', Number.NaN))).toBe(0);
+    expect(capsAfter(end116('maxLength'))).toBe(0); // unknown ratio
     // A misfire is not an end: the counter stays.
     expect(run(s, seg(EPOCH, { kind: 'misfire', frame: 150_000 })).state.noisyCaps).toBe(1);
   });
 
   it('row 20: the third noisy cap raises the margins by 3 dB (twice), then switches to hold-to-talk', () => {
-    const fx = takeFx(190_000 + 7_200);
-    const noisy = end('maxLength', 0.1);
+    const fx = takeFx116(190_000 + 7_200);
+    const noisy = end116('maxLength', 0.1);
     expectStep(stateIn('Recording', { noisyCaps: 2 }), noisy, 'Processing', fx, {
       takeId: TAKE + 1,
       noisyCaps: 0,
@@ -1575,17 +1576,17 @@ describe('#116: noisy room and hold-to-talk', () => {
 
   it('row 20b: holdEnd → Processing with row 20 take, the release clamped to [onset, onset + cap]', () => {
     const s = stateIn('Recording', HOLD); // onset 144 000, armFrame 96 000
-    expectStep(s, { t: 'holdEnd', frame: 200_000 }, 'Processing', takeFx(207_200, [ui(null)]), {
+    expectStep(s, { t: 'holdEnd', frame: 200_000 }, 'Processing', takeFx116(207_200, [ui(null)]), {
       takeId: TAKE + 1,
     });
-    expectStep(s, { t: 'holdEnd', frame: 100_000 }, 'Processing', takeFx(144_000 + 7_200, [ui(null)]), {
+    expectStep(s, { t: 'holdEnd', frame: 100_000 }, 'Processing', takeFx116(144_000 + 7_200, [ui(null)]), {
       takeId: TAKE + 1,
     });
     expectStep(
       s,
       { t: 'holdEnd', frame: 144_000 + 600_000 },
       'Processing',
-      takeFx(144_000 + 480_000 + 7_200, [ui(null)]),
+      takeFx116(144_000 + 480_000 + 7_200, [ui(null)]),
       { takeId: TAKE + 1 },
     );
     expectIgnored(stateIn('Recording'), { t: 'holdEnd', frame: 200_000 });
@@ -1597,7 +1598,7 @@ describe('#116: noisy room and hold-to-talk', () => {
         stateIn('Recording', { ...HOLD, workerRestarts }),
         tmr('recording'),
         'Processing',
-        takeFx(631_200, [ui(null)]),
+        takeFx116(631_200, [ui(null)]),
         { takeId: TAKE + 1 },
       );
       expect(r.effects.some((f) => f.k === 'restartWorker')).toBe(false);
@@ -1608,7 +1609,10 @@ describe('#116: noisy room and hold-to-talk', () => {
     expect(take({ onsetFrame: null })).toMatchObject({ toFrame: 96_000 + 480_000 + 7_200 });
     expect(take({ onsetFrame: null, armFrame: null })).toMatchObject({ toFrame: 480_000 + 7_200 });
     const r = run(stateIn('Recording', { ...HOLD, onsetFrame: null }), { t: 'holdEnd', frame: 200_000 });
-    expect(r.effects.find((f) => f.k === 'take')).toMatchObject({ fromFrame: 200_000 - 14_400, toFrame: 207_200 });
+    expect(r.effects.find((f) => f.k === 'take')).toMatchObject({
+      fromFrame: 200_000 - 14_400,
+      toFrame: 207_200,
+    });
   });
 
   it('entering Asleep resets noisy mode and tooNoisy; Paused and Error keep them; Waking clears tooNoisy', () => {

@@ -149,7 +149,10 @@ function toneBurstFrames(db: number, lead: number, burst: number, tail: number):
   const a = Math.SQRT2 * 10 ** (db / 20);
   return Array.from({ length: lead + burst + tail }, (_, k) =>
     k >= lead && k < lead + burst
-      ? Float32Array.from({ length: FRAME }, (_, i) => a * Math.sin((2 * Math.PI * 1000 * (k * FRAME + i)) / 16000))
+      ? Float32Array.from(
+          { length: FRAME },
+          (_v, i) => a * Math.sin((2 * Math.PI * 1000 * (k * FRAME + i)) / 16000),
+        )
       : new Float32Array(FRAME),
   );
 }
@@ -950,25 +953,45 @@ describe('VadCore proximity gate (Silero segments)', () => {
   });
 });
 
+/** A Voicing that counts its score() calls. */
+function countingVoicing(): Voicing & { calls: number } {
+  const inner = createVoicing(16000);
+  const v = {
+    calls: 0,
+    score(win: Float32Array): number {
+      v.calls++;
+      return inner.score(win);
+    },
+  };
+  return v;
+}
+
+/** Every `end` among `msgs` carries a numeric voicedRatio. */
+function expectRatios(msgs: WorkerToMain[]): void {
+  for (const ev of segs(msgs)) if (ev.kind === 'end') expect(typeof ev.voicedRatio).toBe('number');
+}
+
+/** The hops a listen of `frames` steps. */
+function hopsIn(frames: Float32Array[]): number {
+  return Math.floor((frames.length * FRAME) / ENERGY_HOP);
+}
+
+/** One listen of `frames` on `vad` (Silero: a scripted model), counting the voicing scorer's calls. */
+function countScores(
+  frames: Float32Array[],
+  vad: 'energy' | 'silero',
+  trace = false,
+): { calls: number; msgs: WorkerToMain[] } {
+  const voicing = countingVoicing();
+  const run = newCore(CTX_RATE, { voicing });
+  if (vad === 'silero') run.core.setModel(scriptedModel(0.9, 0.1));
+  run.core.setTrace(trace);
+  run.core.reset(1, vad);
+  feed(run, 1, frames);
+  return { calls: voicing.calls, msgs: run.msgs };
+}
+
 describe('VadCore voicedRatio and marginBoostDb (#116)', () => {
-  /** A Voicing that counts its score() calls. */
-  function countingVoicing(): Voicing & { calls: number } {
-    const inner = createVoicing(16000);
-    const v = {
-      calls: 0,
-      score(win: Float32Array): number {
-        v.calls++;
-        return inner.score(win);
-      },
-    };
-    return v;
-  }
-
-  /** Every `end` among `msgs` carries a numeric voicedRatio. */
-  function expectRatios(msgs: WorkerToMain[]): void {
-    for (const ev of segs(msgs)) if (ev.kind === 'end') expect(typeof ev.voicedRatio).toBe('number');
-  }
-
   it('1: energy, vowel_f0-140: the end carries the voiced fraction of its hops, start hop to end hop', () => {
     const frames = frames16k(fixture('vowel_f0-140'));
     const { msgs } = runFixture('vowel_f0-140');
@@ -987,7 +1010,9 @@ describe('VadCore voicedRatio and marginBoostDb (#116)', () => {
     const [start, end] = segs(msgs);
     if (start?.kind !== 'start' || end?.kind !== 'end') throw new Error('expected start, end');
     expect(end.reason).toBe('maxLength');
-    expect(end.voicedRatio).toBe(ratioOf(hopVoiced(frames), start.frame / HOP_CTX_116, end.frame / HOP_CTX_116));
+    expect(end.voicedRatio).toBe(
+      ratioOf(hopVoiced(frames), start.frame / HOP_CTX_116, end.frame / HOP_CTX_116),
+    );
     expect(end.voicedRatio).toBeGreaterThan(0.3);
     expectRatios(msgs);
   });
@@ -1009,33 +1034,19 @@ describe('VadCore voicedRatio and marginBoostDb (#116)', () => {
   it('4: voicing is scored only for hops inside a segment, and for every hop with the trace on', () => {
     const silence = frames16k(fixture('silence_2s'));
     const vowel = frames16k(fixture('vowel_f0-140'));
-    const hopsIn = (frames: Float32Array[]): number => Math.floor((frames.length * FRAME) / ENERGY_HOP);
-    const count = (
-      frames: Float32Array[],
-      vad: 'energy' | 'silero',
-      trace = false,
-    ): { calls: number; msgs: WorkerToMain[] } => {
-      const voicing = countingVoicing();
-      const run = newCore(CTX_RATE, { voicing });
-      if (vad === 'silero') run.core.setModel(scriptedModel(0.9, 0.1));
-      run.core.setTrace(trace);
-      run.core.reset(1, vad);
-      feed(run, 1, frames);
-      return { calls: voicing.calls, msgs: run.msgs };
-    };
-    expect(count(silence, 'energy').calls).toBe(0);
-    expect(count(silence, 'silero').calls).toBe(0);
-    const energy = count(vowel, 'energy');
+    expect(countScores(silence, 'energy').calls).toBe(0);
+    expect(countScores(silence, 'silero').calls).toBe(0);
+    const energy = countScores(vowel, 'energy');
     const [es, ee] = segs(energy.msgs);
     expect(kinds(energy.msgs)).toEqual(['start', 'end']);
     expect(energy.calls).toBe(ee!.frame / HOP_CTX_116 - es!.frame / HOP_CTX_116 + 1);
-    const silero = count(vowel, 'silero');
+    const silero = countScores(vowel, 'silero');
     const [ss, se] = segs(silero.msgs);
     expect(kinds(silero.msgs)).toEqual(['start', 'end']);
     const [first, last] = sileroHops(ss!.frame / SILERO_GRID, se!.frame / SILERO_GRID);
     expect(silero.calls).toBe(last - first + 1);
-    expect(count(vowel, 'energy', true).calls).toBe(hopsIn(vowel));
-    expect(count(silence, 'silero', true).calls).toBe(hopsIn(silence));
+    expect(countScores(vowel, 'energy', true).calls).toBe(hopsIn(vowel));
+    expect(countScores(silence, 'silero', true).calls).toBe(hopsIn(silence));
   });
 
   it('6: energy: marginBoostDb raises the onset margin', () => {
@@ -2633,7 +2644,9 @@ describe('dsp.worker glue', () => {
       const port = new FakePort();
       self.dispatch({ t: 'init', ctxRate: CTX_RATE, port });
       self.dispatch({ t: 'reset', epoch: 9, vad: 'energy', restoreFloorDb: -60, ...extra });
-      frames.forEach((pcm16k, i) => port.dispatch({ t: 'frame', epoch: 9, firstFrame: i * SILERO_GRID, pcm16k }));
+      frames.forEach((pcm16k, i) =>
+        port.dispatch({ t: 'frame', epoch: 9, firstFrame: i * SILERO_GRID, pcm16k }),
+      );
       return kinds(self.posted.map((p) => p.msg)).filter((k) => k === 'start').length;
     };
     expect(starts({})).toBeGreaterThan(0);

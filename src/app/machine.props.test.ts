@@ -535,13 +535,18 @@ describe('session reducer properties (plan §4.9.1)', () => {
             take.toFrame !== s.onsetFrame + cap + tail ||
             out.effects.some((fx) => fx.k === 'restartWorker')
           ) {
-            fail(sim, `P12: timer recording in hold-mode Recording gave ${out.state.name} [${out.effects.map((fx) => fx.k).join(', ')}]`);
+            fail(
+              sim,
+              `P12: timer recording in hold-mode Recording gave ${out.state.name} [${out.effects.map((fx) => fx.k).join(', ')}]`,
+            );
           }
         },
       );
       if (enteredThisWalk) entered++;
     });
-    console.log(`P12: ${entered} walks entered hold-to-talk mode, ${holdSegs} hold-mode seg transitions, ${holdStates} hold-mode states probed, ${capProbes} hold-mode Recording cap probes`);
+    console.log(
+      `P12: ${entered} walks entered hold-to-talk mode, ${holdSegs} hold-mode seg transitions, ${holdStates} hold-mode states probed, ${capProbes} hold-mode Recording cap probes`,
+    );
     expect(entered).toBeGreaterThan(0);
     expect(holdSegs).toBeGreaterThan(0);
     expect(holdStates).toBeGreaterThan(0);

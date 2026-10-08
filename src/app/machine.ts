@@ -210,7 +210,12 @@ function entryActions(to: StateName, st: SessionState, cfg: SessionConfig): [Ses
       // 12.3 s back, beyond the 12 s ring (ORCH-NOTE on #116).
       return [
         st,
-        [timer('recording', st.holdToTalk ? cfg.maxUtteranceMs : cfg.maxUtteranceMs + RECORDING_WATCHDOG_EXTRA_MS)],
+        [
+          timer(
+            'recording',
+            st.holdToTalk ? cfg.maxUtteranceMs : cfg.maxUtteranceMs + RECORDING_WATCHDOG_EXTRA_MS,
+          ),
+        ],
       ];
     case 'Processing':
       return [st, [timer('processing', cfg.processingMs)]];
@@ -248,7 +253,14 @@ function entryActions(to: StateName, st: SessionState, cfg: SessionConfig): [Ses
           ? next
           : to === 'Paused'
             ? { ...next, workerRestarts: 0 }
-            : { ...next, workerRestarts: 0, noisyCaps: 0, marginBoostDb: 0, holdToTalk: false, tooNoisy: false },
+            : {
+                ...next,
+                workerRestarts: 0,
+                noisyCaps: 0,
+                marginBoostDb: 0,
+                holdToTalk: false,
+                tooNoisy: false,
+              },
         fx,
       ];
     }
@@ -479,7 +491,8 @@ function takeTo(s: SessionState, lastSpeechFrame: number, cfg: SessionConfig, p:
  * it. At NOISY_CAPS the margins rise by 3 dB (and the count restarts) up to 6 dB; then hold-to-talk.
  */
 function noisyPatch(s: SessionState, ev: Extract<SegEvent, { kind: 'end' }>): Partial<SessionState> {
-  const noisy = ev.reason === 'maxLength' && ev.voicedRatio !== undefined && ev.voicedRatio < NOISY_VOICED_RATIO;
+  const noisy =
+    ev.reason === 'maxLength' && ev.voicedRatio !== undefined && ev.voicedRatio < NOISY_VOICED_RATIO;
   const noisyCaps = noisy ? s.noisyCaps + 1 : 0;
   if (noisyCaps < NOISY_CAPS) return { noisyCaps };
   if (s.marginBoostDb < 6) return { noisyCaps: 0, marginBoostDb: s.marginBoostDb === 0 ? 3 : 6 }; // + 3 dB

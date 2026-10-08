@@ -260,7 +260,10 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
     winFloor = e.floorDb;
     if (now - winStart < NOISE_FLOOR_WINDOW_MS) return;
     winOpen = false;
-    io.dispatch({ t: 'noiseFloor', floorDb: Number.isFinite(winFloor) ? Math.max(winMin, winFloor) : winMin });
+    io.dispatch({
+      t: 'noiseFloor',
+      floorDb: Number.isFinite(winFloor) ? Math.max(winMin, winFloor) : winMin,
+    });
   }
 
   // ---- the interpreter -------------------------------------------------------------------------------------

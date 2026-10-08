@@ -236,7 +236,9 @@ function fakeEngine(timeline: string[]): FakeEngine {
     },
     arm(epoch, restoreFloorDb, marginBoostDb) {
       const boost = marginBoostDb === undefined ? '' : ` +${marginBoostDb}`;
-      timeline.push(`${restoreFloorDb === undefined ? `arm ${epoch}` : `arm ${epoch} ${restoreFloorDb}`}${boost}`);
+      timeline.push(
+        `${restoreFloorDb === undefined ? `arm ${epoch}` : `arm ${epoch} ${restoreFloorDb}`}${boost}`,
+      );
       if (hooks.armThrows > 0) {
         hooks.armThrows--;
         throw new Error('fake arm failure');

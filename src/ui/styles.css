@@ -105,6 +105,37 @@ body {
   }
 }
 
+/* Hold-to-talk (#116, plan §4.4): a 120 px paw button at the bottom centre, the one child-facing button. It takes
+   pointer events (the layer lets them through), and a long press neither scrolls, selects nor opens a menu. Pressed,
+   it shrinks a little (a state change, not an animation). */
+.overlay-hold {
+  box-sizing: border-box;
+  width: 120px;
+  height: 120px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.overlay-hold > .icon {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.overlay-hold--pressed {
+  transform: scale(0.92);
+}
+
 .sheet {
   box-sizing: border-box;
   width: 100%;
