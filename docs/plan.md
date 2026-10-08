@@ -400,6 +400,7 @@ stateDiagram-v2
 | 2 | Asleep | `tapBear` | permission `prompt` (first run, or a one-time grant expired) | NeedsParent | `resumeCtx`, `wakeLock on`, `ui parentPermission`, `timer sleep`. This is the one screen with text, for a parent ([§4.5](#45-android-chrome-specifics)). |
 | 3 | Asleep | `tapBear` | permission `denied` | MicDenied | `resumeCtx`, `ui micHelp`, `anim wake` (the bear is awake for reactions, row 11) |
 | 3b | Asleep | `settingsRetry` | — | as rows 1 / 2 / 3 by permission | (#266) |
+| 3c | Asleep | `tapBear` \| `settingsRetry` | `updateActivated`: another tab activated the update (`updateReady{activated}`) | Asleep | `applyUpdate` only: the page reloads at once instead of waking ([§4.7](#47-pwa)); checked before rows 1–3 and 3b (#277) |
 | 4 | NeedsParent | `parentContinue` | — | Waking | `openMic`: Chrome's prompt appears now, in front of the parent |
 | 5 | NeedsParent | `timer sleep` \| `hidden` | — | Asleep | — |
 | 6 | Waking | `micGranted` \| `ctxRunning` | the *other* flag is already set | Listening | `cancelTimer waking` (entry actions arm) |
@@ -1240,6 +1241,10 @@ VitePWA({
   - A parent can also tap "new version – restart" in settings. That control is **enabled only while `updateReady` is true**. In prompt mode, the reload listener is attached inside workbox-window's `waiting` handler, so calling `updateSW()` earlier silently does nothing [E reviewer, V R56/R57].
   - Frozen tabs run no timers, so the hourly `reg.update()` may only happen on the next `visible` [M]. That's acceptable.
   - All lazy resources (worklet, worker, weights, art) are loaded at wake, so an old page never needs old URLs after activation.
+  - **Another tab's update (#230, #277).** Another tab applying an update makes its worker take control of this page too (`clientsClaim`), and that activation deleted the old precache. This page keeps running old code, and nothing is left waiting for it to activate. A page that has woken since it loaded holds its graph, but a never-woken one would fetch old lazy URLs at its first wake (the exception to the bullet above). So the page sets `updateReady{activated}` and reloads in one of three ways:
+    - at once, if hidden;
+    - at its next hide in Asleep or Paused (C11);
+    - in Asleep, at a tap or settings retry instead of waking (§3.4 row 3c).
 - **Update checks:** browsers re-check `sw.js` on navigation, or on subresource fetches only after 24 h [V R26]. A never-navigating single-page app therefore calls `reg.update()` on `visibilitychange→visible` and hourly.
 - **HTTP caching of `sw.js`:** `updateViaCache` defaults to `'imports'`, so the top-level `sw.js` fetch always bypasses the HTTP cache [V R26]. We still serve it `no-cache`.
 
