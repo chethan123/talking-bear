@@ -7,7 +7,7 @@
 // and #tally.
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { Effect, SessionEvent, StateName } from './app/events.ts';
-import type { Session, TransitionListener } from './app/session.ts';
+import type { LevelEvent, Session, TransitionListener } from './app/session.ts';
 import type { BootOptions } from './main.ts';
 
 interface BootCall {
@@ -15,6 +15,8 @@ interface BootCall {
   resolve(): void;
   reject(err: unknown): void;
   listener: TransitionListener | null;
+  /** The page's level listener (`subscribeLevel`), for the capture-jump tests (#268). */
+  level: ((e: LevelEvent) => void) | null;
 }
 
 const h = vi.hoisted(() => ({ boots: [] as BootCall[] }));
@@ -22,9 +24,9 @@ const h = vi.hoisted(() => ({ boots: [] as BootCall[] }));
 vi.mock('./main.ts', () => ({
   boot: (_root: HTMLElement, opts: BootOptions): Promise<void> =>
     new Promise<void>((resolve, reject) => {
-      const call: BootCall = { opts, resolve, reject, listener: null };
+      const call: BootCall = { opts, resolve, reject, listener: null, level: null };
       h.boots.push(call);
-      // The page only subscribes to transitions; the rest of the session is never called.
+      // The page only subscribes to transitions and levels; the rest of the session is never called.
       const session: Session = {
         dispatch: () => {},
         state: () => {
@@ -36,7 +38,10 @@ vi.mock('./main.ts', () => ({
           return () => {};
         },
         addSfxListener: () => () => {},
-        subscribeLevel: () => () => {},
+        subscribeLevel: (cb) => {
+          call.level = cb;
+          return () => {};
+        },
         onEngineEvent: () => {},
       };
       opts.onSession?.(session);
@@ -294,5 +299,206 @@ describe('lab/vad-live tally (D15, D16)', () => {
     expect(quiet()).toMatchObject({ recordings: 2, maxLength: 1, completed: 1 });
     step(page, 'Processing', 'Playing', PROCESSED); // the take ended in Listening
     expect(quiet().completed).toBe(1);
+  });
+});
+
+// ---- capture jumps (#268) -------------------------------------------------------------------------------------------
+// At 48 kHz one level interval is 1440 ctx frames (a level every third 10 ms hop), and the jump rule's limit is
+// 1440 + 24000 (Math.round(48000 / 2)); at 44.1 kHz, 1323 + 22050. The pre-roll is 300 ms: 14400 frames at 48 kHz.
+
+/** One `level` event of `epoch` at ctx `frame`. */
+function level(page: BootCall, epoch: number, frame: number): void {
+  page.level?.({ t: 'level', epoch, frame, db: -30, floorDb: -60 });
+}
+
+/** `n` contiguous level events of `epoch` from `first`, 1440 frames apart; returns the last one's frame. */
+function levels(page: BootCall, epoch: number, first: number, n: number): number {
+  for (let i = 0; i < n; i++) level(page, epoch, first + i * 1440);
+  return first + (n - 1) * 1440;
+}
+
+const segStart = (epoch: number, frame: number): SessionEvent => ({
+  t: 'seg',
+  epoch,
+  ev: { kind: 'start', frame },
+});
+const segEnd = (epoch: number, frame: number): SessionEvent => ({
+  t: 'seg',
+  epoch,
+  ev: { kind: 'end', frame, lastSpeechFrame: frame - 28_800, reason: 'silence' },
+});
+const segMisfire = (epoch: number, frame: number): SessionEvent => ({
+  t: 'seg',
+  epoch,
+  ev: { kind: 'misfire', frame },
+});
+const arm = (epoch: number): Effect[] => [{ k: 'arm', epoch }];
+
+/** The replay of a take that ended in Processing, the cooldown, and a new listen armed as `epoch`. */
+function replay(page: BootCall, epoch: number): void {
+  step(page, 'Processing', 'Playing', PROCESSED);
+  step(page, 'Playing', 'Cooldown', { t: 'playbackAtSpeakerEnded', id: 1 });
+  step(page, 'Cooldown', 'Listening', { t: 'timer', name: 'cooldown' }, arm(epoch));
+}
+
+/** A whole take of `epoch` from its onset at `onset`, with contiguous levels, then a new listen as `epoch + 1`. */
+function cleanTake(page: BootCall, epoch: number, onset: number): void {
+  step(page, 'Listening', 'Recording', segStart(epoch, onset));
+  const last = levels(page, epoch, onset + 1440, 40);
+  step(page, 'Recording', 'Processing', segEnd(epoch, last + 1440));
+  level(page, epoch, last + 1440);
+  replay(page, epoch + 1);
+}
+
+describe('lab/vad-live capture jumps (#268)', () => {
+  test('a jump during an armed take: the jump is counted, the take excluded and its replay unmarkable; the next take counts', async () => {
+    const page = await livePage(); // epoch 1, 48 kHz
+    let f = levels(page, 1, 0, 20);
+    step(page, 'Listening', 'Recording', segStart(1, f));
+    expect(quiet().recordings).toBe(1); // counted at the onset, as before
+    f = levels(page, 1, f + 1440, 30);
+    step(page, 'Recording', 'Processing', segEnd(1, f)); // the gap end comes just before the first level after the gap
+    level(page, 1, f + 1440 + 96_000); // a 2 s re-anchor
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 0, completed: 0 });
+    expect(document.querySelector('#count-quiet-captureJumps')?.textContent).toBe('1');
+    expect(button('Hit').disabled).toBe(true);
+    expect(document.querySelector('#tally p')?.textContent).toContain('A capture jump');
+    replay(page, 2);
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 0, completed: 0 });
+    expect(button('Hit').disabled).toBe(true);
+    step(page, 'Listening', 'Recording', segStart(2, 500_000));
+    expect(button('Hit').disabled).toBe(false);
+    const last = levels(page, 2, 501_440, 40);
+    step(page, 'Recording', 'Processing', segEnd(2, last + 1440));
+    level(page, 2, last + 1440);
+    replay(page, 3);
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1, completed: 1 });
+  });
+
+  test('the jump rule: one level interval plus Math.round(sampleRate / 2) is no jump, one frame more is; epochs apart', async () => {
+    const page = await livePage(); // 48 kHz
+    level(page, 1, 0);
+    level(page, 1, 1439);
+    level(page, 1, 2880); // ±1 rounding
+    level(page, 1, 2880 + 25_440); // exactly the limit
+    expect(quiet().captureJumps).toBe(0);
+    level(page, 1, 2880 + 25_440 + 25_441); // one frame more
+    expect(quiet().captureJumps).toBe(1);
+    level(page, 2, 10_000_000); // the next epoch's first level: not compared with epoch 1's
+    expect(quiet().captureJumps).toBe(1);
+    // A context at 44.1 kHz: the limit is 1323 + 22050.
+    step(page, 'Listening', 'Listening', { t: 'ctxRunning', sampleRate: 44_100 });
+    level(page, 2, 10_000_000 + 23_373);
+    expect(quiet().captureJumps).toBe(1);
+    level(page, 2, 10_000_000 + 23_373 + 23_374);
+    expect(quiet().captureJumps).toBe(2);
+  });
+
+  test('a misfire at a jump is excluded too (no recordings, no misfires); the next take counts', async () => {
+    const page = await livePage(true);
+    let f = levels(page, 1, 0, 20);
+    step(page, 'Listening', 'Recording', segStart(1, f));
+    f = levels(page, 1, f + 1440, 5);
+    step(page, 'Recording', 'Listening', { t: 'seg', epoch: 1, ev: { kind: 'misfire', frame: f } }, arm(2));
+    expect(quiet()).toMatchObject({ recordings: 1, misfires: 1 });
+    level(page, 1, f + 1440 + 48_000); // the first level after a 1 s re-anchor, of the misfire's epoch
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 0, misfires: 0 });
+    expect(button('Hit').disabled).toBe(true);
+    cleanTake(page, 2, 300_000);
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1, completed: 1, misfires: 0 });
+    expect(button('Hit').disabled).toBe(false);
+  });
+
+  test('a jump while listening: counted, excluding nothing; a take whose pre-roll reaches back over it is excluded', async () => {
+    const page = await livePage();
+    const f = levels(page, 1, 0, 20);
+    const after = f + 1440 + 96_000; // the first level after a 2 s re-anchor
+    level(page, 1, after);
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 0 });
+    expect(button('Hit').disabled).toBe(false); // no phrase was cut
+    levels(page, 1, after + 1440, 5);
+    step(page, 'Listening', 'Recording', segStart(1, after + 14_399)); // pre-roll from after − 1: over the gap
+    expect(quiet().recordings).toBe(0);
+    expect(button('Hit').disabled).toBe(true);
+    step(page, 'Recording', 'Processing', segEnd(1, after + 100_000));
+    replay(page, 2);
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 0, completed: 0 });
+    // In epoch 2, a take whose pre-roll starts exactly at the first level after a jump counts.
+    const g = levels(page, 2, 1_000_000, 20);
+    const after2 = g + 1440 + 96_000;
+    level(page, 2, after2);
+    step(page, 'Listening', 'Recording', segStart(2, after2 + 14_400));
+    expect(button('Hit').disabled).toBe(false);
+    step(page, 'Recording', 'Processing', segEnd(2, after2 + 100_000));
+    replay(page, 3);
+    expect(quiet()).toMatchObject({ captureJumps: 2, recordings: 1, completed: 1 });
+  });
+
+  test('a take whose segment ended before a jump keeps its counts: the next level of its epoch closes it', async () => {
+    const page = await livePage();
+    let f = levels(page, 1, 0, 20);
+    step(page, 'Listening', 'Recording', segStart(1, f));
+    f = levels(page, 1, f + 1440, 30);
+    step(page, 'Recording', 'Processing', segEnd(1, f + 1440));
+    f = levels(page, 1, f + 1440, 2); // contiguous: the segment ended before any gap
+    level(page, 1, f + 1440 + 96_000); // a later jump in the same epoch
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1 });
+    replay(page, 2);
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 1, completed: 1 });
+    expect(button('Hit').disabled).toBe(false);
+  });
+
+  test("jumps count only while the tally is live (D15), into the excluded take's condition or else the selected one", async () => {
+    const page = await openPage();
+    page.resolve();
+    await settle();
+    wake(page); // the overlay is still loading
+    level(page, 1, 0);
+    level(page, 1, 100_000);
+    expect(quiet().captureJumps).toBe(0);
+    page.opts.onDebugOverlay?.(true);
+    step(page, 'Listening', 'Listening', { t: 'timer', name: 'doze' }); // a stay: no re-arm
+    level(page, 1, 200_000);
+    expect(quiet().captureJumps).toBe(1); // a capture event, not a phrase: no clean listen needed
+    step(page, 'Listening', 'Listening', { t: 'ctxRunning', sampleRate: 48_000 }, arm(2)); // a clean listen
+    const f = levels(page, 2, 300_000, 5);
+    step(page, 'Listening', 'Recording', segStart(2, f));
+    const fan = document.querySelector<HTMLInputElement>('#tally input[value="fan"]');
+    if (fan === null) throw new Error('test: no fan radio');
+    fan.click(); // the fan goes on mid-take
+    step(page, 'Recording', 'Processing', segEnd(2, f + 1440));
+    level(page, 2, f + 1440 + 96_000);
+    expect(quiet()).toMatchObject({ captureJumps: 2, recordings: 0 });
+    expect(summary().counts.fan).toMatchObject({ captureJumps: 0, recordings: 0 });
+    replay(page, 3);
+    level(page, 3, 1_000_000);
+    level(page, 3, 1_100_000); // a jump while listening, in fan
+    expect(summary().counts.fan).toMatchObject({ captureJumps: 1 });
+  });
+  test('a misfire at a jump re-arms: the rest of the phrase, whose pre-roll reaches back over the jump, is excluded too', async () => {
+    const page = await livePage(true);
+    let f = levels(page, 1, 0, 20);
+    step(page, 'Listening', 'Recording', segStart(1, f));
+    f = levels(page, 1, f + 1440, 5);
+    step(page, 'Recording', 'Listening', segMisfire(1, f), arm(2)); // the gap misfire re-arms at once
+    const after = f + 1440 + 48_000; // the first level after a 1 s re-anchor
+    level(page, 1, after);
+    levels(page, 2, after + 2880, 3);
+    step(page, 'Listening', 'Recording', segStart(2, after + 7200)); // the rest of the phrase, 150 ms on
+    expect(quiet()).toMatchObject({ captureJumps: 1, recordings: 0, misfires: 0 });
+    expect(button('Hit').disabled).toBe(true);
+    expect(document.querySelector('#tally p')?.textContent).toContain('A capture jump');
+    step(page, 'Recording', 'Listening', segMisfire(2, after + 30_000), arm(3));
+    expect(quiet()).toMatchObject({ recordings: 0, misfires: 0 });
+    // A second cut phrase, in epoch 3; then a phrase whose pre-roll starts exactly at the first level after the jump.
+    let g = levels(page, 3, after + 100_000, 20);
+    step(page, 'Listening', 'Recording', segStart(3, g));
+    g = levels(page, 3, g + 1440, 5);
+    step(page, 'Recording', 'Listening', segMisfire(3, g), arm(4));
+    const after2 = g + 1440 + 48_000;
+    level(page, 3, after2);
+    step(page, 'Listening', 'Recording', segStart(4, after2 + 14_400));
+    expect(button('Hit').disabled).toBe(false);
+    expect(quiet()).toMatchObject({ captureJumps: 2, recordings: 1, misfires: 0 });
   });
 });
