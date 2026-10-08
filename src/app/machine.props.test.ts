@@ -412,4 +412,59 @@ describe('session reducer properties (plan §4.9.1)', () => {
     expect(customByWalk).toBeGreaterThan(0);
     expect([...probedIn].toSorted()).toEqual(Object.keys(TABLE).toSorted());
   });
+
+  it('11: updateReady{activated} makes an Asleep tap or retry reload, and changes nothing else (#277)', () => {
+    const PROBES: SessionEvent[] = [
+      { t: 'tapBear' },
+      { t: 'settingsRetry' },
+      { t: 'visible' },
+      { t: 'hidden' },
+      { t: 'parentContinue' },
+    ];
+    const probedIn = new Set<StateName>();
+    let asleepReloads = 0;
+    property((w) => {
+      runWalk(
+        w,
+        () => {},
+        (sim) => {
+          const s = sim.state;
+          probedIn.add(s.name);
+          const a = reduce(s, { t: 'updateReady', activated: true });
+          if (a.effects.length > 0 || !a.state.updateActivated || !a.state.updateReady) {
+            fail(
+              sim,
+              `P11: updateReady{activated} in ${s.name} gave ${fmt(a.state)} [${a.effects.length} fx]`,
+            );
+          }
+          const b = reduce(s, { t: 'updateReady' });
+          for (const e of PROBES) {
+            const x = reduce(a.state, e);
+            const y = reduce(b.state, e);
+            if (s.name === 'Asleep' && (e.t === 'tapBear' || e.t === 'settingsRetry')) {
+              asleepReloads++;
+              if (x.state !== a.state || x.effects.length !== 1 || x.effects[0]?.k !== 'applyUpdate') {
+                fail(
+                  sim,
+                  `P11: ${fmt(e)} in flagged Asleep emitted [${x.effects.map((f) => f.k).join(', ')}]`,
+                );
+              }
+              continue;
+            }
+            try {
+              expect(x.effects).toStrictEqual(y.effects);
+              expect({ ...x.state, updateActivated: false }).toStrictEqual({
+                ...y.state,
+                updateActivated: false,
+              });
+            } catch (err) {
+              fail(sim, `P11: the flag changed ${fmt(e)} in ${s.name}: ${String(err)}`);
+            }
+          }
+        },
+      );
+    });
+    expect([...probedIn].toSorted()).toEqual(Object.keys(TABLE).toSorted());
+    expect(asleepReloads).toBeGreaterThan(0);
+  });
 });
