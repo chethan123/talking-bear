@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { GCProfiler, setFlagsFromString } from 'node:v8';
+import { GCProfiler, getHeapSpaceStatistics, setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 
 import { describe, expect, it } from 'vitest';
@@ -323,19 +323,64 @@ function warmUp(model: SileroModel): WarmUp {
   }
 }
 
-/** One 1000-frame reading: the `heapUsed` growth in bytes, whether a GC ran, and process()'s tier after it. */
+/** A heap space's name and used bytes, as v8.getHeapSpaceStatistics() lists them. */
+interface SpaceUsed {
+  space_name: string;
+  space_used_size: number;
+}
+
+/**
+ * The heap's growth in bytes from snapshot `before` to snapshot `after` of its spaces, summed over the spaces (heapUsed
+ * is their sum), and the spaces that shrank, with how much ('' if none did).
+ */
+function spaceGrowth(
+  before: readonly SpaceUsed[],
+  after: readonly SpaceUsed[],
+): { bytes: number; shrank: string } {
+  let bytes = 0;
+  const shrank: string[] = [];
+  for (const { space_name: space, space_used_size: used } of after) {
+    const grew = used - (before.find((s) => s.space_name === space)?.space_used_size ?? 0);
+    bytes += grew;
+    if (grew < 0) shrank.push(`${space} by ${-grew} B`);
+  }
+  return { bytes, shrank: shrank.join(', ') };
+}
+
+/**
+ * spaceGrowth over `fn`: the heap's growth in bytes (heapUsed's growth, plus what the two snapshots themselves
+ * allocate, a few KB) and the spaces that shrank, and whether any GC ran during it (a scavenge frees garbage it should
+ * count).
+ */
+function heapSpacesOver(fn: () => void): { bytes: number; gc: boolean; shrank: string } {
+  const profiler = new GCProfiler();
+  profiler.start();
+  const before = getHeapSpaceStatistics();
+  fn();
+  const after = getHeapSpaceStatistics();
+  return { ...spaceGrowth(before, after), gc: profiler.stop().statistics.length > 0 };
+}
+
+/**
+ * One 1000-frame reading: the heap's growth in bytes, whether a GC ran, the heap spaces that shrank (heapSpacesOver),
+ * and process()'s tier after it.
+ */
 interface HeapReading {
   bytes: number;
   gc: boolean;
+  shrank: string;
   tier: string;
 }
 
 /**
- * A reading counts only if no GC ran during it, and heapUsed didn't fall: process() never frees memory, so a fall
- * means heapUsed moved for a reason outside the run (seen on #246 right after readings with GCs).
+ * A reading counts only if no GC ran during it, and neither heapUsed nor any heap space shrank: process() never frees
+ * memory, so a fall means the heap moved for a reason outside the run. heapUsed fell right after readings with GCs
+ * (#246). And just after the forced GCs, V8 can still release code, trusted or old space, up to about a page, which
+ * shaved readings of a real allocation of about 300 B per frame to under LIMIT while the allocation itself grew new
+ * space (#262).
  */
 function qualifies(r: HeapReading): boolean {
-  return !r.gc && r.bytes >= 0;
+  return !r.gc && r.bytes >= 0 && r.shrank === '';
 }
 
 /** The smallest qualifying reading's bytes, or +Infinity if none qualified. */
@@ -348,6 +393,12 @@ function bestQualifying(readings: HeapReading[]): number {
 /** The steady state the warm-up waits for, as the report names it. */
 const STEADY = `process() TurboFan and a GC-free chunk under ${STEADY_BYTES_PER_FRAME} B per frame`;
 
+/** Why a GC-free reading doesn't qualify, as its report line ends ('' if it qualifies). */
+function fallNote(r: HeapReading): string {
+  if (r.shrank !== '') return `; shrank without a GC: ${r.shrank}`;
+  return r.bytes < 0 ? '; heapUsed fell without a GC' : '';
+}
+
 /** The report of a measurement: the warm-up, every reading, and the outcome (bestQualifying of the readings). */
 function heapReport(warm: WarmUp, readings: HeapReading[]): string {
   const best = bestQualifying(readings);
@@ -357,7 +408,7 @@ function heapReport(warm: WarmUp, readings: HeapReading[]): string {
       : `warm-up: ${warm.frames} frames, ${warm.ms} ms, stopped at the ${WARM_UP_BUDGET_MS} ms budget before a steady chunk (${STEADY}) (${warm.last})`,
     ...readings.map(
       (r, i) =>
-        `reading ${i + 1}: ${r.bytes} B${r.gc ? ' (GC)' : ''}, process() ${r.tier}${!r.gc && r.bytes < 0 ? '; heapUsed fell without a GC' : ''}`,
+        `reading ${i + 1}: ${r.bytes} B${r.gc ? ' (GC)' : ''}, process() ${r.tier}${r.gc ? '' : fallNote(r)}`,
     ),
   ];
   if (Number.isFinite(best)) {
@@ -365,7 +416,7 @@ function heapReport(warm: WarmUp, readings: HeapReading[]): string {
   } else {
     const gcs = readings.filter((r) => r.gc).length;
     lines.push(
-      `no reading qualified: ${gcs} of ${readings.length} had a GC, ${readings.length - gcs} showed heapUsed falling without one`,
+      `no reading qualified: ${gcs} of ${readings.length} had a GC, ${readings.length - gcs} showed a heap space shrinking without one`,
     );
   }
   return lines.join('\n');
@@ -387,8 +438,8 @@ function measure(model: SileroModel, run: () => void, done: (best: number) => bo
   let best = Number.POSITIVE_INFINITY;
   while (readings.length < 20 && !done(best)) {
     forceGc();
-    const { bytes, gc } = heapUsedOver(run);
-    readings.push({ bytes, gc, tier: tierName(processStatus(model)) });
+    const { bytes, gc, shrank } = heapSpacesOver(run);
+    readings.push({ bytes, gc, shrank, tier: tierName(processStatus(model)) });
     best = bestQualifying(readings);
   }
   return { best, report: heapReport(warm, readings) };
@@ -445,15 +496,15 @@ describe('process() allocates nothing', () => {
       last: 'process() Maglev; last chunk -4547360 B (GC)',
     };
     const maglev: HeapReading[] = [
-      { bytes: 2_317_208, gc: true, tier: 'Maglev' },
-      { bytes: 2_315_696, gc: true, tier: 'Maglev' },
+      { bytes: 2_317_208, gc: true, shrank: '', tier: 'Maglev' },
+      { bytes: 2_315_696, gc: true, shrank: '', tier: 'Maglev' },
     ];
     expect(bestQualifying(maglev)).toBe(Number.POSITIVE_INFINITY);
     expect(heapReport(stalled, maglev).split('\n')).toEqual([
       'warm-up: 3600 frames, 10064 ms, stopped at the 10000 ms budget before a steady chunk (process() TurboFan and a GC-free chunk under 1024 B per frame) (process() Maglev; last chunk -4547360 B (GC))',
       'reading 1: 2317208 B (GC), process() Maglev',
       'reading 2: 2315696 B (GC), process() Maglev',
-      'no reading qualified: 2 of 2 had a GC, 0 showed heapUsed falling without one',
+      'no reading qualified: 2 of 2 had a GC, 0 showed a heap space shrinking without one',
     ]);
     const warm: WarmUp = {
       frames: 100,
@@ -461,14 +512,14 @@ describe('process() allocates nothing', () => {
       optimised: true,
       last: 'process() TurboFan; last chunk 1040 B',
     };
-    const fell: HeapReading = { bytes: -104_480, gc: false, tier: 'TurboFan' };
-    const steady: HeapReading = { bytes: 29_488, gc: false, tier: 'TurboFan' };
-    const larger: HeapReading = { bytes: 31_000, gc: false, tier: 'TurboFan' };
+    const fell: HeapReading = { bytes: -104_480, gc: false, shrank: '', tier: 'TurboFan' };
+    const steady: HeapReading = { bytes: 29_488, gc: false, shrank: '', tier: 'TurboFan' };
+    const larger: HeapReading = { bytes: 31_000, gc: false, shrank: '', tier: 'TurboFan' };
     expect(bestQualifying([fell, larger, steady])).toBe(29_488);
     expect(qualifies(fell)).toBe(false);
     expect(bestQualifying([fell, steady])).toBe(29_488);
     expect(heapReport(warm, [fell]).split('\n').at(-1)).toBe(
-      'no reading qualified: 0 of 1 had a GC, 1 showed heapUsed falling without one',
+      'no reading qualified: 0 of 1 had a GC, 1 showed a heap space shrinking without one',
     );
     expect(heapReport(warm, [fell, steady]).split('\n')).toEqual([
       'warm-up: 100 frames, 110 ms, until steady: process() TurboFan and a GC-free chunk under 1024 B per frame (process() TurboFan; last chunk 1040 B)',
@@ -482,5 +533,46 @@ describe('process() allocates nothing', () => {
     expect(steadyChunk(81, 1040, true)).toBe(false);
     expect(steadyChunk(81, -1, false)).toBe(false);
     expect(steadyChunk(81, 51_200, false)).toBe(false);
+  });
+
+  it('measures each V8 space, and rejects a reading in which one shrank', () => {
+    // Readings recorded on #262, idle, with about 300 B per frame escaping from process() (a scratch
+    // Array.from({ length: 4 }) per frame). The spaces' sizes before are a fresh worker's; the changes are recorded.
+    const before: SpaceUsed[] = [
+      { space_name: 'read_only_space', space_used_size: 0 },
+      { space_name: 'new_space', space_used_size: 397_744 },
+      { space_name: 'old_space', space_used_size: 2_942_792 },
+      { space_name: 'code_space', space_used_size: 26_304 },
+      { space_name: 'trusted_space', space_used_size: 989_384 },
+    ];
+    const grown = (changes: number[]): SpaceUsed[] =>
+      before.map((s, i) => ({ ...s, space_used_size: s.space_used_size + (changes[i] ?? 0) }));
+    // V8 released code and old space during the reading, and heapUsed grew by only 86 120 B.
+    expect(spaceGrowth(before, grown([0, 298_856, -2904, -211_104, 1272]))).toEqual({
+      bytes: 86_120,
+      shrank: 'old_space by 2904 B, code_space by 211104 B',
+    });
+    expect(spaceGrowth(before, grown([0, 298_864, 32, 3456, 4664]))).toEqual({ bytes: 307_016, shrank: '' });
+    // A reading shaved under LIMIT by such a release no longer qualifies, so the unshaved one decides.
+    const shaved: HeapReading = {
+      bytes: 57_000,
+      gc: false,
+      shrank: 'old_space by 16352 B, code_space by 210720 B',
+      tier: 'TurboFan',
+    };
+    const unshaved: HeapReading = { bytes: 283_704, gc: false, shrank: '', tier: 'TurboFan' };
+    expect(qualifies(shaved)).toBe(false);
+    expect(bestQualifying([unshaved, shaved])).toBe(283_704);
+    const warm: WarmUp = {
+      frames: 100,
+      ms: 120,
+      optimised: true,
+      last: 'process() TurboFan; last chunk 13440 B',
+    };
+    expect(heapReport(warm, [unshaved, shaved]).split('\n').slice(1)).toEqual([
+      'reading 1: 283704 B, process() TurboFan',
+      'reading 2: 57000 B, process() TurboFan; shrank without a GC: old_space by 16352 B, code_space by 210720 B',
+      'best qualifying reading: 283704 B per 1000 frames',
+    ]);
   });
 });
