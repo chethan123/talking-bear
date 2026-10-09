@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { GCProfiler, setFlagsFromString } from 'node:v8';
-import { runInNewContext } from 'node:vm';
+import { runInNewContext, runInThisContext } from 'node:vm';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
@@ -14,13 +14,16 @@ import { sampleClip } from './clip.ts';
 import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
 import {
+  CLIP_ANCHORS,
   clipByName,
+  CUT_CLIP_ANCHORS,
   directorReduce,
   directorStep,
   evaluate,
   evaluateFrom,
   initialDirector,
   mouthCloseScale,
+  REACTION_ANCHORS,
 } from './director.ts';
 import type { DirectorState, DirInput, DirOut, DirState, GestureKind } from './director.ts';
 import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
@@ -2529,6 +2532,67 @@ const outgoing = (before: DirectorState, after: DirectorState): DirectorState =>
 
 /** `evaluate(s, now)` into a fresh pose. */
 const poseAt = (s: DirectorState, now: number): Pose => evaluate(s, now, createPose());
+
+/** V8's `%HaveSameMap`, through natives syntax (enabled at run time, as `--expose-gc` is for the heap tests). */
+function sameMapFn(): (a: unknown, b: unknown) => boolean {
+  setFlagsFromString('--allow-natives-syntax');
+  const f: unknown = runInThisContext('(function (a, b) { return %HaveSameMap(a, b); })');
+  if (typeof f !== 'function') throw new Error('%HaveSameMap is not available');
+  return (a, b) => f(a, b) === true;
+}
+
+describe('#281: clips, reactions and cut clips share the hidden classes their anchors keep alive', () => {
+  it("every clip slot object (wake, an additive clip, a start, a refresh restart, both flinches) has the last clip anchor's class", () => {
+    const sameMap = sameMapFn();
+    const idle = stateIn('Idle');
+    const refreshed = stepAll(idle, ...tickles(11, 5)).s;
+    // The last tickle's refresh restarted giggle: its clip is newer than its reaction.
+    expect(refreshed.clip!.start).toBeGreaterThan(refreshed.reaction!.start);
+    const fixtures: [string, DirectorState][] = [
+      ['wake', playing('wake')],
+      ['additive confused', playing('confused')],
+      ['a started sneeze', stepAll(idle, noseTap(11)).s],
+      ['a refresh restart', refreshed],
+      ['the flinch of a tap', stepAll(stateIn('Talking'), gest('cheekPuffR', 'cheekR', 'tap', 11)).s],
+      ['the flinch of a clip input', stepAll(stateIn('Talking'), clipIn('cuppedEar', 11)).s],
+    ];
+    for (const [label, s] of fixtures) {
+      expect(s.clip, label).not.toBeNull();
+      expect(sameMap(s.clip, CLIP_ANCHORS.at(-1)), label).toBe(true);
+    }
+  });
+
+  it("every reaction (started with and without a gesture, refreshed, released) has the last reaction anchor's class", () => {
+    const sameMap = sameMapFn();
+    const idle = stateIn('Idle');
+    const refreshed = stepAll(idle, ...tickles(11, 5)).s.reaction;
+    const released = stepAll(idle, petStroke(11), release(12)).s.reaction;
+    expect(refreshed!.last).toBeGreaterThan(refreshed!.start);
+    expect(released!.release).toBe(12);
+    const fixtures: [string, DirectorState['reaction']][] = [
+      ['a started sneeze', stepAll(idle, noseTap(11)).s.reaction],
+      ['a clip input (no gesture)', stepAll(idle, clipIn('cuppedEar', 11)).s.reaction],
+      ['a refreshed giggle', refreshed],
+      ['a released pet', released],
+    ];
+    for (const [label, a] of fixtures) {
+      expect(a, label).not.toBeNull();
+      expect(sameMap(a, REACTION_ANCHORS.at(-1)), label).toBe(true);
+    }
+  });
+
+  it("every prevClip, with and without a release, has the last cut-clip anchor's class", () => {
+    const sameMap = sameMapFn();
+    let released = 0;
+    for (const { label, before, input } of cuts()) {
+      const p = stepAll(before, input).s.prevClip;
+      expect(p, label).not.toBeNull();
+      if (p?.release !== null) released++;
+      expect(sameMap(p, CUT_CLIP_ANCHORS.at(-1)), label).toBe(true);
+    }
+    expect(released, 'a cut with a release').toBeGreaterThan(0);
+  });
+});
 
 describe('#240: a clip cut while playing crossfades out over 100 ms', () => {
   it("evaluate at the cut equals the outgoing clip's pose (±1e-6), where the incoming clip alone would jump", () => {
