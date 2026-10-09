@@ -326,7 +326,7 @@ export class SessionSim {
       { t: 'takeFailed', epoch: oldEpoch, id: s.takeId },
       { t: 'takeFailed', epoch: s.epoch, id: oldId },
       { t: 'takeFailed', epoch: oldEpoch, id: oldId },
-      { t: 'processed', id: oldId, durationSec: 1 },
+      { t: 'processed', id: oldId, durationSec: 1, clipped: false },
       { t: 'fxError', id: oldId },
     ];
     // An older request, and the current one once closeMic has cancelled it unanswered.
@@ -417,7 +417,13 @@ export class SessionSim {
       case 'process': {
         if (this.lost()) break;
         const durationSec = MIN_DURATION_SEC + this.rng() * (MAX_DURATION_SEC - MIN_DURATION_SEC);
-        this.schedule(this.now + PROCESSED_MS, { t: 'processed', id: fx.id, durationSec });
+        // #117: every other take is clipped, by id (no rng draw), so row 28 runs with and without lastClipped.
+        this.schedule(this.now + PROCESSED_MS, {
+          t: 'processed',
+          id: fx.id,
+          durationSec,
+          clipped: fx.id % 2 === 0,
+        });
         break;
       }
       case 'play': {
@@ -620,7 +626,13 @@ export class SessionSim {
       }
       case 'processed': {
         const id = stale ? older(s.takeId) : s.takeId;
-        return { t: kind, id, durationSec: MIN_DURATION_SEC + rng() * (MAX_DURATION_SEC - MIN_DURATION_SEC) };
+        // #117: clipped by id parity, with no rng draw, so every existing sequence is unchanged.
+        return {
+          t: kind,
+          id,
+          durationSec: MIN_DURATION_SEC + rng() * (MAX_DURATION_SEC - MIN_DURATION_SEC),
+          clipped: id % 2 === 0,
+        };
       }
       case 'fxError':
         return { t: kind, id: stale ? older(s.takeId) : s.takeId };

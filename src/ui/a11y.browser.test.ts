@@ -277,7 +277,7 @@ describe('the live region across real transitions (#118)', () => {
       }),
     ).toBe('Processing');
     expect(m.send({ t: 'clipReady', epoch: m.s.epoch, id: m.s.takeId })).toBe('Processing');
-    expect(m.send({ t: 'processed', id: m.s.takeId, durationSec: 1 })).toBe('Playing');
+    expect(m.send({ t: 'processed', id: m.s.takeId, durationSec: 1, clipped: false })).toBe('Playing');
     expect(m.send({ t: 'playbackAtSpeakerEnded', id: m.s.takeId })).toBe('Cooldown');
     expect(m.send({ t: 'timer', name: 'cooldown' })).toBe('Listening');
     // A reaction with a sound: SfxGated, Cooldown, Listening.

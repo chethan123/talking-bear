@@ -542,7 +542,7 @@ async function toListening(h: Harness): Promise<void> {
 const ramp = (n: number): Float32Array => Float32Array.from({ length: n }, (_, i) => i / n);
 
 /** From Listening: armed, seg start, seg end, clipReady, processed (with a stored result) → Playing. */
-function toPlaying(h: Harness, withResult = true): { id: number; pcm: Float32Array } {
+function toPlaying(h: Harness, withResult = true, clipped = false): { id: number; pcm: Float32Array } {
   const epoch = h.session.state().epoch;
   h.eng.emit({ t: 'armed', epoch, armFrame: 1000 });
   h.eng.emit({ t: 'seg', epoch, ev: { kind: 'start', frame: 48_000 } });
@@ -557,7 +557,7 @@ function toPlaying(h: Harness, withResult = true): { id: number; pcm: Float32Arr
   h.eng.emit({ t: 'clipReady', epoch, id });
   const pcm = ramp(4800);
   if (withResult) h.eng.finishProcess(id, pcm, 48_000);
-  h.eng.emit({ t: 'processed', id, durationSec: 0.0625 });
+  h.eng.emit({ t: 'processed', id, durationSec: 0.0625, clipped });
   return { id, pcm };
 }
 
@@ -1004,7 +1004,7 @@ describe('a processed result the reducer does not replay is released at once', (
     h.clock.advance(DEFAULT_CONFIG.processingMs);
     expect(stateOf(h)).toBe('Cooldown');
     h.eng.finishProcess(id, ramp(4800), 48_000);
-    h.eng.emit({ t: 'processed', id, durationSec: 0.1 });
+    h.eng.emit({ t: 'processed', id, durationSec: 0.1, clipped: false });
     expect(stateOf(h)).toBe('Cooldown');
     expect(h.player.plays).toEqual([]);
     expect(h.timeline).toContain(`release ${id}`);
@@ -1016,7 +1016,7 @@ describe('a processed result the reducer does not replay is released at once', (
     await toListening(h);
     const id = toProcessing(h);
     h.eng.finishProcess(id + 100, ramp(10), 48_000);
-    h.eng.emit({ t: 'processed', id: id + 100, durationSec: 0.1 });
+    h.eng.emit({ t: 'processed', id: id + 100, durationSec: 0.1, clipped: false });
     expect(stateOf(h)).toBe('Processing');
     expect(h.timeline).toContain(`release ${id + 100}`);
     expect(h.eng.engine.getProcessed(id + 100)).toBeUndefined();

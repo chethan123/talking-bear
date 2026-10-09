@@ -22,6 +22,7 @@ import {
   type EventType,
   type Overlay,
   type Permission,
+  type Priority,
   type SessionConfig,
   type SessionEvent,
   type SessionState,
@@ -61,6 +62,10 @@ export const TOO_NOISY_FLOOR_DB = -35;
 export const NOISY_VOICED_RATIO = 0.3;
 /** #116: this many consecutive noisy caps raise the margins (or, at the top boost, switch to hold-to-talk). */
 export const NOISY_CAPS = 3;
+/** #117 (plan §4.4, §7 M8): the reaction row 28 adds after the replay of a clipped take. */
+export const TOO_LOUD_REACTION = 'tooLoud';
+/** #117: tooLoud plays like a tap reaction (P2). */
+const TOO_LOUD_PRIORITY: Priority = 2;
 
 const HIDE_EVENTS: ReadonlySet<EventType> = new Set<EventType>(['hidden', 'pagehide', 'freeze']);
 
@@ -91,6 +96,7 @@ export function initialSessionState(permission: Permission): SessionState {
     updateReady: false,
     updateActivated: false,
     preset: PRESETS.cub,
+    lastClipped: false,
   };
 }
 
@@ -531,6 +537,7 @@ const processingProcessed: Handler<'processed'> = (s, e, cfg) =>
   e.id === s.takeId
     ? transitionTo(s, 'Playing', cfg, [{ k: 'play', id: e.id }, anim({ e: 'talk', id: e.id })], {
         playingId: e.id,
+        lastClipped: e.clipped, // #117: set by every accepted processed, read by row 28
       })
     : same(s);
 const processingTakeFailed: Handler<'takeFailed'> = (s, e, cfg) =>
@@ -539,8 +546,19 @@ const processingFxError: Handler<'fxError'> = (s, e, cfg) =>
   e.id === s.takeId ? toCooldownConfused(s, cfg) : same(s);
 const processingTimer: Handler<'timer'> = (s, e, cfg) =>
   e.name === 'processing' ? toCooldownConfused(s, cfg) : same(s);
+/**
+ * Row 28. #117: after the replay of a clipped take (`lastClipped`), also the playful tooLoud reaction (P2). It is an
+ * `anim` effect only, with no sfx, so the gate and the cooldown (the entry's `timer cooldown`) are unchanged.
+ */
 const playingEnded: Handler<'playbackAtSpeakerEnded'> = (s, e, cfg) =>
-  e.id === s.playingId ? transitionTo(s, 'Cooldown', cfg) : same(s); // row 28
+  e.id === s.playingId
+    ? transitionTo(
+        s,
+        'Cooldown',
+        cfg,
+        s.lastClipped ? [anim({ e: 'reaction', name: TOO_LOUD_REACTION, priority: TOO_LOUD_PRIORITY })] : [],
+      )
+    : same(s);
 
 // SfxGated and Cooldown (rows 34, 35, 35b).
 const sfxGatedSfxEnded: Handler<'sfxAtSpeakerEnded'> = (s, e, cfg) => {
