@@ -1,0 +1,37 @@
+# X-P4 (plan §5, §4.8.3 "Where headers live", Q5; issue #110): front Caddy → sidecar Caddy → the image, as the
+# monorepo deploys it. CI's compose-headers job builds bear:ci, then runs
+#   docker compose -f deploy/compose/compose.yml up -d && bash scripts/check-compose-headers.sh
+# caddy:2-alpine is pinned by its multi-arch index digest (2.11.7-alpine), resolved 2026-10-09 with
+# `docker buildx imagetools inspect caddy:2-alpine`.
+services:
+  app:
+    image: bear:ci
+    pull_policy: never # built by the CI job (or locally, docs/image.md); never pulled
+    # The production run flags (plan §4.8.2, docs/image.md).
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    user: '65532:65532'
+    pids_limit: 64
+    mem_limit: 64m
+    healthcheck:
+      test: ['CMD', '/bearserve', '-probe']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  sidecar:
+    image: caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+    volumes:
+      - ./Caddyfile.sidecar:/etc/caddy/Caddyfile:ro
+    depends_on:
+      app:
+        condition: service_healthy
+  front:
+    image: caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+    volumes:
+      - ./Caddyfile.front:/etc/caddy/Caddyfile:ro
+    ports:
+      - '8443:443'
+      - '8080:80'
+    depends_on:
+      - sidecar
