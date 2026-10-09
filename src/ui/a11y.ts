@@ -14,7 +14,9 @@
 //
 // **One region, outside main#app.** `liveRegion(doc)` finds or creates the single `div.a11y-live` at the end of
 // `document.body`, outside the overlay root, so the child overlays stay text-free (Q3, #115). styles.css hides it
-// visually without hiding it from assistive tech; it is never `hidden`.
+// visually without hiding it from assistive tech; it is never `hidden`. A new region stays empty for
+// `LIVE_REGION_EXPOSE_MS` before its first text, so it is registered before the boot announcement; a clear is
+// never deferred, and a held text is dropped if the state has moved on.
 //
 // **Icon overlays** are `role="status"` with an `aria-label` and an explicit `aria-live="off"`: `status` implies
 // `aria-live="polite"`, and the mic-muted and too-noisy badges are shown in Listening, so without the explicit off
@@ -61,13 +63,33 @@ const LIVE_REGION_ATTR = 'data-a11y-live';
 
 export interface LiveRegion {
   readonly element: HTMLElement;
-  /** Sets the region's text; writes only when it differs, so a repeated text causes no mutation. */
+  /**
+   * Sets the region's text; writes only when it differs, so a repeated text causes no mutation. While the region is
+   * new (`ready` pending) a non-empty text is held and written when it resolves, if no later `say` replaced or
+   * cleared it; a clear ('') is never deferred.
+   */
   say(text: string): void;
+  /** Resolves once the region has been exposed (empty) for `LIVE_REGION_EXPOSE_MS` and any held text written. */
+  readonly ready: Promise<void>;
 }
 
 /**
+ * How long a new region stays empty before its first text (#295 review): screen readers register a polite region
+ * when the empty node is exposed, so text written in the task that creates it (the boot "Juni is asleep") can go
+ * unannounced. A fixed timeout, not rAF: it runs while frames are throttled or paused, and 100 ms spans several
+ * rendering lifecycles and Chromium's accessibility-tree updates. Only the boot announcement waits (the mic is
+ * closed then); the region is created once per document.
+ */
+export const LIVE_REGION_EXPOSE_MS = 100;
+
+/** Per region: the held text while it is new, and the promise that resolves once it is exposed. */
+const pending = new WeakMap<HTMLElement, string>();
+const exposing = new WeakMap<HTMLElement, Promise<void>>();
+
+/**
  * The document's one live region: the element marked `data-a11y-live`, or a new
- * `div.a11y-live[aria-live=polite][aria-atomic=true]` appended to `doc.body`. Every caller shares it.
+ * `div.a11y-live[aria-live=polite][aria-atomic=true]` appended to `doc.body`, empty until `LIVE_REGION_EXPOSE_MS`
+ * has passed. Every caller shares it.
  */
 export function liveRegion(doc: Document = document): LiveRegion {
   let el = doc.querySelector<HTMLElement>(`[${LIVE_REGION_ATTR}]`);
@@ -78,12 +100,34 @@ export function liveRegion(doc: Document = document): LiveRegion {
     el.setAttribute('aria-live', 'polite');
     el.setAttribute('aria-atomic', 'true');
     doc.body.append(el);
+    const created = el;
+    exposing.set(
+      created,
+      new Promise<void>((resolve) => {
+        setTimeout(() => {
+          exposing.delete(created);
+          const text = pending.get(created);
+          pending.delete(created);
+          // Only the latest wish is written: a `say` since then has replaced it, or a clear dropped it.
+          if (text !== undefined && created.textContent !== text) created.textContent = text;
+          resolve();
+        }, LIVE_REGION_EXPOSE_MS);
+      }),
+    );
   }
   const element = el;
   return {
     element,
     say(text) {
+      if (exposing.has(element) && text !== '') {
+        pending.set(element, text); // held until the region is exposed
+        return;
+      }
+      pending.delete(element);
       if (element.textContent !== text) element.textContent = text;
+    },
+    get ready() {
+      return exposing.get(element) ?? Promise.resolve();
     },
   };
 }

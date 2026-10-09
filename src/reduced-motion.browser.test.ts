@@ -121,7 +121,7 @@ describe('boot: reduced motion and Gentle mode (#118)', () => {
     expect(view.director().gentle).toBe(false);
   });
 
-  test('the booted app: the canvas is "Juni the bear", one live region, reading the Asleep text', async () => {
+  test('the booted app: the canvas is "Juni the bear", one live region, empty at boot, then the Asleep text', async () => {
     stubMotion(false);
     const { root, view } = await bootBear();
     expect(root.querySelector('canvas.stage')).toBe(view.canvas);
@@ -133,6 +133,9 @@ describe('boot: reduced motion and Gentle mode (#118)', () => {
     expect(live).toHaveLength(1);
     expect(live[0]?.hasAttribute('data-a11y-live')).toBe(true);
     expect(root.contains(live[0]!)).toBe(false);
-    expect(live[0]?.textContent).toBe(ANNOUNCEMENTS.Asleep);
+    // Created during boot and still empty when boot returns: the screen reader registers the empty region first
+    // (#295 review); the Asleep text follows once it has been exposed.
+    expect(live[0]?.textContent).toBe('');
+    await vi.waitFor(() => expect(live[0]?.textContent).toBe(ANNOUNCEMENTS.Asleep), { timeout: 2_000 });
   });
 });

@@ -10,7 +10,7 @@ import { cdp } from 'vitest/browser';
 import type { Overlay, Permission, SessionEvent, SessionState, StateName } from '../app/events.ts';
 import { initialSessionState, overlayFor, reduce, TABLE } from '../app/machine.ts';
 import { createSettingsStore } from '../app/settings.ts';
-import { A11Y_TEXT, ANNOUNCEMENTS, announcementFor, LIVE_REGION_CLASS } from './a11y.ts';
+import { A11Y_TEXT, ANNOUNCEMENTS, announcementFor, LIVE_REGION_CLASS, liveRegion } from './a11y.ts';
 import { mountOverlay } from './overlay.ts';
 import { mountSettingsSheet, SETTINGS_TEXT, type SheetPwa } from './settings-sheet.ts';
 import './styles.css';
@@ -24,8 +24,11 @@ function newRoot(): HTMLElement {
   return root;
 }
 
-beforeEach(() => {
+// Every test starts with a fresh region that has already been exposed (a new one holds its first text for
+// LIVE_REGION_EXPOSE_MS), so the transitions below read it synchronously; "a new region" tests remove it first.
+beforeEach(async () => {
   for (const el of document.querySelectorAll('[data-a11y-live]')) el.remove();
+  await liveRegion().ready;
 });
 
 afterEach(() => {
@@ -378,6 +381,52 @@ describe('the live region across real transitions (#118)', () => {
     expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep);
     expect(c.send({ t: 'settingsRetry' })).toBe('Waking');
     expect(region().textContent).toBe('');
+  });
+});
+
+describe('a new region is exposed empty before its first text (#295 review)', () => {
+  beforeEach(() => {
+    for (const el of document.querySelectorAll('[data-a11y-live]')) el.remove();
+  });
+
+  test('the first announcement waits until the empty region has been exposed', async () => {
+    const root = newRoot();
+    const show = mountOverlay(root, vi.fn());
+    show('tapToWake'); // as boot does, in the task that creates the region
+    const r = region();
+    expect(r.textContent).toBe('');
+    const records = watch(r);
+    await liveRegion().ready;
+    expect(r.textContent).toBe(ANNOUNCEMENTS.Asleep);
+    expect(records().flatMap((m) => Array.from(m.addedNodes, (n) => n.textContent))).toEqual([
+      ANNOUNCEMENTS.Asleep,
+    ]);
+  });
+
+  test('leaving the state before then writes nothing: the held text is dropped', async () => {
+    const root = newRoot();
+    const show = mountOverlay(root, vi.fn());
+    show('tapToWake');
+    const r = region();
+    const records = watch(r);
+    show(null); // Waking, before the region was exposed
+    await liveRegion().ready;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(records()).toHaveLength(0); // no text ever reached the region
+    expect(r.textContent).toBe('');
+  });
+
+  test('a later announcement replaces a held one; a clear is written at once', async () => {
+    const root = newRoot();
+    const show = mountOverlay(root, vi.fn());
+    show('tapToWake');
+    show('micHelp');
+    const r = region();
+    expect(r.textContent).toBe('');
+    await liveRegion().ready;
+    expect(r.textContent).toBe(ANNOUNCEMENTS.MicDenied);
+    show(null);
+    expect(r.textContent).toBe('');
   });
 });
 
