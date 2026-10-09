@@ -701,8 +701,10 @@ describe('#289: the noise floor estimate over the fixtures and a sustained vowel
     }
   });
 
-  // Up to 1.5 s: the hold-off leaves no full counted window of vowel. A steady 2 s vowel at −20 dBFS can set the flag
-  // on Silero (−23.8 dBFS), whose onset comes earliest; that residual is recorded in the PR (ORCH-PLAN v2 D6).
+  // Up to 1.5 s: the hold-off leaves no full counted window of vowel. The measured residual is energy-only: a voiced
+  // sound held ≥ 2.1 s at ≥ −30 dBFS sets the flag from Recording at about 3.06 s; 1.8 and 2.0 s don't. On Silero,
+  // the −23.8 dBFS reading for a 2 s vowel at −20 dBFS is set in Listening at 2790 ms, the same as on main before
+  // #309, so #289 doesn't cause it (code review 6086706417 on #309).
   const vowels = [1.2, 1.5].flatMap((d) => BACKENDS.map((b): [number, number, Backend] => [d, -20, b]));
   it.each(vowels)(
     'a sustained /a/ of %f s at %f dBFS RMS on %s never sets the flag (ORCH-NOTE 6085389040)',

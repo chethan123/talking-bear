@@ -1528,7 +1528,6 @@ describe('#277: an Asleep wake after another tab activated the update reloads in
 });
 
 // ---- #116: noisy room (too-noisy hint, margin raises) and hold-to-talk ---------------------------------------
-/** #116: a current seg end of Recording (lastSpeechFrame 190 000), with or without a voiced ratio. */
 /** #289: a Recording misfire; `reason` null leaves the field out, `voicedRatio` undefined leaves it out. */
 const capMisfire = (
   voicedRatio?: number,
@@ -1547,6 +1546,7 @@ const noisyFields = (x: SessionState) => ({
   marginBoostDb: x.marginBoostDb,
   holdToTalk: x.holdToTalk,
 });
+/** #116: a current seg end of Recording (lastSpeechFrame 190 000), with or without a voiced ratio. */
 const end116 = (reason: 'silence' | 'maxLength', voicedRatio?: number): SessionEvent =>
   seg(
     EPOCH,
