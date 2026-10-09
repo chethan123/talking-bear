@@ -81,8 +81,8 @@ export type SessionEvent =
   | { t: 'updateReady'; activated?: true } // activated: another tab activated the update (#277)
   // M3 settings (issue #66): the voice preset the next `process` uses. Every state updates `preset`, no effects.
   | { t: 'settingsChanged'; preset: VoicePreset }
-  // #116, plan §4.4: the background level estimate (effects.ts, at most once per second while Listening); every
-  // state updates `tooNoisy`.
+  // #116, #289, plan §4.4: the background level estimate (effects.ts: at most once per second, from Listening
+  // levels and from Recording levels after NOISE_FLOOR_RECORDING_HOLDOFF_MS); every state updates `tooNoisy`.
   | { t: 'noiseFloor'; floorDb: number }
   // #116: the hold-to-talk button pressed / released, at ctx frame `frame` (the capture worklet's frame clock).
   | { t: 'holdStart'; frame: number }
