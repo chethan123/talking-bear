@@ -75,6 +75,12 @@ const energyWalkArb = fc.record({
     NOISY_START,
   ),
 });
+/** #289: the noisy-mode fields a capped end or misfire changes. */
+const noisyFields = (x: SessionState) => ({
+  noisyCaps: x.noisyCaps,
+  marginBoostDb: x.marginBoostDb,
+  holdToTalk: x.holdToTalk,
+});
 /** Property 4 also loses some environment answers, so the waking and processing timeouts fire. */
 const lossyWalkArb = fc.record({ ...walkFields, lossRate: fc.constantFrom(0, 0.1) });
 
@@ -575,11 +581,6 @@ describe('session reducer properties (plan §4.9.1)', () => {
     let otherMisfires = 0; // every other current-epoch Recording misfire
     let raises = 0; // margin raises by a misfire
     let holds = 0; // hold-to-talk entries by a misfire
-    const pick = (x: SessionState) => ({
-      noisyCaps: x.noisyCaps,
-      marginBoostDb: x.marginBoostDb,
-      holdToTalk: x.holdToTalk,
-    });
     fc.assert(
       fc.property(energyWalkArb, (w) => {
         runWalk(
@@ -606,10 +607,13 @@ describe('session reducer properties (plan §4.9.1)', () => {
                   },
                 }).state
               : t.prev;
-            if (t.next.name !== 'Listening' || JSON.stringify(pick(t.next)) !== JSON.stringify(pick(want))) {
+            if (
+              t.next.name !== 'Listening' ||
+              JSON.stringify(noisyFields(t.next)) !== JSON.stringify(noisyFields(want))
+            ) {
               fail(
                 sim,
-                `P13: ${fmt(e)} in Recording gave ${t.next.name} ${JSON.stringify(pick(t.next))}, want Listening ${JSON.stringify(pick(want))}`,
+                `P13: ${fmt(e)} in Recording gave ${t.next.name} ${JSON.stringify(noisyFields(t.next))}, want Listening ${JSON.stringify(noisyFields(want))}`,
               );
             }
             if (capped) capMisfires++;

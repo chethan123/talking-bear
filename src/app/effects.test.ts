@@ -600,7 +600,7 @@ const FIXTURES: string[] = ['../../test/fixtures/', '../../e2e/fixtures/']
       .filter((f) => f.endsWith('.wav'))
       .map((f) => `${dir.slice('../../'.length)}${f}`),
   )
-  .sort();
+  .toSorted();
 const NOISE_FIXTURE = 'e2e/fixtures/noise_pink_-20dbfs_20s.wav';
 const BACKENDS = ['silero', 'energy'] as const;
 type Backend = (typeof BACKENDS)[number];

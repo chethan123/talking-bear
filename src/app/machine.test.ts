@@ -1529,6 +1529,24 @@ describe('#277: an Asleep wake after another tab activated the update reloads in
 
 // ---- #116: noisy room (too-noisy hint, margin raises) and hold-to-talk ---------------------------------------
 /** #116: a current seg end of Recording (lastSpeechFrame 190 000), with or without a voiced ratio. */
+/** #289: a Recording misfire; `reason` null leaves the field out, `voicedRatio` undefined leaves it out. */
+const capMisfire = (
+  voicedRatio?: number,
+  reason: 'maxLength' | null = 'maxLength',
+  epoch = EPOCH,
+): SessionEvent =>
+  seg(epoch, {
+    kind: 'misfire',
+    frame: 150_000,
+    ...(reason === null ? {} : { reason }),
+    ...(voicedRatio === undefined ? {} : { voicedRatio }),
+  });
+/** #289: the noisy-mode fields a capped end or misfire changes. */
+const noisyFields = (x: SessionState) => ({
+  noisyCaps: x.noisyCaps,
+  marginBoostDb: x.marginBoostDb,
+  holdToTalk: x.holdToTalk,
+});
 const end116 = (reason: 'silence' | 'maxLength', voicedRatio?: number): SessionEvent =>
   seg(
     EPOCH,
@@ -1748,19 +1766,6 @@ describe('#116: noisy room and hold-to-talk', () => {
     }
   });
 
-  /** #289: a Recording misfire; `reason` null leaves the field out, `voicedRatio` undefined leaves it out. */
-  const capMisfire = (
-    voicedRatio?: number,
-    reason: 'maxLength' | null = 'maxLength',
-    epoch = EPOCH,
-  ): SessionEvent =>
-    seg(epoch, {
-      kind: 'misfire',
-      frame: 150_000,
-      ...(reason === null ? {} : { reason }),
-      ...(voicedRatio === undefined ? {} : { voicedRatio }),
-    });
-
   it('row 21 (#289): a capped misfire with a voiced ratio below 0.3 counts as a noisy cap; any other misfire leaves the counter', () => {
     const s = stateIn('Recording', { noisyCaps: 1 });
     const capsAfter = (e: SessionEvent): number => run(s, e).state.noisyCaps;
@@ -1781,11 +1786,6 @@ describe('#116: noisy room and hold-to-talk', () => {
   });
 
   it('row 21 (#289): the third noisy capped misfire escalates exactly as a capped end does', () => {
-    const pick = (x: SessionState) => ({
-      noisyCaps: x.noisyCaps,
-      marginBoostDb: x.marginBoostDb,
-      holdToTalk: x.holdToTalk,
-    });
     const overs: Partial<SessionState>[] = [
       { noisyCaps: 2 },
       { noisyCaps: 2, marginBoostDb: 3 },
@@ -1796,7 +1796,7 @@ describe('#116: noisy room and hold-to-talk', () => {
     for (const over of overs) {
       const m = run(stateIn('Recording', over), capMisfire(0.1)).state;
       const n = run(stateIn('Recording', over), end116('maxLength', 0.1)).state;
-      expect(pick(m), JSON.stringify(over)).toStrictEqual(pick(n));
+      expect(noisyFields(m), JSON.stringify(over)).toStrictEqual(noisyFields(n));
     }
     const listen = { epoch: EPOCH + 1, armFrame: null, onsetFrame: null };
     expectStep(
