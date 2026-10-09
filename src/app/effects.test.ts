@@ -294,6 +294,15 @@ describe('noise floor estimate (#116)', () => {
     expect(h.floors).toEqual([-24, -30]);
   });
 
+  it('#288: ±Infinity levels are digital silence, as in the energy gate', () => {
+    const h = harness();
+    feedLevels(h, 35, () => Number.POSITIVE_INFINITY, -30);
+    expect(h.floors).toEqual([-100]); // not max(Infinity, N)
+    h.clock.advance(30);
+    feedLevels(h, 35, () => Number.NEGATIVE_INFINITY, -30);
+    expect(h.floors).toEqual([-100, -100]);
+  });
+
   it('only Listening levels of the current epoch count; leaving Listening or a new epoch restarts the window', () => {
     const h = harness();
     feedLevels(h, 20, () => -24); // 570 ms

@@ -278,7 +278,9 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
       return;
     }
     const silent = DEFAULT_ENERGY_PARAMS.ignoreBelowDb;
-    const db = e.db >= silent ? e.db : silent; // digital silence (and NaN) reads as the gate's silence level
+    // Digital silence and every non-finite level (NaN, ±Infinity) read as the gate's silence level: the same
+    // predicate as energyGateStep's step 1 (src/dsp/energy-gate.ts:91).
+    const db = Number.isFinite(e.db) && e.db >= silent ? e.db : silent;
     const now = clock.now();
     if (!winOpen || winEpoch !== e.epoch) {
       winOpen = true;
