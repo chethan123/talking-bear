@@ -124,7 +124,7 @@ const end = (reason: 'silence' | 'maxLength'): SessionEvent => ({
   epoch: 1,
   ev: { kind: 'end', frame: 2, lastSpeechFrame: 1, reason },
 });
-const PROCESSED: SessionEvent = { t: 'processed', id: 1, durationSec: 1 };
+const PROCESSED: SessionEvent = { t: 'processed', id: 1, durationSec: 1, clipped: false };
 
 /** The wake: Waking → Listening, with the listen's `arm`. */
 function wake(page: BootCall): void {

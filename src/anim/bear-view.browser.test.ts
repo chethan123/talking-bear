@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
 import type { AnimEvent, SessionEvent, SfxId, StateName } from '../app/events.ts';
-import { AWAKE } from '../app/machine.ts';
+import { AWAKE, TOO_LOUD_REACTION } from '../app/machine.ts';
 import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import type { Gesture } from '../input/recognizer.ts';
@@ -29,6 +29,7 @@ import {
   mountBearView,
   REDUCED_MOTION_MIN_ZETA,
   REDUCED_MOTION_SCALE,
+  TOO_LOUD_CLIP,
   type BearView,
   type BearViewDeps,
 } from './bear-view.ts';
@@ -2031,5 +2032,54 @@ describe('#115: the cupped-ear mime in MicDenied', () => {
     const rest = starts[0]! + CUP_S + 0.1 - h.clock.t / 1000;
     if (rest > 0) runFor(h, rest);
     expect(h.view.director().name).toBe('Idle');
+  });
+});
+
+// ---- #117: the session's tooLoud reaction ---------------------------------------------------------------------------
+
+describe("#117: the session's tooLoud reaction", () => {
+  const LOUD = { e: 'reaction', name: 'tooLoud', priority: 2 } as const;
+
+  test('TOO_LOUD_CLIP and TOO_LOUD_REACTION are tooLoud', () => {
+    expect(TOO_LOUD_CLIP).toBe('tooLoud');
+    expect(TOO_LOUD_REACTION).toBe('tooLoud');
+  });
+
+  test("row 28's effects (talkEnd, then the reaction) play tooLoud as a P2 reaction, then Idle; nothing reaches the session", () => {
+    const h = harness();
+    h.session.state = 'Playing';
+    toThinking(h);
+    h.anim({ e: 'talk', id: 1 });
+    h.run(3);
+    expect(h.view.director().name).toBe('Talking');
+    h.session.state = 'Cooldown';
+    h.anim({ e: 'talkEnd' });
+    h.anim(LOUD);
+    const d = h.view.director();
+    expect(d.name).toBe('Reacting');
+    expect(d.clip?.name).toBe('tooLoud');
+    expect(d.reaction?.r.priority).toBe(2);
+    runFor(h, MIME_CLIPS.tooLoud.duration + 0.1);
+    expect(h.view.director().name).toBe('Idle');
+    expect(h.view.director().clip).toBeNull();
+    expect(h.dispatch).not.toHaveBeenCalled();
+  });
+
+  test('reduced motion (or Gentle mode) plays tooLoudGentle', () => {
+    const h = harness();
+    h.session.state = 'Cooldown';
+    h.view.setReducedMotion(true);
+    toIdle(h);
+    h.anim(LOUD);
+    expect(h.view.director().clip?.name).toBe('tooLoudGentle');
+  });
+
+  test('any other session reaction stays ignored (#91)', () => {
+    const h = harness();
+    h.session.state = 'Listening';
+    toIdle(h);
+    const before = h.view.director();
+    h.anim({ e: 'reaction', name: 'sneeze', priority: 2 });
+    expect(h.view.director()).toBe(before);
   });
 });

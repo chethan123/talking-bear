@@ -82,7 +82,7 @@ test("capture re-anchor rule: only the take's epoch counts; the step to the next
 
 /** A session step carrying `e` (only the event matters to reanchorAfterLoop). */
 function stepOf(e: SessionEvent): Step {
-  return { t: 0, frame: 0, from: 'Listening', to: 'Listening', event: e.t, effects: [], e };
+  return { t: 0, frame: 0, from: 'Listening', to: 'Listening', event: e.t, effects: [], anims: [], e };
 }
 
 test('capture re-anchor after a failed loop: every epoch armed since wake is searched, with no window', () => {

@@ -18,6 +18,7 @@ import {
   GATED,
   MIC_OPEN,
   TABLE,
+  TOO_LOUD_REACTION,
   WAKE_LOCK_HELD,
   initialSessionState,
   overlayFor,
@@ -133,6 +134,10 @@ const openMic = (req: number): Effect => ({ k: 'openMic', req });
 const disarm = (epoch: number): Effect => ({ k: 'disarm', epoch });
 const sfx = (seq: number): Effect => ({ k: 'sfx', id: 'testBeep', seq });
 
+/** #117: the effects other than `anim`. */
+const notAnim = (fx: Effect[]): Effect[] => fx.filter((f) => f.k !== 'anim');
+/** #117: row 28's tooLoud reaction after the replay of a clipped take. */
+const TOO_LOUD: Effect = { k: 'anim', ev: { e: 'reaction', name: 'tooLoud', priority: 2 } };
 const SLEEP_T = timer('sleep', 120_000);
 const DOZE_T = timer('doze', 45_000);
 const WAKING_T = timer('waking', 5_000);
@@ -433,7 +438,7 @@ describe('plan §3.4 rows', () => {
   it('row 25: Processing + processed → Playing', () => {
     expectStep(
       stateIn('Processing'),
-      { t: 'processed', id: TAKE, durationSec: 1.5 },
+      { t: 'processed', id: TAKE, durationSec: 1.5, clipped: false },
       'Playing',
       [cancel('processing'), { k: 'play', id: TAKE }, { k: 'anim', ev: { e: 'talk', id: TAKE } }],
       { playingId: TAKE },
@@ -463,6 +468,81 @@ describe('plan §3.4 rows', () => {
       'Cooldown',
       [anim('talkEnd'), COOLDOWN_T],
       { playingId: null },
+    );
+  });
+
+  it('row 25 (#117): processed stores lastClipped from clipped; the next processed resets it', () => {
+    const fx: Effect[] = [
+      cancel('processing'),
+      { k: 'play', id: TAKE },
+      { k: 'anim', ev: { e: 'talk', id: TAKE } },
+    ];
+    expectStep(
+      stateIn('Processing'),
+      { t: 'processed', id: TAKE, durationSec: 1.5, clipped: true },
+      'Playing',
+      fx,
+      {
+        playingId: TAKE,
+        lastClipped: true,
+      },
+    );
+    expectStep(
+      stateIn('Processing', { lastClipped: true }),
+      { t: 'processed', id: TAKE, durationSec: 1.5, clipped: false },
+      'Playing',
+      fx,
+      { playingId: TAKE, lastClipped: false },
+    );
+    expectIgnored(stateIn('Processing'), { t: 'processed', id: TAKE - 1, durationSec: 1.5, clipped: true });
+  });
+
+  it('row 28 (#117): with lastClipped, also anim reaction tooLoud (P2) after talkEnd; no sfx, and the cooldown is unchanged', () => {
+    expect(TOO_LOUD_REACTION).toBe('tooLoud');
+    const ended: SessionEvent = { t: 'playbackAtSpeakerEnded', id: TAKE };
+    const clean = run(stateIn('Playing'), ended);
+    const loud = expectStep(
+      stateIn('Playing', { lastClipped: true }),
+      ended,
+      'Cooldown',
+      [anim('talkEnd'), TOO_LOUD, COOLDOWN_T],
+      { playingId: null },
+    );
+    expect(notAnim(loud.effects)).toStrictEqual(notAnim(clean.effects));
+    expect({ ...loud.state, lastClipped: false }).toStrictEqual(clean.state);
+    expect(run(loud.state, tmr('cooldown')).effects).toStrictEqual(run(clean.state, tmr('cooldown')).effects);
+  });
+
+  it('row 28 (#117) in a noisy room: tooNoisy and hold-to-talk change nothing (no ui effect)', () => {
+    const overs: Partial<SessionState>[] = [
+      { tooNoisy: true },
+      { tooNoisy: true, holdToTalk: true, marginBoostDb: 6 },
+    ];
+    for (const over of overs) {
+      expectStep(
+        stateIn('Playing', { lastClipped: true, ...over }),
+        { t: 'playbackAtSpeakerEnded', id: TAKE },
+        'Cooldown',
+        [anim('talkEnd'), TOO_LOUD, COOLDOWN_T],
+        { playingId: null },
+      );
+    }
+  });
+
+  it('rows 29–30 (#117): an interrupted clipped replay plays no tooLoud', () => {
+    expectStep(
+      stateIn('Playing', { lastClipped: true }),
+      reaction(3, true),
+      'SfxGated',
+      [anim('talkEnd'), STOP, sfx(SEQ + 1), reactionAnim(3)],
+      { playingId: null, sfxEndedSeq: SEQ, sfxSeq: SEQ + 1 },
+    );
+    expectStep(
+      stateIn('Playing', { lastClipped: true }),
+      reaction(4, false),
+      'Cooldown',
+      [anim('talkEnd'), STOP, reactionAnim(4), COOLDOWN_T],
+      { playingId: null, sfxEndedSeq: SEQ },
     );
   });
 
@@ -654,7 +734,7 @@ describe('plan §3.4 rows', () => {
       ['Processing', { t: 'clipReady', epoch: EPOCH, id: TAKE - 1 }],
       ['Processing', { t: 'takeFailed', epoch: EPOCH - 1, id: TAKE }],
       ['Processing', { t: 'takeFailed', epoch: EPOCH, id: TAKE - 1 }],
-      ['Processing', { t: 'processed', id: TAKE - 1, durationSec: 1 }],
+      ['Processing', { t: 'processed', id: TAKE - 1, durationSec: 1, clipped: false }],
       ['Processing', { t: 'fxError', id: TAKE - 1 }],
       ['Playing', { t: 'playbackAtSpeakerEnded', id: TAKE - 1 }],
       ['Waking', { t: 'micGranted', req: REQ - 1 }],
@@ -952,7 +1032,7 @@ describe('clarifications C1–C12', () => {
     const p = stateIn('Processing');
     expectIgnored(p, { t: 'clipReady', epoch: EPOCH, id: TAKE + 1 });
     expectIgnored(p, { t: 'fxError', id: TAKE + 1 });
-    const playing = run(p, { t: 'processed', id: TAKE, durationSec: 2 }).state;
+    const playing = run(p, { t: 'processed', id: TAKE, durationSec: 2, clipped: false }).state;
     expect(playing.playingId).toBe(TAKE);
     expectIgnored(playing, { t: 'playbackAtSpeakerEnded', id: TAKE + 1 });
     // Every way out of Playing clears playingId.
@@ -1678,7 +1758,10 @@ const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
   floorSnapshot: (s) => [{ t: 'floorSnapshot', epoch: s.epoch, floorDb: -44 }],
   clipReady: (s) => [{ t: 'clipReady', epoch: s.epoch, id: s.takeId }],
   takeFailed: (s) => [{ t: 'takeFailed', epoch: s.epoch, id: s.takeId }],
-  processed: (s) => [{ t: 'processed', id: s.takeId, durationSec: 1.2 }],
+  processed: (s) => [
+    { t: 'processed', id: s.takeId, durationSec: 1.2, clipped: false },
+    { t: 'processed', id: s.takeId, durationSec: 1.2, clipped: true },
+  ],
   fxError: (s) => [{ t: 'fxError', id: s.takeId }],
   playbackAtSpeakerEnded: (s) => [{ t: 'playbackAtSpeakerEnded', id: s.playingId ?? s.takeId }],
   sfxAtSpeakerEnded: (s) => [
@@ -1732,7 +1815,7 @@ const STALE: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
     { t: 'takeFailed', epoch: s.epoch - 1, id: s.takeId },
     { t: 'takeFailed', epoch: s.epoch, id: s.takeId - 1 },
   ],
-  processed: (s) => [{ t: 'processed', id: s.takeId - 1, durationSec: 1.2 }],
+  processed: (s) => [{ t: 'processed', id: s.takeId - 1, durationSec: 1.2, clipped: true }],
   fxError: (s) => [{ t: 'fxError', id: s.takeId - 1 }],
   playbackAtSpeakerEnded: (s) => [{ t: 'playbackAtSpeakerEnded', id: (s.playingId ?? s.takeId) - 1 }],
   sfxAtSpeakerEnded: () => [],
@@ -1808,6 +1891,7 @@ function variants(name: StateName): SessionState[] {
       noisyCaps: 2,
       marginBoostDb: 3,
       tooNoisy: true,
+      lastClipped: true, // #117: row 28 also adds the tooLoud reaction
     }),
     stateIn(name, { updateReady: true, updateActivated: true }), // #277: another tab activated the update
     // #116: hold-to-talk mode at the top boost, in a noisy room.
@@ -1976,6 +2060,7 @@ describe('initial state and config', () => {
       updateReady: false,
       updateActivated: false,
       preset: PRESETS.cub,
+      lastClipped: false,
     });
   });
 

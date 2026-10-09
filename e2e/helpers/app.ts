@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
-import type { Effect, SessionEvent, StateName } from '../../src/app/events.ts';
+import type { AnimEvent, Effect, SessionEvent, StateName } from '../../src/app/events.ts';
 import { ENERGY_HOP, VAD_RATE } from '../../src/audio/constants.ts';
 import { PRESETS } from '../../src/dsp/types.ts';
 import { yinF0 } from '../../src/dsp/yin.ts';
@@ -21,6 +21,8 @@ export interface LogEntry {
   to: StateName;
   event: SessionEvent['t'];
   effects: Effect['k'][];
+  /** #117: the step's anim effects' events, in order (a reaction's name included). */
+  anims: AnimEvent[];
 }
 
 /** A log entry together with the event that caused it: `log[i]` and `events[i]` are pushed by the same call. */

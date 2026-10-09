@@ -62,7 +62,8 @@ export type SessionEvent =
   | { t: 'floorSnapshot'; epoch: number; floorDb: number }
   | { t: 'clipReady'; epoch: number; id: number }
   | { t: 'takeFailed'; epoch: number; id: number }
-  | { t: 'processed'; id: number; durationSec: number }
+  // `clipped`: the worker's clipping flag (plan §4.4): the take had ≥ 0.1 % of its samples at |x| > 0.99 (#117).
+  | { t: 'processed'; id: number; durationSec: number; clipped: boolean }
   | { t: 'fxError'; id: number }
   | { t: 'playbackAtSpeakerEnded'; id: number }
   | { t: 'sfxAtSpeakerEnded'; seq: number }
@@ -148,6 +149,8 @@ export interface SessionState {
    */
   updateActivated: boolean;
   preset: VoicePreset;
+  /** #117: the latest accepted `processed` take was clipped; row 28 then adds the tooLoud reaction. */
+  lastClipped: boolean;
 }
 
 export interface SessionConfig {

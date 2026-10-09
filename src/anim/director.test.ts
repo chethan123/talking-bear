@@ -2408,6 +2408,73 @@ describe('#115: the clip input', () => {
   });
 });
 
+// ==== #117: the session's tooLoud reaction through the clip input =================================================
+/** tooLoud's length (s). */
+const LOUD_S = MIME_CLIPS.tooLoud.duration;
+
+describe('#117: tooLoud through the clip input', () => {
+  it('Validation 1: in Idle, {k:"clip", name:"tooLoud"} plays tooLoud as a quiet P2, then Idle', () => {
+    const r = directorStep(stateIn('Idle'), clipIn('tooLoud', 11));
+    expect(r.out).toStrictEqual([]);
+    expect(r.state.name).toBe('Reacting');
+    expect(r.state.clip).toStrictEqual({ name: 'tooLoud', start: 11 });
+    expect(r.state.reaction?.r).toStrictEqual({
+      name: 'tooLoud',
+      priority: 2,
+      sfx: null,
+      clip: 'tooLoud',
+      sustained: false,
+      gentleClip: 'tooLoudGentle',
+    });
+    const d = drive(stateIn('Idle'), [clipIn('tooLoud', 11)], 11 + LOUD_S + 0.1);
+    expect(d.out).toStrictEqual([]);
+    const last = d.states.filter((x) => x.s.clip?.name === 'tooLoud').at(-1);
+    expect(last?.at).toBeLessThan(11 + LOUD_S);
+    expect(d.s.name).toBe('Idle');
+    expect(d.s.clip).toBeNull();
+    expect(d.s.reaction).toBeNull();
+  });
+
+  it('Validation 1: with gentle on it plays tooLoudGentle; off, tooLoud', () => {
+    const on = directorReduce(run(stateIn('Idle'), gentle(true)), clipIn('tooLoud', 11));
+    expect(on.clip).toStrictEqual({ name: 'tooLoudGentle', start: 11 });
+    expect(on.reaction?.r.name).toBe('tooLoud');
+    expect(directorReduce(stateIn('Idle'), clipIn('tooLoud', 11)).clip?.name).toBe('tooLoud');
+  });
+
+  it("row 28's order: talkEnd, then the clip, plays the whole clip (in Talking it would be the flinch)", () => {
+    const s = run(stateIn('Talking'), anim({ e: 'talkEnd' }, 11), clipIn('tooLoud', 11));
+    expect(s.name).toBe('Reacting');
+    expect(s.clip).toStrictEqual({ name: 'tooLoud', start: 11 });
+    expect(directorReduce(stateIn('Talking'), clipIn('tooLoud', 11)).clip?.name).toBe('flinch');
+  });
+
+  it("the session's anim reaction tooLoud itself stays ignored by the director's table (#91)", () => {
+    const idle = stateIn('Idle');
+    expect(directorReduce(idle, anim({ e: 'reaction', name: 'tooLoud', priority: 2 }, 11))).toBe(idle);
+  });
+
+  it('it interrupts a P2 tap reaction with the #240 crossfade, and waits behind a held P3', () => {
+    const sneezing = stepAll(stateIn('Idle'), noseTap(11)).s;
+    expect(sneezing.clip?.name).toBe('sneeze');
+    const cut = directorStep(sneezing, clipIn('tooLoud', 11.2));
+    expect(cut.out).toStrictEqual([]);
+    expect(cut.state.clip).toStrictEqual({ name: 'tooLoud', start: 11.2 });
+    expect(cut.state.prevClip).toStrictEqual({ name: 'sneeze', start: 11, cutAt: 11.2, release: null });
+
+    const held = stepAll(stateIn('Idle'), gest('noseWrinkle', 'nose', 'longPress', 11)).s;
+    const q = directorStep(held, clipIn('tooLoud', 11.2));
+    expect(q.out).toStrictEqual([]);
+    expect(q.state.clip?.name).toBe('noseWrinkle');
+    expect(q.state.queued?.r.name).toBe('tooLoud');
+  });
+
+  it('clipByName knows both clips', () => {
+    expect(clipByName('tooLoud')).toBe(MIME_CLIPS.tooLoud);
+    expect(clipByName('tooLoudGentle')).toBe(MIME_CLIPS.tooLoudGentle);
+  });
+});
+
 describe('#91 allocation: quiet ticks and the release ease-out', () => {
   it('10 000 ticks while a reaction is held: the same state, and directorStep the same frozen result', () => {
     const s = heldPet();

@@ -298,7 +298,8 @@ export function createEngine(opts: {
           id: m.id,
           result: { pcm: m.pcm, sampleRate, envelope: m.envelope, durationSec: m.durationSec },
         };
-        emit({ t: 'processed', id: m.id, durationSec: m.durationSec });
+        // #117: `clipped` is the worker's clipping flag of the raw take (plan §4.4), passed through to row 28.
+        emit({ t: 'processed', id: m.id, durationSec: m.durationSec, clipped: m.clipped });
         break;
       }
       case 'error':

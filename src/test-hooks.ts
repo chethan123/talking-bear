@@ -3,7 +3,8 @@
 // dead-code-eliminate (`pnpm check:no-hooks` proves `__bearTest` is absent from dist/).
 //
 // - `log` / `events`: one entry per event the session reduced, including those that keep the state
-//   (from === to), so specs can also check effects such as "no `arm` while Playing".
+//   (from === to), so specs can also check effects such as "no `arm` while Playing". Each `log` entry also carries
+//   the step's anim events, so a spec can see a reaction's name (#117, ORCH-NOTE 6074844540 on #117).
 // - `setVisibility` drives the app's single visibility source (platform/visibility.ts).
 // - `maxLevelDb` / `levels`: the input level probe, from the engine's `level` events (frames and dB only, never
 //   audio). `levels` lets the loop specs tell a capture gap of the fake mic (digital silence) from a VAD result.
@@ -22,7 +23,7 @@
 
 import type { BearView, FrameLogEntry } from './anim/bear-view.ts';
 import { POSES, type PoseName } from './anim/poses.ts';
-import type { Effect, SessionEvent, SfxId, StateName } from './app/events.ts';
+import type { AnimEvent, Effect, SessionEvent, SfxId, StateName } from './app/events.ts';
 import type { LevelEvent, Session } from './app/session.ts';
 import tapUrl from './audio/test-tap.worklet.ts?worker&url';
 import { DEFAULT_VAD_BACKEND } from './audio/constants.ts';
@@ -39,6 +40,8 @@ export interface TransitionLogEntry {
   to: StateName;
   event: SessionEvent['t'];
   effects: Effect['k'][];
+  /** #117: the step's anim effects' events, in order (a reaction's name included). */
+  anims: AnimEvent[];
 }
 
 export interface EventLogEntry {
@@ -246,7 +249,15 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
 
   session.addTransitionListener((from, to, e, effects) => {
     const t = performance.now();
-    log.push({ t, frame: frameNow(), from, to, event: e.t, effects: effects.map((fx) => fx.k) });
+    log.push({
+      t,
+      frame: frameNow(),
+      from,
+      to,
+      event: e.t,
+      effects: effects.map((fx) => fx.k),
+      anims: effects.flatMap((fx) => (fx.k === 'anim' ? [fx.ev] : [])),
+    });
     events.push({ t, e });
     if (e.t === 'ctxRunning' && !tapStarted) {
       tapStarted = true;
