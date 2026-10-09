@@ -130,7 +130,8 @@ test('smoke: wake, one loop, no enforced CSP violation, offline reload', async (
   await expectNoEnforcedViolations(page);
 
   // 4. Once the service worker is ready and controls the page, a reload with the network off boots into Asleep
-  //    and the stage renders the bear.
+  //    and the stage renders the bear, with every response from the service worker: after the online loop the
+  //    HTTP cache is warm, so a response from anywhere else would hide a file missing from the precache.
   const ready = await page.evaluate(
     (ms) =>
       Promise.race([
@@ -144,6 +145,16 @@ test('smoke: wake, one loop, no enforced CSP violation, offline reload', async (
     timeout: SW_READY_MS,
   });
   await page.waitForLoadState('networkidle');
+  const failed: string[] = [];
+  const notFromSw: string[] = [];
+  let fromSw = 0;
+  page.on('requestfailed', (req) =>
+    failed.push(`${req.url()}: ${req.failure()?.errorText ?? 'unknown error'}`),
+  );
+  page.on('response', (res) => {
+    if (res.fromServiceWorker()) fromSw += 1;
+    else notFromSw.push(`${res.status()} ${res.url()}`);
+  });
   await context.setOffline(true);
   await page.reload();
   await expect(app).toHaveAttribute('data-state', 'Asleep');
@@ -152,4 +163,8 @@ test('smoke: wake, one loop, no enforced CSP violation, offline reload', async (
     .poll(() => bearRowFraction(page), { message: 'the stage canvas draws Juni after the offline reload' })
     .toBeGreaterThanOrEqual(BEAR_ROW_MIN_FRACTION);
   await expectNoEnforcedViolations(page);
+  console.log(`smoke: offline reload: ${fromSw} responses from the service worker`);
+  expect(failed, 'failed requests after going offline').toEqual([]);
+  expect(notFromSw, 'responses not from the service worker after going offline').toEqual([]);
+  expect(fromSw, 'the service worker answered the offline reload').toBeGreaterThan(0);
 });
