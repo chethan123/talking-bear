@@ -134,6 +134,8 @@ const openMic = (req: number): Effect => ({ k: 'openMic', req });
 const disarm = (epoch: number): Effect => ({ k: 'disarm', epoch });
 const sfx = (seq: number): Effect => ({ k: 'sfx', id: 'testBeep', seq });
 
+/** #117: the effects other than `anim`. */
+const notAnim = (fx: Effect[]): Effect[] => fx.filter((f) => f.k !== 'anim');
 /** #117: row 28's tooLoud reaction after the replay of a clipped take. */
 const TOO_LOUD: Effect = { k: 'anim', ev: { e: 'reaction', name: 'tooLoud', priority: 2 } };
 const SLEEP_T = timer('sleep', 120_000);
@@ -506,7 +508,6 @@ describe('plan §3.4 rows', () => {
       [anim('talkEnd'), TOO_LOUD, COOLDOWN_T],
       { playingId: null },
     );
-    const notAnim = (fx: Effect[]): Effect[] => fx.filter((f) => f.k !== 'anim');
     expect(notAnim(loud.effects)).toStrictEqual(notAnim(clean.effects));
     expect({ ...loud.state, lastClipped: false }).toStrictEqual(clean.state);
     expect(run(loud.state, tmr('cooldown')).effects).toStrictEqual(run(clean.state, tmr('cooldown')).effects);

@@ -764,25 +764,19 @@ const GRIN_TEETH = 0.6;
 /** The issue's `Blush` 0.5 with the grin. */
 const GRIN_BLUSH = 0.5;
 
-/**
- * After the replay of a clipped take (#117, plan §4.4 "Clipping (shouting)", §7 M8): the ears fold briefly and the
- * eyes squint with the brows up, then a grin with a 0.5 blush, over 1.2 s. Playful, never pain (Q3): no sound, no
- * kick, no frown.
- */
-const tooLoud: Clip = (() => {
-  const startle = (v: number): Key[] => [
-    k(0, 0, 'out'),
-    k(LOUD_IN, v),
-    k(LOUD_HOLD, v, 'inOut'),
-    k(GRIN_IN, 0),
-  ];
-  const grin = (v: number): Key[] => [
-    k(LOUD_HOLD, 0, 'out'),
-    k(GRIN_IN, v),
-    k(GRIN_HOLD, v, 'inOut'),
-    k(LOUD_S, 0),
-  ];
-  const face = (a: number, b: number): Key[] => [
+/** A startle track: up to `v` by 0.12 s, held to 0.35 s, gone by 0.55 s. */
+function startle(v: number): Key[] {
+  return [k(0, 0, 'out'), k(LOUD_IN, v), k(LOUD_HOLD, v, 'inOut'), k(GRIN_IN, 0)];
+}
+
+/** A grin track: from 0.35 s up to `v` by 0.55 s, held to 0.95 s, gone at 1.2 s. */
+function grin(v: number): Key[] {
+  return [k(LOUD_HOLD, 0, 'out'), k(GRIN_IN, v), k(GRIN_HOLD, v, 'inOut'), k(LOUD_S, 0)];
+}
+
+/** A face track that goes from the startle's `a` straight to the grin's `b`. */
+function face(a: number, b: number): Key[] {
+  return [
     k(0, 0, 'out'),
     k(LOUD_IN, a),
     k(LOUD_HOLD, a, 'inOut'),
@@ -790,22 +784,28 @@ const tooLoud: Clip = (() => {
     k(GRIN_HOLD, b, 'inOut'),
     k(LOUD_S, 0),
   ];
-  return {
-    name: 'tooLoud',
-    duration: LOUD_S,
-    tracks: [
-      track(Ch.EarFoldL, ...startle(LOUD_FOLD)),
-      track(Ch.EarFoldR, ...startle(LOUD_FOLD)),
-      ...lids(...face(LOUD_SQUINT, GRIN_LIDS)),
-      ...brows(...face(LOUD_BROW, GRIN_BROW)),
-      track(Ch.BodyLean, ...startle(LOUD_LEAN)),
-      track(Ch.Jaw, ...grin(GRIN_JAW)),
-      track(Ch.MouthW, ...grin(GRIN_W)),
-      track(Ch.Teeth, ...grin(GRIN_TEETH)),
-      track(Ch.Blush, ...grin(GRIN_BLUSH)),
-    ],
-  };
-})();
+}
+
+/**
+ * After the replay of a clipped take (#117, plan §4.4 "Clipping (shouting)", §7 M8): the ears fold briefly and the
+ * eyes squint with the brows up, then a grin with a 0.5 blush, over 1.2 s. Playful, never pain (Q3): no sound, no
+ * kick, no frown.
+ */
+const tooLoud: Clip = {
+  name: 'tooLoud',
+  duration: LOUD_S,
+  tracks: [
+    track(Ch.EarFoldL, ...startle(LOUD_FOLD)),
+    track(Ch.EarFoldR, ...startle(LOUD_FOLD)),
+    ...lids(...face(LOUD_SQUINT, GRIN_LIDS)),
+    ...brows(...face(LOUD_BROW, GRIN_BROW)),
+    track(Ch.BodyLean, ...startle(LOUD_LEAN)),
+    track(Ch.Jaw, ...grin(GRIN_JAW)),
+    track(Ch.MouthW, ...grin(GRIN_W)),
+    track(Ch.Teeth, ...grin(GRIN_TEETH)),
+    track(Ch.Blush, ...grin(GRIN_BLUSH)),
+  ],
+};
 
 /**
  * The mimes, by name: clips the app asks the director for by name (`{k:'clip'}`, #115): the MicDenied cupped ear, and

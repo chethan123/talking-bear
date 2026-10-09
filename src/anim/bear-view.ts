@@ -68,6 +68,12 @@
  * slot. In Dozing (the session sends `doze` once in MicDenied) the next mime wakes the bear to Idle, as any accepted
  * P2 does, so he stays awake while the help is up.
  *
+ * **Too loud** (#117, plan §4.4, §7 M8): row 28 follows the replay of a clipped take with `anim reaction{name:
+ * TOO_LOUD_REACTION}`. The director's table ignores the session's reactions (#91), so `onAnim` asks for it as the
+ * director's `{k:'clip', name: TOO_LOUD_CLIP}` instead (a reused input, through `directorReduce`: a clip outputs
+ * nothing). Row 28's `talkEnd` comes first, so the director has left Talking and plays the whole clip as a P2
+ * reaction (`tooLoudGentle` in Gentle mode and under reduced motion); no other session reaction is mapped.
+ *
  * **Input** (#93): the pointer adapter (#87) on the canvas, with `hit` = `hitTest` (#85) over the bone matrices
  * of the last drawn pose and the view in **CSS px** (`fitView` of the canvas's CSS size: the adapter's points
  * are CSS px relative to the canvas, never backing-store px). `adapter.tick()` runs in every drawn frame, so a
@@ -99,7 +105,7 @@
  * it into `compose`, so it measures 0.
  */
 import type { AnimEvent, SessionEvent, StateName } from '../app/events.ts';
-import { AWAKE } from '../app/machine.ts';
+import { AWAKE, TOO_LOUD_REACTION } from '../app/machine.ts';
 import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import { attachPointerAdapter } from '../input/pointer-adapter.ts';
@@ -111,6 +117,7 @@ import type { Visibility } from '../platform/visibility.ts';
 import { reactionFor } from '../reactions/table.ts';
 import { A11Y_TEXT } from '../ui/a11y.ts';
 import type { Clip } from './clip.ts';
+import type { MimeClipName } from './clips/reactions.ts';
 import { DISPLAY_LATENCY_MS } from './constants.ts';
 import {
   clipByName,
@@ -152,6 +159,8 @@ const BASE_FADE_S = 0.15;
 export const WEIGHT_RAMP_S = 0.15;
 /** The clip the bear mimes while the session is in MicDenied (#115): a paw to the ear, "I can't hear you". */
 export const MIC_DENIED_MIME = 'cuppedEar';
+/** The clip the session's too-loud reaction plays (#117): row 28's `anim reaction{name: TOO_LOUD_REACTION}`. */
+export const TOO_LOUD_CLIP: MimeClipName = 'tooLoud';
 /** The MicDenied mime repeats this long after each play (s, #115). */
 export const MIC_DENIED_MIME_S = 10;
 /** Frames `frameLog()` keeps (X-A2 logging). */
@@ -336,6 +345,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const tickIn: { k: 'tick'; now: number } = { k: 'tick', now: 0 };
   /** The MicDenied mime's director input, reused (#115). */
   const mimeIn: ClipInput = { k: 'clip', name: MIC_DENIED_MIME, now: 0 };
+  /** The too-loud reaction's director input, reused (#117). */
+  const tooLoudIn: ClipInput = { k: 'clip', name: TOO_LOUD_CLIP, now: 0 };
   const springs = new SpringBank(SPRING_COUNT);
   configureSprings(springs);
   const weights: LayerWeights = { ...WEIGHTS_ASLEEP };
@@ -768,8 +779,14 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     canvas,
     onAnim(ev) {
       const now = advanceNow(deps.now() / 1000);
-      const input: DirInput = { k: 'anim', ev, now };
-      dir = directorReduce(dir, input);
+      if (ev.e === 'reaction' && ev.name === TOO_LOUD_REACTION) {
+        // #117: the director's table ignores the session's reactions; this one is asked for as its clip.
+        tooLoudIn.now = now;
+        dir = directorReduce(dir, tooLoudIn);
+      } else {
+        const input: DirInput = { k: 'anim', ev, now };
+        dir = directorReduce(dir, input);
+      }
       if (ev.e === 'talk') startMouth();
       loop.invalidate();
     },
