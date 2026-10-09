@@ -286,6 +286,14 @@ describe('noise floor estimate (#116)', () => {
     expect(h.floors).toEqual([-24, -30]);
   });
 
+  it('#288: a capture glitch that opens a loud window keeps the gate floor (the window maximum tracks later levels)', () => {
+    const h = harness();
+    feedLevels(h, 35, () => -24, -30);
+    h.clock.advance(30);
+    feedLevels(h, 35, (i) => (i < 3 ? -120 : -24), -30); // the window opens on a 90 ms zero-fed stall
+    expect(h.floors).toEqual([-24, -30]);
+  });
+
   it('only Listening levels of the current epoch count; leaving Listening or a new epoch restarts the window', () => {
     const h = harness();
     feedLevels(h, 20, () => -24); // 570 ms
