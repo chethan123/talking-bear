@@ -697,6 +697,39 @@ describe('Validation 2: the full loop with fakes', () => {
   });
 });
 
+// ---- #117: a clipped take ------------------------------------------------------------------------------------
+
+describe('#117: a clipped take', () => {
+  it('after the replay, anim talkEnd then tooLoud (P2), no sfx and no ui; the cooldown is the unclipped 250 ms; the next unclipped take plays none', async () => {
+    const h = setup();
+    await toListening(h);
+    toPlaying(h, true, true);
+    expect(stateOf(h)).toBe('Playing');
+    const n = h.anims.length;
+    at(h.player.plays, 0).done.resolve('ended');
+    await flush();
+    expect(stateOf(h)).toBe('Cooldown');
+    expect(h.anims.slice(n)).toEqual([{ e: 'talkEnd' }, { e: 'reaction', name: 'tooLoud', priority: 2 }]);
+    expect(h.sfx.plays).toEqual([]);
+    h.clock.advance(249);
+    expect(stateOf(h)).toBe('Cooldown');
+    h.clock.advance(1);
+    expect(stateOf(h)).toBe('Listening');
+    expect(h.session.state().epoch).toBe(2);
+
+    // The next take is not clipped: lastClipped resets on its processed, so its replay ends without tooLoud.
+    toPlaying(h);
+    expect(stateOf(h)).toBe('Playing');
+    const m = h.anims.length;
+    at(h.player.plays, 1).done.resolve('ended');
+    await flush();
+    expect(stateOf(h)).toBe('Cooldown');
+    expect(h.anims.slice(m)).toEqual([{ e: 'talkEnd' }]);
+    expect(h.sfx.plays).toEqual([]);
+    expect(h.violations).toEqual([]);
+  });
+});
+
 // ---- Validation 3: Q1 sleep --------------------------------------------------------------------------------
 
 describe('Validation 3: Q1 sleep', () => {
