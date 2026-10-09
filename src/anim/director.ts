@@ -39,11 +39,12 @@
  * dropped every optimized function that had embedded it ("embedded weak objects cleared"): `evaluateFrom` then ran
  * unoptimized (≈ 2–3.5 KB of boxed doubles per frame) or in the mid tier without `sampleClip` inlined (≈ 32–50 B), and
  * `tick` (and in some runs bear-view's `applyKicks`) were dropped too, for thousands of frames. Each of the three is
- * therefore built by one factory (`clipAt`, `activeReaction`, `cutClip`; a spread of a reaction keeps its class), and
- * module-level anchors made by the same factories (`CLIP_ANCHORS`, `REACTION_ANCHORS`, `CUT_CLIP_ANCHORS`) keep each
- * class alive for the session. The anchors' times are NaN, a double like every director time: a Smi there would make
- * the first real object move the class on. They are exported for director.test.ts, which checks that real objects share
- * their class, and never written.
+ * therefore built by one factory (`clipAt`, `activeReaction`, `cutClip`) that copies a module-level template
+ * (`CLIP_TEMPLATE`, `REACTION_TEMPLATE`, `CUT_CLIP_TEMPLATE`) and overwrites every field; a spread of a reaction keeps
+ * its class too. V8 gives a copy its template's hidden class, and the template, live for the session, keeps that class
+ * alive. The factories read their template on every call, so a bundler keeps it: anchors no live code read were dropped
+ * from the production bundle (#281). The templates' times are NaN, doubles like every director time. They are exported
+ * for director.test.ts, which checks that real objects share their template's class, and never written.
  *
  * **Mouth.** Leaving Talking sets `mouthCloseStart = now` and clears `talk`; `talk` clears
  * `mouthCloseStart`, so every talk starts with the mouth fully open to the mouth layer. `evaluate` writes the mouth
@@ -931,12 +932,36 @@ function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
 }
 
 // ---- hidden classes (#281; see the module doc) ------------------------------------------------------------
-/** A `clip` slot object: every one is built here, so they all share the class `CLIP_ANCHORS` keeps alive. */
+/** Every `clip` slot object is a copy of this, so they all share its hidden class, which it keeps alive. */
+export const CLIP_TEMPLATE: Readonly<NonNullable<DirectorState['clip']>> = { name: '', start: Number.NaN };
+
+/** Every `reaction` is a copy of this (or a spread of one), so they all share its hidden class: a real reaction. */
+export const REACTION_TEMPLATE: Readonly<ActiveReaction> = {
+  r: REACTIONS['tuftBoing']!,
+  clip: '',
+  start: Number.NaN,
+  last: Number.NaN,
+  runStart: Number.NaN,
+  sfxAt: Number.NaN,
+  release: null,
+  region: null,
+  gesture: null,
+};
+
+/** Every `prevClip` is a copy of this, so they all share its hidden class, which it keeps alive. */
+export const CUT_CLIP_TEMPLATE: Readonly<NonNullable<DirectorState['prevClip']>> = {
+  name: '',
+  start: Number.NaN,
+  cutAt: Number.NaN,
+  release: null,
+};
+
+/** A `clip` slot object: `CLIP_TEMPLATE` with both fields set. */
 function clipAt(name: string, clipStart: number): NonNullable<DirectorState['clip']> {
-  return { name, start: clipStart };
+  return { ...CLIP_TEMPLATE, name, start: clipStart };
 }
 
-/** A started reaction: every `reaction` is built here, or spread from one, so they share `REACTION_ANCHORS`' class. */
+/** A started reaction: `REACTION_TEMPLATE` with every field set. */
 function activeReaction(
   r: Reaction,
   clipName: string,
@@ -945,6 +970,7 @@ function activeReaction(
   gesture: GestureKind | null,
 ): ActiveReaction {
   return {
+    ...REACTION_TEMPLATE,
     r,
     clip: clipName,
     start: now,
@@ -957,49 +983,15 @@ function activeReaction(
   };
 }
 
-/** A `prevClip` (#240): built only here, so every cut clip shares the class `CUT_CLIP_ANCHORS` keeps alive. */
+/** A `prevClip` (#240): `CUT_CLIP_TEMPLATE` with every field set. */
 function cutClip(
   name: string,
   clipStart: number,
   cutAt: number,
   releasedAt: number | null,
 ): NonNullable<DirectorState['prevClip']> {
-  return { name, start: clipStart, cutAt, release: releasedAt };
+  return { ...CUT_CLIP_TEMPLATE, name, start: clipStart, cutAt, release: releasedAt };
 }
-
-/** Two clips kept for the session, so the class of `clipAt`'s objects never dies (#281). */
-export const CLIP_ANCHORS: readonly Readonly<NonNullable<DirectorState['clip']>>[] = [
-  clipAt('', Number.NaN),
-  clipAt('', Number.NaN),
-];
-
-/** A reaction anchor: a real reaction, a clip name and NaN times, without a gesture (a `clip` input's reaction). */
-const QUIET_REACTION_ANCHOR = activeReaction(REACTIONS['tuftBoing']!, '', Number.NaN, null, null);
-/** The same with a gesture's region and kind, as a tap's reaction has them. */
-const TAP_REACTION_ANCHOR = activeReaction(REACTIONS['tuftBoing']!, '', Number.NaN, 'headTop', 'tap');
-
-/**
- * Reactions kept for the session, so the classes of `activeReaction`'s objects and of their spreads never die (#281):
- * a started one without and with a gesture, one refreshed and one released by the same spreads as `refresh` and
- * `release`. The released one holds a number in `release` where the others hold null, so whether V8 widens that field
- * in place or moves released reactions to a new class, an anchor holds the class real reactions end on.
- */
-export const REACTION_ANCHORS: readonly Readonly<ActiveReaction>[] = [
-  QUIET_REACTION_ANCHOR,
-  TAP_REACTION_ANCHOR,
-  { ...TAP_REACTION_ANCHOR, last: Number.NaN, runStart: Number.NaN, sfxAt: Number.NaN },
-  { ...TAP_REACTION_ANCHOR, release: Number.NaN },
-];
-
-/**
- * Two cut clips kept for the session, so the class of `cutClip`'s objects never dies (#281). The first holds null in
- * `release`, the second a number, so the class they end on takes both, as real cuts do (if V8 made a new class for the
- * second, real cuts get that one, which the second anchor holds).
- */
-export const CUT_CLIP_ANCHORS: readonly Readonly<NonNullable<DirectorState['prevClip']>>[] = [
-  cutClip('', Number.NaN, Number.NaN, null),
-  cutClip('', Number.NaN, Number.NaN, Number.NaN),
-];
 
 /** Scratch poses for `crossfade`'s choice at a second cut (#240): the pose before it, and with each choice. */
 const CUT_FROM: Pose = createPose();

@@ -14,16 +14,16 @@ import { sampleClip } from './clip.ts';
 import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
 import {
-  CLIP_ANCHORS,
+  CLIP_TEMPLATE,
   clipByName,
-  CUT_CLIP_ANCHORS,
+  CUT_CLIP_TEMPLATE,
   directorReduce,
   directorStep,
   evaluate,
   evaluateFrom,
   initialDirector,
   mouthCloseScale,
-  REACTION_ANCHORS,
+  REACTION_TEMPLATE,
 } from './director.ts';
 import type { DirectorState, DirInput, DirOut, DirState, GestureKind } from './director.ts';
 import { Ch, CH_COUNT, addPose, createPose, lerpPose } from './pose.ts';
@@ -2541,8 +2541,8 @@ function sameMapFn(): (a: unknown, b: unknown) => boolean {
   return (a, b) => f(a, b) === true;
 }
 
-describe('#281: clips, reactions and cut clips share the hidden classes their anchors keep alive', () => {
-  it("every clip slot object (wake, an additive clip, a start, a refresh restart, both flinches) has the last clip anchor's class", () => {
+describe('#281: clips, reactions and cut clips share the hidden classes their templates keep alive', () => {
+  it("every clip slot object (wake, an additive clip, a start, a refresh restart, both flinches) has CLIP_TEMPLATE's class", () => {
     const sameMap = sameMapFn();
     const idle = stateIn('Idle');
     const refreshed = stepAll(idle, ...tickles(11, 5)).s;
@@ -2558,11 +2558,11 @@ describe('#281: clips, reactions and cut clips share the hidden classes their an
     ];
     for (const [label, s] of fixtures) {
       expect(s.clip, label).not.toBeNull();
-      expect(sameMap(s.clip, CLIP_ANCHORS.at(-1)), label).toBe(true);
+      expect(sameMap(s.clip, CLIP_TEMPLATE), label).toBe(true);
     }
   });
 
-  it("every reaction (started with and without a gesture, refreshed, released) has the last reaction anchor's class", () => {
+  it("every reaction (started with and without a gesture, refreshed, released) has REACTION_TEMPLATE's class", () => {
     const sameMap = sameMapFn();
     const idle = stateIn('Idle');
     const refreshed = stepAll(idle, ...tickles(11, 5)).s.reaction;
@@ -2577,18 +2577,18 @@ describe('#281: clips, reactions and cut clips share the hidden classes their an
     ];
     for (const [label, a] of fixtures) {
       expect(a, label).not.toBeNull();
-      expect(sameMap(a, REACTION_ANCHORS.at(-1)), label).toBe(true);
+      expect(sameMap(a, REACTION_TEMPLATE), label).toBe(true);
     }
   });
 
-  it("every prevClip, with and without a release, has the last cut-clip anchor's class", () => {
+  it("every prevClip, with and without a release, has CUT_CLIP_TEMPLATE's class", () => {
     const sameMap = sameMapFn();
     let released = 0;
     for (const { label, before, input } of cuts()) {
       const p = stepAll(before, input).s.prevClip;
       expect(p, label).not.toBeNull();
       if (p?.release !== null) released++;
-      expect(sameMap(p, CUT_CLIP_ANCHORS.at(-1)), label).toBe(true);
+      expect(sameMap(p, CUT_CLIP_TEMPLATE), label).toBe(true);
     }
     expect(released, 'a cut with a release').toBeGreaterThan(0);
   });
