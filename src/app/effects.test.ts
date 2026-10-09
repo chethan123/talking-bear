@@ -261,10 +261,46 @@ describe('noise floor estimate (#116)', () => {
     feedLevels(h, 41, () => -120, -60); // 1.2 s of digital silence
     expect(h.floors).toHaveLength(2);
     expect(h.floors[1]).toBeLessThanOrEqual(-35);
-    expect(h.floors[1]).toBe(-60); // the gate floor, above the silence level
+    expect(h.floors[1]).toBe(-100); // #288: a window of nothing but digital silence dispatches its minimum, not N
     h.clock.advance(30);
     feedLevels(h, 35, () => Number.NaN, Number.NaN);
     expect(h.floors[2]).toBe(-100);
+  });
+
+  it('#288: digital silence clears the flag even when the frozen gate floor is above −35 dBFS', () => {
+    const h = harness();
+    feedLevels(h, 70, () => -24, -30); // 2.07 s of loud noise, ending on a dispatch; N is −30
+    expect(h.floors).toEqual([-24, -24]); // max(window minimum −24, N −30)
+    h.clock.advance(30);
+    feedLevels(h, 41, () => -120, -30); // 1.2 s of digital silence: the gate freezes N at −30
+    expect(h.floors).toHaveLength(3);
+    expect(h.floors[2]).toBeLessThanOrEqual(-35);
+    expect(h.floors[2]).toBe(-100); // a fully silent window dispatches its minimum, not max(−100, N) = −30
+  });
+
+  it('#288: a capture glitch inside a loud window keeps the gate floor (only a fully silent window wins)', () => {
+    const h = harness();
+    feedLevels(h, 35, () => -24, -30);
+    h.clock.advance(30);
+    feedLevels(h, 35, (i) => (i >= 10 && i < 13 ? -120 : -24), -30); // a 90 ms zero-fed stall
+    expect(h.floors).toEqual([-24, -30]);
+  });
+
+  it('#288: a capture glitch that opens a loud window keeps the gate floor (the window maximum tracks later levels)', () => {
+    const h = harness();
+    feedLevels(h, 35, () => -24, -30);
+    h.clock.advance(30);
+    feedLevels(h, 35, (i) => (i < 3 ? -120 : -24), -30); // the window opens on a 90 ms zero-fed stall
+    expect(h.floors).toEqual([-24, -30]);
+  });
+
+  it('#288: ±Infinity levels are digital silence, as in the energy gate', () => {
+    const h = harness();
+    feedLevels(h, 35, () => Number.POSITIVE_INFINITY, -30);
+    expect(h.floors).toEqual([-100]); // not max(Infinity, N)
+    h.clock.advance(30);
+    feedLevels(h, 35, () => Number.NEGATIVE_INFINITY, -30);
+    expect(h.floors).toEqual([-100, -100]);
   });
 
   it('only Listening levels of the current epoch count; leaving Listening or a new epoch restarts the window', () => {
