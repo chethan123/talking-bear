@@ -34,6 +34,7 @@ if (!isCheckDist(loaded)) throw new Error('scripts/check-dist.mjs must export pr
 const { precacheUrls, checkDist } = loaded;
 
 type Mode = 'production' | 'e2e';
+const MODES_UNDER_TEST: readonly Mode[] = ['production', 'e2e'];
 /** Dist-relative POSIX path → file content. */
 type Tree = Record<string, string>;
 
@@ -88,6 +89,19 @@ function withSw(tree: Tree, ...unlisted: string[]): Tree {
 const WORKLET =
   'class P extends AudioWorkletProcessor{process(){return true}}registerProcessor("capture",P);';
 
+/**
+ * The director's three hidden-class templates and their factories, exactly as the minifier emits them on main
+ * (rule 8, #281).
+ */
+const TEMPLATES_JS =
+  'var rs={name:``,start:NaN},is={r:Wn.tuftBoing,clip:``,start:NaN,last:NaN,runStart:NaN,sfxAt:NaN,' +
+  'release:null,region:null,gesture:null},as={name:``,start:NaN,cutAt:NaN,release:null};' +
+  'function os(e,t){return{...rs,name:e,start:t}}' +
+  'function ss(e,t,n,r,i){return{...is,r:e,clip:t,start:n,last:n,runStart:n,sfxAt:n,release:null,region:r,gesture:i}}' +
+  'function cs(e,t,n,r){return{...as,name:e,start:t,cutAt:n,release:r}}';
+/** The fake main JS chunk: the templates plus some app code. */
+const APP_JS = `${TEMPLATES_JS}console.log("app");`;
+
 const MANIFEST = {
   name: 'Talking Bear',
   icons: [{ src: '/icons/icon-192.png' }],
@@ -97,7 +111,7 @@ const MANIFEST = {
 function goodTree(mode: Mode): Tree {
   const tree: Tree = {
     'index.html': '<html><head><script type="module" src="/assets/index-abc.js"></script></head></html>',
-    'assets/index-abc.js': 'console.log("app");',
+    'assets/index-abc.js': APP_JS,
     'assets/capture.worklet--xyz.js': WORKLET,
     'assets/weights-abc.bin': 'weights',
     'assets/workbox-window.prod.es5-abc.js': 'var workbox;',
@@ -121,6 +135,83 @@ function ruleViolations(dir: string, mode: Mode, rule: number): string[] {
 /** A complete production tree with this manifest.webmanifest text. */
 function withManifest(text: string): string {
   return writeTree({ ...goodTree('production'), 'manifest.webmanifest': text });
+}
+
+/** One of the director's hidden-class templates as TEMPLATES_JS holds it (rule 8). */
+interface TemplateCase {
+  name: string;
+  factory: string;
+  /** Its minified variable in TEMPLATES_JS. */
+  ident: string;
+  /** Its declaration in TEMPLATES_JS, with one separating comma, so cutting it leaves valid code. */
+  declaration: string;
+  /** The shape rule 8 prints for it. */
+  shape: string;
+}
+
+const TEMPLATE_CASES: readonly TemplateCase[] = [
+  {
+    name: 'CLIP_TEMPLATE',
+    factory: 'clipAt',
+    ident: 'rs',
+    declaration: 'rs={name:``,start:NaN},',
+    shape: '{name:"",start:NaN}',
+  },
+  {
+    name: 'REACTION_TEMPLATE',
+    factory: 'activeReaction',
+    ident: 'is',
+    declaration:
+      'is={r:Wn.tuftBoing,clip:``,start:NaN,last:NaN,runStart:NaN,sfxAt:NaN,release:null,region:null,gesture:null},',
+    shape:
+      '{r:REACTIONS.tuftBoing,clip:"",start:NaN,last:NaN,runStart:NaN,sfxAt:NaN,release:null,region:null,gesture:null}',
+  },
+  {
+    name: 'CUT_CLIP_TEMPLATE',
+    factory: 'cutClip',
+    ident: 'as',
+    declaration: ',as={name:``,start:NaN,cutAt:NaN,release:null}',
+    shape: '{name:"",start:NaN,cutAt:NaN,release:null}',
+  },
+];
+
+function templateCase(name: string): TemplateCase {
+  const found = TEMPLATE_CASES.find((c) => c.name === name);
+  if (found === undefined) throw new Error(`no template case ${name}`);
+  return found;
+}
+
+/** `js` with `part` replaced once by `by`; throws if `part` is absent, so a fixture can't silently stop mutating. */
+function replaceOnce(js: string, part: string, by = ''): string {
+  if (!js.includes(part)) throw new Error(`fixture does not contain ${part}`);
+  return js.replace(part, by);
+}
+
+/** `js` with this template's factory returning a plain literal with the same keys (#294's regression). */
+function unspread(js: string, ident: string): string {
+  return replaceOnce(js, `return{...${ident},`, 'return{');
+}
+
+/** A complete tree whose main JS chunk (assets/index-abc.js) is `js`. */
+function appTree(js: string, mode: Mode = 'production'): Tree {
+  return { ...goodTree(mode), 'assets/index-abc.js': js };
+}
+
+/** Rule 8's violation for a template whose literal the main chunk lacks. */
+function literalMissing(c: TemplateCase): string {
+  return (
+    `rule 8 (templates): assets/index-abc.js has no ${c.name} literal ${c.shape} (src/anim/director.ts, #281: ` +
+    `the template's property list changed, or ${c.factory} no longer copies it, so the bundler drops it and ` +
+    'the shipped frame allocates again)'
+  );
+}
+
+/** Rule 8's violation for a template that is declared but that no function returns a spread of. */
+function spreadMissing(c: TemplateCase): string {
+  return (
+    `rule 8 (templates): assets/index-abc.js has ${c.name} (as ${c.ident}) but no function returns a spread ` +
+    `of it (src/anim/director.ts, #281: ${c.factory} must return { ...${c.name}, … })`
+  );
 }
 
 /** Runs the script as a CLI (optionally through another path to it). */
@@ -235,7 +326,7 @@ describe('checkDist', () => {
     const DATA_IMPORT = 'import("data:text/javascript,export default 1");';
 
     it('fails a .js file that contains it', () => {
-      const dir = writeTree({ ...goodTree('production'), 'assets/index-abc.js': DATA_IMPORT });
+      const dir = writeTree({ ...goodTree('production'), 'assets/index-abc.js': APP_JS + DATA_IMPORT });
       expect(checkDist(dir, 'production')).toEqual([
         'rule 2 (data-js): assets/index-abc.js contains data:text/javascript',
       ]);
@@ -244,7 +335,9 @@ describe('checkDist', () => {
     it('scans only *.js files', () => {
       const dir = writeTree({
         ...goodTree('production'),
-        'index.html': `<html><body><script type="module">${DATA_IMPORT}</script></body></html>`,
+        'index.html':
+          '<html><head><script type="module" src="/assets/index-abc.js"></script></head>' +
+          `<body><script type="module">${DATA_IMPORT}</script></body></html>`,
       });
       expect(checkDist(dir, 'production')).toEqual([]);
     });
@@ -252,7 +345,7 @@ describe('checkDist', () => {
     it('matches case-insensitively (schemes and media types are)', () => {
       const dir = writeTree({
         ...goodTree('production'),
-        'assets/index-abc.js': 'import("DATA:Text/JavaScript,1");',
+        'assets/index-abc.js': `${APP_JS}import("DATA:Text/JavaScript,1");`,
       });
       expect(checkDist(dir, 'production')).toEqual([
         'rule 2 (data-js): assets/index-abc.js contains data:text/javascript',
@@ -264,7 +357,7 @@ describe('checkDist', () => {
     it('fails a production build that contains __bearTest', () => {
       const dir = writeTree({
         ...goodTree('production'),
-        'assets/index-abc.js': 'globalThis.__bearTest={};',
+        'assets/index-abc.js': `${APP_JS}globalThis.__bearTest={};`,
       });
       expect(checkDist(dir, 'production')).toEqual([
         'rule 3 (hooks): assets/index-abc.js contains __bearTest (test hooks must not ship)',
@@ -272,7 +365,10 @@ describe('checkDist', () => {
     });
 
     it('fails a production build that contains only setVadBackend (#223)', () => {
-      const dir = writeTree({ ...goodTree('production'), 'assets/index-abc.js': 'api.setVadBackend=b=>{};' });
+      const dir = writeTree({
+        ...goodTree('production'),
+        'assets/index-abc.js': `${APP_JS}api.setVadBackend=b=>{};`,
+      });
       expect(checkDist(dir, 'production')).toEqual([
         'rule 3 (hooks): assets/index-abc.js contains setVadBackend (test hooks must not ship)',
       ]);
@@ -454,6 +550,125 @@ describe('checkDist', () => {
       ]);
     });
   });
+  describe("rule 8: the director's hidden-class templates (#281)", () => {
+    const CLIP = templateCase('CLIP_TEMPLATE');
+    const CUT = templateCase('CUT_CLIP_TEMPLATE');
+
+    it.each(MODES_UNDER_TEST)('passes the real minified templates and factories (%s)', (mode) => {
+      expect(ruleViolations(writeTree(goodTree(mode)), mode, 8)).toEqual([]);
+    });
+
+    it('tolerates the minifier: quote style, whitespace, names, Number.NaN, bracket access, arrow factories', () => {
+      const js =
+        'let $a = { name: "", start: Number.NaN };\n' +
+        'let _b = { r: REACTIONS["tuftBoing"], clip: \'\', start: NaN, last: NaN, runStart: NaN, sfxAt: NaN, ' +
+        'release: null, region: null, gesture: null };\n' +
+        'const c$ = {\n  name: "",\n  start: NaN,\n  cutAt: NaN,\n  release: null\n};\n' +
+        'const f = (e, t) => ({ ...$a, name: e, start: t });\n' +
+        'function g(e) { return { ..._b, r: e }; }\n' +
+        'const h = (e) => ( { ...c$, name: e } );\n';
+      expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([]);
+    });
+
+    it.each(TEMPLATE_CASES)(
+      'fails, naming $name, when $factory returns a plain literal and the bundler drops the template',
+      (c) => {
+        const js = unspread(replaceOnce(TEMPLATES_JS, c.declaration), c.ident);
+        expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([literalMissing(c)]);
+        expect(checkDist(writeTree(appTree(js, 'e2e')), 'e2e')).toEqual([literalMissing(c)]);
+      },
+    );
+
+    it.each(TEMPLATE_CASES)(
+      'fails, naming $name, when the template ships but $factory does not spread it',
+      (c) => {
+        const js = `${unspread(TEMPLATES_JS, c.ident)}console.log(${c.ident});`;
+        expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([spreadMissing(c)]);
+      },
+    );
+
+    it('does not count a module-level spread as a function body', () => {
+      const js = `${unspread(TEMPLATES_JS, 'rs')}var z={...rs,name:"a",start:0};`;
+      expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([spreadMissing(CLIP)]);
+    });
+
+    it.each([
+      { change: 'reordered keys', literal: 'rs={start:NaN,name:``}' },
+      { change: 'an extra key', literal: 'rs={name:``,start:NaN,x:0}' },
+    ])('fails a template with $change (the key list is the hidden class)', ({ literal }) => {
+      const js = replaceOnce(TEMPLATES_JS, 'rs={name:``,start:NaN}', literal);
+      expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([literalMissing(CLIP)]);
+    });
+
+    it('matches each property list exactly: neither clip literal stands in for the other', () => {
+      const withoutClip = unspread(replaceOnce(TEMPLATES_JS, CLIP.declaration), 'rs');
+      expect(checkDist(writeTree(appTree(withoutClip)), 'production')).toEqual([literalMissing(CLIP)]);
+      const withoutCut = unspread(replaceOnce(TEMPLATES_JS, CUT.declaration), 'as');
+      expect(checkDist(writeTree(appTree(withoutCut)), 'production')).toEqual([literalMissing(CUT)]);
+    });
+
+    it('checks only the main JS chunk that index.html loads', () => {
+      const tree = withSw({
+        ...goodTree('production'),
+        'assets/index-abc.js': 'console.log("app");',
+        'assets/other-abc.js': TEMPLATES_JS,
+      });
+      expect(checkDist(writeTree(tree), 'production')).toEqual(TEMPLATE_CASES.map(literalMissing));
+    });
+
+    it('finds the main chunk from a single-quoted, ./-relative src with type=module after it', () => {
+      const tree = {
+        ...goodTree('production'),
+        'index.html':
+          "<html><head><script crossorigin src='./assets/index-abc.js' type=module></script></head></html>",
+      };
+      expect(checkDist(writeTree(tree), 'production')).toEqual([]);
+    });
+
+    it('fails when index.html has no module script with a src', () => {
+      const tree = {
+        ...goodTree('production'),
+        'index.html': '<html><head><script src="/assets/index-abc.js"></script></head></html>',
+      };
+      expect(checkDist(writeTree(tree), 'production')).toEqual([
+        'rule 8 (templates): index.html has no <script type="module" src> (the main JS chunk)',
+      ]);
+    });
+
+    it('fails when the main chunk index.html names does not exist', () => {
+      const tree = {
+        ...goodTree('production'),
+        'index.html': '<html><head><script type="module" src="/assets/missing.js"></script></head></html>',
+      };
+      expect(checkDist(writeTree(tree), 'production')).toEqual([
+        'rule 8 (templates): main JS chunk assets/missing.js (from index.html) not found',
+      ]);
+    });
+
+    it('fails without index.html', () => {
+      const dir = writeTree(withSw(omit(goodTree('production'), 'index.html')));
+      expect(checkDist(dir, 'production')).toEqual(['rule 8 (templates): index.html not found']);
+    });
+
+    it('needs a real return or arrow: xreturn does not count', () => {
+      const js = `${unspread(TEMPLATES_JS, 'rs')}function q(e){xreturn{...rs,name:e}}`;
+      expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([spreadMissing(CLIP)]);
+    });
+
+    it('needs a spread of the template itself: a longer name that starts with it does not count', () => {
+      const js = `${unspread(TEMPLATES_JS, 'rs')}var rsx={};function q(e){return{...rsx,name:e}}`;
+      expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([spreadMissing(CLIP)]);
+    });
+
+    it('needs a declared variable: a property assignment of the literal does not count', () => {
+      const js = replaceOnce(
+        TEMPLATES_JS,
+        'var rs={name:``,start:NaN},is=',
+        'x.rs={name:``,start:NaN};var is=',
+      );
+      expect(checkDist(writeTree(appTree(js)), 'production')).toEqual([literalMissing(CLIP)]);
+    });
+  });
 });
 
 describe('CLI', () => {
@@ -463,7 +678,7 @@ describe('CLI', () => {
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     expect(result.stdout).toBe(
-      `check-dist: ${dir} (production): all 7 rules pass (10 files, 8 precache URLs)\n`,
+      `check-dist: ${dir} (production): all 8 rules pass (10 files, 8 precache URLs)\n`,
     );
   });
 
@@ -471,7 +686,7 @@ describe('CLI', () => {
     const dir = writeTree(
       withSw({
         ...goodTree('production'),
-        'assets/index-abc.js': 'import("data:text/javascript,export default 1");',
+        'assets/index-abc.js': `${APP_JS}import("data:text/javascript,export default 1");`,
         'lab/index.html': '<html></html>',
       }),
     );
@@ -509,6 +724,6 @@ describe('CLI', () => {
     const result = run([dir, 'production'], join(link, 'check-dist.mjs'));
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain('all 7 rules pass');
+    expect(result.stdout).toContain('all 8 rules pass');
   });
 });
