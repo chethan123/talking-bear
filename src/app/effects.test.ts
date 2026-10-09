@@ -331,6 +331,20 @@ describe('noise floor estimate (#116)', () => {
     expect(h.floors).toEqual([-24]);
   });
 
+  it("#310: a new epoch restarts the window at its first level, even straight after the old epoch's levels", () => {
+    const h = harness(); // Listening, epoch 4
+    feedLevels(h, 20, () => -50); // 570 ms of epoch 4: the window is open
+    h.set({ epoch: 5 }); // re-armed into Listening, with no level of another state or epoch in between
+    h.clock.advance(30);
+    const t1 = h.clock.now();
+    feedLevels(h, 34, () => -24, -60, 5); // t1 … t1 + 990 ms of epoch 5: no window spans 1 s yet
+    expect(h.floors).toEqual([]);
+    h.clock.advance(10);
+    h.runner.level({ epoch: 5, db: -24, floorDb: -60 }); // t1 + 1000: the window that opened at t1 closes
+    expect(h.floors).toEqual([-24]); // epoch 5's levels only: no −50 from epoch 4
+    expect(h.times).toEqual([t1 + 1000]);
+  });
+
   it("#289: Recording levels count from NOISE_FLOOR_RECORDING_HOLDOFF_MS after the epoch's first one; earlier ones close the window", () => {
     expect(NOISE_FLOOR_RECORDING_HOLDOFF_MS).toBe(1000);
     const h = harness();
