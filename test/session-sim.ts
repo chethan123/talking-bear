@@ -472,8 +472,8 @@ export class SessionSim {
   /**
    * #116: in a noisy room the worker caps a take that the VAD started, with a low voiced ratio, after
    * maxUtteranceMs: before the recording watchdog (maxUtteranceMs + 2 s). On the energy backend the cap is the
-   * voicing rule's capped misfire, which carries its reason and voiced ratio (#289). Not in hold-to-talk mode, where the
-   * timer is the cap itself. A take that ends earlier leaves the end stale or ignored.
+   * voicing rule's capped misfire, which carries its reason and voiced ratio (#289). Not in hold-to-talk mode,
+   * where the timer is the cap itself. A take that ends earlier leaves the end stale or ignored.
    */
   private noisyCap(): void {
     const s = this.state;
