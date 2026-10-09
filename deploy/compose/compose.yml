@@ -6,7 +6,9 @@
 services:
   app:
     image: bear:ci
-    pull_policy: never # built by the CI job (or locally, docs/image.md); never pulled
+    # Never pulled. CI's compose-headers job builds it; locally:
+    #   docker buildx build --load --platform linux/amd64 -t bear:ci .
+    pull_policy: never
     # The production run flags (plan §4.8.2, docs/image.md).
     read_only: true
     cap_drop: [ALL]

@@ -18,6 +18,8 @@
 #   - the module JS asset keeps Content-Encoding: br and the image's own ETag, base64url(sha256(identity
 #     bytes))[:16] plus .br (server/handler.go), and its br ETag still revalidates to a 304: the sidecar does not
 #     re-encode;
+#   - the module JS asset reaches a client that sends no Accept-Encoding as identity bytes with their own ETag (no
+#     .br/.gz suffix), as bearserve serves it directly: both Caddies run `transport http { compression off }` (#306);
 #   - / reaches a client that accepts gzip as the identity bytes the image serves, with their ETag and no Vary: no
 #     Caddy runs `encode`;
 #   - the front redirects ${HTTP_BASE_URL:-http://localhost:8080}/ (its port 80) to https://localhost/ with a 308.
@@ -69,6 +71,7 @@ case_passthrough() {
   fetch GET "$asset" -H 'Accept-Encoding: identity'
   expect_status 200
   expect_no_header Content-Encoding
+  [ -s "$tmp/body" ] || fail 'body: expected bytes, got none'
   tag=$(etag_base "$tmp/body")
   expect_header ETag "\"$tag\""
   fetch GET "$asset" -H 'Accept-Encoding: br'
@@ -82,6 +85,20 @@ case_passthrough() {
   expect_header ETag "$br_etag"
 }
 
+# The module JS asset with no Accept-Encoding: the identity bytes under their own ETag, as bearserve serves them
+# directly. With a Caddy transport's default compression, the client would get those bytes under the .gz ETag (#306).
+case_no_accept_encoding() {
+  local tag
+  begin "GET $asset (no Accept-Encoding)"
+  fetch GET "$asset"
+  expect_status 200
+  expect_no_header Content-Encoding
+  expect_header Vary Accept-Encoding
+  [ -s "$tmp/body" ] || fail 'body: expected bytes, got none'
+  tag=$(etag_base "$tmp/body")
+  expect_header ETag "\"$tag\""
+}
+
 # / (index.html, under precompress.mjs's 1 KB floor, so the image has no compressed variant) reaches a client that
 # accepts gzip as the image serves it: identity, with the ETag of those bytes and no Vary. An `encode` at either
 # Caddy would gzip it, add Vary and rewrite the ETag (plan §4.8.3).
@@ -92,6 +109,7 @@ case_identity_passthrough() {
   expect_status 200
   expect_no_header Content-Encoding
   expect_no_header Vary
+  [ -s "$tmp/body" ] || fail 'body: expected bytes, got none'
   tag=$(etag_base "$tmp/body")
   expect_header ETag "\"$tag\""
 }
@@ -134,9 +152,9 @@ trap 'rm -rf "$tmp"' EXIT
 load_expected
 wait_ready
 # The duplicate checks on / and /sw.js, check-headers.sh's 200/304/404 cases in its order, the duplicate check on the
-# asset (case_asset finds it), the two pass-through checks and the redirect.
+# asset (case_asset finds it), the three pass-through checks and the redirect.
 run_cases case_duplicates case_duplicates_sw case_root case_sw case_manifest case_asset case_duplicates_asset \
-  case_not_found case_revalidate case_head case_passthrough case_identity_passthrough
+  case_not_found case_revalidate case_head case_passthrough case_no_accept_encoding case_identity_passthrough
 case_redirect
 pass
 echo "check-compose-headers: all $passed cases passed against $base ($json)"

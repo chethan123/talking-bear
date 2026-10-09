@@ -1,6 +1,12 @@
 # The sidecar Caddy (plan §4.8.3 "Where headers live", Q5): a plain reverse_proxy to the image, which owns every app
 # header. No `header` directive (reverse_proxy adds upstream headers, so a set here would send a second copy) and no
-# `encode` (it compresses identity responses, drops Accept-Ranges and rewrites ETags).
+# `encode` (it compresses identity responses, drops Accept-Ranges and rewrites ETags). `compression off`: otherwise
+# the transport asks the image for gzip when the client sent no Accept-Encoding and decompresses it, so the client
+# gets identity bytes under the .gz variant's ETag (#306, ORCH-NOTE 6086179079 on #110).
 :8081 {
-	reverse_proxy app:8080
+	reverse_proxy app:8080 {
+		transport http {
+			compression off
+		}
+	}
 }

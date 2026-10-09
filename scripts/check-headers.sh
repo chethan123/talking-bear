@@ -9,8 +9,9 @@
 # so / is served identity, with no .br ETag and no Vary (plan §4.8.2, §4.8.3). Its encoding, ETag suffix and Vary
 # must agree instead, and the brotli assertions run on the module JS asset (ORCH-NOTE 6083551330 on #107).
 #
-# Sourceable (ORCH-NOTE 6084408281 on #110): sourcing only sets curl_opts and defines the functions, one per case,
-# and changes no shell option. scripts/check-compose-headers.sh reuses them. Run directly, main runs the 12 cases.
+# Sourceable (ORCH-NOTE 6084408281 on #110): sourcing only sets curl_opts=() and repeatable_headers=() (a caller
+# sets its own values after sourcing) and defines the functions, one per case, and changes no shell option.
+# scripts/check-compose-headers.sh reuses them. Run directly, main runs the 12 cases.
 
 # Extra options for every curl call: none here. scripts/check-compose-headers.sh sets -k.
 curl_opts=()

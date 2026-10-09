@@ -1,7 +1,12 @@
 # The front Caddy (plan §4.8.3 "Where headers live", Q5): TLS, the HTTP→HTTPS redirect and HSTS only. A header here
-# is set only if absent (`?`), never a plain set, which would duplicate one the image sends.
+# is set only if absent (`?`), never a plain set, which would duplicate one the image sends. `compression off`, as in
+# the sidecar: either hop alone would otherwise relabel identity bytes with a .gz ETag (#306).
 localhost {
 	tls internal
 	header ?Strict-Transport-Security "max-age=31536000"
-	reverse_proxy sidecar:8081
+	reverse_proxy sidecar:8081 {
+		transport http {
+			compression off
+		}
+	}
 }
