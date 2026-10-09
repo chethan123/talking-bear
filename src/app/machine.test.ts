@@ -386,7 +386,7 @@ describe('plan §3.4 rows', () => {
   it('row 20: Recording + seg.end → Processing with the clamped take', () => {
     const s = stateIn('Recording'); // armFrame 96 000, onsetFrame 144 000, 48 kHz
     const end = (reason: 'silence' | 'maxLength') =>
-      seg(EPOCH, { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason });
+      seg(EPOCH, { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason, voicedRatio: 0.8 });
     const fx = [
       cancel('recording'),
       { k: 'take', epoch: EPOCH, id: TAKE + 1, fromFrame: 144_000 - 14_400, toFrame: 190_000 + 7_200 },
@@ -395,7 +395,7 @@ describe('plan §3.4 rows', () => {
       PROCESSING_T,
     ] satisfies Effect[];
     expectStep(s, end('silence'), 'Processing', fx, { takeId: TAKE + 1 });
-    expectStep(s, end('maxLength'), 'Processing', fx, { takeId: TAKE + 1, capHits: 1 });
+    expectStep(s, end('maxLength'), 'Processing', fx, { takeId: TAKE + 1 }); // voiced: not a noisy cap (#116)
   });
 
   it('row 21: Recording + seg.misfire → Listening', () => {
@@ -810,9 +810,32 @@ describe('clarifications C1–C12', () => {
       Paused: null,
       Error: 'error',
     };
+    const plain = { tooNoisy: false, holdToTalk: false };
     for (const name of STATES) {
-      expect(overlayFor({ name, micMuted: false })).toBe(expected[name]);
-      expect(overlayFor({ name, micMuted: true })).toBe(name === 'Listening' ? 'micMuted' : expected[name]);
+      expect(overlayFor({ name, micMuted: false, ...plain })).toBe(expected[name]);
+      expect(overlayFor({ name, micMuted: true, ...plain })).toBe(
+        name === 'Listening' ? 'micMuted' : expected[name],
+      );
+      // #116: Listening shows muted > hold-to-talk > too noisy; Recording keeps the hold button.
+      for (const micMuted of [false, true]) {
+        for (const tooNoisy of [false, true]) {
+          for (const holdToTalk of [false, true]) {
+            const want =
+              name === 'Listening'
+                ? micMuted
+                  ? 'micMuted'
+                  : holdToTalk
+                    ? 'holdToTalk'
+                    : tooNoisy
+                      ? 'tooNoisy'
+                      : null
+                : name === 'Recording' && holdToTalk
+                  ? 'holdToTalk'
+                  : expected[name];
+            expect(overlayFor({ name, micMuted, tooNoisy, holdToTalk }), name).toBe(want);
+          }
+        }
+      }
     }
     // Entering Listening while muted shows the badge; leaving Listening hides it.
     expect(run(stateIn('Cooldown', { micMuted: true }), tmr('cooldown')).effects.at(-1)).toStrictEqual(
@@ -899,7 +922,7 @@ describe('clarifications C1–C12', () => {
     expect(run(first.state, { t: 'workerFailed' }).state.name).toBe('Error');
   });
 
-  it('C8: take range, capHits, armed and floorSnapshot', () => {
+  it('C8: take range, armed and floorSnapshot', () => {
     const endAt = (last: number) =>
       seg(EPOCH, { kind: 'end', frame: last + 1, lastSpeechFrame: last, reason: 'silence' });
     const takeOf = (s: SessionState) => run(s, endAt(200_000)).effects.find((f) => f.k === 'take');
@@ -1003,6 +1026,8 @@ describe('clarifications C1–C12', () => {
       noDevice: ['Waking'],
       ctxResumeFailed: ['Waking'],
       seg: ['Listening', 'Recording'],
+      holdStart: ['Listening'],
+      holdEnd: ['Recording'],
       clipReady: ['Processing'],
       takeFailed: ['Processing'],
       processed: ['Processing'],
@@ -1040,6 +1065,7 @@ describe('clarifications C1–C12', () => {
       'hidden',
       'pagehide',
       'freeze',
+      'noiseFloor',
     ];
     for (const t of everywhere) for (const name of STATES) expect(TABLE[name][t]).not.toBe('ignore');
   });
@@ -1417,6 +1443,204 @@ describe('#277: an Asleep wake after another tab activated the update reloads in
   });
 });
 
+// ---- #116: noisy room (too-noisy hint, margin raises) and hold-to-talk ---------------------------------------
+/** #116: a current seg end of Recording (lastSpeechFrame 190 000), with or without a voiced ratio. */
+const end116 = (reason: 'silence' | 'maxLength', voicedRatio?: number): SessionEvent =>
+  seg(
+    EPOCH,
+    voicedRatio === undefined
+      ? { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason }
+      : { kind: 'end', frame: 220_000, lastSpeechFrame: 190_000, reason, voicedRatio },
+  );
+/** Row 20's effects from Recording (onset 144 000, armFrame 96 000, 48 kHz) for a take to `toFrame`. */
+const takeFx116 = (toFrame: number, ui0: Effect[] = []): Effect[] => [
+  cancel('recording'),
+  { k: 'take', epoch: EPOCH, id: TAKE + 1, fromFrame: 129_600, toFrame },
+  anim('thinking'),
+  disarm(EPOCH),
+  PROCESSING_T,
+  ...ui0,
+];
+
+describe('#116: noisy room and hold-to-talk', () => {
+  /** Hold-to-talk mode at the top boost, in a noisy room. */
+  const HOLD = { holdToTalk: true, tooNoisy: true, marginBoostDb: 6, noisyCaps: 3 } as const;
+  /** Hold-mode Recording entry: the timer is the cap itself (ORCH-NOTE on #116). */
+  const RECORDING_CAP_T = timer('recording', 10_000);
+  it('row 18b: noiseFloor sets tooNoisy above −35 dBFS; Listening shows the badge', () => {
+    const quiet = stateIn('Listening');
+    expectStep(quiet, { t: 'noiseFloor', floorDb: -20 }, 'Listening', [ui('tooNoisy')], { tooNoisy: true });
+    expectStep(quiet, { t: 'noiseFloor', floorDb: -34.9 }, 'Listening', [ui('tooNoisy')], { tooNoisy: true });
+    expectIgnored(quiet, { t: 'noiseFloor', floorDb: -35 });
+    expectIgnored(quiet, { t: 'noiseFloor', floorDb: Number.NaN });
+    const noisy = stateIn('Listening', { tooNoisy: true });
+    expectStep(noisy, { t: 'noiseFloor', floorDb: -50 }, 'Listening', [ui(null)], { tooNoisy: false });
+    expectIgnored(noisy, { t: 'noiseFloor', floorDb: -30 });
+    // Muted: the flag changes, the mic-muted badge stays.
+    expectStep(stateIn('Listening', { micMuted: true }), { t: 'noiseFloor', floorDb: -20 }, 'Listening', [], {
+      tooNoisy: true,
+    });
+    // Every other state only records the flag.
+    for (const name of STATES) {
+      if (name === 'Listening') continue;
+      expectStep(stateIn(name), { t: 'noiseFloor', floorDb: -20 }, name, [], { tooNoisy: true });
+    }
+  });
+
+  it('row 20: the noisy counter counts capped ends with a voiced ratio below 0.3; any other end resets it', () => {
+    const s = stateIn('Recording', { noisyCaps: 1 });
+    const capsAfter = (e: SessionEvent): number => run(s, e).state.noisyCaps;
+    expect(capsAfter(end116('maxLength', 0.29))).toBe(2);
+    expect(capsAfter(end116('maxLength', 0))).toBe(2);
+    expect(capsAfter(end116('maxLength', 0.3))).toBe(0);
+    expect(capsAfter(end116('silence', 0.1))).toBe(0);
+    expect(capsAfter(end116('maxLength', Number.NaN))).toBe(0);
+    expect(capsAfter(end116('maxLength'))).toBe(0); // unknown ratio
+    // A misfire is not an end: the counter stays.
+    expect(run(s, seg(EPOCH, { kind: 'misfire', frame: 150_000 })).state.noisyCaps).toBe(1);
+  });
+
+  it('row 20: the third noisy cap raises the margins by 3 dB (twice), then switches to hold-to-talk', () => {
+    const fx = takeFx116(190_000 + 7_200);
+    const noisy = end116('maxLength', 0.1);
+    expectStep(stateIn('Recording', { noisyCaps: 2 }), noisy, 'Processing', fx, {
+      takeId: TAKE + 1,
+      noisyCaps: 0,
+      marginBoostDb: 3,
+    });
+    expectStep(stateIn('Recording', { noisyCaps: 2, marginBoostDb: 3 }), noisy, 'Processing', fx, {
+      takeId: TAKE + 1,
+      noisyCaps: 0,
+      marginBoostDb: 6,
+    });
+    expectStep(stateIn('Recording', { noisyCaps: 2, marginBoostDb: 6 }), noisy, 'Processing', fx, {
+      takeId: TAKE + 1,
+      noisyCaps: 3,
+      holdToTalk: true,
+    });
+    // Three loops from scratch: Recording → Processing three times reaches boost 3.
+    let st = stateIn('Recording');
+    for (let i = 0; i < 3; i++) st = run({ ...st, name: 'Recording' }, noisy).state;
+    expect(st).toMatchObject({ noisyCaps: 0, marginBoostDb: 3, holdToTalk: false });
+  });
+
+  it('entering Listening arms with the boost (only when > 0) and shows the hold button in hold-to-talk mode', () => {
+    const armOf = (over: Partial<SessionState>): Effect | undefined =>
+      run(stateIn('Cooldown', over), tmr('cooldown')).effects.find((f) => f.k === 'arm');
+    expect(armOf({})).toStrictEqual({ k: 'arm', epoch: EPOCH + 1, restoreFloorDb: FLOOR });
+    expect(armOf({ marginBoostDb: 3 })).toStrictEqual({
+      k: 'arm',
+      epoch: EPOCH + 1,
+      restoreFloorDb: FLOOR,
+      marginBoostDb: 3,
+    });
+    expect(armOf({ marginBoostDb: 6, floorDb: undefined })).toStrictEqual({
+      k: 'arm',
+      epoch: EPOCH + 1,
+      marginBoostDb: 6,
+    });
+    expectStep(
+      stateIn('Cooldown', HOLD),
+      tmr('cooldown'),
+      'Listening',
+      [
+        cancel('cooldown'),
+        { k: 'arm', epoch: EPOCH + 1, restoreFloorDb: FLOOR, marginBoostDb: 6 },
+        SLEEP_T,
+        DOZE_T,
+        anim('idle'),
+        ui('holdToTalk'),
+      ],
+      { epoch: EPOCH + 1, armFrame: null, onsetFrame: null },
+    );
+  });
+
+  it('hold-to-talk mode ignores every seg event in Listening and Recording', () => {
+    for (const name of ['Listening', 'Recording'] as const) {
+      const s = stateIn(name, HOLD);
+      for (const e of SAMPLES.seg(s)) expectIgnored(s, e);
+      for (const e of STALE.seg(s)) expectIgnored(s, e);
+    }
+  });
+
+  it('row 13b: holdStart in hold-to-talk mode → Recording at its frame, with the cap as the recording timer', () => {
+    expectStep(
+      stateIn('Listening', HOLD),
+      { t: 'holdStart', frame: 150_000 },
+      'Recording',
+      [cancel('sleep'), cancel('doze'), anim('attentive'), RECORDING_CAP_T],
+      { onsetFrame: 150_000 },
+    );
+    expectIgnored(stateIn('Listening'), { t: 'holdStart', frame: 150_000 });
+  });
+
+  it('row 20b: holdEnd → Processing with row 20 take, the release clamped to [onset, onset + cap]', () => {
+    const s = stateIn('Recording', HOLD); // onset 144 000, armFrame 96 000
+    expectStep(s, { t: 'holdEnd', frame: 200_000 }, 'Processing', takeFx116(207_200, [ui(null)]), {
+      takeId: TAKE + 1,
+    });
+    expectStep(s, { t: 'holdEnd', frame: 100_000 }, 'Processing', takeFx116(144_000 + 7_200, [ui(null)]), {
+      takeId: TAKE + 1,
+    });
+    expectStep(
+      s,
+      { t: 'holdEnd', frame: 144_000 + 600_000 },
+      'Processing',
+      takeFx116(144_000 + 480_000 + 7_200, [ui(null)]),
+      { takeId: TAKE + 1 },
+    );
+    expectIgnored(stateIn('Recording'), { t: 'holdEnd', frame: 200_000 });
+  });
+
+  it('row 20c: timer recording in hold-to-talk mode is a forced holdEnd at the cap: no restart, no Cooldown', () => {
+    for (const workerRestarts of [0, 1]) {
+      const r = expectStep(
+        stateIn('Recording', { ...HOLD, workerRestarts }),
+        tmr('recording'),
+        'Processing',
+        takeFx116(631_200, [ui(null)]),
+        { takeId: TAKE + 1 },
+      );
+      expect(r.effects.some((f) => f.k === 'restartWorker')).toBe(false);
+    }
+    // Recording is only entered with an onset; without one the cap counts from the arm, then from 0.
+    const take = (over: Partial<SessionState>): Effect | undefined =>
+      run(stateIn('Recording', { ...HOLD, ...over }), tmr('recording')).effects.find((f) => f.k === 'take');
+    expect(take({ onsetFrame: null })).toMatchObject({ toFrame: 96_000 + 480_000 + 7_200 });
+    expect(take({ onsetFrame: null, armFrame: null })).toMatchObject({ toFrame: 480_000 + 7_200 });
+    const r = run(stateIn('Recording', { ...HOLD, onsetFrame: null }), { t: 'holdEnd', frame: 200_000 });
+    expect(r.effects.find((f) => f.k === 'take')).toMatchObject({
+      fromFrame: 200_000 - 14_400,
+      toFrame: 207_200,
+    });
+  });
+
+  it('entering Asleep resets noisy mode and tooNoisy; Paused and Error keep them; Waking clears tooNoisy', () => {
+    for (const from of AWAKE) {
+      const s = stateIn(from, HOLD);
+      expect(transitionTo(s, 'Asleep', DEFAULT_CONFIG).state).toMatchObject({
+        noisyCaps: 0,
+        marginBoostDb: 0,
+        holdToTalk: false,
+        tooNoisy: false,
+      });
+      expect(transitionTo(s, 'Paused', DEFAULT_CONFIG).state).toMatchObject(HOLD);
+      expect(transitionTo(s, 'Error', DEFAULT_CONFIG).state).toMatchObject(HOLD);
+    }
+    const toWaking: [StateName, SessionEvent, Partial<SessionState>][] = [
+      ['Error', { t: 'tapBear' }, {}], // row 42
+      ['Paused', { t: 'visible' }, {}], // row 39
+      ['Listening', { t: 'inputsChanged' }, {}], // row 40
+      ['Cooldown', tmr('cooldown'), { reselectPending: true }], // row 35b
+    ];
+    for (const [from, e, over] of toWaking) {
+      const r = run(stateIn(from, { ...HOLD, ...over }), e);
+      expect(r.state.name).toBe('Waking');
+      expect(r.state).toMatchObject({ tooNoisy: false, holdToTalk: true, marginBoostDb: 6 });
+    }
+  });
+});
+
 // ---- Validation 4 and 5: the full (state × event) cross product ------------------------------------------------
 /** Representative current events for every event type. A missing type is a compile error. */
 const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
@@ -1437,12 +1661,17 @@ const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
     {
       t: 'seg',
       epoch: s.epoch,
-      ev: { kind: 'end', frame: 250_000, lastSpeechFrame: 200_000, reason: 'silence' },
+      ev: { kind: 'end', frame: 250_000, lastSpeechFrame: 200_000, reason: 'silence', voicedRatio: 0.8 },
     },
     {
       t: 'seg',
       epoch: s.epoch,
-      ev: { kind: 'end', frame: 250_000, lastSpeechFrame: 200_000, reason: 'maxLength' },
+      ev: { kind: 'end', frame: 250_000, lastSpeechFrame: 200_000, reason: 'maxLength', voicedRatio: 0.8 },
+    },
+    {
+      t: 'seg',
+      epoch: s.epoch,
+      ev: { kind: 'end', frame: 250_000, lastSpeechFrame: 200_000, reason: 'maxLength', voicedRatio: 0.1 },
     },
     { t: 'seg', epoch: s.epoch, ev: { kind: 'misfire', frame: 150_000 } },
   ],
@@ -1472,6 +1701,12 @@ const SAMPLES: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
     { t: 'settingsChanged', preset: PRESETS.chipmunk },
     { t: 'settingsChanged', preset: { id: 'custom', pitchRatio: 1.85 } },
   ],
+  noiseFloor: () => [
+    { t: 'noiseFloor', floorDb: -50 },
+    { t: 'noiseFloor', floorDb: -20 },
+  ],
+  holdStart: () => [{ t: 'holdStart', frame: 150_000 }],
+  holdEnd: () => [{ t: 'holdEnd', frame: 200_000 }],
 };
 
 /** Stale variants of the events that carry an epoch, id or req (row 44); [] for the others. */
@@ -1514,6 +1749,9 @@ const STALE: { [E in EventType]: (s: SessionState) => EventOf<E>[] } = {
   visible: () => [],
   updateReady: () => [],
   settingsChanged: () => [],
+  noiseFloor: () => [],
+  holdStart: () => [],
+  holdEnd: () => [],
 };
 
 const EVENT_TYPES: EventType[] = [
@@ -1549,6 +1787,9 @@ const EVENT_TYPES: EventType[] = [
   'visible',
   'updateReady',
   'settingsChanged',
+  'noiseFloor',
+  'holdStart',
+  'holdEnd',
 ];
 
 /** Two variants per state: plain, and one with every flag and counter set. */
@@ -1564,9 +1805,13 @@ function variants(name: StateName): SessionState[] {
       sfxEndedSeq: name === 'SfxGated' || name === 'Cooldown' ? SEQ - 1 : SEQ,
       micDeniedSfx: name === 'MicDenied' || name === 'Waking',
       floorDb: undefined,
-      capHits: 2,
+      noisyCaps: 2,
+      marginBoostDb: 3,
+      tooNoisy: true,
     }),
     stateIn(name, { updateReady: true, updateActivated: true }), // #277: another tab activated the update
+    // #116: hold-to-talk mode at the top boost, in a noisy room.
+    stateIn(name, { holdToTalk: true, tooNoisy: true, marginBoostDb: 6, noisyCaps: 3 }),
   ];
 }
 
@@ -1581,6 +1826,8 @@ function checkInvariants(s: SessionState, e: SessionEvent, effects: Effect[], ne
     if (f.k === 'arm') {
       expect(next.name).toBe('Listening');
       expect(f.epoch).toBe(next.epoch);
+      expect(f.marginBoostDb ?? 0).toBe(next.marginBoostDb); // #116: present only when > 0
+      if (f.marginBoostDb !== undefined) expect(f.marginBoostDb).toBeGreaterThan(0);
     }
     if (f.k === 'sfx')
       expect(next.name === 'SfxGated' || (s.name === 'MicDenied' && next.name === 'MicDenied')).toBe(true);
@@ -1600,6 +1847,14 @@ function checkInvariants(s: SessionState, e: SessionEvent, effects: Effect[], ne
     }
   }
   if (next.updateActivated) expect(next.updateReady).toBe(true);
+  // #116: hold-to-talk mode ignores every seg, and its recording timer is the cap, never a worker restart.
+  if (s.holdToTalk && e.t === 'seg') {
+    expect(next).toBe(s);
+    expect(effects).toStrictEqual([]);
+  }
+  if (s.holdToTalk && e.t === 'timer' && e.name === 'recording') {
+    expect(effects.some((f) => f.k === 'restartWorker')).toBe(false);
+  }
 }
 
 describe('cross product (state × event)', () => {
@@ -1644,7 +1899,7 @@ describe('cross product (state × event)', () => {
         }
       }
     }
-    expect(stale).toBe(STATES.length * 3 * 16);
+    expect(stale).toBe(STATES.length * 4 * 17); // 17 stale events per state: seg has 5 since #116
   });
 
   it('reduce never mutates its input (the frozen input is unchanged)', () => {
@@ -1711,7 +1966,10 @@ describe('initial state and config', () => {
       micMuted: false,
       reselectPending: false,
       workerRestarts: 0,
-      capHits: 0,
+      noisyCaps: 0,
+      tooNoisy: false,
+      marginBoostDb: 0,
+      holdToTalk: false,
       sfxSeq: 0,
       sfxEndedSeq: 0,
       micDeniedSfx: false,

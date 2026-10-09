@@ -5,7 +5,15 @@
 //
 // Noisy room (plan §4.1.1, §7 M8, #113): each `openMic` reads the settings, and with `noisyRoomNs` on passes
 // `NOISY_ROOM_CONSTRAINTS` as the engine's `extra`, so a change applies at the next mic open.
+//
+// Too noisy (#116, plan §4.4, and the ORCH-NOTE on #116): the session hands every engine `level` to `level()`, which
+// turns them into at most one `noiseFloor` per second: over a window of at least NOISE_FLOOR_WINDOW_MS of Listening
+// levels of the current epoch, the larger of the gate floor N and the minimum hop level (digital silence counts at
+// the gate's `ignoreBelowDb`, so a silent input clears the flag). The gate floor alone absorbs a loud steady noise
+// only with its 20 s in-speech time constant. Levels outside Listening (speech is Recording) never count, and a
+// new epoch starts a new window. The window lives in closure scalars: nothing is allocated per level.
 
+import { DEFAULT_ENERGY_PARAMS } from '../dsp/energy-gate.ts';
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
 import type { Player, SessionDeps, Sfx, SfxScheduled } from './session.ts';
 
@@ -29,6 +37,16 @@ export const NOISY_ROOM_CONSTRAINTS: Readonly<MediaTrackConstraints> = Object.fr
   noiseSuppression: true,
 });
 
+/** #116: a `noiseFloor` is dispatched once a window of Listening levels spans at least this long. */
+export const NOISE_FLOOR_WINDOW_MS = 1000;
+
+/** The parts of an engine `level` event the noise floor estimate reads. */
+export interface LevelSample {
+  epoch: number;
+  db: number;
+  floorDb: number;
+}
+
 /** How effects talk back to the session. */
 export interface EffectIo {
   /** Queues an event while a dispatch is running (re-entrancy), else runs it at once. */
@@ -42,6 +60,8 @@ export interface EffectIo {
 export interface EffectRunner {
   /** Runs one effect. An effect that throws is logged, never rethrown, so the loop continues. */
   run(fx: Effect): void;
+  /** An engine `level` event (#116): feeds the noise floor estimate, which dispatches `noiseFloor` (see above). */
+  level(e: LevelSample): void;
 }
 
 type SfxEffect = Extract<Effect, { k: 'sfx' }>;
@@ -212,6 +232,40 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
     timers.clear();
   }
 
+  // ---- noise floor (#116) ------------------------------------------------------------------------------------
+
+  let winOpen = false;
+  let winEpoch = 0;
+  let winStart = 0;
+  let winMin = 0;
+  let winFloor = Number.NaN;
+
+  function level(e: LevelSample): void {
+    const s = io.state();
+    if (s.name !== 'Listening' || e.epoch !== s.epoch) {
+      winOpen = false;
+      return;
+    }
+    const silent = DEFAULT_ENERGY_PARAMS.ignoreBelowDb;
+    const db = e.db >= silent ? e.db : silent; // digital silence (and NaN) reads as the gate's silence level
+    const now = clock.now();
+    if (!winOpen || winEpoch !== e.epoch) {
+      winOpen = true;
+      winEpoch = e.epoch;
+      winStart = now;
+      winMin = db;
+    } else if (db < winMin) {
+      winMin = db;
+    }
+    winFloor = e.floorDb;
+    if (now - winStart < NOISE_FLOOR_WINDOW_MS) return;
+    winOpen = false;
+    io.dispatch({
+      t: 'noiseFloor',
+      floorDb: Number.isFinite(winFloor) ? Math.max(winMin, winFloor) : winMin,
+    });
+  }
+
   // ---- the interpreter -------------------------------------------------------------------------------------
 
   function exec(fx: Effect): void {
@@ -237,7 +291,7 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
         engine.restartWorker();
         return;
       case 'arm':
-        engine.arm(fx.epoch, fx.restoreFloorDb);
+        engine.arm(fx.epoch, fx.restoreFloorDb, fx.marginBoostDb);
         return;
       case 'disarm':
         engine.disarm(fx.epoch);
@@ -296,5 +350,6 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
         console.error(`effects: ${fx.k} failed`, err);
       }
     },
+    level,
   };
 }

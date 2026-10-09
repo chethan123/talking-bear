@@ -40,6 +40,14 @@ export interface SimOptions {
    * fire (default 0: nothing is lost, and no extra random draw is made).
    */
   lossRate?: number;
+  /**
+   * #116: a noisy room: every `seg` end the sim makes is a cap (`maxLength`) with a voiced ratio below 0.3
+   * (default false: the reason is drawn as before and the ratio is uniform in [0, 1)); the worker also caps every
+   * VAD-started take after maxUtteranceMs, and in hold-to-talk mode it still reports an onset after each arm.
+   */
+  noisy?: boolean;
+  /** Fields applied over the initial (Asleep) state, e.g. a noisy mode one cap short of hold-to-talk (#116). */
+  initial?: Partial<SessionState>;
 }
 
 /** The simulated context rate: resumeCtx answers `ctxRunning{48000}`, and ctx frames are `now · 48`. */
@@ -116,6 +124,9 @@ export const POOL_KINDS = [
   'visible',
   'updateReady',
   'settingsChanged',
+  'noiseFloor',
+  'holdStart',
+  'holdEnd',
 ] as const satisfies readonly EventType[];
 export type PoolKind = (typeof POOL_KINDS)[number];
 
@@ -172,6 +183,8 @@ const CUSTOM_PITCH_GRID: readonly number[] = Array.from(
 const ONSET_AFTER_ARM_MS = 100;
 const MAX_ONSET_AGE_MS = 100;
 const MAX_HANGOVER_MS = 800;
+/** #116: in a noisy room in hold-to-talk mode, the VAD's onset this long after each arm. */
+const NOISY_ONSET_MS = 300;
 
 const pick = <T>(rng: SimRng, xs: readonly T[]): T => {
   const x = xs[Math.min(xs.length - 1, Math.floor(rng() * xs.length))];
@@ -204,6 +217,7 @@ export class SessionSim {
   private readonly cfg: SessionConfig;
   private readonly mic: MicMode;
   private readonly lossRate: number;
+  private readonly noisy: boolean;
   /** Environment callbacks, sorted by due time, then by scheduling order. */
   private readonly queue: Pending[] = [];
   private order = 0;
@@ -223,7 +237,8 @@ export class SessionSim {
     this.cfg = opts.cfg ?? DEFAULT_CONFIG;
     this.mic = opts.mic ?? 'granted';
     this.lossRate = opts.lossRate ?? 0;
-    this.state = initialSessionState(opts.permission ?? 'granted');
+    this.noisy = opts.noisy ?? false;
+    this.state = { ...initialSessionState(opts.permission ?? 'granted'), ...opts.initial };
   }
 
   /** The current ctx frame. */
@@ -292,8 +307,16 @@ export class SessionSim {
     const oldId = s.takeId - 1;
     const out: SessionEvent[] = [
       { t: 'seg', epoch: oldEpoch, ev: { kind: 'start', frame } },
-      { t: 'seg', epoch: oldEpoch, ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'silence' } },
-      { t: 'seg', epoch: oldEpoch, ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'maxLength' } },
+      {
+        t: 'seg',
+        epoch: oldEpoch,
+        ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'silence', voicedRatio: 0.1 },
+      },
+      {
+        t: 'seg',
+        epoch: oldEpoch,
+        ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'maxLength', voicedRatio: 0.1 },
+      },
       { t: 'seg', epoch: oldEpoch, ev: { kind: 'misfire', frame } },
       { t: 'armed', epoch: oldEpoch, armFrame: frame },
       { t: 'floorSnapshot', epoch: oldEpoch, floorDb: -50 },
@@ -357,6 +380,7 @@ export class SessionSim {
       case 'timer':
         this.timers.delete(fx.name); // re-insert, so insertion order breaks ties by scheduling order
         this.timers.set(fx.name, this.now + fx.ms);
+        if (fx.name === 'recording') this.noisyCap();
         break;
       case 'cancelTimer':
         if (fx.name === '*') this.timers.clear();
@@ -419,6 +443,7 @@ export class SessionSim {
         arms.push({ at: this.now, voiceUntil: this.audibleVoiceUntil, sfxUntil: this.audibleSfxUntil });
         this.armed = true;
         this.armFrame = this.nowFrame();
+        this.noisyOnset(fx.epoch);
         break;
       case 'disarm':
         this.armed = false;
@@ -427,6 +452,32 @@ export class SessionSim {
         break;
     }
     this.effectsLog.push({ at: this.now, fx });
+  }
+
+  /**
+   * #116: in a noisy room the worker caps a take that the VAD started, with a low voiced ratio, after
+   * maxUtteranceMs: before the recording watchdog (maxUtteranceMs + 2 s). Not in hold-to-talk mode, where the
+   * timer is the cap itself. A take that ends earlier leaves the end stale or ignored.
+   */
+  private noisyCap(): void {
+    const s = this.state;
+    if (!this.noisy || s.name !== 'Recording' || s.holdToTalk) return;
+    const frame = this.nowFrame() + this.cfg.maxUtteranceMs * FRAMES_PER_MS;
+    this.schedule(this.now + this.cfg.maxUtteranceMs, {
+      t: 'seg',
+      epoch: s.epoch,
+      ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'maxLength', voicedRatio: 0.1 },
+    });
+  }
+
+  /** #116: in hold-to-talk mode the VAD still segments the noise: an onset 300 ms after each arm (ignored). */
+  private noisyOnset(epoch: number): void {
+    if (!this.noisy || !this.state.holdToTalk) return;
+    this.schedule(this.now + NOISY_ONSET_MS, {
+      t: 'seg',
+      epoch,
+      ev: { kind: 'start', frame: this.nowFrame() + NOISY_ONSET_MS * FRAMES_PER_MS },
+    });
   }
 
   private lost(): boolean {
@@ -508,8 +559,11 @@ export class SessionSim {
       case 'MicDenied':
         return rng() < 0.5 ? { t: 'settingsRetry' } : this.reaction(rng);
       case 'Listening':
-        return rng() < 0.75 ? this.seg(rng, s.epoch, 'start') : this.reaction(rng);
+        // #116: in hold-to-talk mode the hold button starts a take; seg events would be ignored.
+        if (rng() >= 0.75) return this.reaction(rng);
+        return s.holdToTalk ? { t: 'holdStart', frame: this.nowFrame() } : this.seg(rng, s.epoch, 'start');
       case 'Recording':
+        if (s.holdToTalk) return { t: 'holdEnd', frame: this.nowFrame() };
         return this.seg(rng, s.epoch, rng() < 0.8 ? 'end' : 'misfire');
       case 'Playing':
       case 'SfxGated':
@@ -572,6 +626,11 @@ export class SessionSim {
         return { t: kind, id: stale ? older(s.takeId) : s.takeId };
       case 'settingsChanged':
         return { t: kind, preset: settingsPreset(rng) };
+      case 'noiseFloor':
+        return { t: kind, floorDb: -70 + rng() * 50 }; // −70 … −20 dBFS: about 30 % above −35
+      case 'holdStart':
+      case 'holdEnd':
+        return { t: kind, frame: this.nowFrame() };
       default:
         return { t: kind };
     }
@@ -607,11 +666,15 @@ export class SessionSim {
       case 'end': {
         const onset = this.state.onsetFrame ?? earliestOnset;
         const lastSpeechFrame = Math.max(onset, now - Math.floor(rng() * MAX_HANGOVER_MS * FRAMES_PER_MS));
-        const reason = rng() < 0.8 ? 'silence' : 'maxLength';
+        // The same two draws either way (#116): a noisy room caps every take with a low voiced ratio.
+        const r = rng();
+        const v = rng();
+        const reason = this.noisy || r >= 0.8 ? 'maxLength' : 'silence';
+        const voicedRatio = this.noisy ? v * 0.3 : v;
         return {
           t: 'seg',
           epoch,
-          ev: { kind, frame: Math.max(now, lastSpeechFrame), lastSpeechFrame, reason },
+          ev: { kind, frame: Math.max(now, lastSpeechFrame), lastSpeechFrame, reason, voicedRatio },
         };
       }
       default: // misfire

@@ -36,7 +36,15 @@ export type AnimEvent =
   | { e: 'earTwitch' }
   | { e: 'shrug' }
   | { e: 'reaction'; name: string; priority: Priority };
-export type Overlay = 'tapToWake' | 'parentPermission' | 'micHelp' | 'micMuted' | 'tooNoisy' | 'error' | null;
+export type Overlay =
+  | 'tapToWake'
+  | 'parentPermission'
+  | 'micHelp'
+  | 'micMuted'
+  | 'tooNoisy'
+  | 'holdToTalk' // #116: the hold-to-talk button (Listening and Recording in hold-to-talk mode)
+  | 'error'
+  | null;
 
 export type SessionEvent =
   | { t: 'tapBear' }
@@ -71,7 +79,13 @@ export type SessionEvent =
   | { t: 'visible' }
   | { t: 'updateReady'; activated?: true } // activated: another tab activated the update (#277)
   // M3 settings (issue #66): the voice preset the next `process` uses. Every state updates `preset`, no effects.
-  | { t: 'settingsChanged'; preset: VoicePreset };
+  | { t: 'settingsChanged'; preset: VoicePreset }
+  // #116, plan §4.4: the background level estimate (effects.ts, at most once per second while Listening); every
+  // state updates `tooNoisy`.
+  | { t: 'noiseFloor'; floorDb: number }
+  // #116: the hold-to-talk button pressed / released, at ctx frame `frame` (the capture worklet's frame clock).
+  | { t: 'holdStart'; frame: number }
+  | { t: 'holdEnd'; frame: number };
 export type EventType = SessionEvent['t'];
 
 // Plan §3.3, plus `seq` on sfx and `applyUpdate`.
@@ -81,7 +95,7 @@ export type Effect =
   | { k: 'resumeCtx' }
   | { k: 'suspendCtx' }
   | { k: 'restartWorker' }
-  | { k: 'arm'; epoch: number; restoreFloorDb?: number }
+  | { k: 'arm'; epoch: number; restoreFloorDb?: number; marginBoostDb?: number } // marginBoostDb: only when > 0
   | { k: 'disarm'; epoch: number }
   | { k: 'take'; epoch: number; id: number; fromFrame: number; toFrame: number }
   | { k: 'process'; id: number; preset: VoicePreset }
@@ -112,7 +126,17 @@ export interface SessionState {
   micMuted: boolean;
   reselectPending: boolean;
   workerRestarts: number;
-  capHits: number;
+  /**
+   * #116, plan §4.4: consecutive capped takes with a low voiced ratio (row 20's noisy counter). At 3 the margins
+   * rise (`marginBoostDb`), then hold-to-talk takes over.
+   */
+  noisyCaps: number;
+  /** #116: the latest `noiseFloor` was above −35 dBFS; Listening shows the too-noisy badge. */
+  tooNoisy: boolean;
+  /** #116: the dB the worker adds to its energy margins and proximity X, carried by every Listening `arm`. */
+  marginBoostDb: 0 | 3 | 6;
+  /** #116: hold-to-talk mode: `seg` events are ignored and the hold button records. Entering Asleep clears it. */
+  holdToTalk: boolean;
   sfxSeq: number;
   sfxEndedSeq: number;
   /** A MicDenied reaction played an sfx since the last Waking completion (D22). */
