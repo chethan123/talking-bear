@@ -469,6 +469,16 @@ describe('timer cooldown: also on the context clock (#286, plan §3.1, §4.4 poi
     expect(clock.pending()).toBe(0);
   });
 
+  it('(f2) the last re-arm is clamped to the wall cap, not the whole context rest', () => {
+    const { clock, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 300 }); // frozen: re-arms at 300 and 600 for 300 ms each
+    clock.advance(300 + COOLDOWN_CTX_WAIT_MAX_MS - 1);
+    expect(dispatched).toEqual([]);
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
   it('(d2) with no context yet it fires on the wall clock alone', () => {
     const { clock, runner, dispatched } = timerHarness(false);
     runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
