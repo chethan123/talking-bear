@@ -19,7 +19,8 @@
  *   with the spring's own constants (`kick`).
  * - Content (plan Q3): surprise, ticklishness, delight or mild grumpiness only.
  * - Mimes (`MIME_CLIPS`, #115) are clips the app asks the director for by name (`{k:'clip'}`), not reactions of the
- *   #90 table: the MicDenied cupped ear.
+ *   #90 table: the MicDenied cupped ear, and the session's playful "too loud!" reaction after the replay of a clipped
+ *   take with its gentle variant (#117).
  */
 import type { Clip, Key, Track } from '../clip.ts';
 import { Ch } from '../pose.ts';
@@ -737,14 +738,92 @@ const cuppedEar: Clip = (() => {
   };
 })();
 
-/** The mimes, by name: clips the app asks the director for by name (`{k:'clip'}`, #115). */
-export type MimeClipName = 'cuppedEar';
+// ---- the session's "too loud!" reaction (#117) --------------------------------------------------------------
+
+/** tooLoud's timing (s): the startle peaks from 0.12 to 0.35 s and is gone by 0.55 s. */
+const LOUD_IN = 0.12;
+const LOUD_HOLD = 0.35;
+/** The grin rises from 0.35 s, is full from 0.55 to 0.95 s, and is gone at the clip's end, 1.2 s. */
+const GRIN_IN = 0.55;
+const GRIN_HOLD = 0.95;
+const LOUD_S = 1.2;
+/** The startle ("whoa, loud!"): both ears fold 0.7 and the lids squint 0.6, briefly. */
+const LOUD_FOLD = 0.7;
+const LOUD_SQUINT = 0.6;
+/** Brows up (surprise), never down: no wince (plan Q3). */
+const LOUD_BROW = 4;
+/** A small lean back (counter-clockwise, as the laugh fit's), which reduced motion scales × 0.3. */
+const LOUD_LEAN = -4 * DEG;
+/** The grin: happy half-lids, brows still a little up. */
+const GRIN_LIDS = 0.3;
+const GRIN_BROW = 2;
+/** An open "D" smile: the jaw open whenever the teeth show, so never a clenched grimace. */
+const GRIN_JAW = 0.3;
+const GRIN_W = 0.9;
+const GRIN_TEETH = 0.6;
+/** The issue's `Blush` 0.5 with the grin. */
+const GRIN_BLUSH = 0.5;
+
+/**
+ * After the replay of a clipped take (#117, plan §4.4 "Clipping (shouting)", §7 M8): the ears fold briefly and the
+ * eyes squint with the brows up, then a grin with a 0.5 blush, over 1.2 s. Playful, never pain (Q3): no sound, no
+ * kick, no frown.
+ */
+const tooLoud: Clip = (() => {
+  const startle = (v: number): Key[] => [
+    k(0, 0, 'out'),
+    k(LOUD_IN, v),
+    k(LOUD_HOLD, v, 'inOut'),
+    k(GRIN_IN, 0),
+  ];
+  const grin = (v: number): Key[] => [
+    k(LOUD_HOLD, 0, 'out'),
+    k(GRIN_IN, v),
+    k(GRIN_HOLD, v, 'inOut'),
+    k(LOUD_S, 0),
+  ];
+  const face = (a: number, b: number): Key[] => [
+    k(0, 0, 'out'),
+    k(LOUD_IN, a),
+    k(LOUD_HOLD, a, 'inOut'),
+    k(GRIN_IN, b),
+    k(GRIN_HOLD, b, 'inOut'),
+    k(LOUD_S, 0),
+  ];
+  return {
+    name: 'tooLoud',
+    duration: LOUD_S,
+    tracks: [
+      track(Ch.EarFoldL, ...startle(LOUD_FOLD)),
+      track(Ch.EarFoldR, ...startle(LOUD_FOLD)),
+      ...lids(...face(LOUD_SQUINT, GRIN_LIDS)),
+      ...brows(...face(LOUD_BROW, GRIN_BROW)),
+      track(Ch.BodyLean, ...startle(LOUD_LEAN)),
+      track(Ch.Jaw, ...grin(GRIN_JAW)),
+      track(Ch.MouthW, ...grin(GRIN_W)),
+      track(Ch.Teeth, ...grin(GRIN_TEETH)),
+      track(Ch.Blush, ...grin(GRIN_BLUSH)),
+    ],
+  };
+})();
+
+/**
+ * The mimes, by name: clips the app asks the director for by name (`{k:'clip'}`, #115): the MicDenied cupped ear, and
+ * the session's too-loud reaction with its gentle variant (#117), which the director plays in Gentle mode and under
+ * reduced motion.
+ */
+export type MimeClipName = 'cuppedEar' | 'tooLoud' | 'tooLoudGentle';
 
 /**
  * The mime clips; each clip's `name` equals its key. They are not reactions of the #90 table, so they are kept out
- * of `REACTION_CLIPS`; the director plays them too.
+ * of `REACTION_CLIPS`; the director plays them too. `tooLoudGentle` is `tooLoud` × `GENTLE_SCALE`, like every gentle
+ * variant (#117).
  */
-export const MIME_CLIPS: Readonly<Record<MimeClipName, Clip>> = { cuppedEar };
+export const MIME_CLIPS: Readonly<Record<MimeClipName, Clip>> = {
+  cuppedEar,
+  tooLoud,
+  tooLoudGentle: gentle(tooLoud),
+};
 
 // ---- the set ------------------------------------------------------------------------------------------------
 
