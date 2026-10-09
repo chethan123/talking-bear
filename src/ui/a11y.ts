@@ -19,8 +19,10 @@
 // never deferred, and a held text is dropped if the state has moved on.
 //
 // **Icon overlays** are `role="status"` with an `aria-label` and an explicit `aria-live="off"`: `status` implies
-// `aria-live="polite"`, and the mic-muted and too-noisy badges are shown in Listening, so without the explicit off
-// they would be live regions there. The labels are attributes only: no text node is added to any overlay.
+// `aria-live="polite"`, and the mic-muted badge is shown in Listening and the too-noisy badge in Listening and in
+// Recording (#289; the hold-to-talk button still takes priority in Recording), so without the explicit off they
+// would be live regions there. So the too-noisy badge never announces. The labels are attributes only: no text node
+// is added to any overlay.
 
 import type { Overlay, StateName } from '../app/events.ts';
 
