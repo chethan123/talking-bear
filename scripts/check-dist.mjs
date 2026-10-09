@@ -23,6 +23,12 @@
 //   6. If any *.bin (the Silero weights) ships, licenses.txt exists and contains "Silero Team".
 //   7. manifest.webmanifest parses as a JSON object with name "Talking Bear", and every icons[].src and
 //      screenshots[].src names a file in dist (`/icons/…`; `//host/…` and absolute URLs fail).
+//   8. The main JS chunk (the dist-relative src of index.html's `<script type="module" src>`) keeps the director's
+//      hidden-class templates (#281, src/anim/director.ts: CLIP_TEMPLATE, REACTION_TEMPLATE, CUT_CLIP_TEMPLATE):
+//      each is declared as an object literal with exactly its property list, in order, and some function returns a
+//      spread of that declaration's variable (`return{...t,` or `=>({...t,`). A factory that returns a plain
+//      literal with the same keys gets the same hidden class in V8 and passes every unbundled test, but lets the
+//      bundler drop the template, and the shipped rAF frame allocates 2–3.5 KB again (#294).
 //
 // The observed sw.js (vite-plugin-pwa 1.3.0, generateSW, inlineWorkboxRuntime; checked on main 8034412) is one
 // minified file without importScripts. precacheAndRoute is inlined and renamed, and its keys are unquoted:
@@ -44,6 +50,24 @@
 // turns Workbox's warning into an error by default), after writing an sw.js without it. Rule 1 is the second line
 // of defence there, and the main guard against files outside workbox.globPatterns (e.g. wasm/onnx, plan §7 M2)
 // and against plugin regressions.
+//
+// Rule 8 on main 83e9162 (rolldown's minifier; the same in the e2e build): the templates and their factories are
+//
+//   var rs={name:``,start:NaN},is={r:Wn.tuftBoing,clip:``,start:NaN,last:NaN,runStart:NaN,sfxAt:NaN,release:null,
+//   region:null,gesture:null},as={name:``,start:NaN,cutAt:NaN,release:null};function os(e,t){return{...rs,name:e,
+//   start:t}}…function cs(e,t,n,r){return{...as,name:e,start:t,cutAt:n,release:r}}
+//
+// So the rule matches property lists, never minified names: keys and their order are exact (the order is the
+// hidden class), an empty string may use any quote style, a time is `NaN` or `Number.NaN`, whitespace is optional,
+// and REACTION_TEMPLATE's `r` is any expression without `,{}()` (today `Wn.tuftBoing`). The variable a literal is
+// declared as is captured only to look for its spread. "Inside a function body" is `return{...t` or `=>({...t`:
+// both are only legal in a function, and they are the factory shapes; telling a module-level `{...t}` from one in a
+// function would need a JS parser, and this script has no dependencies. A minifier that inlines a factory into
+// another expression, uses Object.assign, or lowers the target to `_objectSpread` fails this rule, and that change
+// then updates it. With today's bundler an unspread template is dropped, so the literal check fires; the spread
+// check is defence in depth for a bundler that keeps it. Known gap: the spread check accepts `return{...t` anywhere
+// in the chunk, so if a template were ever minified to the same name as a common local (`e`), an unrelated
+// `return{...e,` would satisfy it; that only matters when a template survives without its spread.
 
 import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
@@ -64,6 +88,65 @@ const LICENCE_MARK = 'Silero Team';
 const MANIFEST_NAME = 'Talking Bear';
 /** Characters of context printed on each side of a forbidden worklet match. */
 const CONTEXT = 60;
+
+// Rule 8 regex fragments (strings, spliced into RegExp sources).
+const IDENT = '[A-Za-z_$][\\w$]*';
+/** Not preceded by an identifier character or a dot. */
+const NOT_AFTER = '(?<![\\w$.])';
+/** Not followed by an identifier character. */
+const NOT_IDENT_NEXT = '(?![\\w$])';
+const EMPTY_STRING = '(?:""|\'\'|``)';
+const NAN = '(?:NaN|Number\\.NaN)';
+/** REACTION_TEMPLATE.r is `REACTIONS['tuftBoing']`: any expression without a comma, brace or parenthesis. */
+const EXPRESSION = '[^,{}()]+';
+/** index.html's module script with a src; group 1 is the src. */
+const MODULE_SCRIPT = /<script\b(?=[^>]*\btype\s*=\s*["']?module\b)[^>]*\bsrc\s*=\s*["']([^"']+)["']/i;
+const TEMPLATES_SEE = 'src/anim/director.ts, #281';
+
+/**
+ * The director's hidden-class templates (#281): each one's property list in declaration order, as
+ * [key, value regex source] pairs, and the shape printed when it is missing.
+ * @type {readonly {name: string, factory: string, shape: string, props: readonly [string, string][]}[]}
+ */
+export const DIRECTOR_TEMPLATES = [
+  {
+    name: 'CLIP_TEMPLATE',
+    factory: 'clipAt',
+    shape: '{name:"",start:NaN}',
+    props: [
+      ['name', EMPTY_STRING],
+      ['start', NAN],
+    ],
+  },
+  {
+    name: 'REACTION_TEMPLATE',
+    factory: 'activeReaction',
+    shape:
+      '{r:REACTIONS.tuftBoing,clip:"",start:NaN,last:NaN,runStart:NaN,sfxAt:NaN,release:null,region:null,gesture:null}',
+    props: [
+      ['r', EXPRESSION],
+      ['clip', EMPTY_STRING],
+      ['start', NAN],
+      ['last', NAN],
+      ['runStart', NAN],
+      ['sfxAt', NAN],
+      ['release', 'null'],
+      ['region', 'null'],
+      ['gesture', 'null'],
+    ],
+  },
+  {
+    name: 'CUT_CLIP_TEMPLATE',
+    factory: 'cutClip',
+    shape: '{name:"",start:NaN,cutAt:NaN,release:null}',
+    props: [
+      ['name', EMPTY_STRING],
+      ['start', NAN],
+      ['cutAt', NAN],
+      ['release', 'null'],
+    ],
+  },
+];
 
 /**
  * The precache URLs listed in an sw.js, each once, in order of first appearance.
@@ -182,6 +265,52 @@ function checkWorklet(files, contents) {
   });
 }
 
+/**
+ * `<ident> = {k: v, …}` with exactly this property list: a declaration (or a plain assignment), not a property
+ * assignment. Group 1 is the variable.
+ * @param {readonly [string, string][]} props
+ */
+function templateRe(props) {
+  const body = props.map(([key, value]) => `${key}\\s*:\\s*${value}`).join('\\s*,\\s*');
+  return new RegExp(`${NOT_AFTER}(${IDENT})\\s*=\\s*\\{\\s*${body}\\s*\\}`, 'g');
+}
+
+/**
+ * A function returning a copy of `ident`: `return{...ident` or `=>({...ident` (`=>{...` would be a block).
+ * @param {string} ident
+ */
+function spreadRe(ident) {
+  return new RegExp(
+    `(?:${NOT_AFTER}return|=>\\s*\\()\\s*\\{\\s*\\.\\.\\.${ident.replaceAll('$', '\\$')}${NOT_IDENT_NEXT}`,
+  );
+}
+
+/** @param {Map<string, Buffer>} contents */
+function checkTemplates(contents) {
+  const html = contents.get('index.html');
+  if (html === undefined) return ['index.html not found'];
+  const src = MODULE_SCRIPT.exec(html.toString('utf8'))?.[1];
+  if (src === undefined) return ['index.html has no <script type="module" src> (the main JS chunk)'];
+  const chunk = src.replace(/^\.?\//, '');
+  const text = contents.get(chunk)?.toString('utf8');
+  if (text === undefined) return [`main JS chunk ${chunk} (from index.html) not found`];
+  return DIRECTOR_TEMPLATES.flatMap(({ name, factory, shape, props }) => {
+    const idents = [...new Set(Array.from(text.matchAll(templateRe(props)), (m) => m[1]))];
+    if (idents.length === 0) {
+      return [
+        `${chunk} has no ${name} literal ${shape} (${TEMPLATES_SEE}: the template's property list changed, or ` +
+          `${factory} no longer copies it, so the bundler drops it and the shipped frame allocates again)`,
+      ];
+    }
+    return idents.some((id) => spreadRe(id).test(text))
+      ? []
+      : [
+          `${chunk} has ${name} (as ${idents.join(', ')}) but no function returns a spread of it ` +
+            `(${TEMPLATES_SEE}: ${factory} must return { ...${name}, … })`,
+        ];
+  });
+}
+
 /** @param {string} distDir */
 function checkNoLab(distDir) {
   return lstatSync(join(distDir, 'lab'), { throwIfNoEntry: false }) === undefined
@@ -270,6 +399,7 @@ export function checkDist(distDir, mode) {
     ['5 (lab)', checkNoLab(distDir)],
     ['6 (licences)', checkLicences(files, contents)],
     ['7 (manifest)', checkManifest(distDir, files, contents)],
+    ['8 (templates)', checkTemplates(contents)],
   ];
   return rules.flatMap(([rule, violations]) => violations.map((v) => `rule ${rule}: ${v}`));
 }
@@ -291,7 +421,7 @@ function main() {
   }
   const files = listFiles(dist).length;
   const urls = precacheUrls(readFileSync(join(dist, 'sw.js'), 'utf8')).length;
-  console.log(`check-dist: ${dist} (${mode}): all 7 rules pass (${files} files, ${urls} precache URLs)`);
+  console.log(`check-dist: ${dist} (${mode}): all 8 rules pass (${files} files, ${urls} precache URLs)`);
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href)
