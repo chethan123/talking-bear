@@ -1,16 +1,25 @@
 // The effect runner's `onPlayStarted` report (issue #81): a `play{id}` effect that starts a replay reports the
 // player's scheduled start, synchronously, before the transition's next effect (`anim talk{id}`). The noise floor
-// estimate (#116): engine `level`s become at most one `noiseFloor` per second while Listening. The cooldown timer
+// estimate (#116): engine `level`s become at most one `noiseFloor` per second while Listening, or Recording after its
+// hold-off (#289), checked over every fixture and a sustained vowel on both VAD backends. The cooldown timer
 // (#286) also waits on the context clock; other timers stay on the wall clock. Node, with minimal fakes; the rest of
 // the runner is covered through the session in session.test.ts.
+import { readdirSync, readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
+import { readWav } from '../../test/wav.ts';
 import type { Engine } from '../audio/engine.ts';
+import type { WorkerToMain } from '../audio/messages.ts';
 import type { PlayHandle } from '../audio/player.ts';
+import { resampleOffline } from '../dsp/resample.ts';
+import { createSilero } from '../dsp/silero/model.ts';
+import { decodeWeights } from '../dsp/silero/weights.ts';
 import { emptyEnvelope } from '../dsp/types.ts';
+import { VadCore } from '../workers/vad-core.ts';
 import {
   COOLDOWN_CTX_WAIT_MAX_MS,
   createEffectRunner,
+  NOISE_FLOOR_RECORDING_HOLDOFF_MS,
   NOISE_FLOOR_WINDOW_MS,
   type EffectDeps,
   type EffectRunner,
@@ -303,10 +312,10 @@ describe('noise floor estimate (#116)', () => {
     expect(h.floors).toEqual([-100, -100]);
   });
 
-  it('only Listening levels of the current epoch count; leaving Listening or a new epoch restarts the window', () => {
+  it('only Listening and Recording levels of the current epoch count; another state or a new epoch restarts the window', () => {
     const h = harness();
     feedLevels(h, 20, () => -24); // 570 ms
-    h.set({ name: 'Recording' });
+    h.set({ name: 'Processing' });
     feedLevels(h, 40, () => -24); // never counted, and the window closes
     h.set({ name: 'Listening' });
     feedLevels(h, 20, () => -24); // a fresh window: 570 ms only
@@ -320,6 +329,44 @@ describe('noise floor estimate (#116)', () => {
     h.clock.advance(30);
     feedLevels(h, 15, () => -24, -60, 5); // now 1.02 s
     expect(h.floors).toEqual([-24]);
+  });
+
+  it("#289: Recording levels count from NOISE_FLOOR_RECORDING_HOLDOFF_MS after the epoch's first one; earlier ones close the window", () => {
+    expect(NOISE_FLOOR_RECORDING_HOLDOFF_MS).toBe(1000);
+    const h = harness();
+    feedLevels(h, 20, () => -24); // 570 ms in Listening: the window is open
+    h.set({ name: 'Recording' });
+    h.clock.advance(30);
+    const t0 = h.clock.now();
+    feedLevels(h, 34, () => -26); // t0 … t0 + 990: inside the hold-off
+    h.clock.advance(9);
+    h.runner.level({ epoch: 4, db: -26, floorDb: -60 }); // t0 + 999: still inside
+    expect(h.floors).toEqual([]); // the Listening window was closed; nothing carried over
+    h.clock.advance(1);
+    h.runner.level({ epoch: 4, db: -22, floorDb: -60 }); // t0 + 1000: the first counted level opens a window
+    h.clock.advance(30);
+    feedLevels(h, 34, () => -22); // the window spans 30 + 33 · 30 = 1020 ms
+    expect(h.floors).toEqual([-22]);
+    expect(h.times[0]! - t0).toBeGreaterThanOrEqual(2000);
+  });
+
+  it("#289: the hold-off restarts with each epoch's first Recording level", () => {
+    const h = harness({ name: 'Recording' });
+    feedLevels(h, 70, () => -24); // 2070 ms of epoch 4: counted from 1000 ms, one window closes at ≥ 2000 ms
+    expect(h.floors).toEqual([-24]);
+    h.set({ epoch: 5 });
+    h.clock.advance(30);
+    feedLevels(h, 60, () => -24, -60, 5); // 1770 ms of epoch 5: 1000 ms of hold-off, then only 770 ms counted
+    expect(h.floors).toEqual([-24]);
+  });
+
+  it('#289: stale-epoch Recording levels are ignored and close the window', () => {
+    const h = harness();
+    feedLevels(h, 20, () => -24); // 570 ms in Listening
+    h.set({ name: 'Recording' });
+    feedLevels(h, 20, () => -24, -60, 3); // a stale epoch: ignored, and the window closes
+    feedLevels(h, 20, () => -24); // the current epoch's Recording levels: inside the hold-off
+    expect(h.floors).toEqual([]);
   });
 
   it('at most one noiseFloor per second over a steady stream', () => {
@@ -531,6 +578,127 @@ describe('timer cooldown: also on the context clock (#286, plan §3.1, §4.4 poi
       expect(dispatched).toEqual([]);
       clock.advance(1);
       expect(dispatched).toEqual([{ t: 'timer', name }]);
+    },
+  );
+});
+
+// ---- #289: the estimate over real VAD levels ----------------------------------------------------------------------
+
+/** weights.bin as a fresh ArrayBuffer (a copy: never the Node Buffer, whose memory may be a shared pool). */
+function weightsBuffer(): ArrayBuffer {
+  const bytes = readFileSync(new URL('../dsp/silero/weights.bin', import.meta.url));
+  const buf = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buf).set(bytes);
+  return buf;
+}
+const W = decodeWeights(weightsBuffer());
+
+/** Every WAV directly in test/fixtures and e2e/fixtures (48 kHz), found at collection time. */
+const FIXTURES: string[] = ['../../test/fixtures/', '../../e2e/fixtures/']
+  .flatMap((dir) =>
+    readdirSync(new URL(dir, import.meta.url))
+      .filter((f) => f.endsWith('.wav'))
+      .map((f) => `${dir.slice('../../'.length)}${f}`),
+  )
+  .sort();
+const NOISE_FIXTURE = 'e2e/fixtures/noise_pink_-20dbfs_20s.wav';
+const BACKENDS = ['silero', 'energy'] as const;
+type Backend = (typeof BACKENDS)[number];
+
+/**
+ * The noise floor values the real runner dispatches for `x48` (48 kHz, then 1.5 s of zeros) on `backend`: one VadCore
+ * listen (epoch 1, never re-armed, so every level counts and no floor is restored), with the session in Recording
+ * while a segment is open and Listening otherwise. `times` are ms from the start of the input.
+ */
+function floorsOf(x48: Float32Array, backend: Backend): { floors: number[]; times: number[] } {
+  const x16 = resampleOffline(x48, 1 / 3);
+  const pcm = new Float32Array(x16.length + 24_000);
+  pcm.set(x16);
+  const h = harness({ epoch: 1, name: 'Listening' });
+  const t0 = h.clock.now();
+  let last: number | null = null;
+  const core = new VadCore(48_000, (m: WorkerToMain) => {
+    if (m.t === 'level') {
+      if (last !== null) h.clock.advance((m.frame - last) / 48);
+      last = m.frame;
+      h.runner.level(m);
+    } else if (m.t === 'seg') {
+      h.set({ name: m.ev.kind === 'start' ? 'Recording' : 'Listening' });
+    }
+  });
+  if (backend === 'silero') core.setModel(createSilero(W));
+  core.reset(1, backend);
+  for (let i = 0; i + 512 <= pcm.length; i += 512) core.frame(1, i * 3, pcm.subarray(i, i + 512));
+  return { floors: h.floors, times: h.times.map((t) => t - t0) };
+}
+
+/**
+ * The plan review's sustained /a/ (#289): f0 with ±3 % 5 Hz vibrato, harmonics shaped by formants at 800, 1200 and
+ * 2500 Hz, ±3 dB 4 Hz amplitude modulation, 60 ms attack and release, after 1 s of silence; scaled to `rmsDb`
+ * active RMS.
+ */
+function vowel(rate: number, durS: number, f0: number, rmsDb: number): Float32Array {
+  const n = Math.round(durS * rate);
+  const lead = rate;
+  const x = new Float32Array(lead + n);
+  const formants = [800, 1200, 2500];
+  const widths = [80, 90, 120];
+  const amp = (f: number): number =>
+    formants.reduce((a, fc, i) => a + 1 / (1 + ((f - fc) / widths[i]!) ** 2), 0) / (1 + f / 1000);
+  let ph = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / rate;
+    const f = f0 * (1 + 0.03 * Math.sin(2 * Math.PI * 5 * t));
+    ph += (2 * Math.PI * f) / rate;
+    let v = 0;
+    for (let k = 1; k * f0 < 4000; k++) v += amp(k * f0) * Math.sin(k * ph);
+    const env = Math.min(1, t / 0.06, (durS - t) / 0.06) * 10 ** ((3 * Math.sin(2 * Math.PI * 4 * t)) / 20);
+    x[lead + i] = v * env;
+  }
+  let sum = 0;
+  for (let i = lead; i < x.length; i++) sum += x[i]! * x[i]!;
+  const g = 10 ** (rmsDb / 20) / Math.sqrt(sum / n);
+  for (let i = 0; i < x.length; i++) x[i] = x[i]! * g;
+  return x;
+}
+
+describe('#289: the noise floor estimate over the fixtures and a sustained vowel, on both backends', () => {
+  it('finds the fixtures', () => {
+    expect(FIXTURES.length).toBeGreaterThanOrEqual(20);
+    expect(FIXTURES).toContain(NOISE_FIXTURE);
+  });
+
+  const cases = FIXTURES.flatMap((f) => BACKENDS.map((b): [string, Backend] => [f, b]));
+  it.each(cases)('%s on %s', { timeout: 120_000 }, (path, backend) => {
+    const wav = readWav(readFileSync(new URL(`../../${path}`, import.meta.url)));
+    expect(wav.sampleRate).toBe(48_000);
+    const { floors, times } = floorsOf(wav.channels[0]!, backend);
+    if (path === NOISE_FIXTURE) {
+      // The −20 dBFS pink noise reads above −35 dBFS within 5 s (#289 Validation; plan §4.4).
+      const i = floors.findIndex((v) => v > -35);
+      expect(i, `floors ${floors.join(', ')}`).toBeGreaterThanOrEqual(0);
+      expect(times[i]).toBeLessThanOrEqual(5000);
+    } else {
+      // No false positive (#289 spec).
+      expect(
+        Math.max(Number.NEGATIVE_INFINITY, ...floors),
+        `floors ${floors.join(', ')}`,
+      ).toBeLessThanOrEqual(-35);
+    }
+  });
+
+  // Up to 1.5 s: the hold-off leaves no full counted window of vowel. A steady 2 s vowel at −20 dBFS can set the flag
+  // on Silero (−23.8 dBFS), whose onset comes earliest; that residual is recorded in the PR (ORCH-PLAN v2 D6).
+  const vowels = [1.2, 1.5].flatMap((d) => BACKENDS.map((b): [number, number, Backend] => [d, -20, b]));
+  it.each(vowels)(
+    'a sustained /a/ of %f s at %f dBFS RMS on %s never sets the flag (ORCH-NOTE 6085389040)',
+    { timeout: 120_000 },
+    (durS, rmsDb, backend) => {
+      const { floors } = floorsOf(vowel(48_000, durS, 260, rmsDb), backend);
+      expect(
+        Math.max(Number.NEGATIVE_INFINITY, ...floors),
+        `floors ${floors.join(', ')}`,
+      ).toBeLessThanOrEqual(-35);
     },
   );
 });
