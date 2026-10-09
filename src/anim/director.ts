@@ -31,6 +31,21 @@
  * continuous base, it never jumps more than a plain cut would. A step that empties the slot, and the first tick
  * from `cutAt` + 100 ms, clear `prevClip`. See `crossfade`.
  *
+ * **Hidden classes** (#281). The frame reads three kinds of object the director makes per event: the playing clip
+ * (`clip`, `{ name, start }`), the active reaction (`reaction`) and the cut clip (`prevClip`). V8 holds an object's
+ * hidden class strongly only from objects that have it (and from an object literal's boilerplate once the literal has
+ * run twice); transition trees, feedback and optimized code hold it weakly. So when the last object of a class died,
+ * e.g. the session's first reaction ended or its first cut's fade was over, the next major GC cleared the class, and V8
+ * dropped every optimized function that had embedded it ("embedded weak objects cleared"): `evaluateFrom` then ran
+ * unoptimized (≈ 2–3.5 KB of boxed doubles per frame) or in the mid tier without `sampleClip` inlined (≈ 32–50 B), and
+ * `tick` (and in some runs bear-view's `applyKicks`) were dropped too, for thousands of frames. Each of the three is
+ * therefore built by one factory (`clipAt`, `activeReaction`, `cutClip`) that copies a module-level template
+ * (`CLIP_TEMPLATE`, `REACTION_TEMPLATE`, `CUT_CLIP_TEMPLATE`) and overwrites every field; a spread of a reaction keeps
+ * its class too. V8 gives a copy its template's hidden class, and the template, live for the session, keeps that class
+ * alive. The factories read their template on every call, so a bundler keeps it: anchors no live code read were dropped
+ * from the production bundle (#281). The templates' times are NaN, doubles like every director time. They are exported
+ * for director.test.ts, which checks that real objects share their template's class, and never written.
+ *
  * **Mouth.** Leaving Talking sets `mouthCloseStart = now` and clears `talk`; `talk` clears
  * `mouthCloseStart`, so every talk starts with the mouth fully open to the mouth layer. `evaluate` writes the mouth
  * channels only when asked (`mouth`, #221): bear-view lets a reaction clip's mouth tracks through while not talking.
@@ -421,8 +436,8 @@ type Transition = (s: DirectorState, _ev: unknown, now: number) => DirectorState
 const calm = (s: DirectorState): DirectorState =>
   s.reaction === null && s.queued === null ? s : { ...s, reaction: null, queued: null };
 
-const toWaking: Transition = (s, _ev, now) => enter(calm(s), 'Waking', now, { name: 'wake', start: now });
-const toAsleep: Transition = (s, _ev, now) => enter(calm(s), 'Asleep', now, { name: 'sleep', start: now });
+const toWaking: Transition = (s, _ev, now) => enter(calm(s), 'Waking', now, clipAt('wake', now));
+const toAsleep: Transition = (s, _ev, now) => enter(calm(s), 'Asleep', now, clipAt('sleep', now));
 /**
  * To Idle, or to the reaction going on there: a reaction handed to the session while Talking (queued,
  * announced) starts at `talkEnd`; an active reaction (additive until now) becomes Reacting or Sustained.
@@ -462,7 +477,7 @@ const additive = (
 ): DirectorState =>
   s.reaction !== null || (s.clip !== null && now < clipEnd(s, s.clip))
     ? s
-    : { ...s, clip: { name: ev.e, start: now } };
+    : { ...s, clip: clipAt(ev.e, now) };
 
 /** Every (state, anim event) pair (plan §3.3 design rule 5). `'ignore'` returns the same state object. */
 const TABLE: { readonly [S in DirState]: Row } = {
@@ -694,22 +709,12 @@ function start(
   const quiet = announced || region === null || gesture === null;
   if (!quiet) accept(out, r, r.sfx);
   const clipName = clipFor(r, s.gentle, dirX);
-  const clip = { name: clipName, start: now };
+  const clip = clipAt(clipName, now);
   const next: DirectorState = {
     ...s,
     cooldowns: quiet ? s.cooldowns : withCooldown(s.cooldowns, region, gesture, r.priority, now),
     repeats: quiet ? s.repeats : withRepeat(s.repeats, r, now),
-    reaction: {
-      r,
-      clip: clipName,
-      start: now,
-      last: now,
-      runStart: now,
-      sfxAt: now,
-      release: null,
-      region,
-      gesture,
-    },
+    reaction: activeReaction(r, clipName, now, region, gesture),
   };
   if (s.name === 'Attentive' || s.name === 'Thinking') return { ...next, clip };
   return enter(next, r.sustained ? 'Sustained' : 'Reacting', now, clip);
@@ -755,7 +760,7 @@ function refresh(s: DirectorState, a: ActiveReaction, i: GestureInput, out: Out)
     def !== undefined &&
     (clip === null || clip.name !== a.clip || (def.sustained !== true && now >= clip.start + def.duration))
   )
-    clip = { name: a.clip, start: now };
+    clip = clipAt(a.clip, now);
   let sfxAt = a.sfxAt;
   const loop = a.r.sfxLoopMs;
   if (!talking && a.r.sfx !== null && loop !== undefined && now >= a.sfxAt + loop / 1000) {
@@ -797,7 +802,7 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
     if (r.priority < STOPS_PLAYBACK) {
       accept(out, r, null);
       const free = st.clip === null || now >= clipEnd(st, st.clip);
-      return { ...st, cooldowns, repeats: counted, clip: free ? { name: FLINCH.name, start: now } : st.clip };
+      return { ...st, cooldowns, repeats: counted, clip: free ? clipAt(FLINCH.name, now) : st.clip };
     }
     accept(out, r, r.sfx);
     const queued = { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: true };
@@ -826,7 +831,7 @@ function onClip(s0: DirectorState, i: ClipInput, out: Out): DirectorState {
   const s = s0.name === 'Dozing' ? enter(s0, 'Idle', now) : s0;
   if (s.name === 'Talking') {
     const free = s.clip === null || now >= clipEnd(s, s.clip);
-    return free ? { ...s, clip: { name: FLINCH.name, start: now } } : s;
+    return free ? { ...s, clip: clipAt(FLINCH.name, now) } : s;
   }
   const r = clipReaction(i.name);
   const live = s.reaction !== null && !isOver(s, s.reaction, now) ? s.reaction : null;
@@ -926,6 +931,68 @@ function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
   }
 }
 
+// ---- hidden classes (#281; see the module doc) ------------------------------------------------------------
+/** Every `clip` slot object is a copy of this, so they all share its hidden class, which it keeps alive. */
+export const CLIP_TEMPLATE: Readonly<NonNullable<DirectorState['clip']>> = { name: '', start: Number.NaN };
+
+/** Every `reaction` is a copy of this (or a spread of one), so they all share its hidden class: a real reaction. */
+export const REACTION_TEMPLATE: Readonly<ActiveReaction> = {
+  r: REACTIONS['tuftBoing']!,
+  clip: '',
+  start: Number.NaN,
+  last: Number.NaN,
+  runStart: Number.NaN,
+  sfxAt: Number.NaN,
+  release: null,
+  region: null,
+  gesture: null,
+};
+
+/** Every `prevClip` is a copy of this, so they all share its hidden class, which it keeps alive. */
+export const CUT_CLIP_TEMPLATE: Readonly<NonNullable<DirectorState['prevClip']>> = {
+  name: '',
+  start: Number.NaN,
+  cutAt: Number.NaN,
+  release: null,
+};
+
+/** A `clip` slot object: `CLIP_TEMPLATE` with both fields set. */
+function clipAt(name: string, clipStart: number): NonNullable<DirectorState['clip']> {
+  return { ...CLIP_TEMPLATE, name, start: clipStart };
+}
+
+/** A started reaction: `REACTION_TEMPLATE` with every field set. */
+function activeReaction(
+  r: Reaction,
+  clipName: string,
+  now: number,
+  region: RegionId | null,
+  gesture: GestureKind | null,
+): ActiveReaction {
+  return {
+    ...REACTION_TEMPLATE,
+    r,
+    clip: clipName,
+    start: now,
+    last: now,
+    runStart: now,
+    sfxAt: now,
+    release: null,
+    region,
+    gesture,
+  };
+}
+
+/** A `prevClip` (#240): `CUT_CLIP_TEMPLATE` with every field set. */
+function cutClip(
+  name: string,
+  clipStart: number,
+  cutAt: number,
+  releasedAt: number | null,
+): NonNullable<DirectorState['prevClip']> {
+  return { ...CUT_CLIP_TEMPLATE, name, start: clipStart, cutAt, release: releasedAt };
+}
+
 /** Scratch poses for `crossfade`'s choice at a second cut (#240): the pose before it, and with each choice. */
 const CUT_FROM: Pose = createPose();
 const CUT_KEEP: Pose = createPose();
@@ -971,7 +1038,7 @@ function crossfade(s: DirectorState, next: DirectorState, i: DirInput): Director
     const a = s.reaction;
     const releasedAt = a !== null && a.release !== null && a.clip === old.name ? a.release : null;
     const now = i.now;
-    const cut = { ...next, prevClip: { name: old.name, start: old.start, cutAt: now, release: releasedAt } };
+    const cut = { ...next, prevClip: cutClip(old.name, old.start, now, releasedAt) };
     const q = s.prevClip;
     if (q === null || now >= q.cutAt + CUT_S) return cut;
     evaluate(s, now, CUT_FROM);
