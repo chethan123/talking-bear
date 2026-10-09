@@ -1,5 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import type { ServerResponse } from 'node:http';
+import { resolve } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { PWA_MANIFEST } from './src/pwa-manifest.ts';
@@ -67,11 +68,24 @@ function contentTypeOf(res: ServerResponse, args: readonly unknown[]): string {
  * middleware (sirv, or Vite's index.html fallback) writes the head, so `writeHead` is wrapped; an implicit head
  * (`res.end()` without `writeHead`) goes through it too. The headers are appended, like the Go server's
  * `Header.Add`, so an HTML-only header never replaces a common one.
+ *
+ * Vite skips its own "Did you build your project?" check as soon as any plugin defines `configurePreviewServer`,
+ * so this plugin makes the same check, with Vite 8.3.1's message: a preview without a build fails at once instead of
+ * serving 404s.
  */
 function htmlOnlyHeaders(htmlOnly: Record<string, string>): Plugin {
+  let outDir = '';
+  let distDir = '';
   return {
     name: 'bear-html-only-headers',
+    configResolved(config) {
+      outDir = config.build.outDir;
+      distDir = resolve(config.root, outDir);
+    },
     configurePreviewServer(server) {
+      if (!existsSync(distDir)) {
+        throw new Error(`The directory "${outDir}" does not exist. Did you build your project?`);
+      }
       server.middlewares.use((_req, res, next) => {
         const writeHead = res.writeHead.bind(res);
         res.writeHead = (...args: unknown[]): ServerResponse => {
