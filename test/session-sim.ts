@@ -46,6 +46,12 @@ export interface SimOptions {
    * VAD-started take after maxUtteranceMs, and in hold-to-talk mode it still reports an onset after each arm.
    */
   noisy?: boolean;
+  /**
+   * #289: the VAD backend the noisy worker model stands for (default 'silero'). On 'energy' its cap is the voicing
+   * rule's misfire of a capped segment, `{ kind: 'misfire', frame, reason: 'maxLength', voicedRatio: 0 }`, rather
+   * than a `maxLength` end; nothing else changes and no draw is added.
+   */
+  backend?: 'silero' | 'energy';
   /** Fields applied over the initial (Asleep) state, e.g. a noisy mode one cap short of hold-to-talk (#116). */
   initial?: Partial<SessionState>;
 }
@@ -218,6 +224,7 @@ export class SessionSim {
   private readonly mic: MicMode;
   private readonly lossRate: number;
   private readonly noisy: boolean;
+  private readonly backend: 'silero' | 'energy';
   /** Environment callbacks, sorted by due time, then by scheduling order. */
   private readonly queue: Pending[] = [];
   private order = 0;
@@ -238,6 +245,7 @@ export class SessionSim {
     this.mic = opts.mic ?? 'granted';
     this.lossRate = opts.lossRate ?? 0;
     this.noisy = opts.noisy ?? false;
+    this.backend = opts.backend ?? 'silero';
     this.state = { ...initialSessionState(opts.permission ?? 'granted'), ...opts.initial };
   }
 
@@ -318,6 +326,7 @@ export class SessionSim {
         ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'maxLength', voicedRatio: 0.1 },
       },
       { t: 'seg', epoch: oldEpoch, ev: { kind: 'misfire', frame } },
+      { t: 'seg', epoch: oldEpoch, ev: { kind: 'misfire', frame, reason: 'maxLength', voicedRatio: 0 } }, // #289
       { t: 'armed', epoch: oldEpoch, armFrame: frame },
       { t: 'floorSnapshot', epoch: oldEpoch, floorDb: -50 },
       { t: 'clipReady', epoch: oldEpoch, id: s.takeId },
@@ -462,7 +471,8 @@ export class SessionSim {
 
   /**
    * #116: in a noisy room the worker caps a take that the VAD started, with a low voiced ratio, after
-   * maxUtteranceMs: before the recording watchdog (maxUtteranceMs + 2 s). Not in hold-to-talk mode, where the
+   * maxUtteranceMs: before the recording watchdog (maxUtteranceMs + 2 s). On the energy backend the cap is the
+   * voicing rule's capped misfire, which carries its reason and voiced ratio (#289). Not in hold-to-talk mode, where the
    * timer is the cap itself. A take that ends earlier leaves the end stale or ignored.
    */
   private noisyCap(): void {
@@ -472,7 +482,10 @@ export class SessionSim {
     this.schedule(this.now + this.cfg.maxUtteranceMs, {
       t: 'seg',
       epoch: s.epoch,
-      ev: { kind: 'end', frame, lastSpeechFrame: frame, reason: 'maxLength', voicedRatio: 0.1 },
+      ev:
+        this.backend === 'energy'
+          ? { kind: 'misfire', frame, reason: 'maxLength', voicedRatio: 0 }
+          : { kind: 'end', frame, lastSpeechFrame: frame, reason: 'maxLength', voicedRatio: 0.1 },
     });
   }
 

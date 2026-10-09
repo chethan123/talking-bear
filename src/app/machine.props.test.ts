@@ -16,7 +16,7 @@ import {
   type SessionState,
   type StateName,
 } from './events.ts';
-import { GATED, MIC_OPEN, TABLE, reduce } from './machine.ts';
+import { GATED, MIC_OPEN, NOISY_VOICED_RATIO, TABLE, reduce } from './machine.ts';
 
 /** At least 300 runs per property, each a sequence of up to 400 steps (issue #29). */
 const RUNS = 300;
@@ -57,7 +57,24 @@ const walkFields = {
   noisy: fc.boolean(),
 };
 const walkArb = fc.record(walkFields);
-type Walk = (typeof walkArb extends fc.Arbitrary<infer W> ? W : never) & { lossRate?: number };
+type Walk = (typeof walkArb extends fc.Arbitrary<infer W> ? W : never) & {
+  lossRate?: number;
+  /** #289: the noisy worker model's backend (test/session-sim.ts `SimOptions.backend`). */
+  backend?: 'silero' | 'energy';
+  /** #289: a noisy walk's initial fields (default NOISY_START). */
+  initial?: Partial<SessionState>;
+};
+/** #289: noisy walks on the energy backend, starting one noisy cap short of each escalation step. */
+const energyWalkArb = fc.record({
+  ...walkFields,
+  noisy: fc.constant(true),
+  backend: fc.constant<'energy'>('energy'),
+  initial: fc.constantFrom<Partial<SessionState>>(
+    { noisyCaps: 2, marginBoostDb: 0 },
+    { noisyCaps: 2, marginBoostDb: 3 },
+    NOISY_START,
+  ),
+});
 /** Property 4 also loses some environment answers, so the waking and processing timeouts fire. */
 const lossyWalkArb = fc.record({ ...walkFields, lossRate: fc.constantFrom(0, 0.1) });
 
@@ -129,8 +146,9 @@ function runWalk(
     mic: w.mic,
     lossRate: w.lossRate,
     noisy: w.noisy,
+    ...(w.backend !== undefined ? { backend: w.backend } : {}),
     // The reset happens only on entering Asleep, so the first noisy cap before the first nap enters hold mode.
-    ...(w.noisy ? { initial: NOISY_START } : {}),
+    ...(w.noisy ? { initial: w.initial ?? NOISY_START } : {}),
   });
   onState(sim);
   for (const tape of w.steps) {
@@ -551,5 +569,76 @@ describe('session reducer properties (plan §4.9.1)', () => {
     expect(holdSegs).toBeGreaterThan(0);
     expect(holdStates).toBeGreaterThan(0);
     expect(capProbes).toBeGreaterThan(0);
+  });
+  it('13: on the energy backend a capped unvoiced misfire escalates exactly as a capped end does; others leave the counter (#289)', () => {
+    let capMisfires = 0; // Recording misfires that are noisy caps (reason maxLength, voiced ratio below 0.3)
+    let otherMisfires = 0; // every other current-epoch Recording misfire
+    let raises = 0; // margin raises by a misfire
+    let holds = 0; // hold-to-talk entries by a misfire
+    const pick = (x: SessionState) => ({
+      noisyCaps: x.noisyCaps,
+      marginBoostDb: x.marginBoostDb,
+      holdToTalk: x.holdToTalk,
+    });
+    fc.assert(
+      fc.property(energyWalkArb, (w) => {
+        runWalk(
+          w,
+          (t, sim) => {
+            const e = t.event;
+            if (e.t !== 'seg' || e.ev.kind !== 'misfire') return;
+            if (e.epoch !== t.prev.epoch || t.prev.name !== 'Recording' || t.prev.holdToTalk) return;
+            const ev = e.ev;
+            const capped =
+              ev.reason === 'maxLength' &&
+              ev.voicedRatio !== undefined &&
+              ev.voicedRatio < NOISY_VOICED_RATIO;
+            const want = capped
+              ? reduce(t.prev, {
+                  t: 'seg',
+                  epoch: t.prev.epoch,
+                  ev: {
+                    kind: 'end',
+                    frame: ev.frame,
+                    lastSpeechFrame: ev.frame,
+                    reason: 'maxLength',
+                    voicedRatio: ev.voicedRatio,
+                  },
+                }).state
+              : t.prev;
+            if (t.next.name !== 'Listening' || JSON.stringify(pick(t.next)) !== JSON.stringify(pick(want))) {
+              fail(
+                sim,
+                `P13: ${fmt(e)} in Recording gave ${t.next.name} ${JSON.stringify(pick(t.next))}, want Listening ${JSON.stringify(pick(want))}`,
+              );
+            }
+            if (capped) capMisfires++;
+            else otherMisfires++;
+            if (t.next.marginBoostDb > t.prev.marginBoostDb) raises++;
+            if (t.next.holdToTalk) holds++;
+          },
+          (sim) => {
+            const s = sim.state;
+            if (!s.holdToTalk) return;
+            const probe: SessionEvent = {
+              t: 'seg',
+              epoch: s.epoch,
+              ev: { kind: 'misfire', frame: sim.nowFrame(), reason: 'maxLength', voicedRatio: 0 },
+            };
+            const out = reduce(s, probe);
+            if (out.state !== s || out.effects.length > 0) {
+              fail(sim, `P13: ${fmt(probe)} changed ${s.name} in hold-to-talk mode (probe)`);
+            }
+          },
+        );
+      }),
+      { numRuns: RUNS },
+    );
+    console.log(
+      `P13: ${capMisfires} capped noisy misfires, ${otherMisfires} other Recording misfires, ${raises} margin raises and ${holds} hold-to-talk entries by a misfire`,
+    );
+    expect(capMisfires).toBeGreaterThan(0);
+    expect(raises).toBeGreaterThan(0);
+    expect(holds).toBeGreaterThan(0);
   });
 });
