@@ -1,7 +1,8 @@
 // The effect interpreter (plan §3.3, §3.4): runs the reducer's effects against the engine, the voice player, the
 // sfx scheduler, the wake lock, the injected clock and the UI callbacks. The session (session.ts) owns the loop and
 // calls `run` for each effect in order; events an effect produces go back through `io.dispatch`, which queues them
-// while a dispatch is running. Named timers use the injected `Clock` only, never the global timers.
+// while a dispatch is running. Named timers use the injected `Clock`, never the global timers; the cooldown also
+// waits on the context clock (#286, see `setTimer`).
 //
 // Noisy room (plan §4.1.1, §7 M8, #113): each `openMic` reads the settings, and with `noisyRoomNs` on passes
 // `NOISY_ROOM_CONSTRAINTS` as the engine's `extra`, so a change applies at the next mic open.
@@ -39,6 +40,13 @@ export const NOISY_ROOM_CONSTRAINTS: Readonly<MediaTrackConstraints> = Object.fr
 
 /** #116: a `noiseFloor` is dispatched once a window of Listening levels spans at least this long. */
 export const NOISE_FLOOR_WINDOW_MS = 1000;
+
+/**
+ * #286: the longest the cooldown waits on the context clock beyond its wall-clock `ms`. A render stall longer
+ * than 0.5 s is a capture gap the worklet re-anchors over (plan §3.1), and a context can report `running`
+ * while its clock is frozen, so past this the wall clock decides and Cooldown can never hang.
+ */
+export const COOLDOWN_CTX_WAIT_MAX_MS = 500;
 
 /** The parts of an engine `level` event the noise floor estimate reads. */
 export interface LevelSample {
@@ -216,15 +224,35 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
     clock.clearTimeout(id);
   }
 
-  /** Replaces any pending timer with that name; when it fires it deletes itself and dispatches `timer{name}`. */
+  /**
+   * Replaces any pending timer with that name; when it fires it deletes itself and dispatches `timer{name}`.
+   *
+   * The cooldown is audio timing (plan §4.4 point 5; §3.1 keeps the wall clock for UI timers only), so it also
+   * waits until the context clock, which the capture frames and `arm` run on, has advanced `ms` (#286). If the
+   * audio thread stalled, so `currentTime` fell behind the wall clock, the wall-clock timeout is re-armed for the
+   * rest under the same map entry, so `cancelTimer` and `clearAllTimers` still stop it. With no context yet, one
+   * not `running` when the timeout fires, or once `ms + COOLDOWN_CTX_WAIT_MAX_MS` of wall time has passed, the wall
+   * clock alone decides, so it never hangs (ORCH-NOTE on #286).
+   */
   function setTimer(name: TimerName, ms: number): void {
     clearTimer(name);
-    const id = clock.setTimeout(() => {
-      if (timers.get(name) !== id) return;
-      timers.delete(name);
-      io.dispatch({ t: 'timer', name });
-    }, ms);
-    timers.set(name, id);
+    const ctx = name === 'cooldown' ? engine.context() : null;
+    const ctxDue = ctx === null ? 0 : ctx.currentTime + ms / 1000;
+    const wallCap = clock.now() + ms + COOLDOWN_CTX_WAIT_MAX_MS;
+    const wait = (delay: number): void => {
+      const id = clock.setTimeout(() => {
+        if (timers.get(name) !== id) return;
+        const left = wallCap - clock.now();
+        if (ctx !== null && ctx.state === 'running' && ctx.currentTime < ctxDue && left > 0) {
+          wait(Math.max(1, Math.min((ctxDue - ctx.currentTime) * 1000, left)));
+          return;
+        }
+        timers.delete(name);
+        io.dispatch({ t: 'timer', name });
+      }, delay);
+      timers.set(name, id);
+    };
+    wait(ms);
   }
 
   function clearAllTimers(): void {
