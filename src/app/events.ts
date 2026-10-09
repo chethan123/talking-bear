@@ -128,11 +128,11 @@ export interface SessionState {
   reselectPending: boolean;
   workerRestarts: number;
   /**
-   * #116, plan §4.4: consecutive capped takes with a low voiced ratio (row 20's noisy counter). At 3 the margins
-   * rise (`marginBoostDb`), then hold-to-talk takes over.
+   * #116, plan §4.4: consecutive capped takes with a low voiced ratio (row 20's noisy counter), and capped energy
+   * misfires with one (row 21, #289). At 3 the margins rise (`marginBoostDb`), then hold-to-talk takes over.
    */
   noisyCaps: number;
-  /** #116: the latest `noiseFloor` was above −35 dBFS; Listening shows the too-noisy badge. */
+  /** #116: the latest `noiseFloor` was above −35 dBFS; Listening and Recording show the too-noisy badge (#289). */
   tooNoisy: boolean;
   /** #116: the dB the worker adds to its energy margins and proximity X, carried by every Listening `arm`. */
   marginBoostDb: 0 | 3 | 6;

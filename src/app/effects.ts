@@ -16,9 +16,10 @@
 // flag even when N is above −35 dBFS, while a short capture glitch inside a loud window does not. The gate floor
 // alone absorbs a loud steady noise only with its 20 s in-speech time constant. Recording levels count only from
 // NOISE_FLOOR_RECORDING_HOLDOFF_MS after the epoch's first one (ORCH-NOTE 6085389040 on #289), and earlier ones close
-// the window, so a child's own sustained vowel or loud speech doesn't set the flag. Levels of any other state never
-// count and close the window, and a new epoch starts a new one. The window lives in closure scalars: nothing is
-// allocated per level.
+// the window, so a child's own speech rarely sets the flag. The measured residual is energy-only: a voiced sound
+// held ≥ 2.1 s at ≥ −30 dBFS sets it from Recording at about 3.06 s (code review 6086706417 on #309).
+// Levels of any other state never count and close the window, and a new epoch starts a new one. The window lives in
+// closure scalars: nothing is allocated per level.
 
 import { DEFAULT_ENERGY_PARAMS } from '../dsp/energy-gate.ts';
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
@@ -49,8 +50,9 @@ export const NOISE_FLOOR_WINDOW_MS = 1000;
 
 /**
  * #289 (ORCH-NOTE 6085389040 on #289): Recording levels count toward the noise floor window only from this long
- * after the epoch's first Recording level, so a child's own sustained vowel or loud speech never sets the flag,
- * while a steady noise that holds the energy gate open does, about a second later.
+ * after the epoch's first Recording level, so a child's own speech rarely sets the flag (energy-only residual: a
+ * voiced sound held ≥ 2.1 s at ≥ −30 dBFS sets it at about 3.06 s), while a steady noise that holds the energy gate
+ * open does, about a second later.
  */
 export const NOISE_FLOOR_RECORDING_HOLDOFF_MS = 1000;
 
