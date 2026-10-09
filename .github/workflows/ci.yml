@@ -141,3 +141,53 @@ jobs:
       - name: Container log
         if: always()
         run: docker logs bear || true
+
+  image-smoke:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: BUILD_MODE=production
+          tags: bear:ci
+          cache-from: type=gha,scope=ci
+          cache-to: type=gha,scope=ci,mode=max
+      - name: Run with the production flags
+        run: |
+          docker run -d --name bear --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --user 65532:65532 --pids-limit 64 --memory 64m -p 8080:8080 bear:ci
+      - name: Wait for the probe (30 s limit)
+        shell: bash
+        run: |
+          deadline=$((SECONDS + 30))
+          until docker exec bear /bearserve -probe; do
+            if [ "$SECONDS" -ge "$deadline" ]; then echo '/bearserve -probe did not succeed within 30 s'; exit 1; fi
+            sleep 1
+          done
+      - run: bash scripts/check-headers.sh http://localhost:8080
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps --no-shell chromium
+      - run: BASE_URL=http://localhost:8080 pnpm exec playwright test -c playwright.smoke.config.ts
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-smoke-report
+          path: test-results/
+          retention-days: 7
+      - name: Container log
+        if: always()
+        run: docker logs bear || true
