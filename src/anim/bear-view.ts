@@ -1,6 +1,7 @@
 /**
  * Juni on screen (plan §4.6, §7 M4; issue #81): the full-viewport canvas stage that replaced the M1 circle. It
- * owns the canvas, the rig, the pose buffers, the director, the layers, the springs and the frame loop.
+ * owns the canvas, the rig, the pose buffers, the director, the layers, the springs and the frame loop. The canvas
+ * is `role="img"` named "Juni the bear" (`A11Y_TEXT.stage`, plan §7 M8, #118).
  *
  * **Per frame** (loop.ts drives it):
  * - `substep(dt)`, at 120 Hz: director tick, the playing clip's spring kicks that are due (#221), `springs.step(dt)`,
@@ -108,6 +109,7 @@ import { hitTest, REGIONS } from '../input/regions.ts';
 import type { Haptics } from '../platform/haptics.ts';
 import type { Visibility } from '../platform/visibility.ts';
 import { reactionFor } from '../reactions/table.ts';
+import { A11Y_TEXT } from '../ui/a11y.ts';
 import type { Clip } from './clip.ts';
 import { DISPLAY_LATENCY_MS } from './constants.ts';
 import {
@@ -316,6 +318,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   const canvas = document.createElement('canvas');
   canvas.className = 'stage';
+  canvas.setAttribute('role', 'img');
+  canvas.setAttribute('aria-label', A11Y_TEXT.stage);
   root.append(canvas);
   const g = createContext(canvas);
   const rig = createRig();
