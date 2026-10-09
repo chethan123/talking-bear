@@ -66,6 +66,7 @@ export function mountLicencesScreen(root: HTMLElement, deps: LicencesScreenDeps 
 
   const status = element('p', 'licences-status');
   status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'off');
   status.hidden = true;
   const text = element('pre', 'licences-text');
   text.hidden = true;

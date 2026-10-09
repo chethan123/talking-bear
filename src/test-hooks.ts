@@ -17,6 +17,8 @@
 // - Interactions (#93): `sfxLog` records every scheduled sfx with the context time its sound ends (`sfx.play`'s
 //   `endCtxTime`), and `regionCenter(id)` gives a hit region's centre in viewport CSS px, from the bear's current
 //   bone matrices (the CDP touch points of the `gestures` spec).
+// - Accessibility (#118): `pose()` names the director's base pose and the clip in its slot, so the `a11y` spec can
+//   check that reduced motion and Gentle mode play the gentle clips.
 
 import type { BearView, FrameLogEntry } from './anim/bear-view.ts';
 import { POSES, type PoseName } from './anim/poses.ts';
@@ -108,6 +110,12 @@ export interface BearTestApi {
    * matrices. Throws before the bear is mounted, and for `background`.
    */
   regionCenter(id: RegionId): { x: number; y: number };
+  /**
+   * The director's current base pose and the name of the clip in its slot (a session clip, a reaction clip or the
+   * flinch), or null when none plays; a clip fading out under a cut is not reported. Throws before the bear is
+   * mounted.
+   */
+  pose(): { base: string; clip: string | null };
 }
 
 declare global {
@@ -121,7 +129,7 @@ export interface TestHookDeps {
   engine: Pick<Engine, 'context'> & OutputTapHost & VadBackendHost;
   visibility: Visibility;
   /** The bear, once main.ts has mounted it (after the hooks are installed). */
-  bear: () => Pick<BearView, 'showPose' | 'frameLog' | 'regionCenter'> | null;
+  bear: () => Pick<BearView, 'showPose' | 'frameLog' | 'regionCenter' | 'director'> | null;
 }
 
 /** Default canvas size of `showPose`: the renderer screenshots' 500 × 700 CSS px (#75). */
@@ -298,6 +306,12 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
       const bear = deps.bear();
       if (bear === null) throw new Error('regionCenter: the bear is not mounted yet');
       return bear.regionCenter(id);
+    },
+    pose() {
+      const bear = deps.bear();
+      if (bear === null) throw new Error('pose: the bear is not mounted yet');
+      const dir = bear.director();
+      return { base: dir.base, clip: dir.clip?.name ?? null };
     },
   };
   window.__bearTest = api;

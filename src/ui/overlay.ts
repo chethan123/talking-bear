@@ -10,7 +10,16 @@
 // Listening and Recording. Pressing it dispatches `holdStart{frame}` and releasing it `holdEnd{frame}`, with frames on
 // the capture worklet's clock (`nowFrame`, round(ctx.currentTime · sampleRate)). Only the first pointer counts; the
 // button captures it, so sliding off keeps recording, and a cancel, a lost capture or the view being hidden ends the
-// hold as a release does. It is the only child-facing button; its accessible name comes with #118.
+// hold as a release does. It is the only child-facing button; its accessible name is "Hold to talk" (#118).
+//
+// Accessibility (#118, a11y.ts): every icon variant is `role="status"` with an `aria-label` and `aria-live="off"`;
+// the labels are attributes, so the variants keep an empty `textContent`. The app's one aria-live region sits outside
+// `root` (a11y.ts `liveRegion`), and `show(o)` sets it to `announcementFor(o)`: the Asleep, MicDenied or Error text
+// while `tapToWake`, `micHelp` or `error` is up, '' otherwise. So it speaks only on entering those three mic-closed
+// states and is cleared, in the same dispatch, on leaving them; nothing shown while the mic is armed (Listening's
+// badges, the hold button) ever changes it, since a same-text `say` writes nothing. While the settings or licences
+// sheet is open (a modal dialog) the region outside it is inert and announces nothing. That is intended: a missed
+// announcement is harmless, while a region inside the dialogs could speak with the mic open. Don't move it there.
 //
 // CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/createElementNS and
 // textContent only, never HTML strings, and nothing sets a `style` attribute; the paw's pulse is a styles.css
@@ -18,6 +27,7 @@
 // toggled with the `hidden` attribute.
 
 import type { Overlay, SessionEvent } from '../app/events.ts';
+import { A11Y_TEXT, announcementFor, labelStatus, liveRegion } from './a11y.ts';
 import { icon, type IconName } from './icons.ts';
 
 /** The parent-permission sheet's text: the only text among the overlays (plan §4.5). */
@@ -41,13 +51,15 @@ function element<K extends keyof HTMLElementTagNameMap>(
   return el;
 }
 
-/** An icon-only variant: `tag.className` holding icon `name`, with no text. */
+/** An icon-only variant: `tag.className` holding icon `name`, with no text; `role="status"` named `label` (#118). */
 function iconView<K extends 'div' | 'section'>(
   tag: K,
   className: string,
   name: IconName,
+  label: string,
 ): HTMLElementTagNameMap[K] {
   const el = element(tag, className);
+  labelStatus(el, label);
   el.append(icon(name));
   return el;
 }
@@ -59,10 +71,11 @@ function button(text: string, onClick: () => void): HTMLButtonElement {
   return b;
 }
 
-/** The hold-to-talk button (#116): a paw icon, no text; pointer handling is wired by `mountOverlay`. */
+/** The hold-to-talk button (#116): a paw icon, no text, named "Hold to talk"; pointer handling is in `mountOverlay`. */
 function holdButton(): HTMLButtonElement {
   const b = element('button', 'overlay-hold');
   b.type = 'button';
+  b.setAttribute('aria-label', A11Y_TEXT.holdToTalk);
   b.append(icon('paw'));
   return b;
 }
@@ -75,7 +88,8 @@ function holdButton(): HTMLButtonElement {
  * The icon variants are not interactive and let pointer events through to the canvas below (styles.css), so a tap
  * on the paw or the retry arrow reaches the bear. The paw, mic-help and retry icons sit at the bottom centre, over
  * the bear's body; the mic-muted and too-noisy badges at the top centre. The mic help stays a `section`. The hold
- * button (#116) takes pointer events and sits at the bottom centre too.
+ * button (#116) takes pointer events and sits at the bottom centre too. Every `show(o)` also sets the document's live
+ * region to `announcementFor(o)` (#118): the announcement of Asleep, MicDenied or Error, or '' (no write if unchanged).
  */
 export function mountOverlay(
   root: HTMLElement,
@@ -93,14 +107,16 @@ export function mountOverlay(
   );
 
   const views: Record<View, HTMLElement> = {
-    tapToWake: iconView('div', 'overlay-icon overlay-paw', 'paw'),
+    tapToWake: iconView('div', 'overlay-icon overlay-paw', 'paw', A11Y_TEXT.tapToWake),
     parentPermission: parent,
-    micHelp: iconView('section', 'overlay-icon', 'micBlocked'),
-    micMuted: iconView('div', 'overlay-badge', 'micMuted'),
-    tooNoisy: iconView('div', 'overlay-badge', 'noise'),
+    micHelp: iconView('section', 'overlay-icon', 'micBlocked', A11Y_TEXT.micHelp),
+    micMuted: iconView('div', 'overlay-badge', 'micMuted', A11Y_TEXT.micMuted),
+    tooNoisy: iconView('div', 'overlay-badge', 'noise', A11Y_TEXT.tooNoisy),
     holdToTalk: holdButton(),
-    error: iconView('div', 'overlay-icon', 'retry'),
+    error: iconView('div', 'overlay-icon', 'retry', A11Y_TEXT.error),
   };
+  // The document's one live region (#118), shared with any other mount: outside `root`, so no overlay has text.
+  const live = liveRegion(root.ownerDocument);
 
   // The hold: the pointer that pressed the button and the frame it pressed at; null while nothing is held.
   const hold = views.holdToTalk;
@@ -151,5 +167,6 @@ export function mountOverlay(
     if (o !== 'holdToTalk') endHold();
     const shown = o === null ? null : views[o];
     for (const view of all) view.hidden = view !== shown;
+    live.say(announcementFor(o));
   };
 }

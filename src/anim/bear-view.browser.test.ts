@@ -308,6 +308,12 @@ describe('the canvas stage', () => {
     }
   });
 
+  test('the canvas is role=img named "Juni the bear" (#118)', () => {
+    const h = harness();
+    expect(h.view.canvas.getAttribute('role')).toBe('img');
+    expect(h.view.canvas.getAttribute('aria-label')).toBe('Juni the bear');
+  });
+
   test('dispose cancels the frame and removes the canvas', () => {
     const h = harness();
     h.view.dispose();
