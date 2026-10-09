@@ -9,10 +9,12 @@
 //
 // Too noisy (#116, plan §4.4, and the ORCH-NOTE on #116): the session hands every engine `level` to `level()`, which
 // turns them into at most one `noiseFloor` per second: over a window of at least NOISE_FLOOR_WINDOW_MS of Listening
-// levels of the current epoch, the larger of the gate floor N and the minimum hop level (digital silence counts at
-// the gate's `ignoreBelowDb`, so a silent input clears the flag). The gate floor alone absorbs a loud steady noise
-// only with its 20 s in-speech time constant. Levels outside Listening (speech is Recording) never count, and a
-// new epoch starts a new window. The window lives in closure scalars: nothing is allocated per level.
+// levels of the current epoch, the larger of the gate floor N and the minimum hop level. Digital silence counts
+// at the gate's `ignoreBelowDb`, and a window of nothing but digital silence (or with no finite N) dispatches its
+// minimum alone: the gate freezes N on silence (#288), so a silent input clears the flag even when N is above
+// −35 dBFS, while a short capture glitch inside a loud window does not. The gate floor alone absorbs a loud
+// steady noise only with its 20 s in-speech time constant. Levels outside Listening (speech is Recording) never
+// count, and a new epoch starts a new window. The window lives in closure scalars: nothing is allocated per level.
 
 import { DEFAULT_ENERGY_PARAMS } from '../dsp/energy-gate.ts';
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
@@ -266,6 +268,7 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
   let winEpoch = 0;
   let winStart = 0;
   let winMin = 0;
+  let winMax = 0;
   let winFloor = Number.NaN;
 
   function level(e: LevelSample): void {
@@ -282,15 +285,21 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
       winEpoch = e.epoch;
       winStart = now;
       winMin = db;
+      winMax = db;
     } else if (db < winMin) {
       winMin = db;
+    } else if (db > winMax) {
+      winMax = db;
     }
     winFloor = e.floorDb;
     if (now - winStart < NOISE_FLOOR_WINDOW_MS) return;
     winOpen = false;
     io.dispatch({
       t: 'noiseFloor',
-      floorDb: Number.isFinite(winFloor) ? Math.max(winMin, winFloor) : winMin,
+      floorDb:
+        winMax <= DEFAULT_ENERGY_PARAMS.ignoreBelowDb || !Number.isFinite(winFloor)
+          ? winMin
+          : Math.max(winMin, winFloor),
     });
   }
 
