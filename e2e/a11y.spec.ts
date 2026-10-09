@@ -40,7 +40,7 @@ const APP = 'main#app';
 const LIVE = '[data-a11y-live]';
 /** Every element that is a live region (an `aria-live` other than off, or an implicitly live role without one). */
 const LIVE_REGIONS =
-  '[aria-live]:not([aria-live="off"]), :is([role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"]):not([aria-live])';
+  '[aria-live]:not([aria-live="off"]), :is([role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"]):not([aria-live]), output:not([aria-live])';
 const ASLEEP_TEXT = 'Juni is asleep. Tap to wake.';
 /** After each gesture: its reaction plays out and the cooldowns pass before the next one (gestures.spec.ts). */
 const GAP_MS = 1_200;
@@ -191,6 +191,8 @@ test('names: the canvas is an image "Juni the bear", every button is named, one 
   await expect(live).toHaveCount(1);
   await expect(live).toHaveAttribute('data-a11y-live', '');
   await expect(page.locator(LIVE)).toHaveText(ASLEEP_TEXT);
+  // Outside main#app (D4): the overlays stay text-free.
+  await expect(page.locator(`main#app ${LIVE}`)).toHaveCount(0);
 });
 
 test('the live region: the Asleep text after boot, cleared on waking, untouched by Listening, a reaction or a pause', async ({

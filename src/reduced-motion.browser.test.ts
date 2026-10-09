@@ -128,7 +128,7 @@ describe('boot: reduced motion and Gentle mode (#118)', () => {
     expect(view.canvas.getAttribute('role')).toBe('img');
     expect(view.canvas.getAttribute('aria-label')).toBe('Juni the bear');
     const live = document.querySelectorAll(
-      '[aria-live]:not([aria-live="off"]), :is([role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"]):not([aria-live])',
+      '[aria-live]:not([aria-live="off"]), :is([role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"]):not([aria-live]), output:not([aria-live])',
     );
     expect(live).toHaveLength(1);
     expect(live[0]?.hasAttribute('data-a11y-live')).toBe(true);

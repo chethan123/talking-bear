@@ -47,7 +47,7 @@ function region(): HTMLElement {
 function liveRegions(): Element[] {
   return Array.from(
     document.querySelectorAll(
-      '[aria-live]:not([aria-live="off"]), :is([role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"]):not([aria-live])',
+      '[aria-live]:not([aria-live="off"]), :is([role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"]):not([aria-live]), output:not([aria-live])',
     ),
   );
 }
@@ -309,6 +309,21 @@ describe('the live region across real transitions (#118)', () => {
     expect(records()).toHaveLength(0);
     expect(region().textContent).toBe('');
   });
+
+  test.each(['tapToWake', 'micHelp', 'error'] as const)(
+    'showing %s again writes nothing: the same announcement is never re-set',
+    (o) => {
+      const root = newRoot();
+      const show = mountOverlay(root, vi.fn());
+      show(o);
+      const text = announcementFor(o);
+      expect(region().textContent).toBe(text);
+      const records = watch(region());
+      show(o);
+      expect(records()).toHaveLength(0);
+      expect(region().textContent).toBe(text);
+    },
+  );
 
   test('entering Asleep, MicDenied and Error sets the specified text; leaving clears it', () => {
     const root = newRoot();
