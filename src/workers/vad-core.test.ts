@@ -1140,6 +1140,32 @@ describe('VadCore energy voicing rule', () => {
     expect(evs.slice(0, 2).map((e) => e.kind)).toEqual(['start', 'misfire']);
     expect(Math.abs(evs[1]!.frame - evs[0]!.frame - 10 * CTX_RATE)).toBeLessThanOrEqual(0.05 * CTX_RATE);
   });
+
+  it('7c (#289): the capped voicing misfire keeps reason maxLength and its voiced ratio; a silence one carries neither', () => {
+    const capped = newCore();
+    capped.core.reset(1, 'energy');
+    feed(capped, 1, frames16k(concat48(whiteNoise48(31, 1.0, -70), whiteNoise48(32, 10.5, -20))));
+    const c = segs(capped.msgs);
+    expect(c[1]).toStrictEqual({
+      kind: 'misfire',
+      frame: c[1]!.frame,
+      reason: 'maxLength',
+      voicedRatio: expect.any(Number),
+    });
+    const ratio = c[1]!.kind === 'misfire' ? c[1]!.voicedRatio : undefined;
+    expect(ratio).toBeGreaterThanOrEqual(0);
+    // 1000 hops in the 10 s cap, fewer than MIN_VOICED_MS / 10 ms = 6 of them voiced.
+    expect(ratio).toBeLessThan(MIN_VOICED_MS / 10_000);
+    const burst = newCore();
+    burst.core.reset(1, 'energy');
+    feed(
+      burst,
+      1,
+      frames16k(concat48(whiteNoise48(21, 1.0, -70), whiteNoise48(22, 0.3, -20), whiteNoise48(23, 0.3, -70))),
+    );
+    const b = segs(burst.msgs);
+    expect(b[1]).toStrictEqual({ kind: 'misfire', frame: b[1]!.frame });
+  });
 });
 
 describe('defaults', () => {
@@ -2120,6 +2146,21 @@ describe('VadCore capture gaps (#244)', () => {
     expect(evs.map((e) => e.kind)).toEqual(['start', 'misfire', 'start', 'misfire']);
     expect(evs[1]!.frame).toBeLessThan(noiseCut * SILERO_GRID);
     expect(evs[2]!.frame).toBeGreaterThanOrEqual(noiseCut * SILERO_GRID + GAP);
+  });
+
+  it('#289: a gap misfire carries no reason or voiced ratio, on either backend', () => {
+    const cut = LEAD + 2;
+    const silero = newCore();
+    silero.core.setModel(burstModel(LEAD, LEAD + BURST));
+    silero.core.reset(1, 'silero', undefined, false, 6);
+    feedWithGap(silero, 1, burstFrames(75, -50, 12, LEAD, BURST, TAIL), cut);
+    expect(segs(silero.msgs)[1]).toStrictEqual({ kind: 'misfire', frame: (cut - 1) * SILERO_GRID });
+    const x = concat48(whiteNoise48(41, 1.0, -70), whiteNoise48(42, 0.6, -20), whiteNoise48(43, 1.0, -70));
+    const energy = newCore();
+    energy.core.reset(1, 'energy');
+    feedWithGap(energy, 1, frames16k(x), Math.round((1.3 * 16000) / FRAME));
+    const evs = segs(energy.msgs);
+    expect(evs[1]).toStrictEqual({ kind: 'misfire', frame: evs[1]!.frame });
   });
 
   it('a gap while idle posts nothing: the events after it are the gapless run’s, shifted by the gap', () => {
