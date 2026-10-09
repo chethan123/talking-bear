@@ -107,9 +107,10 @@ const FIRST_REACTION_FRAMES = 90;
  *   `pnpm test:browser` runs with Vitest's results cache deleted 3.6 / 1.2; 3 runs after bear-view.browser.test.ts
  *   in the same process 3.6, 3.5, 3.6 / 1.2; 3 runs beside one busy loop per core 3.6 / 1.2, 3.6 / 13.8 (every
  *   reaction view window one box higher), 2.6 / 1.2. Positive control 187.9–268.8.
- * - **Readings after #281**, local Chromium 141, first reaction / talking / reaction / mood / cut: 3 solo runs
- *   0.0 / 2.6 / 1.2 / 3.4 / 1.2, 0.0 / 4.1 / 1.2 / 0.4 / 1.2, 0.0 / 2.6 / 1.2 / 0.4 / 1.2; positive control
- *   190.5–241.9. Phase 0's mood bump moves the talking reading from 3.6 to 2.6–4.1.
+ * - **Readings after #281**, local Chromium 141, first reaction / talking / reaction / mood / cut: 6 solo runs
+ *   0.0 / 2.6 / 1.2 / 0.4 / 1.2 (three), 0.0 / 2.6 / 1.2 / 3.4 / 1.2 (two), 0.0 / 4.1 / 1.2 / 0.4 / 1.2; a full
+ *   `pnpm test:browser` 0.0 / 2.6 / 1.2 / 0.4 / 1.2. Positive control 187.7–241.9. Phase 0's mood bump moves the
+ *   talking reading from 3.6 to 2.6–4.1.
  * - **Before #229.** Local: 52.5 (3 runs); 38.5 at 20k frames, 36.9 at 30k (the TurboFan steady state). CI
  *   (`verify`, Chrome for Testing 153, 2026-10-02): e6eedd9 39.2, 36f7674 39.2, be1fbd0 52.4, 26cdabf 40.4, e2850e8
  *   39.2, e8995a8 39.2, 126892a 39.2, 3590bd3 41.0, 70c906c 39.2 (jobs 110891434021, 110898093153, 110912655108,
