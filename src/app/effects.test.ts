@@ -1,13 +1,20 @@
 // The effect runner's `onPlayStarted` report (issue #81): a `play{id}` effect that starts a replay reports the
 // player's scheduled start, synchronously, before the transition's next effect (`anim talk{id}`). The noise floor
-// estimate (#116): engine `level`s become at most one `noiseFloor` per second while Listening. Node, with minimal
-// fakes; the rest of the runner is covered through the session in session.test.ts.
+// estimate (#116): engine `level`s become at most one `noiseFloor` per second while Listening. The cooldown timer
+// (#286) also waits on the context clock; other timers stay on the wall clock. Node, with minimal fakes; the rest of
+// the runner is covered through the session in session.test.ts.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
 import type { Engine } from '../audio/engine.ts';
 import type { PlayHandle } from '../audio/player.ts';
 import { emptyEnvelope } from '../dsp/types.ts';
-import { createEffectRunner, NOISE_FLOOR_WINDOW_MS, type EffectDeps, type EffectRunner } from './effects.ts';
+import {
+  COOLDOWN_CTX_WAIT_MAX_MS,
+  createEffectRunner,
+  NOISE_FLOOR_WINDOW_MS,
+  type EffectDeps,
+  type EffectRunner,
+} from './effects.ts';
 import type { SessionEvent, SessionState } from './events.ts';
 import { initialSessionState } from './machine.ts';
 import type { Player, Sfx } from './session.ts';
@@ -303,4 +310,181 @@ describe('noise floor estimate (#116)', () => {
       [4, undefined, undefined],
     ]);
   });
+});
+
+/** A context whose `state` and `currentTime` the test sets; the timers read only those two. */
+interface FakeAudioClock {
+  state: AudioContextState;
+  currentTime: number;
+}
+
+/** An engine whose context() is `audio` (null: no context yet), with the play-path methods stubbed. */
+function clockedEngine(audio: FakeAudioClock | null): Engine {
+  const ctx =
+    audio === null
+      ? null
+      : {
+          createBuffer: () => {
+            throw new Error('unused');
+          },
+          get state() {
+            return audio.state;
+          },
+          get currentTime() {
+            return audio.currentTime;
+          },
+        };
+  if (ctx !== null && !isAudioContext(ctx)) throw new Error('unreachable');
+  const bus = fakeBus();
+  const engine = {
+    getProcessed: () => undefined,
+    releaseProcessed: noop,
+    context: () => ctx,
+    masterBus: () => bus,
+  };
+  if (!isEngine(engine)) throw new Error('unreachable');
+  return engine;
+}
+
+/** A runner on a FakeClock (t = 0) whose context clock starts at 10 s and runs; records what it dispatches. */
+function timerHarness(withContext = true): {
+  clock: FakeClock;
+  audio: FakeAudioClock;
+  runner: EffectRunner;
+  dispatched: SessionEvent[];
+} {
+  const clock = new FakeClock();
+  const audio: FakeAudioClock = { state: 'running', currentTime: 10 };
+  const dispatched: SessionEvent[] = [];
+  const runner = createEffectRunner(
+    deps(clockedEngine(withContext ? audio : null), fakePlayer(0), { clock }),
+    {
+      dispatch: (e) => dispatched.push(e),
+      state: () => initialSessionState('granted'),
+    },
+  );
+  return { clock, audio, runner, dispatched };
+}
+
+const COOLDOWN_FIRED: SessionEvent[] = [{ t: 'timer', name: 'cooldown' }];
+
+describe('timer cooldown: also on the context clock (#286, plan §3.1, §4.4 point 5)', () => {
+  it('(a) fires after 250 ms when the context clock kept up with the wall clock', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.249;
+    clock.advance(249);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.25;
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(b) a stall left the context clock 60 ms behind: it waits, and fires only once it reaches ctxDue', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.19;
+    clock.advance(250);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.249;
+    clock.advance(59);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.25;
+    clock.advance(2);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(b2) the re-arm waits at least 1 ms, even for a sub-millisecond rest', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.2499999;
+    clock.advance(250);
+    audio.currentTime = 10.25;
+    clock.advance(0.5);
+    expect(dispatched).toEqual([]);
+    clock.advance(0.5);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+  });
+
+  it('(c) a cancelled cooldown never fires, even while it waits on the context clock', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.1;
+    clock.advance(250);
+    runner.run({ k: 'cancelTimer', name: 'cooldown' });
+    audio.currentTime = 11;
+    clock.advance(1000);
+    expect(dispatched).toEqual([]);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(c2) cancelTimer * (clearAllTimers) also stops a cooldown waiting on the context clock', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.1;
+    clock.advance(250);
+    runner.run({ k: 'cancelTimer', name: '*' });
+    audio.currentTime = 11;
+    clock.advance(1000);
+    expect(dispatched).toEqual([]);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(c3) a new cooldown (row 45) replaces one waiting on the context clock, and fires once', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.1;
+    clock.advance(250); // waiting: ctxDue 10.25
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 }); // ctxDue 10.35
+    audio.currentTime = 10.3;
+    clock.advance(249);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.35;
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    clock.advance(1000);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+  });
+
+  it.each(['suspended', 'closed', 'interrupted'] as const)(
+    '(d) with the context %s it fires on the wall clock alone',
+    (state) => {
+      const { clock, audio, runner, dispatched } = timerHarness();
+      runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+      audio.state = state;
+      clock.advance(250);
+      expect(dispatched).toEqual(COOLDOWN_FIRED);
+    },
+  );
+
+  it('(f) a context that says running but whose clock froze: it fires at ms + COOLDOWN_CTX_WAIT_MAX_MS', () => {
+    const { clock, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 }); // currentTime stays 10 s
+    clock.advance(250 + COOLDOWN_CTX_WAIT_MAX_MS - 1);
+    expect(dispatched).toEqual([]);
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(d2) with no context yet it fires on the wall clock alone', () => {
+    const { clock, runner, dispatched } = timerHarness(false);
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    clock.advance(250);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+  });
+
+  it.each(['processing', 'doze', 'sleep', 'waking', 'recording'] as const)(
+    '(e) timer %s ignores the context clock (wall clock only, §3.1)',
+    (name) => {
+      const { clock, runner, dispatched } = timerHarness();
+      runner.run({ k: 'timer', name, ms: 250 }); // the context clock stays at 10 s: 250 ms behind
+      clock.advance(249);
+      expect(dispatched).toEqual([]);
+      clock.advance(1);
+      expect(dispatched).toEqual([{ t: 'timer', name }]);
+    },
+  );
 });
