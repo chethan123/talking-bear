@@ -24,8 +24,11 @@ import (
 // Plan §4.8.3 (copied character for character into headers.json by T06).
 const (
 	wantCSP = "default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; style-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"
-	wantTT  = "require-trusted-types-for 'script'; trusted-types default" // HTML only, Report-Only in M7 (T98)
+	wantTT  = "require-trusted-types-for 'script'; trusted-types default" // HTML only; merged into the CSP from M8 (T110)
 	wantPP  = "microphone=(self), screen-wake-lock=(self), autoplay=(self), fullscreen=(self), camera=(), geolocation=(), display-capture=(), usb=(), serial=(), midi=(), payment=(), accelerometer=(), gyroscope=(), magnetometer=(), idle-detection=(), publickey-credentials-get=(), browsing-topics=()"
+
+	// The CSP of text/html responses (issue #121): wantCSP with wantTT merged in.
+	wantHTMLCSP = "default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; style-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types default"
 
 	immutable = "public, max-age=31536000, immutable"
 	htmlType  = "text/html; charset=utf-8"
@@ -95,11 +98,17 @@ func with(kv ...string) http.Header {
 	return h
 }
 
-// withHTML adds headers.json's htmlOnly headers the way the handler does,
-// so these expectations stay exact as htmlOnly changes.
+// withHTML applies headers.json's htmlOnly headers by the handler's rule
+// (issue #121): one that common also names is merged into it as
+// common + "; " + htmlOnly, any other is added. So these expectations stay
+// exact as htmlOnly changes.
 func withHTML(h http.Header) http.Header {
 	for k, v := range headers.HTMLOnly {
-		h.Add(k, v)
+		if c, ok := headers.Common[k]; ok {
+			h.Set(k, c+"; "+v)
+		} else {
+			h.Add(k, v)
+		}
 	}
 	return h
 }
@@ -283,8 +292,12 @@ func checkResponse(t *testing.T, c serveCase, res *http.Response, body []byte, w
 		}
 		t.Errorf("unexpected header %s: %q", k, got)
 	}
-	if got := res.Header.Values("Content-Security-Policy"); len(got) == 0 || got[0] != wantCSP {
-		t.Errorf("Content-Security-Policy %q, want %q first", got, wantCSP)
+	wantPolicy := wantCSP
+	if servesHTML(c) {
+		wantPolicy = wantHTMLCSP
+	}
+	if got := res.Header.Values("Content-Security-Policy"); !slices.Equal(got, []string{wantPolicy}) {
+		t.Errorf("Content-Security-Policy %q, want exactly [%q]", got, wantPolicy)
 	}
 	if etag := res.Header.Get("Etag"); etag != "" && !etagRE.MatchString(etag) {
 		t.Errorf("ETag %s does not match %s", etag, etagRE)
@@ -292,6 +305,12 @@ func checkResponse(t *testing.T, c serveCase, res *http.Response, body []byte, w
 	if !bytes.Equal(body, c.body) {
 		t.Errorf("body %q, want %q", body, c.body)
 	}
+}
+
+// servesHTML reports whether c's response is index.html (or its 304), which
+// carries the merged HTML CSP: the 405 on / is an error response.
+func servesHTML(c serveCase) bool {
+	return (c.path == "/" || c.path == "/index.html") && c.status != http.StatusMethodNotAllowed
 }
 
 func TestHeadersJSON(t *testing.T) {
@@ -309,8 +328,14 @@ func TestHeadersJSON(t *testing.T) {
 			t.Errorf("common %s: %q, want %q", k, got, want)
 		}
 	}
-	if want := map[string]string{"Content-Security-Policy-Report-Only": wantTT}; !maps.Equal(headers.HTMLOnly, want) {
+	if want := map[string]string{"Content-Security-Policy": wantTT}; !maps.Equal(headers.HTMLOnly, want) {
 		t.Errorf("htmlOnly %q, want %q", headers.HTMLOnly, want)
+	}
+	if wantCSP+"; "+wantTT != wantHTMLCSP {
+		t.Errorf("wantCSP + \"; \" + wantTT differs from wantHTMLCSP")
+	}
+	if got, want := headers.htmlHeaders(), map[string]string{"Content-Security-Policy": wantHTMLCSP}; !maps.Equal(got, want) {
+		t.Errorf("htmlHeaders() %q, want %q", got, want)
 	}
 	wantRules := []CacheRule{
 		{"/assets/**", immutable}, {"/", "no-cache"}, {"/index.html", "no-cache"},
@@ -336,17 +361,19 @@ func TestParseHeadersRejects(t *testing.T) {
 		t.Fatalf("minimal valid file rejected: %v", err)
 	}
 	for name, doc := range map[string]string{
-		"unknown field":      `{"common":{},"extra":1,"cacheControl":[{"match":"**","value":"no-cache"}],` + tail,
-		"unknown rule field": `{"common":{},"cacheControl":[{"match":"**","value":"no-cache","glob":true}],` + tail,
-		"no rules":           `{"common":{},"cacheControl":[],` + tail,
-		"no catch-all":       `{"common":{},"cacheControl":[{"match":"/assets/**","value":"x"}],` + tail,
-		"catch-all not last": `{"common":{},"cacheControl":[{"match":"**","value":"x"},{"match":"/a","value":"y"}],` + tail,
-		"relative match":     `{"common":{},"cacheControl":[{"match":"assets/**","value":"x"},{"match":"**","value":"y"}],` + tail,
-		"empty rule value":   `{"common":{},"cacheControl":[{"match":"/a","value":""},{"match":"**","value":"y"}],` + tail,
-		"no error value":     `{"common":{},"cacheControl":[{"match":"**","value":"x"}],"errorCacheControl":"","mime":{}}`,
-		"empty header value": `{"common":{"X-A":""},"cacheControl":[{"match":"**","value":"x"}],` + tail,
-		"trailing data":      valid + `{}`,
-		"not an object":      `[]`,
+		"unknown field":       `{"common":{},"extra":1,"cacheControl":[{"match":"**","value":"no-cache"}],` + tail,
+		"unknown rule field":  `{"common":{},"cacheControl":[{"match":"**","value":"no-cache","glob":true}],` + tail,
+		"no rules":            `{"common":{},"cacheControl":[],` + tail,
+		"no catch-all":        `{"common":{},"cacheControl":[{"match":"/assets/**","value":"x"}],` + tail,
+		"catch-all not last":  `{"common":{},"cacheControl":[{"match":"**","value":"x"},{"match":"/a","value":"y"}],` + tail,
+		"relative match":      `{"common":{},"cacheControl":[{"match":"assets/**","value":"x"},{"match":"**","value":"y"}],` + tail,
+		"empty rule value":    `{"common":{},"cacheControl":[{"match":"/a","value":""},{"match":"**","value":"y"}],` + tail,
+		"no error value":      `{"common":{},"cacheControl":[{"match":"**","value":"x"}],"errorCacheControl":"","mime":{}}`,
+		"empty header value":  `{"common":{"X-A":""},"cacheControl":[{"match":"**","value":"x"}],` + tail,
+		"common name twice":   `{"common":{"X-A":"1","x-a":"2"},"cacheControl":[{"match":"**","value":"x"}],` + tail,
+		"htmlOnly name twice": `{"common":{},"htmlOnly":{"X-A":"1","x-A":"2"},"cacheControl":[{"match":"**","value":"x"}],` + tail,
+		"trailing data":       valid + `{}`,
+		"not an object":       `[]`,
 	} {
 		if _, err := parseHeaders([]byte(doc)); err == nil {
 			t.Errorf("%s: accepted %s", name, doc)
@@ -492,13 +519,38 @@ func TestOptionsAsterisk(t *testing.T) {
 	checkResponse(t, serveCase{name: "OPTIONS *", status: 405, header: na, body: naBody}, res, body, true)
 }
 
+// TestHTMLHeadersMerge checks the merge rule on its own (issue #121): an
+// htmlOnly header that common also names, in any letter case, is merged into
+// the common value; any other is passed through.
+func TestHTMLHeadersMerge(t *testing.T) {
+	common := map[string]string{"Content-Security-Policy": "a", "X-C": "c"}
+	for _, c := range []struct {
+		name     string
+		htmlOnly map[string]string
+		want     map[string]string
+	}{
+		{"none", map[string]string{}, map[string]string{}},
+		{"same name", map[string]string{"Content-Security-Policy": "b"}, map[string]string{"Content-Security-Policy": "a; b"}},
+		{"same name, other case", map[string]string{"content-security-policy": "b"}, map[string]string{"Content-Security-Policy": "a; b"}},
+		{"html only", map[string]string{"X-B": "b"}, map[string]string{"X-B": "b"}},
+		{"report-only stays separate", map[string]string{"Content-Security-Policy-Report-Only": "b"},
+			map[string]string{"Content-Security-Policy-Report-Only": "b"}},
+		{"both", map[string]string{"Content-Security-Policy": "b", "x-b": "b"},
+			map[string]string{"Content-Security-Policy": "a; b", "X-B": "b"}},
+	} {
+		if got := (Headers{Common: common, HTMLOnly: c.htmlOnly}).htmlHeaders(); !maps.Equal(got, c.want) {
+			t.Errorf("%s: htmlHeaders() %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestHTMLOnlyHeaders(t *testing.T) {
 	const tt = "require-trusted-types-for 'script'; trusted-types default"
-	// Content-Security-Policy-Report-Only is the M7 shape (T98). The same-name
-	// CSP entry pins today's Add behaviour; interim: T110 (#121) replaces
-	// same-name HTML-only headers with a merged value.
+	// A header common has not (the M7 Report-Only shape) is added; a same-name
+	// one, here in lower case, is merged into the common CSP as one field
+	// (issue #121).
 	h := headers
-	h.HTMLOnly = map[string]string{"Content-Security-Policy-Report-Only": tt, "Content-Security-Policy": tt}
+	h.HTMLOnly = map[string]string{"Content-Security-Policy-Report-Only": tt, "content-security-policy": tt}
 	srv := newHandler(testFS(), h)
 	for _, c := range []struct {
 		method, path string
@@ -526,8 +578,7 @@ func TestHTMLOnlyHeaders(t *testing.T) {
 		ro := rec.Result().Header.Values("Content-Security-Policy-Report-Only")
 		csp := rec.Result().Header.Values("Content-Security-Policy")
 		if c.html {
-			// HTML-only headers are added: the common CSP stays and comes first.
-			if !slices.Equal(ro, []string{tt}) || !slices.Equal(csp, []string{wantCSP, tt}) {
+			if !slices.Equal(ro, []string{tt}) || !slices.Equal(csp, []string{wantCSP + "; " + tt}) {
 				t.Errorf("%s %s: report-only %q, CSP %q", c.method, c.path, ro, csp)
 			}
 		} else if len(ro) != 0 || !slices.Equal(csp, []string{wantCSP}) {
@@ -536,11 +587,12 @@ func TestHTMLOnlyHeaders(t *testing.T) {
 	}
 }
 
-// TestTrustedTypesReportOnly checks headers.json's own htmlOnly entry (T98,
-// plan §4.8.3): Trusted Types in Report-Only on HTML responses only. On / it
-// comes with the common CSP; /sw.js, the JS assets and a 404 never get it (TT
-// directives on worker scripts would break importScripts).
-func TestTrustedTypesReportOnly(t *testing.T) {
+// TestTrustedTypesEnforced checks headers.json's own htmlOnly entry (T110,
+// plan §4.8.3, §7 M8): Trusted Types enforced on HTML responses only, as one
+// CSP field that is the common policy plus the TT directives. /sw.js, the JS
+// assets and a 404 keep the common CSP only (TT directives on worker scripts
+// would break importScripts), and no response has a Report-Only header.
+func TestTrustedTypesEnforced(t *testing.T) {
 	srv := newHandler(testFS(), headers)
 	for _, c := range []struct {
 		method, path string
@@ -570,13 +622,13 @@ func TestTrustedTypesReportOnly(t *testing.T) {
 		res := rec.Result()
 		ro := res.Header.Values("Content-Security-Policy-Report-Only")
 		csp := res.Header.Values("Content-Security-Policy")
-		want := []string{}
+		want := wantCSP
 		if c.html {
-			want = []string{wantTT}
+			want = wantHTMLCSP
 		}
-		if res.StatusCode != c.status || !slices.Equal(ro, want) || !slices.Equal(csp, []string{wantCSP}) {
-			t.Errorf("%s %s %q: %d, report-only %q, CSP %q; want %d, report-only %q, CSP [%q]",
-				c.method, c.path, c.req, res.StatusCode, ro, csp, c.status, want, wantCSP)
+		if res.StatusCode != c.status || len(ro) != 0 || !slices.Equal(csp, []string{want}) {
+			t.Errorf("%s %s %q: %d, report-only %q, CSP %q; want %d, no report-only, CSP [%q]",
+				c.method, c.path, c.req, res.StatusCode, ro, csp, c.status, want)
 		}
 	}
 }
