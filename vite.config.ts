@@ -39,6 +39,24 @@ function readHeaders(): PreviewHeaders {
 
 const HEADERS = readHeaders();
 
+/**
+ * The header fields `vite preview` sets on a text/html response on top of the common ones, by the Go server's rule
+ * (server/headers.go `htmlHeaders`; plan §4.8.3, issue #121): every `htmlOnly` header, except that one `common` also
+ * names (compared case-insensitively) is merged into the common value as `common + '; ' + htmlOnly`, so it is sent
+ * once. A browser enforces every CSP field it receives as a separate policy.
+ */
+function htmlHeaderFields(
+  common: Record<string, string>,
+  htmlOnly: Record<string, string>,
+): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const [name, value] of Object.entries(htmlOnly)) {
+    const base = Object.entries(common).find(([c]) => c.toLowerCase() === name.toLowerCase())?.[1];
+    fields[name] = base === undefined ? value : `${base}; ${value}`;
+  }
+  return fields;
+}
+
 /** The Content-Type a `writeHead(status, [message], [headers])` call sends: its headers argument wins over setHeader. */
 function contentTypeOf(res: ServerResponse, args: readonly unknown[]): string {
   for (const arg of args.slice(1)) {
@@ -62,18 +80,18 @@ function contentTypeOf(res: ServerResponse, args: readonly unknown[]): string {
 }
 
 /**
- * Adds headers.json's `htmlOnly` headers to `vite preview`'s text/html responses, as the Go server does (plan
- * §4.8.3: the Trusted Types directives go on HTML only; on worker scripts they would break `importScripts`).
+ * Sets the HTML header fields (`htmlHeaderFields`) on `vite preview`'s text/html responses, as the Go server does
+ * (plan §4.8.3: the Trusted Types directives go on HTML only; on worker scripts they would break `importScripts`).
  * `preview.headers` keeps sending the common ones on every response. The Content-Type is only known when a later
  * middleware (sirv, or Vite's index.html fallback) writes the head, so `writeHead` is wrapped; an implicit head
- * (`res.end()` without `writeHead`) goes through it too. The headers are appended, like the Go server's
- * `Header.Add`, so an HTML-only header never replaces a common one.
+ * (`res.end()` without `writeHead`) goes through it too. The fields are set, like the Go server's `Header.Set`: a
+ * merged field replaces the common one (one CSP field, never two), any other is added.
  *
  * Vite skips its own "Did you build your project?" check as soon as any plugin defines `configurePreviewServer`,
  * so this plugin makes the same check, with Vite 8.3.1's message: a preview without a build fails at once instead of
  * serving 404s.
  */
-function htmlOnlyHeaders(htmlOnly: Record<string, string>): Plugin {
+function htmlOnlyHeaders(fields: Record<string, string>): Plugin {
   let outDir = '';
   let distDir = '';
   return {
@@ -90,7 +108,7 @@ function htmlOnlyHeaders(htmlOnly: Record<string, string>): Plugin {
         const writeHead = res.writeHead.bind(res);
         res.writeHead = (...args: unknown[]): ServerResponse => {
           if (!res.headersSent && /^text\/html\b/i.test(contentTypeOf(res, args))) {
-            for (const [name, value] of Object.entries(htmlOnly)) res.appendHeader(name, value);
+            for (const [name, value] of Object.entries(fields)) res.setHeader(name, value);
           }
           Reflect.apply(writeHead, res, args);
           return res;
@@ -135,7 +153,7 @@ export default defineConfig({
   },
   plugins: [
     buildIdAttribute(),
-    htmlOnlyHeaders(HEADERS.htmlOnly),
+    htmlOnlyHeaders(htmlHeaderFields(HEADERS.common, HEADERS.htmlOnly)),
     // The service worker and the manifest (plan §4.7): generateSW in prompt mode, registered by
     // src/pwa/register.ts through `virtual:pwa-register` (no injected <script>, so nothing inline under the CSP).
     VitePWA({
