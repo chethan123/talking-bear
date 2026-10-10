@@ -19,8 +19,12 @@ interface HeadersJson {
 const CSP =
   "default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; style-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'";
 
-// Plan §4.8.3: the Trusted Types directives, on HTML responses only, in Report-Only from M7 (enforced from M8).
+// Plan §4.8.3: the Trusted Types directives, on HTML responses only: Report-Only in M7, enforced from M8 (issue #121).
 const TRUSTED_TYPES = "require-trusted-types-for 'script'; trusted-types default";
+
+// Issue #121: the one CSP field of text/html responses, the common CSP with the Trusted Types directives merged in.
+const HTML_CSP =
+  "default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; style-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types default";
 
 const PERMISSIONS_POLICY =
   'microphone=(self), screen-wake-lock=(self), autoplay=(self), fullscreen=(self), camera=(), geolocation=(), display-capture=(), usb=(), serial=(), midi=(), payment=(), accelerometer=(), gyroscope=(), magnetometer=(), idle-detection=(), publickey-credentials-get=(), browsing-topics=()';
@@ -110,9 +114,13 @@ describe('server/headers.json', () => {
     });
   });
 
-  it('sends Trusted Types in Report-Only on HTML only (plan §4.8.3, §7 M7)', () => {
+  it('enforces Trusted Types on HTML only: htmlOnly adds the TT directives to the CSP (plan §4.8.3, §7 M8)', () => {
     const headers = loadHeaders();
-    expect(headers.htmlOnly).toStrictEqual({ 'Content-Security-Policy-Report-Only': TRUSTED_TYPES });
+    expect(headers.htmlOnly).toStrictEqual({ 'Content-Security-Policy': TRUSTED_TYPES });
+    // The Go server and vite preview merge a same-name htmlOnly header into the common value: one CSP field.
+    expect(
+      `${headers.common['Content-Security-Policy']}; ${headers.htmlOnly['Content-Security-Policy']}`,
+    ).toBe(HTML_CSP);
     // Not in the common headers: on worker scripts the TT directives would break importScripts.
     expect(Object.values(headers.common).join('\n')).not.toContain('trusted-types');
   });

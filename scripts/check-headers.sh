@@ -9,6 +9,10 @@
 # so / is served identity, with no .br ETag and no Vary (plan §4.8.2, §4.8.3). Its encoding, ETag suffix and Vary
 # must agree instead, and the brotli assertions run on the module JS asset (ORCH-NOTE 6083551330 on #107).
 #
+# Text/html responses carry one CSP field: the common CSP with htmlOnly's same-name value merged in as
+# "<common>; <htmlOnly>" (server/headers.go htmlHeaders, issue #121), so / is checked against that merged value, and
+# /sw.js and the module JS asset are checked to carry none of the HTML-only directives (T98 code review finding 4).
+#
 # Sourceable (ORCH-NOTE 6084408281 on #110): sourcing only sets curl_opts=() and repeatable_headers=() (a caller
 # sets its own values after sourcing) and defines the functions, one per case, and changes no shell option.
 # scripts/check-compose-headers.sh reuses them. Run directly, main runs the 12 cases.
@@ -49,9 +53,23 @@ json_value() {
   jq -er "$1 | strings" "$json" || fail "$json has no string at $1"
 }
 
-# load_expected: reads the expected values from $json into csp, cc_*, mime_*, html_only and security_headers.
+# html_value <name>: prints the value of header <name> on a text/html response, from $json: the common value, the
+# htmlOnly value, or "<common>; <htmlOnly>" when both name it (names compared case-insensitively), as
+# server/headers.go's htmlHeaders merges them. Fails if neither names it; use it as `var=$(html_value …)`.
+html_value() {
+  jq -er --arg n "$1" '
+    def pick(m): [m | to_entries[] | select((.key | ascii_downcase) == ($n | ascii_downcase)) | .value] | first;
+    pick(.common) as $c | pick(.htmlOnly) as $h
+    | if $c != null and $h != null then "\($c); \($h)" else ($h // $c) end | strings' "$json" \
+    || fail "$json names no header $1"
+}
+
+# load_expected: reads the expected values from $json into csp, html_csp, cc_*, mime_*, html_only and
+# security_headers.
 load_expected() {
   csp=$(json_value '.common["Content-Security-Policy"]')
+  # The one CSP field of text/html responses (issue #121).
+  html_csp=$(html_value Content-Security-Policy)
   # bearserve rewrites / to /index.html before its lookup, so / gets the /index.html rule; the "/" rule (vite
   # preview) must agree with it.
   cc_root=$(json_value '.cacheControl[] | select(.match == "/index.html") | .value')
@@ -64,7 +82,7 @@ load_expected() {
   cc_error=$(json_value '.errorCacheControl')
   mime_js=$(json_value '.mime[".js"]')
   mime_manifest=$(json_value '.mime[".webmanifest"]')
-  # The HTML-only header names (an empty list until Trusted Types Report-Only lands, plan §4.8.3), one per line.
+  # The HTML-only header names (plan §4.8.3: the Trusted Types directives, merged into the CSP from M8), one per line.
   html_only=$(jq -er '.htmlOnly | if type == "object" then keys | join("\n") else error("not an object") end' "$json") \
     || fail "$json: .htmlOnly must be an object"
   # The common security headers that every response carries, besides the CSP (issue #107, case 1).
@@ -120,6 +138,29 @@ expect_no_header() {
   [ -z "$got" ] || fail "$1: expected none, got '$got'"
 }
 
+# expect_no_html_only: the last response carries none of the HTML-only headers (T98 code review finding 4; ORCH-NOTE
+# 6093197699 on #121): an htmlOnly name that common also names has exactly its common value, any other is absent, and
+# no header field contains any directive of an htmlOnly value (split on ';', trimmed; fixed string, any case).
+expect_no_html_only() {
+  local name common value directive
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    common=$(jq -r --arg n "$name" \
+      '[.common | to_entries[] | select((.key | ascii_downcase) == ($n | ascii_downcase)) | .value] | first // empty' \
+      "$json")
+    if [ -n "$common" ]; then
+      expect_header "$name" "$common"
+    else
+      expect_no_header "$name"
+    fi
+    value=$(json_value ".htmlOnly[\"$name\"]")
+    while IFS= read -r directive; do
+      [ -n "$directive" ] || continue
+      ! grep -iqF -e "$directive" "$tmp/headers" || fail "HTML-only directive present: $directive"
+    done < <(tr ';' '\n' <<<"$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  done <<<"$html_only"
+}
+
 # expect_unique_header_names <path>: GET <path> with no extra request header; no header field name appears twice
 # (a duplicated CSP is enforced twice: plan §4.8.3), except those in repeatable_headers. Leaves the header fields,
 # without CRs, in $tmp/headers.
@@ -143,14 +184,14 @@ case_root() {
   begin 'GET / (Accept-Encoding: br)'
   fetch GET / -H 'Accept-Encoding: br'
   expect_status 200
-  expect_header Content-Security-Policy "$csp"
+  expect_header Content-Security-Policy "$html_csp"
   for name in "${security_headers[@]}"; do
-    value=$(json_value ".common[\"$name\"]")
+    value=$(html_value "$name")
     expect_header "$name" "$value"
   done
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    value=$(json_value ".htmlOnly[\"$name\"]")
+    value=$(html_value "$name")
     expect_header "$name" "$value"
   done <<<"$html_only"
   expect_header Cache-Control "$cc_root"
@@ -177,6 +218,7 @@ case_sw() {
   expect_header Cache-Control "$cc_sw"
   expect_header Content-Type "$mime_js"
   expect_header Content-Security-Policy "$csp" # a worker's policy comes from its own response (plan §4.8.3)
+  expect_no_html_only
 }
 
 # 3. /manifest.webmanifest
@@ -206,6 +248,7 @@ case_asset() {
   expect_header Content-Encoding br
   expect_header_match ETag '^"[A-Za-z0-9_-]{16}\.br"$'
   expect_header Vary Accept-Encoding
+  expect_no_html_only
 }
 
 # 5. /healthz
@@ -237,7 +280,7 @@ case_revalidate() {
   begin "GET / (If-None-Match: $root_etag)"
   fetch GET / -H 'Accept-Encoding: br' -H "If-None-Match: $root_etag"
   expect_status 304
-  expect_header Content-Security-Policy "$csp"
+  expect_header Content-Security-Policy "$html_csp"
 }
 
 # 9. A satisfiable range of the identity JS asset
