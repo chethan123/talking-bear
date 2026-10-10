@@ -20,16 +20,18 @@ Neither job runs when a `v*.*.*` tag is deleted (GitHub sends a push event for t
    anything is built or pushed, if either check doesn't hold.
 1. Sets up QEMU (arm64 only) and Buildx. QEMU only runs the arm64 image for the smoke test: both build stages run on
    the build platform and Go cross-compiles.
-2. Computes the image tags and OCI labels with `docker/metadata-action`.
-3. **arm64 smoke, before any push:** builds `linux/arm64` with `--load` as `bear:arm64`, runs it under QEMU with the
+2. **arm64 smoke, before any push:** builds `linux/arm64` with `--load` as `bear:arm64`, runs it under QEMU with the
    production flags ([`image.md`](image.md#run)), waits for `/bearserve -probe`, and runs
    `bash scripts/check-headers.sh http://localhost:8080`. A failure here stops the release before anything is
    pushed.
-4. Logs in to `ghcr.io` with the job's `GITHUB_TOKEN`.
-5. Builds and pushes `linux/amd64,linux/arm64` with `provenance: mode=max` and `sbom: true`. It uses the same build
+3. Logs in to `ghcr.io` with the job's `GITHUB_TOKEN`.
+4. **Moves `X.Y` only forward:** reads the version annotation of the published `X.Y` image and moves `X.Y` only if
+   this release is the same or newer (see [How to tag](#how-to-tag)).
+5. Computes the image tags and OCI labels with `docker/metadata-action`.
+6. Builds and pushes `linux/amd64,linux/arm64` with `provenance: mode=max` and `sbom: true`. It uses the same build
    args as the smoke build, so it reuses those layers: the arm64 image it pushes has exactly the layers that were
    smoke-tested.
-6. Writes the image digest and tags to the job summary.
+7. Writes the image digest and tags to the job summary.
 
 Both builds use `BUILD_MODE=production` and `BEAR_BUILD_ID=<version>`, so the released `index.html` carries
 `data-build="1.2.3"`.
@@ -55,21 +57,25 @@ also edits `release.yml`, because GitHub runs the workflow file from the tagged 
 a **tag ruleset** that restricts creating `v*` tags to the maintainer (repository **Settings → Rules → Rulesets**).
 Whether to add one is the repo owner's decision; rulesets on a private repository may need a paid plan.
 
-The tag must be `v<major>.<minor>.<patch>`, optionally with a pre-release suffix such as `-rc.1`, with no leading
-zeros in the three numbers and no `+build` suffix (metadata-action would drop it and overwrite `1.2.3`). The
-workflow's first step rejects any other tag, so nothing is pushed for it. Git tag `v1.2.3` gives the image tags
-`1.2.3` and `1.2`. There is no `latest` tag: the monorepo pins by version and digest. A pre-release tag such as
+The tag must be `v<major>.<minor>.<patch>`, optionally with a pre-release suffix such as `-rc.1`, as SemVer defines
+them: no leading zeros in a number (so not `v1.02.3` or `v1.2.3-rc.01`), and no `+build` suffix (metadata-action
+would drop it and overwrite `1.2.3`). The workflow's first step rejects any other tag, so nothing is pushed for it.
+Git tag `v1.2.3` gives the image tags `1.2.3` and `1.2`. There is no `latest` tag: the monorepo pins by version and digest. A pre-release tag such as
 `v1.3.0-rc.1` gives only `1.3.0-rc.1` (`docker/metadata-action` doesn't move `1.3` for a pre-release).
 
 Follow the run under **Actions → Release**. If `ci` or the arm64 smoke fails, nothing is pushed: fix it on `main`
 and tag the next patch version. Re-running a failed `publish` job with **Re-run failed jobs** is fine; it pushes the
-same tags again, with a new digest; pin the digest from the job summary of the last successful run. Don't re-run an
-older tag's publish after a newer patch has shipped: it moves the `X.Y` tag back.
+same tags again, with a new digest; pin the digest from the job summary of the last successful run. Re-running an
+older tag's publish after a newer patch has shipped republishes only its `X.Y.Z` and leaves `X.Y` alone (below).
 
-Releases run one at a time, in the order the tags were pushed (`concurrency: release`), so two patch tags pushed close
-together can't finish out of order and move `X.Y` back. While one release runs, GitHub keeps at most one more
-waiting: if a third tag arrives, it may cancel the waiting run of the older tag. That is fine, because the newer tag
-carries `X.Y`. The cancelled tag's own `X.Y.Z` image is then not published; the newer patch supersedes it.
+**`X.Y.Z` always publishes; `X.Y` only moves forward.** Each tag gets its own run (concurrency group
+`release-<tag>`: a re-run waits for the same tag's run in progress, and different tags never cancel each other), so
+runs for different tags may overlap. Right before pushing, `publish` reads the `org.opencontainers.image.version`
+annotation of the published `X.Y` image and moves `X.Y` only if this release is the same version or newer. An older
+patch that finishes last still publishes its own `X.Y.Z`, but leaves `X.Y` alone. A missing `X.Y` (the first release
+on that line) moves it; any other registry error fails the job before the push. The one remaining race is two runs
+on the same line that both pass this check before either pushes: a narrow window, but avoid it by pushing one
+release tag at a time and waiting for its run to finish.
 
 ## One-time step after the first push: make the package public
 

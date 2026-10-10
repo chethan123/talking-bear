@@ -10,11 +10,11 @@ on:
 permissions:
   contents: read
 
-# One release at a time, in push order, so two patch tags of one minor line can't finish out of order and move the
-# X.Y tag back. GitHub keeps at most one run pending here: a newer tag's run may replace a pending older one, which is
-# fine, because the newer tag carries X.Y.
+# One run per tag: a re-run of the same tag waits for the one in progress, and different tags never cancel each other
+# (a single shared group would keep at most one run pending and could drop a release). Different tags may run at the
+# same time; the publish job's guard keeps X.Y from moving backwards.
 concurrency:
-  group: release
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -36,17 +36,25 @@ jobs:
       contents: read
       packages: write
     steps:
-      # Before anything else: the tag must be vMAJOR.MINOR.PATCH with an optional pre-release, SemVer's rules (no
-      # leading zeros in the core numbers) and no +build suffix. The glob above also admits v1.2.3+build, whose
-      # metadata-action version drops the suffix and would overwrite 1.2.3 and 1.2.
+      # Before anything else: the tag must be vMAJOR.MINOR.PATCH with an optional pre-release, by SemVer's rules (no
+      # leading zeros in numeric identifiers) and with no +build suffix. The glob above also admits v1.2.3+build, whose
+      # metadata-action version drops the suffix and would overwrite 1.2.3 and 1.2. Outputs: version (the tag without
+      # its v, which is metadata-action's {{version}} for a tag that passes) and line (MAJOR.MINOR).
       - name: Check the tag format
+        id: tag
         shell: bash
         run: |
-          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          n='(0|[1-9][0-9]*)'
+          id='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          re="^v$n\.$n\.$n(-$id(\.$id)*)?\$"
           if [[ ! "$GITHUB_REF_NAME" =~ $re ]]; then
             echo "::error::tag '$GITHUB_REF_NAME' is not vMAJOR.MINOR.PATCH[-prerelease] (no +build, no leading zeros)"
             exit 1
           fi
+          version=${GITHUB_REF_NAME#v}
+          core=${version%%-*}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "line=${core%.*}" >> "$GITHUB_OUTPUT"
           echo "tag $GITHUB_REF_NAME ok"
       # Full history, so origin/main is here for the next step without handing the token to any later step.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,23 +83,10 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
-      # Git tag v1.2.3 → image tags 1.2.3 and 1.2. No latest: the monorepo pins by version and digest. The OCI
-      # source label links the package to this repo; the same keys also go out as annotations on the manifests and
-      # the multi-arch index, for registries that read them there.
-      - id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        env:
-          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
-        with:
-          images: ghcr.io/chethan123/talking-bear
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-          flavor: latest=false
-          labels: org.opencontainers.image.source=https://github.com/chethan123/talking-bear
       # arm64 smoke before any push. The release reads and writes only its own cache scope, which PR and main runs
       # never write (plan §9, caching in a privileged workflow). The push below uses the same build args, so it
-      # reuses these layers: the arm64 image it pushes has exactly the layers smoke-tested here.
+      # reuses these layers: the arm64 image it pushes has exactly the layers smoke-tested here. BEAR_BUILD_ID is the
+      # tag's version (data-build="1.2.3").
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -100,7 +95,7 @@ jobs:
           push: false
           build-args: |
             BUILD_MODE=production
-            BEAR_BUILD_ID=${{ steps.meta.outputs.version }}
+            BEAR_BUILD_ID=${{ steps.tag.outputs.version }}
           tags: bear:arm64
           cache-from: type=gha,scope=release
           cache-to: type=gha,scope=release,mode=max
@@ -126,6 +121,62 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # X.Y only moves forward: read the version annotation of the published X.Y index and move X.Y only if this
+      # release is the same or newer (X.Y.Z itself is always pushed). Tags of different versions may run at the same
+      # time; the window between this read and the push below is the residual race (docs/release.md). A missing tag
+      # or package means the first release on this line; any other registry error fails the job. A pre-release never
+      # gets X.Y (metadata-action renders {{major}}.{{minor}} as {{version}} for it), so it skips the read.
+      - name: Move X.Y only forward
+        id: guard
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          LINE: ${{ steps.tag.outputs.line }}
+        run: |
+          # ge A B: A >= B for decimal integers without leading zeros (length first, so no overflow).
+          ge() { if [ ${#1} -ne ${#2} ]; then [ ${#1} -gt ${#2} ]; else [[ ! "$1" < "$2" ]]; fi; }
+          if [[ "$VERSION" == *-* ]]; then
+            echo "pre-release $VERSION: no $LINE tag"
+            echo "minor=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ref="ghcr.io/chethan123/talking-bear:$LINE"
+          err=$(mktemp)
+          if raw=$(docker buildx imagetools inspect --raw "$ref" 2> "$err"); then
+            published=$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$raw")
+            patch=${published##*.}
+            if [ "${published%.*}" != "$LINE" ] || [[ ! "$patch" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::$ref has version annotation '$published', expected $LINE.<patch>"
+              exit 1
+            fi
+            if ge "${VERSION##*.}" "$patch"; then
+              echo "$ref is $published: moving it to $VERSION"
+              echo "minor=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$ref is $published, newer than $VERSION: leaving $LINE, pushing only $VERSION"
+              echo "minor=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif grep -qiE 'not found|manifest unknown|name unknown' "$err"; then
+            echo "$ref not published yet: first release on $LINE, moving it to $VERSION"
+            echo "minor=true" >> "$GITHUB_OUTPUT"
+          else
+            cat "$err" >&2
+            echo "::error::cannot read $ref"
+            exit 1
+          fi
+      # Git tag v1.2.3 → image tags 1.2.3 and 1.2 (the latter only if the guard says so). No latest: the monorepo pins
+      # by version and digest. The OCI source label links the package to this repo; the same keys also go out as
+      # annotations on the manifests and the multi-arch index, for registries that read them there.
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ghcr.io/chethan123/talking-bear
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.guard.outputs.minor }}
+          flavor: latest=false
+          labels: org.opencontainers.image.source=https://github.com/chethan123/talking-bear
       - id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -134,7 +185,7 @@ jobs:
           push: true
           build-args: |
             BUILD_MODE=production
-            BEAR_BUILD_ID=${{ steps.meta.outputs.version }}
+            BEAR_BUILD_ID=${{ steps.tag.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
