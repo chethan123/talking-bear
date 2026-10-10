@@ -10,13 +10,6 @@ on:
 permissions:
   contents: read
 
-# One run per tag: a re-run of the same tag waits for the one in progress, and different tags never cancel each other
-# (a single shared group would keep at most one run pending and could drop a release). Different tags may run at the
-# same time; the publish job's guard keeps X.Y from moving backwards.
-concurrency:
-  group: release-${{ github.ref_name }}
-  cancel-in-progress: false
-
 jobs:
   # Deleting a v*.*.* tag also sends a push event for it: no job runs for a deleted tag.
   # Before anything else, CI included: the tag must be vMAJOR.MINOR.PATCH with an optional pre-release, by SemVer's
@@ -63,6 +56,14 @@ jobs:
   publish:
     needs: [tag, ci]
     if: github.event.deleted != true
+    # One publish per version: a re-run of the same tag waits for the one in progress, and different versions never
+    # cancel each other (a single shared group would keep at most one run pending and could drop a release). The key
+    # is the tag job's validated, lowercase version, so an unvalidated ref never enters a group (group names ignore
+    # case). Different versions may publish at the same time; the guard below keeps X.Y from moving backwards. ci
+    # runs ungrouped: it holds no write permission.
+    concurrency:
+      group: release-${{ needs.tag.outputs.version }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:

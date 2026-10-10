@@ -72,9 +72,10 @@ and tag the next patch version. Re-running a failed `publish` job with **Re-run 
 same tags again, with a new digest; pin the digest from the job summary of the last successful run. Re-running an
 older tag's publish after a newer patch has shipped republishes only its `X.Y.Z` and leaves `X.Y` alone (below).
 
-**`X.Y.Z` always publishes; `X.Y` only moves forward.** Each tag gets its own run (concurrency group
-`release-<tag>`: a re-run waits for the same tag's run in progress, and different tags never cancel each other), so
-runs for different tags may overlap. Right before pushing, `publish` reads the `org.opencontainers.image.version`
+**`X.Y.Z` always publishes; `X.Y` only moves forward.** Each version gets its own `publish` concurrency group
+(`release-<version>`, keyed on the version the `tag` job validated, so a rejected tag never enters one): a re-run waits
+for the same version's `publish` in progress, and different versions never cancel each other, so runs for different
+tags may overlap. Right before pushing, `publish` reads the `org.opencontainers.image.version`
 annotation of the published `X.Y` image and moves `X.Y` only if this release is the same version or newer. An older
 patch that finishes last still publishes its own `X.Y.Z`, but leaves `X.Y` alone. A missing `X.Y` (the first release
 on that line) moves it; any other registry error fails the job before the push. The one remaining race is two runs
