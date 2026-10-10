@@ -509,25 +509,17 @@ export function createVadPlot(
   return new VadPlotImpl(canvas, dpr);
 }
 
-// The plot's per-draw and per-hop helpers are module functions and prototype methods, never per-plot closures:
-// every call site then has one target, which V8 inlines, so no number gets boxed on its way in or out.
+// The plot's per-draw and per-hop helpers are module functions and prototype methods, never per-plot closures, so
+// every call site has one target. Whether V8 inlines a call still depends on how often it ran before the compile,
+// and a call it doesn't inline boxes a fractional number it returns. So a loop that runs per point, hop, run or
+// marker computes its coordinates inline (the same expressions, so the same values) and hands numbers only to
+// canvas methods, which TurboFan calls without boxing (#319).
 
 const PLOT_H = DEBUG_PLOT_HEIGHT - DEBUG_GATE_BAR_PX;
 
-/** The x of ctx frame `f` in the window `geo` holds (G_T0, G_SPAN). */
-function plotX(geo: Float64Array, f: number): number {
-  return ((f - geo[G_T0]!) / geo[G_SPAN]!) * DEBUG_PLOT_WIDTH;
-}
-
-/** The y of a Silero p, clamped to 0–1. */
+/** The y of a Silero p, clamped to 0–1. (strokeSeries writes it out inline.) */
 function plotYP(p: number): number {
   return (1 - Math.min(1, Math.max(0, p))) * PLOT_H;
-}
-
-/** The y of a level in dBFS, clamped to the dB axis. */
-function plotYDb(db: number): number {
-  const d = Math.min(DEBUG_PLOT_DB_MAX, Math.max(DEBUG_PLOT_DB_MIN, db));
-  return ((DEBUG_PLOT_DB_MAX - d) / (DEBUG_PLOT_DB_MAX - DEBUG_PLOT_DB_MIN)) * PLOT_H;
 }
 
 /** The Silero thresholds' dashed lines (SILERO_SEG_PARAMS, 0.5 and 0.35). */
@@ -535,8 +527,9 @@ const Y_POS = plotYP(SILERO_SEG_PARAMS.posThreshold);
 const Y_NEG = plotYP(SILERO_SEG_PARAMS.negThreshold);
 
 /**
- * One series, newest to oldest, in `color`: on the dB axis if `db`, else on the p axis. Points more than
- * GAP_STEPS steps (geo[G_STEP]) apart aren't joined; a non-finite value lifts the pen.
+ * One series, newest to oldest, in `color`: on the dB axis if `db` (clamped to DEBUG_PLOT_DB_MIN–MAX), else on the
+ * p axis (clamped to 0–1). A point's x is ((f - t0) / span) · DEBUG_PLOT_WIDTH in the window geo holds (G_T0,
+ * G_SPAN). Points more than GAP_STEPS steps (geo[G_STEP]) apart aren't joined; a non-finite value lifts the pen.
  */
 function strokeSeries(
   c: CanvasRenderingContext2D,
@@ -547,6 +540,7 @@ function strokeSeries(
 ): void {
   const gap = GAP_STEPS * geo[G_STEP]!;
   const t0 = geo[G_T0]!;
+  const span = geo[G_SPAN]!;
   c.strokeStyle = color;
   c.beginPath();
   let prev = Number.POSITIVE_INFINITY;
@@ -557,8 +551,12 @@ function strokeSeries(
     if (f > prev) break; // older than a restarted timeline (a new AudioContext)
     const v = ring.values[i]!;
     if (Number.isFinite(v)) {
-      const px = plotX(geo, f);
-      const py = db ? plotYDb(v) : plotYP(v);
+      const px = ((f - t0) / span) * DEBUG_PLOT_WIDTH;
+      const py = db
+        ? ((DEBUG_PLOT_DB_MAX - Math.min(DEBUG_PLOT_DB_MAX, Math.max(DEBUG_PLOT_DB_MIN, v))) /
+            (DEBUG_PLOT_DB_MAX - DEBUG_PLOT_DB_MIN)) *
+          PLOT_H
+        : (1 - Math.min(1, Math.max(0, v))) * PLOT_H;
       if (pen && prev - f <= gap) c.lineTo(px, py);
       else c.moveTo(px, py);
       pen = true;
@@ -571,42 +569,57 @@ function strokeSeries(
   c.stroke();
 }
 
-/** The energy-gate bar: one rectangle per run of contiguous open hops (hop length geo[G_HOP]). */
+/**
+ * The energy-gate bar: one rectangle per run of contiguous open hops (hop length geo[G_HOP]), its x as in
+ * strokeSeries.
+ *
+ * The walk's last step (k = hops.size, or a hop older than the timeline or left of the window) closes the last run
+ * inside the loop, at the loop's one fillRect, and nothing follows the loop. V8 keeps a function's on-stack-
+ * replacement (OSR) code when it deoptimises after the OSR'd loop, so a flush after the loop that had no type
+ * feedback when the loop was compiled would deoptimise on every draw that ends inside an open run (#319).
+ */
 function drawGateBar(c: CanvasRenderingContext2D, hops: TimedRing, geo: Float64Array): void {
   const hop = geo[G_HOP]!;
   const t0 = geo[G_T0]!;
+  const span = geo[G_SPAN]!;
   c.fillStyle = DEBUG_PLOT_COLORS.egate;
   let inRun = false;
   let runStart = 0;
   let runEnd = 0;
   let prev = Number.POSITIVE_INFINITY;
-  for (let k = 0; k < hops.size; k++) {
-    const i = hops.at(k);
-    const f = hops.frames[i]!;
-    if (f > prev || f + hop < t0) break; // an older timeline, or left of the window
-    prev = f;
-    const open = hops.tags[i] === 1;
+  for (let k = 0; k <= hops.size; k++) {
+    let last = k === hops.size;
+    let open = false;
+    let f = 0;
+    if (!last) {
+      const i = hops.at(k);
+      f = hops.frames[i]!;
+      if (f > prev || f + hop < t0) {
+        last = true; // an older timeline, or left of the window
+      } else {
+        prev = f;
+        open = hops.tags[i] === 1;
+      }
+    }
     if (open && inRun && runStart - (f + hop) <= hop / 2) {
       runStart = f; // the run reaches one hop further back
       continue;
     }
     if (inRun) {
-      const xa = plotX(geo, runStart);
-      c.fillRect(xa, PLOT_H, plotX(geo, runEnd) - xa, DEBUG_GATE_BAR_PX);
+      const xa = ((runStart - t0) / span) * DEBUG_PLOT_WIDTH;
+      c.fillRect(xa, PLOT_H, ((runEnd - t0) / span) * DEBUG_PLOT_WIDTH - xa, DEBUG_GATE_BAR_PX);
     }
+    if (last) break;
     inRun = open;
     runStart = f;
     runEnd = f + hop;
   }
-  if (inRun) {
-    const xa = plotX(geo, runStart);
-    c.fillRect(xa, PLOT_H, plotX(geo, runEnd) - xa, DEBUG_GATE_BAR_PX);
-  }
 }
 
-/** The segment markers in the window: 2 px columns, green start, red end, grey misfire. */
+/** The segment markers in the window: 2 px columns, green start, red end, grey misfire; x as in strokeSeries. */
 function drawMarkers(c: CanvasRenderingContext2D, marks: TimedRing, geo: Float64Array): void {
   const t0 = geo[G_T0]!;
+  const span = geo[G_SPAN]!;
   let prev = Number.POSITIVE_INFINITY;
   for (let k = 0; k < marks.size; k++) {
     const i = marks.at(k);
@@ -620,7 +633,7 @@ function drawMarkers(c: CanvasRenderingContext2D, marks: TimedRing, geo: Float64
         : kind === MARK_END
           ? DEBUG_PLOT_COLORS.end
           : DEBUG_PLOT_COLORS.misfire;
-    c.fillRect(Math.round(plotX(geo, f)) - 1, 0, 2, PLOT_H);
+    c.fillRect(Math.round(((f - t0) / span) * DEBUG_PLOT_WIDTH) - 1, 0, 2, PLOT_H);
   }
 }
 
