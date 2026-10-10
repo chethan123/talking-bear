@@ -2498,6 +2498,8 @@ describe('#317: a repeated input at the same instant returns the same state (the
       region: null,
       gesture: null,
     });
+    const gentleClip = run(stateIn('Idle'), gentle(true), clipIn('sneezeGentle', 11));
+    expect(directorReduce(gentleClip, clipIn('sneeze', 11)).reaction?.r.name).toBe('sneeze');
     const held = stepAll(stateIn('Idle'), gest('noseWrinkle', 'nose', 'longPress', 11)).s;
     const queued = directorReduce(held, clipIn('cuppedEar', 11.2));
     expect(directorReduce(queued, clipIn('sneeze', 11.2)).queued).toMatchObject({
@@ -2510,6 +2512,9 @@ describe('#317: a repeated input at the same instant returns the same state (the
     });
     const petQ = stepAll(stateIn('Idle'), gest('hug', 'belly', 'hug', 11), petStroke(11.1, 1)).s;
     expect(directorReduce(petQ, petStroke(11.1, -1)).queued).toMatchObject({ dirX: -1 });
+    expect(directorReduce(petQ, gest('pet', 'belly', 'stroke', 11.1, 1)).queued).toMatchObject({
+      region: 'belly',
+    });
     const back = stepAll(
       stateIn('Thinking'),
       petStroke(10),

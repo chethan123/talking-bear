@@ -63,7 +63,8 @@
  *   duration-based (a held run, gaps ≤ `maxGapMs`, longer than `continuousMs`): `escalation.to` plays instead.
  * - **Interruption:** a reaction interrupts the active one only if its priority is ≥ the active one's;
  *   otherwise it is queued (one slot, replaced by a newer one) and dropped if it hasn't started 500 ms later.
- *   The same reaction queued again at the instant it was queued changes nothing (#317).
+ *   The same reaction queued again by the same gesture (or clip input) at the instant it was queued changes
+ *   nothing (#317).
  *   A one-shot ends at its clip end, a sustained reaction 400 ms after its release; a fresh queued reaction
  *   then starts. This holds in Talking too: a P3+ below a carried-over reaction is queued, not announced.
  * - **Where it plays:** from Idle (Reacting/Sustained) a reaction is the base; in Attentive and Thinking it
