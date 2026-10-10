@@ -2,7 +2,8 @@ import * as fs from 'node:fs';
 import { expect, test } from '@playwright/test';
 import { expectNoEnforcedViolations, installCspRecorder } from './helpers/csp';
 
-// server/headers.json is the single source of the response headers vite preview serves (plan §4.8.3).
+// server/headers.json is the single source of the response headers vite preview serves (plan §4.8.3). The document
+// gets the common CSP with a same-name htmlOnly value merged in, as one field (issue #121).
 function expectedCsp(): string {
   const parsed: unknown = JSON.parse(
     fs.readFileSync(new URL('../server/headers.json', import.meta.url), 'utf8'),
@@ -15,7 +16,13 @@ function expectedCsp(): string {
   if (typeof csp !== 'string') {
     throw new Error('server/headers.json: common["Content-Security-Policy"] must be a string');
   }
-  return csp;
+  const htmlOnly =
+    typeof parsed === 'object' && parsed !== null && 'htmlOnly' in parsed ? parsed.htmlOnly : null;
+  const html =
+    typeof htmlOnly === 'object' && htmlOnly !== null && 'Content-Security-Policy' in htmlOnly
+      ? htmlOnly['Content-Security-Policy']
+      : undefined;
+  return typeof html === 'string' ? `${csp}; ${html}` : csp;
 }
 
 test('vite preview serves the production CSP and the page loads without enforced violations', async ({
