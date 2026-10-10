@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # release.yml runs this whole workflow on a v*.*.* tag, with a contents: read token (plan §9, issue #111)
+  workflow_call:
 
 permissions:
   contents: read
