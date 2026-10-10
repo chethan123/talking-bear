@@ -149,9 +149,12 @@ async function expectReaction(page: Page, name: string): Promise<void> {
     .toContain(name);
 }
 
-// Every run, green or red: add this test's report-only violations to the X-P5 list first (Playwright empties the
-// output directory at the start of a run, so the file holds this run's list), then assert no violation of either kind.
+// Every run that reached the page, green or red: add this test's report-only violations to the X-P5 list first
+// (Playwright empties the output directory at the start of a run, so the file holds this run's list), then assert no
+// violation of either kind.
 test.afterEach(async ({ page }, testInfo) => {
+  // A failure before navigation (the first-import check, headers.json) leaves nothing to record or assert.
+  if (page.url() === 'about:blank') return;
   const reportOnly = await getReportOnlyViolations(page);
   const file = path.join(testInfo.project.outputDir, XP5_FILE);
   fs.mkdirSync(testInfo.project.outputDir, { recursive: true });
@@ -201,8 +204,9 @@ for (const leg of LEGS) {
         return typeof p === 'object' && p !== null ? Reflect.get(p, 'name') : null;
       });
       expect(policy, 'trustedTypes.defaultPolicy.name').toBe('default');
-      // The policy's rule: same-origin script URLs pass unchanged, any other origin throws. The flow only ever passes
-      // same-origin URLs, so this is the one place a policy that allows everything would show.
+      // The policy's rules: same-origin script URLs pass unchanged, any other origin throws, and there is no createHTML
+      // or createScript rule. The flow never passes a cross-origin URL or an HTML string, so these probes are where a
+      // policy that allows everything would show.
       const results = await page.evaluate(
         (inputs) => {
           const tt: unknown = Reflect.get(globalThis, 'trustedTypes');
@@ -227,6 +231,29 @@ for (const leg of LEGS) {
         'throw:TypeError:blocked script URL: https://example.com/x.js',
       ]);
       expect(results[3], 'createScriptURL(data:)').toMatch(/^throw:TypeError:blocked script URL:/);
+      // HTML and script text: the policy has no createHTML or createScript rule, so every such sink throws.
+      const otherRules = await page.evaluate(() => {
+        const tt: unknown = Reflect.get(globalThis, 'trustedTypes');
+        const p: unknown = typeof tt === 'object' && tt !== null ? Reflect.get(tt, 'defaultPolicy') : null;
+        const probes = [
+          ['createHTML', '<b>x</b>'],
+          ['createScript', '1'],
+        ] as const;
+        return probes.map(([name, input]) => {
+          const fn: unknown = typeof p === 'object' && p !== null ? Reflect.get(p, name) : null;
+          if (typeof fn !== 'function') return `missing:${name}`;
+          try {
+            Reflect.apply(fn, p, [input]);
+            return `ok:${name}`;
+          } catch (e) {
+            return e instanceof Error ? `throw:${e.name}` : `throw:${String(e)}`;
+          }
+        });
+      });
+      expect(otherRules, 'the default policy blesses no HTML or script text').toEqual([
+        'throw:TypeError',
+        'throw:TypeError',
+      ]);
 
       await test.step('one loop', async () => {
         await expectMicSignal(page);
