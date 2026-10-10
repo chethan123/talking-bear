@@ -1,0 +1,121 @@
+name: Release
+
+# Plan §9 (release.yml) and Q6, issue #111. A v*.*.* tag runs the whole of ci.yml with a read-only token, smoke-tests
+# the arm64 image under QEMU, then pushes linux/amd64 and linux/arm64 to GHCR with BuildKit provenance and SBOM.
+# How to tag, the one-time package visibility step and pulling by digest: docs/release.md.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # The only job in any workflow whose token can push packages (plan §9). It logs in to GHCR only after the arm64
+  # smoke.
+  publish:
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # QEMU only runs the arm64 image for the smoke: both build stages run on the build platform and Go
+      # cross-compiles (docs/image.md). The binfmt image runs privileged in this job, so it is pinned by digest
+      # (tonistiigi/binfmt qemu-v10.2.3, the action's default `latest` on 2026-10-10) and never restored from the
+      # Actions cache.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+          cache-image: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Git tag v1.2.3 → image tags 1.2.3 and 1.2. No latest: the monorepo pins by version and digest. The OCI
+      # source label links the package to this repo; the same keys also go out as annotations on the manifests and
+      # the multi-arch index, for registries that read them there.
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ghcr.io/chethan123/talking-bear
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          flavor: latest=false
+          labels: org.opencontainers.image.source=https://github.com/chethan123/talking-bear
+      # arm64 smoke before any push. The release reads and writes only its own cache scope, which PR and main runs
+      # never write (plan §9, caching in a privileged workflow). The push below uses the same build args, so it
+      # reuses these layers: the arm64 image it pushes has exactly the layers smoke-tested here.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          push: false
+          build-args: |
+            BUILD_MODE=production
+            BEAR_BUILD_ID=${{ steps.meta.outputs.version }}
+          tags: bear:arm64
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
+      - name: Run the arm64 image under QEMU with the production flags
+        run: |
+          test "$(docker image inspect bear:arm64 --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
+          docker run -d --name bear --platform linux/arm64 --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges --user 65532:65532 --pids-limit 64 --memory 64m -p 8080:8080 bear:arm64
+      - name: Wait for the probe (60 s limit under QEMU)
+        shell: bash
+        run: |
+          deadline=$((SECONDS + 60))
+          until docker exec bear /bearserve -probe; do
+            if [ "$SECONDS" -ge "$deadline" ]; then echo '/bearserve -probe did not succeed within 60 s'; exit 1; fi
+            sleep 1
+          done
+      - run: bash scripts/check-headers.sh http://localhost:8080
+      - name: Container log
+        if: always()
+        run: docker logs bear || true
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BUILD_MODE=production
+            BEAR_BUILD_ID=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release
+      # The monorepo pins the image by digest.
+      - name: Job summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "digest: $DIGEST"
+            echo
+            echo 'tags:'
+            printf '%s\n' "$TAGS" | sed '/^$/d; s/^/- /'
+            echo
+            echo "pull: docker pull ghcr.io/chethan123/talking-bear@$DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"
