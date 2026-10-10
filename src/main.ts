@@ -4,6 +4,7 @@
 // and touched through the pointer input: adapter → recogniser → reactions table → director → session), the M1 text
 // overlays and the settings sheet (M3, M8: behind a 1 s press of the gear), with `data-state` on main#app for
 // hook-free smoke tests (plan §4.9.3).
+import './security/tt-policy.ts'; // first: the Trusted Types default policy must exist before any sink call
 import './ui/styles.css';
 import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
 import type { Overlay, SessionState, StateName } from './app/events.ts';

@@ -7,7 +7,9 @@
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer"
   },
-  "htmlOnly": {},
+  "htmlOnly": {
+    "Content-Security-Policy-Report-Only": "require-trusted-types-for 'script'; trusted-types default"
+  },
   "cacheControl": [
     { "match": "/assets/**", "value": "public, max-age=31536000, immutable" },
     { "match": "/", "value": "no-cache" },

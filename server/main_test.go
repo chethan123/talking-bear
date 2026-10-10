@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,7 @@ import (
 // Plan §4.8.3 (copied character for character into headers.json by T06).
 const (
 	wantCSP = "default-src 'none'; script-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; media-src 'self'; font-src 'self'; style-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"
+	wantTT  = "require-trusted-types-for 'script'; trusted-types default" // HTML only, Report-Only in M7 (T98)
 	wantPP  = "microphone=(self), screen-wake-lock=(self), autoplay=(self), fullscreen=(self), camera=(), geolocation=(), display-capture=(), usb=(), serial=(), midi=(), payment=(), accelerometer=(), gyroscope=(), magnetometer=(), idle-detection=(), publickey-credentials-get=(), browsing-topics=()"
 
 	immutable = "public, max-age=31536000, immutable"
@@ -93,8 +95,8 @@ func with(kv ...string) http.Header {
 	return h
 }
 
-// withHTML adds headers.json's htmlOnly headers (none today) the way the
-// handler does, so these expectations stay exact if htmlOnly gains entries.
+// withHTML adds headers.json's htmlOnly headers the way the handler does,
+// so these expectations stay exact as htmlOnly changes.
 func withHTML(h http.Header) http.Header {
 	for k, v := range headers.HTMLOnly {
 		h.Add(k, v)
@@ -307,8 +309,8 @@ func TestHeadersJSON(t *testing.T) {
 			t.Errorf("common %s: %q, want %q", k, got, want)
 		}
 	}
-	if headers.HTMLOnly == nil {
-		t.Error(`htmlOnly: the "htmlOnly" key was not decoded`)
+	if want := map[string]string{"Content-Security-Policy-Report-Only": wantTT}; !maps.Equal(headers.HTMLOnly, want) {
+		t.Errorf("htmlOnly %q, want %q", headers.HTMLOnly, want)
 	}
 	wantRules := []CacheRule{
 		{"/assets/**", immutable}, {"/", "no-cache"}, {"/index.html", "no-cache"},
@@ -530,6 +532,51 @@ func TestHTMLOnlyHeaders(t *testing.T) {
 			}
 		} else if len(ro) != 0 || !slices.Equal(csp, []string{wantCSP}) {
 			t.Errorf("%s %s: report-only %q, CSP %q; want no HTML-only headers", c.method, c.path, ro, csp)
+		}
+	}
+}
+
+// TestTrustedTypesReportOnly checks headers.json's own htmlOnly entry (T98,
+// plan §4.8.3): Trusted Types in Report-Only on HTML responses only. On / it
+// comes with the common CSP; /sw.js, the JS assets and a 404 never get it (TT
+// directives on worker scripts would break importScripts).
+func TestTrustedTypesReportOnly(t *testing.T) {
+	srv := newHandler(testFS(), headers)
+	for _, c := range []struct {
+		method, path string
+		req          []string
+		status       int
+		html         bool
+	}{
+		{"GET", "/", []string{"Accept-Encoding", chrome}, 200, true},
+		{"GET", "/index.html", nil, 200, true},
+		{"HEAD", "/", nil, 200, true},
+		{"GET", "/", []string{"If-None-Match", indexETag}, 304, true},
+		{"GET", "/sw.js", nil, 200, false},
+		{"GET", "/sw.js", []string{"Accept-Encoding", chrome}, 200, false},
+		{"GET", "/assets/app-abc.js", []string{"Accept-Encoding", chrome}, 200, false},
+		{"GET", "/assets/app-abc.js", []string{"Accept-Encoding", "gzip"}, 200, false},
+		{"GET", "/assets/app-abc.js", nil, 200, false},
+		{"GET", "/assets/app-abc.js", []string{"If-None-Match", idETag}, 304, false},
+		{"GET", "/assets/_chunk-x.js", nil, 200, false},
+		{"GET", "/does-not-exist", nil, 404, false},
+	} {
+		req := httptest.NewRequest(c.method, c.path, nil)
+		for i := 0; i < len(c.req); i += 2 {
+			req.Header.Add(c.req[i], c.req[i+1])
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		res := rec.Result()
+		ro := res.Header.Values("Content-Security-Policy-Report-Only")
+		csp := res.Header.Values("Content-Security-Policy")
+		want := []string{}
+		if c.html {
+			want = []string{wantTT}
+		}
+		if res.StatusCode != c.status || !slices.Equal(ro, want) || !slices.Equal(csp, []string{wantCSP}) {
+			t.Errorf("%s %s %q: %d, report-only %q, CSP %q; want %d, report-only %q, CSP [%q]",
+				c.method, c.path, c.req, res.StatusCode, ro, csp, c.status, want, wantCSP)
 		}
 	}
 }

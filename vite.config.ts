@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import type { ServerResponse } from 'node:http';
+import { resolve } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { PWA_MANIFEST } from './src/pwa-manifest.ts';
@@ -15,13 +17,88 @@ function isStringMap(value: unknown): value is Record<string, string> {
   );
 }
 
-function readCommonHeaders(): Record<string, string> {
+/** headers.json's two header maps: `common` on every response, `htmlOnly` added on text/html responses. */
+interface PreviewHeaders {
+  common: Record<string, string>;
+  htmlOnly: Record<string, string>;
+}
+
+function readHeaders(): PreviewHeaders {
   const parsed: unknown = JSON.parse(readFileSync(new URL('./server/headers.json', import.meta.url), 'utf8'));
-  const common = typeof parsed === 'object' && parsed !== null && 'common' in parsed ? parsed.common : null;
+  const obj = typeof parsed === 'object' && parsed !== null ? parsed : {};
+  const common = 'common' in obj ? obj.common : null;
+  const htmlOnly = 'htmlOnly' in obj ? obj.htmlOnly : null;
   if (!isStringMap(common)) {
     throw new Error('server/headers.json: "common" must map header names to string values');
   }
-  return common;
+  if (!isStringMap(htmlOnly)) {
+    throw new Error('server/headers.json: "htmlOnly" must map header names to string values');
+  }
+  return { common, htmlOnly };
+}
+
+const HEADERS = readHeaders();
+
+/** The Content-Type a `writeHead(status, [message], [headers])` call sends: its headers argument wins over setHeader. */
+function contentTypeOf(res: ServerResponse, args: readonly unknown[]): string {
+  for (const arg of args.slice(1)) {
+    if (Array.isArray(arg)) {
+      // The flat [name, value, name, value, …] form.
+      for (let i = 0; i + 1 < arg.length; i += 2) {
+        const name: unknown = arg[i];
+        const value: unknown = arg[i + 1];
+        if (typeof name === 'string' && name.toLowerCase() === 'content-type' && typeof value === 'string') {
+          return value;
+        }
+      }
+    } else if (typeof arg === 'object' && arg !== null) {
+      for (const [name, value] of Object.entries(arg)) {
+        if (name.toLowerCase() === 'content-type' && typeof value === 'string') return value;
+      }
+    }
+  }
+  const set = res.getHeader('content-type');
+  return typeof set === 'string' ? set : '';
+}
+
+/**
+ * Adds headers.json's `htmlOnly` headers to `vite preview`'s text/html responses, as the Go server does (plan
+ * §4.8.3: the Trusted Types directives go on HTML only; on worker scripts they would break `importScripts`).
+ * `preview.headers` keeps sending the common ones on every response. The Content-Type is only known when a later
+ * middleware (sirv, or Vite's index.html fallback) writes the head, so `writeHead` is wrapped; an implicit head
+ * (`res.end()` without `writeHead`) goes through it too. The headers are appended, like the Go server's
+ * `Header.Add`, so an HTML-only header never replaces a common one.
+ *
+ * Vite skips its own "Did you build your project?" check as soon as any plugin defines `configurePreviewServer`,
+ * so this plugin makes the same check, with Vite 8.3.1's message: a preview without a build fails at once instead of
+ * serving 404s.
+ */
+function htmlOnlyHeaders(htmlOnly: Record<string, string>): Plugin {
+  let outDir = '';
+  let distDir = '';
+  return {
+    name: 'bear-html-only-headers',
+    configResolved(config) {
+      outDir = config.build.outDir;
+      distDir = resolve(config.root, outDir);
+    },
+    configurePreviewServer(server) {
+      if (!existsSync(distDir)) {
+        throw new Error(`The directory "${outDir}" does not exist. Did you build your project?`);
+      }
+      server.middlewares.use((_req, res, next) => {
+        const writeHead = res.writeHead.bind(res);
+        res.writeHead = (...args: unknown[]): ServerResponse => {
+          if (!res.headersSent && /^text\/html\b/i.test(contentTypeOf(res, args))) {
+            for (const [name, value] of Object.entries(htmlOnly)) res.appendHeader(name, value);
+          }
+          Reflect.apply(writeHead, res, args);
+          return res;
+        };
+        next();
+      });
+    },
+  };
 }
 
 // The build id (issue #101): `BEAR_BUILD_ID` names a build, e.g. the update spec's v1 and v2 variants
@@ -54,10 +131,11 @@ export default defineConfig({
     format: 'es',
   },
   preview: {
-    headers: readCommonHeaders(),
+    headers: HEADERS.common,
   },
   plugins: [
     buildIdAttribute(),
+    htmlOnlyHeaders(HEADERS.htmlOnly),
     // The service worker and the manifest (plan §4.7): generateSW in prompt mode, registered by
     // src/pwa/register.ts through `virtual:pwa-register` (no injected <script>, so nothing inline under the CSP).
     VitePWA({
