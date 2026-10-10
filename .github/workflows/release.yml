@@ -39,6 +39,8 @@ jobs:
           platforms: arm64
           cache-image: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       # Git tag v1.2.3 → image tags 1.2.3 and 1.2. No latest: the monorepo pins by version and digest. The OCI
       # source label links the package to this repo; the same keys also go out as annotations on the manifests and
       # the multi-arch index, for registries that read them there.

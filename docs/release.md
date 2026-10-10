@@ -44,13 +44,15 @@ From an up-to-date `main` whose CI is green:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The tag must be `v<major>.<minor>.<patch>`. Git tag `v1.2.3` gives the image tags `1.2.3` and `1.2`. There is no
-`latest` tag: the monorepo pins by version and digest. A pre-release tag such as `v1.3.0-rc.1` gives only `1.3.0-rc.1`
-(`docker/metadata-action` doesn't move `1.3` for a pre-release).
+The tag must be `v<major>.<minor>.<patch>` (no `+build` suffix: metadata-action drops it and would overwrite
+`1.2.3`). Git tag `v1.2.3` gives the image tags `1.2.3` and `1.2`. There is no `latest` tag: the monorepo pins by
+version and digest. A pre-release tag such as `v1.3.0-rc.1` gives only `1.3.0-rc.1` (`docker/metadata-action`
+doesn't move `1.3` for a pre-release).
 
 Follow the run under **Actions → Release**. If `ci` or the arm64 smoke fails, nothing is pushed: fix it on `main`
 and tag the next patch version. Re-running a failed `publish` job with **Re-run failed jobs** is fine; it pushes the
-same tags again, with a new digest; pin the digest from the job summary of the last successful run.
+same tags again, with a new digest; pin the digest from the job summary of the last successful run. Don't re-run an
+older tag's publish after a newer patch has shipped: it moves the `X.Y` tag back.
 
 ## One-time step after the first push: make the package public
 
@@ -107,10 +109,17 @@ docker buildx imagetools inspect ghcr.io/chethan123/talking-bear:0.1.0 --format 
 
 Every action in `release.yml` is pinned by commit SHA with its tag in a comment, as in `ci.yml`; Dependabot's
 `github-actions` entry bumps them. A Dependabot bump of an action used only in `release.yml` is first exercised by
-the next tag; check that run's publish log. The QEMU `binfmt` image that `docker/setup-qemu-action` runs privileged is pinned
-by tag and digest in the action's `image` input. Dependabot doesn't track that input, so to bump it, resolve the new
-tag's digest and update the input:
+the next tag; check that run's publish log.
+
+Two images run privileged in the `publish` job, so both are pinned by tag and digest in an action input:
+
+- the QEMU `binfmt` image that `docker/setup-qemu-action` runs (its `image` input);
+- the BuildKit daemon image that `docker/setup-buildx-action` starts, which builds and pushes every layer (its
+  `driver-opts: image=…` input; buildx's default is the mutable `moby/buildkit:buildx-stable-1`).
+
+Dependabot doesn't track either input, so to bump one, resolve the new tag's index digest and update the input:
 
 ```sh
 docker buildx imagetools inspect docker.io/tonistiigi/binfmt:<qemu-vX.Y.Z>   # the "Digest:" line
+docker buildx imagetools inspect moby/buildkit:<vX.Y.Z>                      # the "Digest:" line
 ```
