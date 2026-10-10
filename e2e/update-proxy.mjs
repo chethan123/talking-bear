@@ -15,18 +15,18 @@
 //   Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade and any field the Connection
 //   header names. The request keeps its Host. A 404 from the upstream goes into the 404 log like a static one; an
 //   upstream that cannot be reached gets the proxy's own 502 (logged to stderr).
-// - Static mode: static files come from the **active** directory, dist-e2e-v1/ at start (scripts/build-update-variants.mjs
-//   builds both), with server/headers.json's headers, as the Go server sends them (server/handler.go): the common
-//   headers on every response, htmlOnly on HTML, the first matching cacheControl rule, and the MIME type by
-//   extension (application/octet-stream otherwise; never sniffed). GET and HEAD only (405 otherwise); `/` is
-//   /index.html; exact lookup: no directory index, no SPA fallback. No ETag, 304, ranges or precompressed variants:
-//   the update spec needs none of them, and the Go server's tests cover them.
-// - Test-only endpoints, in both modes, which exist only in this proxy: `GET /__switch?to=v1|v2` makes that directory the active
-//   one (204; any other method gets 405, so a HEAD never switches), and `GET /__404s` returns every 404 so far as a
-//   JSON array of "<METHOD> <raw path> (<active id>)", the path as requested, without its query (any method but GET
-//   and HEAD gets 405). Both are `no-store`, like the 404s and 405s (errorCacheControl). The proxy's own responses
-//   (these two, its 400, 405 and 502, and every static-mode response) carry server/headers.json's common headers;
-//   a forwarded response carries the upstream's headers only.
+// - Static mode: static files come from the **active** directory, dist-e2e-v1/ at start
+//   (scripts/build-update-variants.mjs builds both), with server/headers.json's headers, as the Go server sends
+//   them (server/handler.go): the common headers on every response, htmlOnly on HTML, the first matching
+//   cacheControl rule, and the MIME type by extension (application/octet-stream otherwise; never sniffed). GET and
+//   HEAD only (405 otherwise); `/` is /index.html; exact lookup: no directory index, no SPA fallback. No ETag, 304,
+//   ranges or precompressed variants: the update spec needs none of them, and the Go server's tests cover them.
+// - Test-only endpoints, in both modes, which exist only in this proxy: `GET /__switch?to=v1|v2` makes that variant
+//   the active one (204; any other method gets 405, so a HEAD never switches), and `GET /__404s` returns every 404
+//   so far as a JSON array of "<METHOD> <raw path> (<active id>)", the path as requested, without its query (any
+//   method but GET and HEAD gets 405). Both are `no-store`, like the 404s and 405s (errorCacheControl). The proxy's
+//   own responses (these two, its 400, 405 and 502, and every static-mode response) carry server/headers.json's
+//   common headers; a forwarded response carries the upstream's headers only.
 // Plain Node ESM with no dependencies.
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -226,6 +226,7 @@ function forward(req, res, upstreams) {
     }
     res.sendDate = false; // the upstream's own Date passes through; Node adds none
     res.writeHead(up.statusCode ?? 502, up.statusMessage, endToEnd(up.rawHeaders));
+    up.on('error', (err) => res.destroy(err)); // the upstream broke off mid-response: so does this one
     up.pipe(res);
   });
   upstreamReq.on('error', (err) => {
