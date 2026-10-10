@@ -140,13 +140,13 @@ jobs:
       - run: BASE_URL=http://localhost:8080 pnpm exec playwright test
       # The X-P5 list (plan §5, §7 M7): e2e/csp.spec.ts writes the Trusted Types report-only violations on every run.
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: xp5-report-only
           path: test-results/xp5-report-only.json
           if-no-files-found: error
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-report
           path: |
@@ -266,7 +266,7 @@ jobs:
       - run: pnpm exec playwright install --with-deps --no-shell chromium
       - run: BASE_URL=http://localhost:8080 pnpm exec playwright test -c playwright.smoke.config.ts
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-smoke-report
           path: test-results/
