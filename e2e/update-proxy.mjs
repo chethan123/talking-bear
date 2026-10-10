@@ -17,7 +17,8 @@
 //   upstream that cannot be reached gets the proxy's own 502 (logged to stderr).
 // - Static mode: static files come from the **active** directory, dist-e2e-v1/ at start
 //   (scripts/build-update-variants.mjs builds both), with server/headers.json's headers, as the Go server sends
-//   them (server/handler.go): the common headers on every response, htmlOnly on HTML, the first matching
+//   them (server/handler.go): the common headers on every response, the HTML header fields on HTML (htmlOnly, a
+//   header common also names merged into one field, as server/headers.go htmlHeaders does), the first matching
 //   cacheControl rule, and the MIME type by extension (application/octet-stream otherwise; never sniffed). GET and
 //   HEAD only (405 otherwise); `/` is /index.html; exact lookup: no directory index, no SPA fallback. No ETag, 304,
 //   ranges or precompressed variants: the update spec needs none of them, and the Go server's tests cover them.
@@ -46,6 +47,19 @@ const DIRS = { v1: join(ROOT, 'dist-e2e-v1'), v2: join(ROOT, 'dist-e2e-v2') };
  *   cacheControl: { match: string, value: string }[], errorCacheControl: string, mime: Record<string, string> }}
  */
 const HEADERS = JSON.parse(readFileSync(join(ROOT, 'server', 'headers.json'), 'utf8'));
+
+/**
+ * The header fields static mode sets on a text/html response on top of the common ones, by the Go server's rule
+ * (server/headers.go `htmlHeaders`, issue #121; ORCH-NOTE 6093452852 on #108): every `htmlOnly` header, except that
+ * one `common` also names (compared case-insensitively) is merged into the common value as
+ * `common + '; ' + htmlOnly`, so it is sent once. A browser enforces every CSP field it receives as a separate policy.
+ * @type {Record<string, string>}
+ */
+const HTML_FIELDS = {};
+for (const [name, value] of Object.entries(HEADERS.htmlOnly)) {
+  const base = Object.entries(HEADERS.common).find(([c]) => c.toLowerCase() === name.toLowerCase())?.[1];
+  HTML_FIELDS[name] = base === undefined ? value : `${base}; ${value}`;
+}
 
 const { values } = parseArgs({
   options: { port: { type: 'string', default: '4174' }, upstream: { type: 'string', multiple: true } },
@@ -333,7 +347,8 @@ const server = createServer((req, res) => {
   setCommon(res);
   const contentType = HEADERS.mime[extname(file).toLowerCase()] ?? 'application/octet-stream';
   if (contentType.split(';')[0]?.trim().toLowerCase() === 'text/html') {
-    for (const [name, value] of Object.entries(HEADERS.htmlOnly)) res.appendHeader(name, value);
+    // Set, like the Go server's Header.Set: a merged field replaces the common one (one CSP field, never two).
+    for (const [name, value] of Object.entries(HTML_FIELDS)) res.setHeader(name, value);
   }
   res.setHeader('Content-Type', contentType);
   res.setHeader('Cache-Control', cacheControlFor(path));
