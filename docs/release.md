@@ -9,15 +9,16 @@ A `v*.*.*` tag publishes the image to GHCR as `ghcr.io/chethan123/talking-bear`,
 
 | Job | Token | What it does |
 |---|---|---|
-| `ci` | `contents: read` | the whole of [`ci.yml`](../.github/workflows/ci.yml), called as a reusable workflow: verify, coverage, go, the image jobs and e2e, on the tagged commit |
-| `publish` (needs `ci`) | `contents: read`, `packages: write` | the steps below; the only job in any workflow that can push packages |
+| `tag` | none | checks the tag format (see [How to tag](#how-to-tag)) before anything else runs, CI included, and hands the version to `publish` |
+| `ci` (needs `tag`) | `contents: read` | the whole of [`ci.yml`](../.github/workflows/ci.yml), called as a reusable workflow: verify, coverage, go, the image jobs and e2e, on the tagged commit |
+| `publish` (needs `tag` and `ci`) | `contents: read`, `packages: write` | the steps below; the only job in any workflow that can push packages |
 
-Neither job runs when a `v*.*.*` tag is deleted (GitHub sends a push event for the deletion too).
+No job runs when a `v*.*.*` tag is deleted (GitHub sends a push event for the deletion too).
 
 `publish`, in order:
 
-0. Checks the tag format (see [How to tag](#how-to-tag)) and that the tagged commit is on `main`, and fails, before
-   anything is built or pushed, if either check doesn't hold.
+0. Checks that the tagged commit is on `main` (see [How to tag](#how-to-tag)) and fails, before anything is built or
+   pushed, if it isn't.
 1. Sets up QEMU (arm64 only) and Buildx. QEMU only runs the arm64 image for the smoke test: both build stages run on
    the build platform and Go cross-compiles.
 2. **arm64 smoke, before any push:** builds `linux/arm64` with `--load` as `bear:arm64`, runs it under QEMU with the
@@ -59,9 +60,12 @@ Whether to add one is the repo owner's decision; rulesets on a private repositor
 
 The tag must be `v<major>.<minor>.<patch>`, optionally with a pre-release suffix such as `-rc.1`, as SemVer defines
 them: no leading zeros in a number (so not `v1.02.3` or `v1.2.3-rc.01`), and no `+build` suffix (metadata-action
-would drop it and overwrite `1.2.3`). The workflow's first step rejects any other tag, so nothing is pushed for it.
-Git tag `v1.2.3` gives the image tags `1.2.3` and `1.2`. There is no `latest` tag: the monorepo pins by version and digest. A pre-release tag such as
-`v1.3.0-rc.1` gives only `1.3.0-rc.1` (`docker/metadata-action` doesn't move `1.3` for a pre-release).
+would drop it and overwrite `1.2.3`). Pre-release identifiers are lowercase (`-rc.1`, not `-RC.1`: GitHub's concurrency
+group names ignore case), each number has at most 15 digits (metadata-action's semver parser stops at 2^53), and the
+version after the `v` is at most 128 characters (Docker's tag limit). The workflow's first job rejects any other tag
+before CI runs, so nothing is built or pushed for it. Git tag `v1.2.3` gives the image tags `1.2.3` and `1.2`. There
+is no `latest` tag: the monorepo pins by version and digest. A pre-release tag such as `v1.3.0-rc.1` gives only
+`1.3.0-rc.1` (`docker/metadata-action` doesn't move `1.3` for a pre-release).
 
 Follow the run under **Actions → Release**. If `ci` or the arm64 smoke fails, nothing is pushed: fix it on `main`
 and tag the next patch version. Re-running a failed `publish` job with **Re-run failed jobs** is fine; it pushes the

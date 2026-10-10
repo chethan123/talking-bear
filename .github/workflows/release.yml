@@ -18,8 +18,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Deleting a v*.*.* tag also sends a push event for it: neither job runs for a deleted tag.
+  # Deleting a v*.*.* tag also sends a push event for it: no job runs for a deleted tag.
+  # Before anything else, CI included: the tag must be vMAJOR.MINOR.PATCH with an optional pre-release, by SemVer's
+  # rules (no leading zeros in numeric identifiers), with lowercase pre-release identifiers (concurrency group names
+  # are case-insensitive), numbers of at most 15 digits (below 2^53, metadata-action's semver limit), at most 128
+  # characters after the v (Docker's tag limit) and no +build suffix. The glob above also admits v1.2.3+build, whose
+  # metadata-action version drops the suffix and would overwrite 1.2.3 and 1.2. Outputs: version (the tag without its
+  # v, which is metadata-action's {{version}} for a tag that passes) and line (MAJOR.MINOR).
+  tag:
+    if: github.event.deleted != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      line: ${{ steps.check.outputs.line }}
+    steps:
+      - name: Check the tag format
+        id: check
+        shell: bash
+        run: |
+          n='(0|[1-9][0-9]{0,14})'
+          id='(0|[1-9][0-9]{0,14}|[0-9a-z-]*[a-z-][0-9a-z-]*)'
+          re="^v$n\.$n\.$n(-$id(\.$id)*)?\$"
+          version=${GITHUB_REF_NAME#v}
+          if [[ ! "$GITHUB_REF_NAME" =~ $re ]] || [ ${#version} -gt 128 ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not an accepted release tag (docs/release.md, How to tag)"
+            exit 1
+          fi
+          core=${version%%-*}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "line=${core%.*}" >> "$GITHUB_OUTPUT"
+          echo "tag $GITHUB_REF_NAME ok"
+
   ci:
+    needs: tag
     if: github.event.deleted != true
     uses: ./.github/workflows/ci.yml
     permissions:
@@ -28,7 +61,7 @@ jobs:
   # The only job in any workflow whose token can push packages (plan §9). It logs in to GHCR only after the arm64
   # smoke.
   publish:
-    needs: ci
+    needs: [tag, ci]
     if: github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -36,26 +69,6 @@ jobs:
       contents: read
       packages: write
     steps:
-      # Before anything else: the tag must be vMAJOR.MINOR.PATCH with an optional pre-release, by SemVer's rules (no
-      # leading zeros in numeric identifiers) and with no +build suffix. The glob above also admits v1.2.3+build, whose
-      # metadata-action version drops the suffix and would overwrite 1.2.3 and 1.2. Outputs: version (the tag without
-      # its v, which is metadata-action's {{version}} for a tag that passes) and line (MAJOR.MINOR).
-      - name: Check the tag format
-        id: tag
-        shell: bash
-        run: |
-          n='(0|[1-9][0-9]*)'
-          id='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
-          re="^v$n\.$n\.$n(-$id(\.$id)*)?\$"
-          if [[ ! "$GITHUB_REF_NAME" =~ $re ]]; then
-            echo "::error::tag '$GITHUB_REF_NAME' is not vMAJOR.MINOR.PATCH[-prerelease] (no +build, no leading zeros)"
-            exit 1
-          fi
-          version=${GITHUB_REF_NAME#v}
-          core=${version%%-*}
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "line=${core%.*}" >> "$GITHUB_OUTPUT"
-          echo "tag $GITHUB_REF_NAME ok"
       # Full history, so origin/main is here for the next step without handing the token to any later step.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -95,7 +108,7 @@ jobs:
           push: false
           build-args: |
             BUILD_MODE=production
-            BEAR_BUILD_ID=${{ steps.tag.outputs.version }}
+            BEAR_BUILD_ID=${{ needs.tag.outputs.version }}
           tags: bear:arm64
           cache-from: type=gha,scope=release
           cache-to: type=gha,scope=release,mode=max
@@ -129,8 +142,8 @@ jobs:
       - name: Move X.Y only forward
         id: guard
         env:
-          VERSION: ${{ steps.tag.outputs.version }}
-          LINE: ${{ steps.tag.outputs.line }}
+          VERSION: ${{ needs.tag.outputs.version }}
+          LINE: ${{ needs.tag.outputs.line }}
         run: |
           # ge A B: A >= B for decimal integers without leading zeros (length first, so no overflow).
           ge() { if [ ${#1} -ne ${#2} ]; then [ ${#1} -gt ${#2} ]; else [[ ! "$1" < "$2" ]]; fi; }
@@ -185,7 +198,7 @@ jobs:
           push: true
           build-args: |
             BUILD_MODE=production
-            BEAR_BUILD_ID=${{ steps.tag.outputs.version }}
+            BEAR_BUILD_ID=${{ needs.tag.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
