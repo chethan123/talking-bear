@@ -9,7 +9,9 @@
 #   docker compose -f deploy/compose/compose.yml up -d && bash scripts/check-compose-headers.sh
 #
 # It sources scripts/check-headers.sh and runs its 200/304/404 cases through the front, with curl -k (the front's
-# certificate comes from Caddy's internal CA). On top of those:
+# certificate comes from Caddy's internal CA). So / carries the merged CSP (the common one plus the Trusted Types
+# directives, issue #121) and /sw.js and the module asset none of the HTML-only directives, through both proxies. On top
+# of those:
 #   - every response carries exactly one Strict-Transport-Security field, the front's value, and exactly two Via
 #     fields, `1.1 Caddy` from each proxy (RFC 9110 §7.6.3: every proxy appends one, so via is the one name that
 #     may repeat);
