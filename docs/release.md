@@ -16,8 +16,8 @@ Neither job runs when a `v*.*.*` tag is deleted (GitHub sends a push event for t
 
 `publish`, in order:
 
-0. Checks the tag format (see [How to tag](#how-to-tag)) and fails, before anything is built or pushed, if the tag
-   isn't one.
+0. Checks the tag format (see [How to tag](#how-to-tag)) and that the tagged commit is on `main`, and fails, before
+   anything is built or pushed, if either check doesn't hold.
 1. Sets up QEMU (arm64 only) and Buildx. QEMU only runs the arm64 image for the smoke test: both build stages run on
    the build platform and Go cross-compiles.
 2. Computes the image tags and OCI labels with `docker/metadata-action`.
@@ -47,6 +47,13 @@ From an up-to-date `main` whose CI is green:
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
+
+The tag must point at a commit on `main` (the merged, reviewed history): `publish` checks that the tagged commit is
+an ancestor of `origin/main` and refuses any other commit before it builds or logs in. That check catches mistakes,
+such as tagging a local or feature-branch commit. It can't stop someone with write access who tags a commit that
+also edits `release.yml`, because GitHub runs the workflow file from the tagged commit. The real control for that is
+a **tag ruleset** that restricts creating `v*` tags to the maintainer (repository **Settings → Rules → Rulesets**).
+Whether to add one is the repo owner's decision; rulesets on a private repository may need a paid plan.
 
 The tag must be `v<major>.<minor>.<patch>`, optionally with a pre-release suffix such as `-rc.1`, with no leading
 zeros in the three numbers and no `+build` suffix (metadata-action would drop it and overwrite `1.2.3`). The
@@ -121,15 +128,22 @@ Every action in `release.yml` is pinned by commit SHA with its tag in a comment,
 `github-actions` entry bumps them. A Dependabot bump of an action used only in `release.yml` is first exercised by
 the next tag; check that run's publish log.
 
-Two images run privileged in the `publish` job, so both are pinned by tag and digest in an action input:
+Two images run privileged in the `publish` job, and two more shape what is built and attested, so all four are
+pinned by tag and digest:
 
 - the QEMU `binfmt` image that `docker/setup-qemu-action` runs (its `image` input);
 - the BuildKit daemon image that `docker/setup-buildx-action` starts, which builds and pushes every layer (its
-  `driver-opts: image=…` input; buildx's default is the mutable `moby/buildkit:buildx-stable-1`).
+  `driver-opts: image=…` input; buildx's default is the mutable `moby/buildkit:buildx-stable-1`);
+- the Dockerfile frontend, in the `# syntax=` line of the [`Dockerfile`](../Dockerfile) (the floating
+  `docker/dockerfile:1` would pull whatever is newest before each build);
+- the SBOM generator, in the push step's `sbom: generator=…` input (the default is the mutable
+  `docker/buildkit-syft-scanner:stable-1`).
 
-Dependabot doesn't track either input, so to bump one, resolve the new tag's index digest and update the input:
+Don't rely on Dependabot for these pins; to bump one, resolve the new tag's index digest and update the pin:
 
 ```sh
-docker buildx imagetools inspect docker.io/tonistiigi/binfmt:<qemu-vX.Y.Z>   # the "Digest:" line
-docker buildx imagetools inspect moby/buildkit:<vX.Y.Z>                      # the "Digest:" line
+docker buildx imagetools inspect docker.io/tonistiigi/binfmt:<qemu-vX.Y.Z>       # the "Digest:" line
+docker buildx imagetools inspect moby/buildkit:<vX.Y.Z>                          # the "Digest:" line
+docker buildx imagetools inspect docker/dockerfile:<X.Y.Z>                       # the "Digest:" line
+docker buildx imagetools inspect docker/buildkit-syft-scanner:<X.Y.Z>            # the "Digest:" line
 ```

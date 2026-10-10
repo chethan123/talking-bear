@@ -48,9 +48,21 @@ jobs:
             exit 1
           fi
           echo "tag $GITHUB_REF_NAME ok"
+      # Full history, so origin/main is here for the next step without handing the token to any later step.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      # The tag must point at a commit on main, checked before QEMU, Buildx, login or any build. This catches tagging
+      # the wrong commit; it can't stop a writer who also edits this workflow in the tagged commit (that needs a tag
+      # ruleset on v*, docs/release.md).
+      - name: Check the tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA ($GITHUB_REF_NAME) is not on origin/main: tag a commit on main"
+            exit 1
+          fi
+          echo "commit $GITHUB_SHA is on origin/main"
       # QEMU only runs the arm64 image for the smoke: both build stages run on the build platform and Go
       # cross-compiles (docs/image.md). The binfmt image runs privileged in this job, so it is pinned by digest
       # (tonistiigi/binfmt qemu-v10.2.3, the action's default `latest` on 2026-10-10) and never restored from the
@@ -127,7 +139,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           provenance: mode=max
-          sbom: true
+          # The SBOM generator runs inside the build, so it is pinned by digest too (1.12.0, the scanner's default
+          # `stable-1` on 2026-10-10).
+          sbom: generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
           cache-from: type=gha,scope=release
       # The monorepo pins the image by digest.
       - name: Job summary
