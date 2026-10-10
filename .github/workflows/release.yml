@@ -10,8 +10,17 @@ on:
 permissions:
   contents: read
 
+# One release at a time, in push order, so two patch tags of one minor line can't finish out of order and move the
+# X.Y tag back. GitHub keeps at most one run pending here: a newer tag's run may replace a pending older one, which is
+# fine, because the newer tag carries X.Y.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  # Deleting a v*.*.* tag also sends a push event for it: neither job runs for a deleted tag.
   ci:
+    if: github.event.deleted != true
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -20,12 +29,25 @@ jobs:
   # smoke.
   publish:
     needs: ci
+    if: github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
       packages: write
     steps:
+      # Before anything else: the tag must be vMAJOR.MINOR.PATCH with an optional pre-release, SemVer's rules (no
+      # leading zeros in the core numbers) and no +build suffix. The glob above also admits v1.2.3+build, whose
+      # metadata-action version drops the suffix and would overwrite 1.2.3 and 1.2.
+      - name: Check the tag format
+        shell: bash
+        run: |
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$GITHUB_REF_NAME" =~ $re ]]; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not vMAJOR.MINOR.PATCH[-prerelease] (no +build, no leading zeros)"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME ok"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

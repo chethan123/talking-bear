@@ -12,8 +12,12 @@ A `v*.*.*` tag publishes the image to GHCR as `ghcr.io/chethan123/talking-bear`,
 | `ci` | `contents: read` | the whole of [`ci.yml`](../.github/workflows/ci.yml), called as a reusable workflow: verify, coverage, go, the image jobs and e2e, on the tagged commit |
 | `publish` (needs `ci`) | `contents: read`, `packages: write` | the steps below; the only job in any workflow that can push packages |
 
+Neither job runs when a `v*.*.*` tag is deleted (GitHub sends a push event for the deletion too).
+
 `publish`, in order:
 
+0. Checks the tag format (see [How to tag](#how-to-tag)) and fails, before anything is built or pushed, if the tag
+   isn't one.
 1. Sets up QEMU (arm64 only) and Buildx. QEMU only runs the arm64 image for the smoke test: both build stages run on
    the build platform and Go cross-compiles.
 2. Computes the image tags and OCI labels with `docker/metadata-action`.
@@ -44,15 +48,21 @@ From an up-to-date `main` whose CI is green:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The tag must be `v<major>.<minor>.<patch>` (no `+build` suffix: metadata-action drops it and would overwrite
-`1.2.3`). Git tag `v1.2.3` gives the image tags `1.2.3` and `1.2`. There is no `latest` tag: the monorepo pins by
-version and digest. A pre-release tag such as `v1.3.0-rc.1` gives only `1.3.0-rc.1` (`docker/metadata-action`
-doesn't move `1.3` for a pre-release).
+The tag must be `v<major>.<minor>.<patch>`, optionally with a pre-release suffix such as `-rc.1`, with no leading
+zeros in the three numbers and no `+build` suffix (metadata-action would drop it and overwrite `1.2.3`). The
+workflow's first step rejects any other tag, so nothing is pushed for it. Git tag `v1.2.3` gives the image tags
+`1.2.3` and `1.2`. There is no `latest` tag: the monorepo pins by version and digest. A pre-release tag such as
+`v1.3.0-rc.1` gives only `1.3.0-rc.1` (`docker/metadata-action` doesn't move `1.3` for a pre-release).
 
 Follow the run under **Actions → Release**. If `ci` or the arm64 smoke fails, nothing is pushed: fix it on `main`
 and tag the next patch version. Re-running a failed `publish` job with **Re-run failed jobs** is fine; it pushes the
 same tags again, with a new digest; pin the digest from the job summary of the last successful run. Don't re-run an
 older tag's publish after a newer patch has shipped: it moves the `X.Y` tag back.
+
+Releases run one at a time, in the order the tags were pushed (`concurrency: release`), so two patch tags pushed close
+together can't finish out of order and move `X.Y` back. While one release runs, GitHub keeps at most one more
+waiting: if a third tag arrives, it may cancel the waiting run of the older tag. That is fine, because the newer tag
+carries `X.Y`. The cancelled tag's own `X.Y.Z` image is then not published; the newer patch supersedes it.
 
 ## One-time step after the first push: make the package public
 
