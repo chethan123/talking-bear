@@ -3,7 +3,7 @@
 // (BearView: Juni on the canvas stage, driven by the session's `anim` effects and the replay's processed envelope,
 // and touched through the pointer input: adapter → recogniser → reactions table → director → session), the M1 text
 // overlays and the settings sheet (M3, M8: behind a 1 s press of the gear), with `data-state` on main#app for
-// hook-free smoke tests (plan §4.9.3).
+// hook-free smoke tests (plan §4.9.3), and the §4.10 performance marks (#122, src/perf.ts).
 import './security/tt-policy.ts'; // first: the Trusted Types default policy must exist before any sink call
 import './ui/styles.css';
 import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
@@ -24,6 +24,11 @@ import { createWakeLock } from './platform/wake-lock.ts';
 import { setupPwa } from './pwa/register.ts';
 import { mountOverlay } from './ui/overlay.ts';
 import { mountSettingsSheet, type SettingsSheet } from './ui/settings-sheet.ts';
+import { markBootStart } from './perf.ts';
+
+// #122: the start of `first-frame`, the first statement of this module's body (its static imports, hoisted, have
+// already been fetched and evaluated).
+markBootStart();
 
 const noop = (): void => {};
 

@@ -22,6 +22,7 @@
 // closure scalars: nothing is allocated per level.
 
 import { DEFAULT_ENERGY_PARAMS } from '../dsp/energy-gate.ts';
+import { cancelTap, markListening } from '../perf.ts';
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
 import type { Player, SessionDeps, Sfx, SfxScheduled } from './session.ts';
 
@@ -340,6 +341,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
         else engine.openMic(fx.req);
         return;
       case 'closeMic':
+        // #122: closeMic comes with the entry into Asleep, Paused and Error: a pending wake tap never got to Listening.
+        cancelTap();
         engine.closeMic();
         return;
       case 'resumeCtx':
@@ -356,6 +359,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
         engine.restartWorker();
         return;
       case 'arm':
+        // #122: only the entry into Listening emits `arm` (machine.ts entryActions), so this is every entry into it.
+        markListening();
         engine.arm(fx.epoch, fx.restoreFloorDb, fx.marginBoostDb);
         return;
       case 'disarm':
