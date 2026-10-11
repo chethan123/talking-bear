@@ -24,7 +24,7 @@ import { createWakeLock } from './platform/wake-lock.ts';
 import { setupPwa } from './pwa/register.ts';
 import { mountOverlay } from './ui/overlay.ts';
 import { mountSettingsSheet, type SettingsSheet } from './ui/settings-sheet.ts';
-import { markBootStart } from './perf.ts';
+import { markBootStart, readPerfMeasures } from './perf.ts';
 
 // #122: the start of `first-frame`, the first statement of this module's body (its static imports, hoisted, have
 // already been fetched and evaluated).
@@ -244,16 +244,19 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     },
   });
 
-  // Developer overlay (plan §7 M2, M4, M5, M6): the frame loop's p95 frame time and fps, storage persistence and
-  // usage, the device lines (#93: the latest vibrate result, ctx.state, the mic track's events, the audio inputs),
-  // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted). It is loaded on
-  // demand and nothing waits for it (#57): its code, and the energy gate it replays, stay out of the initial bundle.
+  // Developer overlay (plan §7 M2, M4, M5, M6, M8): the frame loop's p95 frame time and fps, the §4.10 performance
+  // measures (#122), storage persistence and usage, the device lines (#93: the latest vibrate result, ctx.state, the
+  // mic track's events, the audio inputs), and the live VAD plot and lines (#56; the worker's feature trace is on
+  // while it is mounted). It is loaded on demand and nothing waits for it (#57): its code, and the energy gate it
+  // replays, stay out of the initial bundle.
   if (overlayModule !== null) {
     mountDebugOverlayWhenLoaded(
       overlayModule,
       (m) =>
         m.mountDebugOverlay(app, {
           frameStats: (out) => view.frameStats(out),
+          // #122: the last first-frame and tap-to-listening measures.
+          perf: readPerfMeasures,
           clock,
           storage,
           device: {

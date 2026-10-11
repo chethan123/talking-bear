@@ -2,8 +2,8 @@
 //
 // - the frame-loop line (#81): the main-thread time per drawn frame (p95 over the last 120 drawn frames) and the
 //   current fps, read from the bear's frame loop four times a second;
-// - the performance line (#122, plan §4.10): the last `first-frame` and `tap-to-listening` measures (src/perf.ts),
-//   copied from two cached numbers and formatted with the frame line, four times a second;
+// - the performance line (#122, plan §4.10): the last `first-frame` and `tap-to-listening` measures (src/perf.ts's
+//   `readPerfMeasures`, two cached numbers), formatted with the frame line, four times a second;
 // - the storage line (#98, plan §4.7 "Offline guarantees"): `navigator.storage.persisted()` and `estimate()`,
 //   read every 5 s;
 // - the device lines (#93, for the owner checks of #95, #123 and #120): the haptics log's latest `vibrate` line,
@@ -41,7 +41,7 @@ import {
 } from '../dsp/energy-gate.ts';
 import { SILERO_SEG_PARAMS, type SegEvent } from '../dsp/segmenter.ts';
 import type { StorageApi, StorageUsage } from '../platform/storage.ts';
-import { readPerfMeasures, type PerfMeasures } from '../perf.ts';
+import type { PerfMeasures } from '../perf.ts';
 
 /** How often the text is refreshed, in ms. */
 export const DEBUG_REFRESH_MS = 250;
@@ -52,6 +52,8 @@ export interface DebugOverlayDeps {
   /** The frame loop's stats (`BearView.frameStats`). */
   frameStats(out: FrameStats): FrameStats;
   clock: Pick<Clock, 'setTimeout' | 'clearTimeout'>;
+  /** The last performance measures (#122: src/perf.ts `readPerfMeasures`); without it there is no perf line. */
+  perf?(out: PerfMeasures): PerfMeasures;
   /** Storage persistence and usage (#98); without it there is no storage line. */
   storage?: Pick<StorageApi, 'persisted' | 'estimate'>;
   /** The device lines (#93); without it there are none. */
@@ -94,10 +96,16 @@ export function mountDebugOverlay(root: HTMLElement, deps: DebugOverlayDeps): De
   box.className = 'debug-overlay';
   const frames = document.createElement('p');
   frames.className = 'debug-line';
-  const perfLine = document.createElement('p');
-  perfLine.className = 'debug-line';
-  perfLine.dataset.line = 'perf';
-  box.append(frames, perfLine);
+  box.append(frames);
+  // The perf line (#122) follows the frame line, so the frame line stays the overlay's first `.debug-line`.
+  const { perf } = deps;
+  let perfLine: HTMLElement | null = null;
+  if (perf !== undefined) {
+    perfLine = document.createElement('p');
+    perfLine.className = 'debug-line';
+    perfLine.dataset.line = 'perf';
+    box.append(perfLine);
+  }
   root.append(box);
 
   const stats: FrameStats = { p95Ms: Number.NaN, fps: Number.NaN, frames: 0 };
@@ -107,7 +115,7 @@ export function mountDebugOverlay(root: HTMLElement, deps: DebugOverlayDeps): De
 
   function refresh(): void {
     frames.textContent = formatFrameStats(deps.frameStats(stats));
-    perfLine.textContent = formatPerfMeasures(readPerfMeasures(measures));
+    if (perfLine !== null && perf !== undefined) perfLine.textContent = formatPerfMeasures(perf(measures));
   }
 
   function schedule(): void {
