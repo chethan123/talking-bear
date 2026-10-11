@@ -67,3 +67,42 @@ test('the debug overlay shows the last first-frame measure, and a dash before an
     /^first frame \d+ ms · tap→listening – ms$/,
   );
 });
+
+// A wake tap stays pending only on its way to Listening (src/perf.ts): these two pin the cancellations.
+test('tap-to-listening: a wake tap whose wake is paused before Listening measures nothing', async ({
+  page,
+}) => {
+  await openApp(page);
+  // Runs after BearView's canvas listener (the event bubbles to window last): hidden once, so the tap's Waking
+  // goes to Paused (closeMic, which cancels the pending tap); visible then wakes by permission (row 39), no tap.
+  await page.evaluate(() => {
+    window.addEventListener('pointerdown', () => window.__bearTest?.setVisibility('hidden'), { once: true });
+  });
+  await page.locator('canvas.stage').click();
+  await expect(page.locator(APP)).toHaveAttribute('data-state', 'Paused');
+  expect(await entries(page, 'tap', 'mark')).toHaveLength(1);
+  await page.evaluate(() => window.__bearTest?.setVisibility('visible'));
+  await expect(page.locator(APP)).toHaveAttribute('data-state', 'Listening', { timeout: 10_000 });
+  await expect.poll(async () => (await entries(page, 'listening', 'mark')).length).toBe(1);
+  expect(await entries(page, 'tap-to-listening', 'measure')).toHaveLength(0);
+});
+
+test('tap-to-listening: a tap in Paused, which stays Paused, is not measured by the later visible wake', async ({
+  page,
+}) => {
+  await openApp(page);
+  await page.locator('canvas.stage').click();
+  await expect(page.locator(APP)).toHaveAttribute('data-state', 'Listening', { timeout: 10_000 });
+  await expect.poll(async () => (await entries(page, 'tap-to-listening', 'measure')).length).toBe(1);
+  const [before] = await entries(page, 'tap-to-listening', 'measure');
+  await page.evaluate(() => window.__bearTest?.setVisibility('hidden'));
+  await expect(page.locator(APP)).toHaveAttribute('data-state', 'Paused');
+  // Hidden, a tap in Paused dispatches tapBear and stays Paused, so BearView cancels it at once.
+  await page.locator('canvas.stage').click();
+  await expect(page.locator(APP)).toHaveAttribute('data-state', 'Paused');
+  await page.evaluate(() => window.__bearTest?.setVisibility('visible'));
+  await expect(page.locator(APP)).toHaveAttribute('data-state', 'Listening', { timeout: 10_000 });
+  const [listening] = await entries(page, 'listening', 'mark');
+  expect(listening!.startTime).toBeGreaterThan(before!.startTime + before!.duration);
+  expect(await entries(page, 'tap-to-listening', 'measure')).toEqual([before]);
+});

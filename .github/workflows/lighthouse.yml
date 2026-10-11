@@ -15,7 +15,8 @@ permissions:
   contents: read
 
 concurrency:
-  # Every main commit keeps its LCP and TBT: a newer push queues behind a running one, never cancels it.
+  # Every main commit keeps its LCP and TBT: a newer push waits for the running one instead of cancelling it
+  # (GitHub keeps one pending run per group).
   group: lighthouse-${{ github.ref }}
   cancel-in-progress: false
 
