@@ -2,6 +2,8 @@
 //
 // - the frame-loop line (#81): the main-thread time per drawn frame (p95 over the last 120 drawn frames) and the
 //   current fps, read from the bear's frame loop four times a second;
+// - the performance line (#122, plan §4.10): the last `first-frame` and `tap-to-listening` measures (src/perf.ts),
+//   copied from two cached numbers and formatted with the frame line, four times a second;
 // - the storage line (#98, plan §4.7 "Offline guarantees"): `navigator.storage.persisted()` and `estimate()`,
 //   read every 5 s;
 // - the device lines (#93, for the owner checks of #95, #123 and #120): the haptics log's latest `vibrate` line,
@@ -39,6 +41,7 @@ import {
 } from '../dsp/energy-gate.ts';
 import { SILERO_SEG_PARAMS, type SegEvent } from '../dsp/segmenter.ts';
 import type { StorageApi, StorageUsage } from '../platform/storage.ts';
+import { readPerfMeasures, type PerfMeasures } from '../perf.ts';
 
 /** How often the text is refreshed, in ms. */
 export const DEBUG_REFRESH_MS = 250;
@@ -71,6 +74,13 @@ export function formatFrameStats(s: FrameStats): string {
   return `frame p95 ${p95} · ${fps}`;
 }
 
+/** "first frame 312 ms · tap→listening 208 ms" (plan §4.10, #122); dashes until a measure exists. */
+export function formatPerfMeasures(m: PerfMeasures): string {
+  const first = Number.isFinite(m.firstFrameMs) ? `${Math.round(m.firstFrameMs)} ms` : '– ms';
+  const tap = Number.isFinite(m.tapToListeningMs) ? `${Math.round(m.tapToListeningMs)} ms` : '– ms';
+  return `first frame ${first} · tap→listening ${tap}`;
+}
+
 /** "storage persisted yes · 870 / 1953125 KB" (usage / quota); "?" and dashes where the API is missing. */
 export function formatStorage(persisted: boolean | null, usage: StorageUsage | null): string {
   const p = persisted === null ? '?' : persisted ? 'yes' : 'no';
@@ -84,15 +94,20 @@ export function mountDebugOverlay(root: HTMLElement, deps: DebugOverlayDeps): De
   box.className = 'debug-overlay';
   const frames = document.createElement('p');
   frames.className = 'debug-line';
-  box.append(frames);
+  const perfLine = document.createElement('p');
+  perfLine.className = 'debug-line';
+  perfLine.dataset.line = 'perf';
+  box.append(frames, perfLine);
   root.append(box);
 
   const stats: FrameStats = { p95Ms: Number.NaN, fps: Number.NaN, frames: 0 };
+  const measures: PerfMeasures = { firstFrameMs: Number.NaN, tapToListeningMs: Number.NaN };
   let timer = 0;
   let live = true;
 
   function refresh(): void {
     frames.textContent = formatFrameStats(deps.frameStats(stats));
+    perfLine.textContent = formatPerfMeasures(readPerfMeasures(measures));
   }
 
   function schedule(): void {
