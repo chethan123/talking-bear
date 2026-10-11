@@ -53,7 +53,7 @@ export interface DebugOverlayDeps {
   frameStats(out: FrameStats): FrameStats;
   clock: Pick<Clock, 'setTimeout' | 'clearTimeout'>;
   /** The last performance measures (#122: src/perf.ts `readPerfMeasures`); without it there is no perf line. */
-  perf?(out: PerfMeasures): PerfMeasures;
+  perf?: (out: PerfMeasures) => PerfMeasures;
   /** Storage persistence and usage (#98); without it there is no storage line. */
   storage?: Pick<StorageApi, 'persisted' | 'estimate'>;
   /** The device lines (#93); without it there are none. */
