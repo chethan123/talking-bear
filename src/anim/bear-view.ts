@@ -31,6 +31,10 @@
  * `engine.getProcessed(id).envelope` and the start. It keeps its own reference to the envelope (mouth features,
  * not audio) until the mouth has closed after talkEnd, then drops it.
  *
+ * **Performance marks** (#122, src/perf.ts): `first-bear-frame` right after the frame loop's first `render`
+ * (a closure flag: later frames test it and call nothing), and `tap` as a wake tap dispatches `tapBear`, kept
+ * pending only when the session went to Waking (the granted path).
+ *
  * **Throttling** (`minFrameMs`): 30 fps while the director is Idle or Dozing and nothing moves but breathing and
  * blinks, 15 fps while Asleep and nothing moves but breathing; every frame otherwise. "Moves" is: a clip, a
  * spring with |v| > 1e-3, a layer other than breathing and blink still changing its output (the gaze iris eases
@@ -114,6 +118,7 @@ import type { RegionId } from '../input/region-ids.ts';
 import { hitTest, REGIONS } from '../input/regions.ts';
 import type { Haptics } from '../platform/haptics.ts';
 import type { Visibility } from '../platform/visibility.ts';
+import { cancelTap, markFirstBearFrame, markTap } from '../perf.ts';
 import { reactionFor } from '../reactions/table.ts';
 import { A11Y_TEXT } from '../ui/a11y.ts';
 import type { Clip } from './clip.ts';
@@ -586,6 +591,9 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     logged++;
   }
 
+  /** #122: the frame loop has drawn its first frame (`first-bear-frame` is marked). */
+  let firstFrameMarked = false;
+
   const loop = createFrameLoop(
     {
       beginFrame(t) {
@@ -602,6 +610,11 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
         compose();
         bonesStale = true;
         render(g, rig, pose, view);
+        // #122: the first frame ends `first-frame`; after it the rAF path does this one test, no call.
+        if (!firstFrameMarked) {
+          firstFrameMarked = true;
+          markFirstBearFrame();
+        }
         logFrame(t);
       },
       minFrameMs() {
@@ -744,7 +757,12 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     onGesture,
     onRawDown() {
       deps.haptics?.noteActivation('down');
-      if (TAP_TO_WAKE.has(deps.state())) deps.dispatch({ t: 'tapBear' });
+      if (TAP_TO_WAKE.has(deps.state())) {
+        // #122: `tap-to-listening` starts here and stays pending only if the tap woke the mic (granted: Waking).
+        markTap();
+        deps.dispatch({ t: 'tapBear' });
+        if (deps.state() !== 'Waking') cancelTap();
+      }
     },
     onRawUp(e) {
       if (!e.cancel) deps.haptics?.noteActivation('up');
