@@ -6,7 +6,7 @@
 ARG BUILD_MODE=production
 
 # node:24.21.0-alpine3.24 index digest, resolved 2026-10-09
-FROM --platform=$BUILDPLATFORM node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web
+FROM --platform=$BUILDPLATFORM node:26.12.0-alpine3.24@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS web
 WORKDIR /src
 # include node_modules/dist in the SBOM, not just the final image
 ARG BUILDKIT_SBOM_SCAN_STAGE=true
