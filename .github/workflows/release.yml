@@ -1,0 +1,224 @@
+name: Release
+
+# Plan §9 (release.yml) and Q6, issue #111. A v*.*.* tag runs the whole of ci.yml with a read-only token, smoke-tests
+# the arm64 image under QEMU, then pushes linux/amd64 and linux/arm64 to GHCR with BuildKit provenance and SBOM.
+# How to tag, the one-time package visibility step and pulling by digest: docs/release.md.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  # Deleting a v*.*.* tag also sends a push event for it: no job runs for a deleted tag.
+  # Before anything else, CI included: the tag must be vMAJOR.MINOR.PATCH with an optional pre-release, by SemVer's
+  # rules (no leading zeros in numeric identifiers), with lowercase pre-release identifiers (concurrency group names
+  # are case-insensitive), numbers of at most 15 digits (below 2^53, metadata-action's semver limit), at most 128
+  # characters after the v (Docker's tag limit) and no +build suffix. The glob above also admits v1.2.3+build, whose
+  # metadata-action version drops the suffix and would overwrite 1.2.3 and 1.2. Outputs: version (the tag without its
+  # v, which is metadata-action's {{version}} for a tag that passes) and line (MAJOR.MINOR).
+  tag:
+    if: github.event.deleted != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      line: ${{ steps.check.outputs.line }}
+    steps:
+      - name: Check the tag format
+        id: check
+        shell: bash
+        run: |
+          n='(0|[1-9][0-9]{0,14})'
+          id='(0|[1-9][0-9]{0,14}|[0-9a-z-]*[a-z-][0-9a-z-]*)'
+          re="^v$n\.$n\.$n(-$id(\.$id)*)?\$"
+          version=${GITHUB_REF_NAME#v}
+          if [[ ! "$GITHUB_REF_NAME" =~ $re ]] || [ ${#version} -gt 128 ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not an accepted release tag (docs/release.md, How to tag)"
+            exit 1
+          fi
+          core=${version%%-*}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "line=${core%.*}" >> "$GITHUB_OUTPUT"
+          echo "tag $GITHUB_REF_NAME ok"
+
+  ci:
+    needs: tag
+    if: github.event.deleted != true
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # The only job in any workflow whose token can push packages (plan §9). It logs in to GHCR only after the arm64
+  # smoke.
+  publish:
+    needs: [tag, ci]
+    if: github.event.deleted != true
+    # One publish per version: a re-run of the same tag waits for the one in progress, and different versions never
+    # cancel each other (a single shared group would keep at most one run pending and could drop a release). The key
+    # is the tag job's validated, lowercase version, so an unvalidated ref never enters a group (group names ignore
+    # case). Different versions may publish at the same time; the guard below keeps X.Y from moving backwards. ci
+    # runs ungrouped: it holds no write permission.
+    concurrency:
+      group: release-${{ needs.tag.outputs.version }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Full history, so origin/main is here for the next step without handing the token to any later step.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The tag must point at a commit on main, checked before QEMU, Buildx, login or any build. This catches tagging
+      # the wrong commit; it can't stop a writer who also edits this workflow in the tagged commit (that needs a tag
+      # ruleset on v*, docs/release.md).
+      - name: Check the tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA ($GITHUB_REF_NAME) is not on origin/main: tag a commit on main"
+            exit 1
+          fi
+          echo "commit $GITHUB_SHA is on origin/main"
+      # QEMU only runs the arm64 image for the smoke: both build stages run on the build platform and Go
+      # cross-compiles (docs/image.md). The binfmt image runs privileged in this job, so it is pinned by digest
+      # (tonistiigi/binfmt qemu-v10.2.3, the action's default `latest` on 2026-10-10) and never restored from the
+      # Actions cache.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+          cache-image: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      # arm64 smoke before any push. The release reads and writes only its own cache scope, which PR and main runs
+      # never write (plan §9, caching in a privileged workflow). The push below uses the same build args, so it
+      # reuses these layers: the arm64 image it pushes has exactly the layers smoke-tested here. BEAR_BUILD_ID is the
+      # tag's version (data-build="1.2.3").
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          push: false
+          build-args: |
+            BUILD_MODE=production
+            BEAR_BUILD_ID=${{ needs.tag.outputs.version }}
+          tags: bear:arm64
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
+      - name: Run the arm64 image under QEMU with the production flags
+        run: |
+          test "$(docker image inspect bear:arm64 --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
+          docker run -d --name bear --platform linux/arm64 --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges --user 65532:65532 --pids-limit 64 --memory 64m -p 8080:8080 bear:arm64
+      - name: Wait for the probe (60 s limit under QEMU)
+        shell: bash
+        run: |
+          deadline=$((SECONDS + 60))
+          until docker exec bear /bearserve -probe; do
+            if [ "$SECONDS" -ge "$deadline" ]; then echo '/bearserve -probe did not succeed within 60 s'; exit 1; fi
+            sleep 1
+          done
+      - run: bash scripts/check-headers.sh http://localhost:8080
+      - name: Container log
+        if: always()
+        run: docker logs bear || true
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # X.Y only moves forward: read the version annotation of the published X.Y index and move X.Y only if this
+      # release is the same or newer (X.Y.Z itself is always pushed). Tags of different versions may run at the same
+      # time; the window between this read and the push below is the residual race (docs/release.md). A missing tag
+      # or package means the first release on this line; any other registry error fails the job. A pre-release never
+      # gets X.Y (metadata-action renders {{major}}.{{minor}} as {{version}} for it), so it skips the read.
+      - name: Move X.Y only forward
+        id: guard
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+          LINE: ${{ needs.tag.outputs.line }}
+        run: |
+          # ge A B: A >= B for decimal integers without leading zeros (length first, so no overflow).
+          ge() { if [ ${#1} -ne ${#2} ]; then [ ${#1} -gt ${#2} ]; else [[ ! "$1" < "$2" ]]; fi; }
+          if [[ "$VERSION" == *-* ]]; then
+            echo "pre-release $VERSION: no $LINE tag"
+            echo "minor=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ref="ghcr.io/chethan123/talking-bear:$LINE"
+          err=$(mktemp)
+          if raw=$(docker buildx imagetools inspect --raw "$ref" 2> "$err"); then
+            published=$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$raw")
+            patch=${published##*.}
+            if [ "${published%.*}" != "$LINE" ] || [[ ! "$patch" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::$ref has version annotation '$published', expected $LINE.<patch>"
+              exit 1
+            fi
+            if ge "${VERSION##*.}" "$patch"; then
+              echo "$ref is $published: moving it to $VERSION"
+              echo "minor=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$ref is $published, newer than $VERSION: leaving $LINE, pushing only $VERSION"
+              echo "minor=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif grep -qiE 'not found|manifest unknown|name unknown' "$err"; then
+            echo "$ref not published yet: first release on $LINE, moving it to $VERSION"
+            echo "minor=true" >> "$GITHUB_OUTPUT"
+          else
+            cat "$err" >&2
+            echo "::error::cannot read $ref"
+            exit 1
+          fi
+      # Git tag v1.2.3 → image tags 1.2.3 and 1.2 (the latter only if the guard says so). No latest: the monorepo pins
+      # by version and digest. The OCI source label links the package to this repo; the same keys also go out as
+      # annotations on the manifests and the multi-arch index, for registries that read them there.
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ghcr.io/chethan123/talking-bear
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.guard.outputs.minor }}
+          flavor: latest=false
+          labels: org.opencontainers.image.source=https://github.com/chethan123/talking-bear
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BUILD_MODE=production
+            BEAR_BUILD_ID=${{ needs.tag.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          # The SBOM generator runs inside the build, so it is pinned by digest too (1.12.0, the scanner's default
+          # `stable-1` on 2026-10-10).
+          sbom: generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
+          cache-from: type=gha,scope=release
+      # The monorepo pins the image by digest.
+      - name: Job summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "digest: $DIGEST"
+            echo
+            echo 'tags:'
+            printf '%s\n' "$TAGS" | sed '/^$/d; s/^/- /'
+            echo
+            echo "pull: docker pull ghcr.io/chethan123/talking-bear@$DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -6,7 +6,8 @@
 // - energy (M1, and the fallback): the frames are band-limited and carved into 10 ms hops across frame
 //   boundaries; each hop steps the adaptive energy gate and the segmenter. A segment ends as a `misfire`
 //   instead of an `end` unless at least 60 ms of its hops were voiced (normalised autocorrelation over the
-//   last 512 band-limited samples, plan §4.2.1 step 5).
+//   last 512 band-limited samples, plan §4.2.1 step 5); a capped one keeps reason 'maxLength' and its voiced
+//   ratio (#289), so the session counts it as a noisy cap.
 // - Silero (once `setModel` has handed over the model): each raw frame's speech probability steps the
 //   segmenter. The energy gate still runs on every hop, for `level`, the floor and `floorSnapshot`. A model
 //   that throws switches the epoch to energy (an open segment ends as a `misfire`). The optional pre-gate
@@ -449,7 +450,12 @@ export class VadCore {
       let ev: SegEvent | null = segmenterStep(seg, ENERGY_SEG_PARAMS, ctxFrame, prob);
       if (ev !== null && ev.kind === 'start') segmenterVoicing(seg, voiced);
       if (ev !== null && ev.kind === 'end' && seg.voicedHops * HOP_MS < MIN_VOICED_MS) {
-        ev = { kind: 'misfire', frame: ev.frame }; // plan §4.2.1 step 5: an utterance needs ≥ 60 ms voiced
+        // plan §4.2.1 step 5: an utterance needs ≥ 60 ms voiced. #289: a capped one keeps its reason and voiced
+        // ratio, so the session counts it as a noisy cap (plan §4.4); every other misfire carries neither.
+        ev =
+          ev.reason === 'maxLength'
+            ? { kind: 'misfire', frame: ev.frame, reason: 'maxLength', voicedRatio: segmentVoicedRatio(seg) }
+            : { kind: 'misfire', frame: ev.frame };
       }
       if (ev !== null) this.emit(epoch, ev, floorDb);
     } else if (inSegment) {
