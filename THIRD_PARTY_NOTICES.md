@@ -37,7 +37,7 @@ SOFTWARE.
 ## vite-plugin-pwa (service worker registration)
 
 - Upstream: https://github.com/vite-pwa/vite-plugin-pwa
-- Version: `1.3.0` (npm `vite-plugin-pwa`)
+- Version: `2.0.0` (npm `vite-plugin-pwa`)
 - Source file: `dist/client/build/register.js`, the `virtual:pwa-register` module that `src/pwa/register.ts` imports
 - Shipped as: its `registerSW()`, bundled into `assets/index-*.js`
 - Licence: MIT. The full licence text, copied verbatim from the package's `LICENSE` file:
