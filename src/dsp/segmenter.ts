@@ -8,6 +8,8 @@
 // Voiced ratio (#116, plan §4.4): the caller records the voicing of each 10 ms hop of an open segment with
 // `segmenterVoicing` (it only counts between a `start` and its `end` or `misfire`), and every `end` carries the
 // fraction of those hops that were voiced, so the session can tell a capped take of noise from a long utterance.
+// A capped energy segment that the worker's voicing rule turns into a `misfire` keeps its reason and ratio on the
+// misfire (#289).
 
 export type SegEvent =
   | { kind: 'start'; frame: number }
@@ -23,7 +25,17 @@ export type SegEvent =
        */
       voicedRatio?: number;
     }
-  | { kind: 'misfire'; frame: number };
+  | {
+      kind: 'misfire';
+      frame: number;
+      /**
+       * #289: set only by the worker's VadCore on the energy voicing rule's misfire of a capped segment (an `end`
+       * with reason 'maxLength' and under MIN_VOICED_MS voiced), together with that segment's voiced ratio, so
+       * the session counts it as a noisy cap (plan §4.4). Absent on every other misfire.
+       */
+      reason?: 'maxLength';
+      voicedRatio?: number;
+    };
 
 export interface SegParams {
   posThreshold: number;

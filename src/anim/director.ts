@@ -55,13 +55,16 @@
  * - **Gates:** ignored in Asleep and Waking; in Dozing it moves to Idle first.
  * - **Refresh:** the same reaction name as the held Sustained reaction refreshes it, bypassing the cooldown:
  *   its clip keeps playing (a finite clip that has ended restarts), its escalation run goes on, and its sfx
- *   is output again only every `sfxLoopMs` (never, without it). Haptic and mood are output once per run.
+ *   is output again only every `sfxLoopMs` (never, without it). Haptic and mood are output once per run. A
+ *   refresh at the instant of the last one, with no sfx due, changes nothing (#317).
  * - **Cooldown:** 800 ms per (region, gesture kind) from the reaction that started it; inputs in it are
  *   ignored unless their priority is higher than that reaction's.
  * - **Escalation:** repeat-based (the `count`-th acceptance within `withinMs`; defaults 3 and 4 s) or
  *   duration-based (a held run, gaps ≤ `maxGapMs`, longer than `continuousMs`): `escalation.to` plays instead.
  * - **Interruption:** a reaction interrupts the active one only if its priority is ≥ the active one's;
  *   otherwise it is queued (one slot, replaced by a newer one) and dropped if it hasn't started 500 ms later.
+ *   The same reaction queued again by the same gesture (or clip input) at the instant it was queued changes
+ *   nothing (#317).
  *   A one-shot ends at its clip end, a sustained reaction 400 ms after its release; a fresh queued reaction
  *   then starts. This holds in Talking too: a P3+ below a carried-over reaction is queued, not announced.
  * - **Where it plays:** from Idle (Reacting/Sustained) a reaction is the base; in Attentive and Thinking it
@@ -82,7 +85,8 @@
  * - its `<name>Gentle` clip when `gentle` is on and one exists;
  * - no cooldown, no repeat count and no outputs (`toSession`, `haptic`, `mood`): its reaction has no gesture
  *   (`region` and `gesture` null), which `start` treats as quiet;
- * - a name the director doesn't know is ignored.
+ * - a name the director doesn't know is ignored;
+ * - the same clip input again at the instant its reaction started or was queued changes nothing (#317).
  * bear-view sends `cuppedEar` (a mime, `MIME_CLIPS`) in MicDenied; #117 reuses it for `tooLoud`.
  */
 import type { AnimEvent, Priority, SessionEvent, SfxId } from '../app/events.ts';
@@ -767,7 +771,27 @@ function refresh(s: DirectorState, a: ActiveReaction, i: GestureInput, out: Out)
     toSession(out, a.r, a.r.sfx);
     sfxAt = now;
   }
+  // A refresh at the instant of the last one changes nothing: `s` itself (#317).
+  if (clip === s.clip && now === a.last && runStart === a.runStart && sfxAt === a.sfxAt) return s;
   return { ...s, clip, reaction: { ...a, last: now, runStart, sfxAt } };
+}
+
+/**
+ * `s` with `q` queued, or `s` itself when an equal reaction is already queued at the same instant (#317): a repeated
+ * input then changes nothing. The reaction is equal when it is the same object, or, for two clip inputs (no
+ * gesture), has the same name, as `clipReaction` builds it from the name alone.
+ */
+function withQueued(s: DirectorState, q: QueuedReaction): DirectorState {
+  const o = s.queued;
+  const same =
+    o !== null &&
+    (o.r === q.r || (o.region === null && q.region === null && o.r.name === q.r.name)) &&
+    o.region === q.region &&
+    o.gesture === q.gesture &&
+    o.dirX === q.dirX &&
+    o.at === q.at &&
+    o.announced === q.announced;
+  return same ? s : { ...s, queued: q };
 }
 
 /** A gesture's reaction (see the module comment for the rules, in this order). */
@@ -796,7 +820,7 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
   const st = repeats === s.repeats ? s : { ...s, repeats };
   if (st.name === 'Talking') {
     if (live !== null && r.priority >= STOPS_PLAYBACK && r.priority < live.r.priority)
-      return { ...st, queued: { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false } };
+      return withQueued(st, { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false });
     const cooldowns = withCooldown(st.cooldowns, i.region, i.gesture, r.priority, now);
     const counted = withRepeat(st.repeats, r, now);
     if (r.priority < STOPS_PLAYBACK) {
@@ -809,7 +833,7 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
     return { ...st, cooldowns, repeats: counted, queued };
   }
   if (live !== null && r.priority < live.r.priority)
-    return { ...st, queued: { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false } };
+    return withQueued(st, { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false });
   return start(st, r, i.region, i.gesture, dirX, now, out, false);
 }
 
@@ -836,8 +860,30 @@ function onClip(s0: DirectorState, i: ClipInput, out: Out): DirectorState {
   const r = clipReaction(i.name);
   const live = s.reaction !== null && !isOver(s, s.reaction, now) ? s.reaction : null;
   if (live !== null && r.priority < live.r.priority)
-    return { ...s, queued: { r, region: null, gesture: null, dirX: null, at: now, announced: false } };
-  return start(s, r, null, null, null, now, out, false);
+    return withQueued(s, { r, region: null, gesture: null, dirX: null, at: now, announced: false });
+  return playsFrom(s, i.name, clipFor(r, s.gentle, null), now)
+    ? s
+    : start(s, r, null, null, null, now, out, false);
+}
+
+/**
+ * Whether `s` already plays the reaction of a `clip` input for `name` (clip `clipName`) from `now` (#317): `start`
+ * would then build a new state equal to `s`, so a repeated clip input at the same instant returns `s` itself.
+ */
+function playsFrom(s: DirectorState, name: string, clipName: string, now: number): boolean {
+  const a = s.reaction;
+  const c = s.clip;
+  return (
+    a !== null &&
+    a.region === null &&
+    a.r.name === name &&
+    a.clip === clipName &&
+    a.start === now &&
+    c !== null &&
+    c.name === clipName &&
+    c.start === now &&
+    (s.name === 'Attentive' || s.name === 'Thinking' || (s.name === 'Reacting' && s.since === now))
+  );
 }
 
 /**
