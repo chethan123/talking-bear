@@ -2408,6 +2408,126 @@ describe('#115: the clip input', () => {
   });
 });
 
+// ==== #317: a repeated input at the same instant returns the same state ===========================================
+/** One `directorStep` from `s`, checking the #91 identity invariant (the same object back, or a state that differs). */
+function stepKeepingIdentity(s: DirectorState, i: DirInput, what: string): DirectorState {
+  const r = directorStep(s, i).state;
+  expect(r === s || !isDeepStrictEqual(r, s), what).toBe(true);
+  const reduced = directorReduce(s, i);
+  if (r === s) expect(reduced, what).toBe(s);
+  else expect(reduced, what).toStrictEqual(r);
+  return r;
+}
+
+/** `directorStep(s, i)` returns `s` itself, with no output. */
+function expectSameState(s: DirectorState, i: DirInput): void {
+  const r = directorStep(s, i);
+  expect(r.state).toBe(s);
+  expect(r.out).toStrictEqual([]);
+}
+
+describe('#317: a repeated input at the same instant returns the same state (the #91 identity invariant)', () => {
+  it('the #91 property counterexample [idle, clip(cuppedEar), clip(cuppedEar), wake], all at 0', () => {
+    // fast-check 4.10.2 { seed: 1700979257, path: "63:1:0:2:2:2:2:5:5:5:7:7:7:7:7:7:7" }: the second clip input
+    // returned a new state deep-equal to its input.
+    const seq: readonly DirInput[] = [
+      anim(SAMPLES.idle, 0),
+      clipIn('cuppedEar', 0),
+      clipIn('cuppedEar', 0),
+      anim(SAMPLES.wake, 0),
+    ];
+    let s = initialDirector(0);
+    for (const [j, i] of seq.entries()) s = stepKeepingIdentity(s, i, `step ${j + 1}`);
+    expect(s).toMatchObject({ name: 'Waking', clip: { name: 'wake', start: 0 }, reaction: null });
+  });
+
+  it('a clip input again at its instant returns the state itself (playing, additive, queued); later, another clip or Gentle restarts it', () => {
+    const cupped = directorReduce(stateIn('Idle'), clipIn('cuppedEar', 11));
+    expect(directorStep(cupped, clipIn('cuppedEar', 11)).state).toBe(cupped);
+    expect(directorReduce(cupped, clipIn('cuppedEar', 11.01)).clip).toStrictEqual({
+      name: 'cuppedEar',
+      start: 11.01,
+    });
+    const sneezed = directorReduce(stateIn('Idle'), clipIn('sneeze', 11));
+    expect(directorReduce(sneezed, clipIn('sneeze', 11))).toBe(sneezed);
+    expect(run(sneezed, gentle(true), clipIn('sneeze', 11)).clip).toStrictEqual({
+      name: 'sneezeGentle',
+      start: 11,
+    });
+    expect(directorReduce(sneezed, clipIn('cuppedEar', 11)).clip).toStrictEqual({
+      name: 'cuppedEar',
+      start: 11,
+    });
+    const additive = directorReduce(stateIn('Attentive'), clipIn('cuppedEar', 11));
+    expect(additive.name).toBe('Attentive');
+    expect(directorStep(additive, clipIn('cuppedEar', 11)).state).toBe(additive);
+    const held = stepAll(stateIn('Idle'), gest('noseWrinkle', 'nose', 'longPress', 11)).s;
+    const queued = directorReduce(held, clipIn('cuppedEar', 11.2));
+    expect(queued.queued).toMatchObject({ r: { name: 'cuppedEar' }, at: 11.2 });
+    expect(directorStep(queued, clipIn('cuppedEar', 11.2)).state).toBe(queued);
+    expect(directorReduce(queued, clipIn('cuppedEar', 11.3)).queued).toMatchObject({
+      r: { name: 'cuppedEar' },
+      at: 11.3,
+    });
+  });
+
+  it('a gesture: a refresh at the instant of the last one, or the same reaction queued again at its instant, returns the state itself', () => {
+    const petted = stepAll(stateIn('Idle'), petStroke(11)).s;
+    expectSameState(petted, petStroke(11));
+    expect(directorReduce(petted, petStroke(11.1)).reaction).toMatchObject({ start: 11, last: 11.1 });
+    const pressed = stepAll(stateIn('Idle'), gest('noseWrinkle', 'nose', 'longPress', 11)).s;
+    expect(directorReduce(pressed, gest('noseWrinkle', 'nose', 'longPress', 11))).toBe(pressed);
+    const hugged = stepAll(stateIn('Idle'), gest('hug', 'belly', 'hug', 11), noseTap(11.1)).s;
+    expect(hugged.queued).toMatchObject({ r: R('sneeze'), at: 11.1, announced: false });
+    expectSameState(hugged, noseTap(11.1));
+    expect(directorReduce(hugged, noseTap(11.2)).queued).toMatchObject({ r: R('sneeze'), at: 11.2 });
+    // While Talking: a P3 queued unannounced behind the carried-over hug (A2), again at its instant.
+    const talking = stepAll(
+      stateIn('Thinking'),
+      gest('hug', 'belly', 'hug', 10),
+      anim({ e: 'talk', id: 9 }, 11),
+      gest('giggle', 'belly', 'allOver', 12),
+    ).s;
+    expect(talking.queued).toMatchObject({ r: R('giggle'), at: 12, announced: false });
+    expectSameState(talking, gest('giggle', 'belly', 'allOver', 12));
+  });
+
+  it('a different input at the same instant still changes the state: every guard keeps the fields that differ', () => {
+    const tapped = stepAll(stateIn('Idle'), noseTap(11)).s;
+    expect(directorReduce(tapped, clipIn('sneeze', 11)).reaction).toMatchObject({
+      region: null,
+      gesture: null,
+    });
+    const gentleClip = run(stateIn('Idle'), gentle(true), clipIn('sneezeGentle', 11));
+    expect(directorReduce(gentleClip, clipIn('sneeze', 11)).reaction?.r.name).toBe('sneeze');
+    const held = stepAll(stateIn('Idle'), gest('noseWrinkle', 'nose', 'longPress', 11)).s;
+    const queued = directorReduce(held, clipIn('cuppedEar', 11.2));
+    expect(directorReduce(queued, clipIn('sneeze', 11.2)).queued).toMatchObject({
+      r: { name: 'sneeze' },
+      at: 11.2,
+    });
+    const hugged = stepAll(stateIn('Idle'), gest('hug', 'belly', 'hug', 11), tickle(11.1)).s;
+    expect(directorReduce(hugged, gest('giggle', 'belly', 'allOver', 11.1)).queued).toMatchObject({
+      gesture: 'allOver',
+    });
+    const petQ = stepAll(stateIn('Idle'), gest('hug', 'belly', 'hug', 11), petStroke(11.1, 1)).s;
+    expect(directorReduce(petQ, petStroke(11.1, -1)).queued).toMatchObject({ dirX: -1 });
+    expect(directorReduce(petQ, gest('pet', 'belly', 'stroke', 11.1, 1)).queued).toMatchObject({
+      region: 'belly',
+    });
+    const back = stepAll(
+      stateIn('Thinking'),
+      petStroke(10),
+      anim({ e: 'talk', id: 9 }, 10.5),
+      petStroke(12),
+      anim({ e: 'talkEnd' }, 12),
+    ).s;
+    const r = directorStep(back, petStroke(12));
+    expect(r.out).toStrictEqual([toSess('pet', 'purr')]);
+    expect(r.state.reaction).toMatchObject({ last: 12, sfxAt: 12 });
+  });
+});
+
 // ==== #117: the session's tooLoud reaction through the clip input =================================================
 /** tooLoud's length (s). */
 const LOUD_S = MIME_CLIPS.tooLoud.duration;

@@ -16,10 +16,12 @@
 // the labels are attributes, so the variants keep an empty `textContent`. The app's one aria-live region sits outside
 // `root` (a11y.ts `liveRegion`), and `show(o)` sets it to `announcementFor(o)`: the Asleep, MicDenied or Error text
 // while `tapToWake`, `micHelp` or `error` is up, '' otherwise. So it speaks only on entering those three mic-closed
-// states and is cleared, in the same dispatch, on leaving them; nothing shown while the mic is armed (Listening's
-// badges, the hold button) ever changes it, since a same-text `say` writes nothing. While the settings or licences
-// sheet is open (a modal dialog) the region outside it is inert and announces nothing. That is intended: a missed
-// announcement is harmless, while a region inside the dialogs could speak with the mic open. Don't move it there.
+// states and is cleared, in the same dispatch, on leaving them; nothing shown while the mic is armed ever changes
+// it, since a same-text `say` writes nothing: not the mic-muted badge (Listening), not the too-noisy badge
+// (Listening and Recording, #289; the hold button takes priority over it in Recording, `overlayFor`), and not the
+// hold button. Both badges are `aria-live="off"` and never announce. While the settings or licences sheet is open
+// (a modal dialog) the region outside it is inert and announces nothing. That is intended: a missed announcement
+// is harmless, while a region inside the dialogs could speak with the mic open. Don't move it there.
 //
 // CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/createElementNS and
 // textContent only, never HTML strings, and nothing sets a `style` attribute; the paw's pulse is a styles.css
