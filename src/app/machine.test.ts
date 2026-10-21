@@ -896,7 +896,7 @@ describe('clarifications C1–C12', () => {
       expect(overlayFor({ name, micMuted: true, ...plain })).toBe(
         name === 'Listening' ? 'micMuted' : expected[name],
       );
-      // #116: Listening shows muted > hold-to-talk > too noisy; Recording keeps the hold button.
+      // #116: Listening shows muted > hold-to-talk > too noisy; Recording shows hold-to-talk > too noisy (#289).
       for (const micMuted of [false, true]) {
         for (const tooNoisy of [false, true]) {
           for (const holdToTalk of [false, true]) {
@@ -909,8 +909,12 @@ describe('clarifications C1–C12', () => {
                     : tooNoisy
                       ? 'tooNoisy'
                       : null
-                : name === 'Recording' && holdToTalk
-                  ? 'holdToTalk'
+                : name === 'Recording'
+                  ? holdToTalk
+                    ? 'holdToTalk'
+                    : tooNoisy
+                      ? 'tooNoisy'
+                      : null
                   : expected[name];
             expect(overlayFor({ name, micMuted, tooNoisy, holdToTalk }), name).toBe(want);
           }
@@ -1524,6 +1528,24 @@ describe('#277: an Asleep wake after another tab activated the update reloads in
 });
 
 // ---- #116: noisy room (too-noisy hint, margin raises) and hold-to-talk ---------------------------------------
+/** #289: a Recording misfire; `reason` null leaves the field out, `voicedRatio` undefined leaves it out. */
+const capMisfire = (
+  voicedRatio?: number,
+  reason: 'maxLength' | null = 'maxLength',
+  epoch = EPOCH,
+): SessionEvent =>
+  seg(epoch, {
+    kind: 'misfire',
+    frame: 150_000,
+    ...(reason === null ? {} : { reason }),
+    ...(voicedRatio === undefined ? {} : { voicedRatio }),
+  });
+/** #289: the noisy-mode fields a capped end or misfire changes. */
+const noisyFields = (x: SessionState) => ({
+  noisyCaps: x.noisyCaps,
+  marginBoostDb: x.marginBoostDb,
+  holdToTalk: x.holdToTalk,
+});
 /** #116: a current seg end of Recording (lastSpeechFrame 190 000), with or without a voiced ratio. */
 const end116 = (reason: 'silence' | 'maxLength', voicedRatio?: number): SessionEvent =>
   seg(
@@ -1560,11 +1582,35 @@ describe('#116: noisy room and hold-to-talk', () => {
     expectStep(stateIn('Listening', { micMuted: true }), { t: 'noiseFloor', floorDb: -20 }, 'Listening', [], {
       tooNoisy: true,
     });
-    // Every other state only records the flag.
+    // Every other state only records the flag; Recording also shows it (#289).
     for (const name of STATES) {
       if (name === 'Listening') continue;
-      expectStep(stateIn(name), { t: 'noiseFloor', floorDb: -20 }, name, [], { tooNoisy: true });
+      expectStep(
+        stateIn(name),
+        { t: 'noiseFloor', floorDb: -20 },
+        name,
+        name === 'Recording' ? [ui('tooNoisy')] : [],
+        {
+          tooNoisy: true,
+        },
+      );
     }
+    expectStep(
+      stateIn('Recording', { tooNoisy: true }),
+      { t: 'noiseFloor', floorDb: -50 },
+      'Recording',
+      [ui(null)],
+      {
+        tooNoisy: false,
+      },
+    );
+    expectStep(
+      stateIn('Recording', { holdToTalk: true, marginBoostDb: 6, noisyCaps: 3 }),
+      { t: 'noiseFloor', floorDb: -20 },
+      'Recording',
+      [],
+      { tooNoisy: true },
+    );
   });
 
   it('row 20: the noisy counter counts capped ends with a voiced ratio below 0.3; any other end resets it', () => {
@@ -1718,6 +1764,104 @@ describe('#116: noisy room and hold-to-talk', () => {
       expect(r.state.name).toBe('Waking');
       expect(r.state).toMatchObject({ tooNoisy: false, holdToTalk: true, marginBoostDb: 6 });
     }
+  });
+
+  it('row 21 (#289): a capped misfire with a voiced ratio below 0.3 counts as a noisy cap; any other misfire leaves the counter', () => {
+    const s = stateIn('Recording', { noisyCaps: 1 });
+    const capsAfter = (e: SessionEvent): number => run(s, e).state.noisyCaps;
+    expect(capsAfter(capMisfire(0.29))).toBe(2);
+    expect(capsAfter(capMisfire(0))).toBe(2);
+    expect(capsAfter(capMisfire(0.3))).toBe(1);
+    expect(capsAfter(capMisfire(Number.NaN))).toBe(1);
+    expect(capsAfter(capMisfire())).toBe(1); // no ratio
+    expect(capsAfter(capMisfire(0.1, null))).toBe(1); // no reason
+    expect(capsAfter(seg(EPOCH, { kind: 'misfire', frame: 150_000 }))).toBe(1);
+    expectStep(
+      s,
+      capMisfire(0.1),
+      'Listening',
+      [cancel('recording'), anim('earTwitch'), ...listenEntry(EPOCH + 1, FLOOR)],
+      { epoch: EPOCH + 1, armFrame: null, onsetFrame: null, noisyCaps: 2 },
+    );
+  });
+
+  it('row 21 (#289): the third noisy capped misfire escalates exactly as a capped end does', () => {
+    const overs: Partial<SessionState>[] = [
+      { noisyCaps: 2 },
+      { noisyCaps: 2, marginBoostDb: 3 },
+      { noisyCaps: 2, marginBoostDb: 6 },
+      { noisyCaps: 0 },
+      { noisyCaps: 1, marginBoostDb: 6 },
+    ];
+    for (const over of overs) {
+      const m = run(stateIn('Recording', over), capMisfire(0.1)).state;
+      const n = run(stateIn('Recording', over), end116('maxLength', 0.1)).state;
+      expect(noisyFields(m), JSON.stringify(over)).toStrictEqual(noisyFields(n));
+    }
+    const listen = { epoch: EPOCH + 1, armFrame: null, onsetFrame: null };
+    expectStep(
+      stateIn('Recording', { noisyCaps: 2 }),
+      capMisfire(0.1),
+      'Listening',
+      [
+        cancel('recording'),
+        anim('earTwitch'),
+        { k: 'arm', epoch: EPOCH + 1, restoreFloorDb: FLOOR, marginBoostDb: 3 },
+        SLEEP_T,
+        DOZE_T,
+        anim('idle'),
+      ],
+      { ...listen, noisyCaps: 0, marginBoostDb: 3 },
+    );
+    expectStep(
+      stateIn('Recording', { noisyCaps: 2, marginBoostDb: 6 }),
+      capMisfire(0.1),
+      'Listening',
+      [
+        cancel('recording'),
+        anim('earTwitch'),
+        { k: 'arm', epoch: EPOCH + 1, restoreFloorDb: FLOOR, marginBoostDb: 6 },
+        SLEEP_T,
+        DOZE_T,
+        anim('idle'),
+        ui('holdToTalk'),
+      ],
+      { ...listen, noisyCaps: 3, holdToTalk: true },
+    );
+    // Three capped misfires from scratch (each re-arm bumps the epoch) reach boost 3.
+    let st = stateIn('Recording');
+    for (let i = 0; i < 3; i++)
+      st = run({ ...st, name: 'Recording' }, capMisfire(0.1, 'maxLength', st.epoch)).state;
+    expect(st).toMatchObject({ noisyCaps: 0, marginBoostDb: 3, holdToTalk: false });
+  });
+
+  it('row 21 (#289): a stale or hold-mode capped misfire is ignored', () => {
+    expectIgnored(
+      stateIn('Recording'),
+      seg(EPOCH - 1, { kind: 'misfire', frame: 1, reason: 'maxLength', voicedRatio: 0 }),
+    );
+    expectIgnored(stateIn('Recording', HOLD), capMisfire(0));
+    expectIgnored(stateIn('Listening', HOLD), capMisfire(0));
+    expectIgnored(stateIn('Listening'), capMisfire(0)); // Listening ignores every misfire
+  });
+
+  it('C2 (#289): the too-noisy badge stays across Listening → Recording → Listening and hides on Processing', () => {
+    expectStep(
+      stateIn('Listening', { tooNoisy: true }),
+      seg(EPOCH, { kind: 'start', frame: 150_000 }),
+      'Recording',
+      [cancel('sleep'), cancel('doze'), anim('attentive'), RECORDING_T],
+      { onsetFrame: 150_000 },
+    );
+    const misfire = run(
+      stateIn('Recording', { tooNoisy: true }),
+      seg(EPOCH, { kind: 'misfire', frame: 150_000 }),
+    );
+    expect(misfire.state.name).toBe('Listening');
+    expect(misfire.effects.filter((f) => f.k === 'ui')).toStrictEqual([]);
+    const ended = run(stateIn('Recording', { tooNoisy: true }), end116('silence', 0.9));
+    expect(ended.state.name).toBe('Processing');
+    expect(ended.effects.at(-1)).toStrictEqual(ui(null));
   });
 });
 

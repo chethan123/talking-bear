@@ -11,9 +11,10 @@
 // Listening shows as a badge. Three consecutive capped takes with a voiced ratio below 0.3 raise the worker's
 // margins by 3 dB (to 6 at most), then switch to hold-to-talk: `seg` events are ignored in Listening and
 // Recording, and the hold button's `holdStart` / `holdEnd` record instead (rows 13b, 20b, 20c). A nap clears it.
+// A capped misfire with a low voiced ratio (the energy backend's voicing rule, #289) counts as a noisy cap too, and
+// Recording also shows the too-noisy badge (#289, ORCH-ANSWER 6084880690 on #289).
 
 import { ONSET_BLOCK_MS } from '../audio/constants.ts';
-import type { SegEvent } from '../dsp/segmenter.ts';
 import { PRESETS } from '../dsp/types.ts';
 import {
   DEFAULT_CONFIG,
@@ -102,7 +103,8 @@ export function initialSessionState(permission: Permission): SessionState {
 
 /**
  * The overlay a state shows (C2). Listening: the mic-muted badge, else the hold-to-talk button in hold-to-talk
- * mode, else the too-noisy badge (#116). Recording keeps the hold button while it is held (ORCH-NOTE on #116).
+ * mode, else the too-noisy badge (#116). Recording keeps the hold button while it is held (ORCH-NOTE on #116),
+ * else shows the too-noisy badge (#289, ORCH-ANSWER 6084880690 on #289).
  */
 export function overlayFor(s: Pick<SessionState, 'name' | 'micMuted' | 'tooNoisy' | 'holdToTalk'>): Overlay {
   switch (s.name) {
@@ -117,7 +119,7 @@ export function overlayFor(s: Pick<SessionState, 'name' | 'micMuted' | 'tooNoisy
     case 'Listening':
       return s.micMuted ? 'micMuted' : s.holdToTalk ? 'holdToTalk' : s.tooNoisy ? 'tooNoisy' : null;
     case 'Recording':
-      return s.holdToTalk ? 'holdToTalk' : null;
+      return s.holdToTalk ? 'holdToTalk' : s.tooNoisy ? 'tooNoisy' : null;
     default:
       return null;
   }
@@ -492,13 +494,15 @@ function takeTo(s: SessionState, lastSpeechFrame: number, cfg: SessionConfig, p:
     { takeId: id, ...p },
   );
 }
+/** #116, #289: a capped end (row 20) or capped misfire (row 21) with a voiced ratio below 0.3 is a noisy cap. */
+function isNoisyCap(ev: { reason?: 'silence' | 'maxLength'; voicedRatio?: number }): boolean {
+  return ev.reason === 'maxLength' && ev.voicedRatio !== undefined && ev.voicedRatio < NOISY_VOICED_RATIO;
+}
 /**
- * Row 20's noisy counter (#116, plan §4.4): a capped end with a voiced ratio below 0.3 counts, any other end resets
- * it. At NOISY_CAPS the margins rise by 3 dB (and the count restarts) up to 6 dB; then hold-to-talk.
+ * The noisy counter (#116, plan §4.4): a noisy cap counts, any other end resets it. At NOISY_CAPS the margins
+ * rise by 3 dB (and the count restarts) up to 6 dB; then hold-to-talk.
  */
-function noisyPatch(s: SessionState, ev: Extract<SegEvent, { kind: 'end' }>): Partial<SessionState> {
-  const noisy =
-    ev.reason === 'maxLength' && ev.voicedRatio !== undefined && ev.voicedRatio < NOISY_VOICED_RATIO;
+function noisyPatch(s: SessionState, noisy: boolean): Partial<SessionState> {
   const noisyCaps = noisy ? s.noisyCaps + 1 : 0;
   if (noisyCaps < NOISY_CAPS) return { noisyCaps };
   if (s.marginBoostDb < 6) return { noisyCaps: 0, marginBoostDb: s.marginBoostDb === 0 ? 3 : 6 }; // + 3 dB
@@ -516,9 +520,15 @@ const recordingSeg: Handler<'seg'> = (s, e, cfg) => {
   if (s.holdToTalk || e.epoch !== s.epoch) return same(s); // in hold-to-talk mode every seg is ignored (#116)
   switch (e.ev.kind) {
     case 'end':
-      return takeTo(s, e.ev.lastSpeechFrame, cfg, noisyPatch(s, e.ev)); // row 20
-    case 'misfire':
-      return transitionTo(s, 'Listening', cfg, [anim({ e: 'earTwitch' })]); // row 21
+      return takeTo(s, e.ev.lastSpeechFrame, cfg, noisyPatch(s, isNoisyCap(e.ev))); // row 20
+    case 'misfire': // row 21; #289: the energy backend's capped unvoiced misfire is a noisy cap, as in row 20
+      return transitionTo(
+        s,
+        'Listening',
+        cfg,
+        [anim({ e: 'earTwitch' })],
+        isNoisyCap(e.ev) ? noisyPatch(s, true) : {},
+      );
     default: // a second start
       return same(s);
   }

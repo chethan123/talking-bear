@@ -9,14 +9,20 @@
 //
 // Too noisy (#116, plan §4.4, and the ORCH-NOTE on #116): the session hands every engine `level` to `level()`, which
 // turns them into at most one `noiseFloor` per second: over a window of at least NOISE_FLOOR_WINDOW_MS of Listening
-// levels of the current epoch, the larger of the gate floor N and the minimum hop level. Digital silence counts
-// at the gate's `ignoreBelowDb`, and a window of nothing but digital silence (or with no finite N) dispatches its
-// minimum alone: the gate freezes N on silence (#288), so a silent input clears the flag even when N is above
-// −35 dBFS, while a short capture glitch inside a loud window does not. The gate floor alone absorbs a loud
-// steady noise only with its 20 s in-speech time constant. Levels outside Listening (speech is Recording) never
-// count, and a new epoch starts a new window. The window lives in closure scalars: nothing is allocated per level.
+// and Recording levels of the current epoch (#289, ORCH-ANSWER 6084880690 on #289: on the energy backend a steady
+// noise holds the gate open, so the session is in Recording), the larger of the gate floor N and the minimum hop
+// level. Digital silence counts at the gate's `ignoreBelowDb`, and a window of nothing but digital silence (or with
+// no finite N) dispatches its minimum alone: the gate freezes N on silence (#288), so a silent input clears the
+// flag even when N is above −35 dBFS, while a short capture glitch inside a loud window does not. The gate floor
+// alone absorbs a loud steady noise only with its 20 s in-speech time constant. Recording levels count only from
+// NOISE_FLOOR_RECORDING_HOLDOFF_MS after the epoch's first one (ORCH-NOTE 6085389040 on #289), and earlier ones close
+// the window, so a child's own speech rarely sets the flag. The measured residual is energy-only: a voiced sound
+// held ≥ 2.1 s at ≥ −30 dBFS sets it from Recording at about 3.06 s (code review 6086706417 on #309).
+// Levels of any other state never count and close the window, and a new epoch starts a new one. The window lives in
+// closure scalars: nothing is allocated per level.
 
 import { DEFAULT_ENERGY_PARAMS } from '../dsp/energy-gate.ts';
+import { cancelTap, markListening } from '../perf.ts';
 import type { Effect, SessionEvent, SessionState, TimerName } from './events.ts';
 import type { Player, SessionDeps, Sfx, SfxScheduled } from './session.ts';
 
@@ -40,8 +46,16 @@ export const NOISY_ROOM_CONSTRAINTS: Readonly<MediaTrackConstraints> = Object.fr
   noiseSuppression: true,
 });
 
-/** #116: a `noiseFloor` is dispatched once a window of Listening levels spans at least this long. */
+/** #116: a `noiseFloor` is dispatched once a window of Listening (and Recording, #289) levels spans this long. */
 export const NOISE_FLOOR_WINDOW_MS = 1000;
+
+/**
+ * #289 (ORCH-NOTE 6085389040 on #289): Recording levels count toward the noise floor window only from this long
+ * after the epoch's first Recording level, so a child's own speech rarely sets the flag (energy-only residual: a
+ * voiced sound held ≥ 2.1 s at ≥ −30 dBFS sets it at about 3.06 s), while a steady noise that holds the energy gate
+ * open does, about a second later.
+ */
+export const NOISE_FLOOR_RECORDING_HOLDOFF_MS = 1000;
 
 /**
  * #286: the longest the cooldown waits on the context clock beyond its wall-clock `ms`. A render stall longer
@@ -70,7 +84,7 @@ export interface EffectIo {
 export interface EffectRunner {
   /** Runs one effect. An effect that throws is logged, never rethrown, so the loop continues. */
   run(fx: Effect): void;
-  /** An engine `level` event (#116): feeds the noise floor estimate, which dispatches `noiseFloor` (see above). */
+  /** An engine `level` (#116, #289): feeds the noise floor estimate, which dispatches `noiseFloor` (see above). */
   level(e: LevelSample): void;
 }
 
@@ -270,18 +284,31 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
   let winMin = 0;
   let winMax = 0;
   let winFloor = Number.NaN;
+  // #289: the epoch of the latest Recording level and when that epoch's first one came (NaN matches no epoch).
+  let recEpoch = Number.NaN;
+  let recSince = 0;
 
   function level(e: LevelSample): void {
     const s = io.state();
-    if (s.name !== 'Listening' || e.epoch !== s.epoch) {
+    if ((s.name !== 'Listening' && s.name !== 'Recording') || e.epoch !== s.epoch) {
       winOpen = false;
       return;
+    }
+    const now = clock.now();
+    if (s.name === 'Recording') {
+      if (recEpoch !== e.epoch) {
+        recEpoch = e.epoch;
+        recSince = now;
+      }
+      if (now - recSince < NOISE_FLOOR_RECORDING_HOLDOFF_MS) {
+        winOpen = false; // the hold-off closes the window, as another state does
+        return;
+      }
     }
     const silent = DEFAULT_ENERGY_PARAMS.ignoreBelowDb;
     // Digital silence and every non-finite level (NaN, ±Infinity) read as the gate's silence level: the same
     // predicate as energyGateStep's step 1 (src/dsp/energy-gate.ts:91).
     const db = Number.isFinite(e.db) && e.db >= silent ? e.db : silent;
-    const now = clock.now();
     if (!winOpen || winEpoch !== e.epoch) {
       winOpen = true;
       winEpoch = e.epoch;
@@ -314,6 +341,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
         else engine.openMic(fx.req);
         return;
       case 'closeMic':
+        // #122: closeMic comes with the entry into Asleep, Paused and Error: a pending wake tap never got to Listening.
+        cancelTap();
         engine.closeMic();
         return;
       case 'resumeCtx':
@@ -330,6 +359,8 @@ export function createEffectRunner(deps: EffectDeps, io: EffectIo): EffectRunner
         engine.restartWorker();
         return;
       case 'arm':
+        // #122: only the entry into Listening emits `arm` (machine.ts entryActions), so this is every entry into it.
+        markListening();
         engine.arm(fx.epoch, fx.restoreFloorDb, fx.marginBoostDb);
         return;
       case 'disarm':

@@ -24,7 +24,7 @@ type variant struct {
 type entry struct {
 	contentType  string
 	cacheControl string
-	html         bool // media type text/html: gets Headers.HTMLOnly
+	html         bool // media type text/html: gets the HTML-only headers (Headers.htmlHeaders)
 	identity     variant
 	br, gz       *variant // nil when dist has no such variant
 }
@@ -32,6 +32,7 @@ type entry struct {
 type handler struct {
 	files map[string]*entry // keyed by URL path: "/index.html", "/assets/app-abc.js", …
 	h     Headers
+	html  map[string]string // h.htmlHeaders(), computed once
 }
 
 // newHandler walks fsys once and returns the static-file handler (plan §4.8.1).
@@ -71,7 +72,7 @@ func newHandler(fsys fs.FS, h Headers) http.Handler {
 	if err != nil {
 		panic("newHandler: " + err.Error())
 	}
-	return &handler{files: files, h: h}
+	return &handler{files: files, h: h, html: h.htmlHeaders()}
 }
 
 // etagBase is the first 16 characters of base64url(sha256(data)), unquoted.
@@ -127,10 +128,10 @@ func (s *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e.html {
-		// Add, so an HTML-only header never drops a common one. Interim: T110
-		// (#121) merges a same-name HTML-only header into the common value.
-		for k, v := range s.h.HTMLOnly {
-			hdr.Add(k, v)
+		// Set: a same-name HTML-only header replaces the common field with the
+		// merged value (Headers.htmlHeaders), never a second field (issue #121).
+		for k, v := range s.html {
+			hdr.Set(k, v)
 		}
 	}
 	v := &e.identity

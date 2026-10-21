@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"strings"
 )
@@ -25,7 +26,8 @@ var headers = mustParseHeaders(headersJSON)
 type Headers struct {
 	// Common is sent on every response.
 	Common map[string]string `json:"common"`
-	// HTMLOnly is sent in addition to Common on text/html responses.
+	// HTMLOnly is sent on text/html responses on top of Common. A header that
+	// Common also names is merged into the common value (htmlHeaders).
 	HTMLOnly map[string]string `json:"htmlOnly"`
 	// CacheControl is an ordered rule list; the first matching rule wins.
 	CacheControl []CacheRule `json:"cacheControl"`
@@ -91,7 +93,40 @@ func (h Headers) validate() error {
 			}
 		}
 	}
+	// Header names are case-insensitive: one header named twice would make the
+	// merged value (htmlHeaders) depend on map order.
+	for name, m := range map[string]map[string]string{"common": h.Common, "htmlOnly": h.HTMLOnly} {
+		seen := map[string]bool{}
+		for k := range m {
+			ck := http.CanonicalHeaderKey(k)
+			if seen[ck] {
+				return fmt.Errorf("%s: header %q is listed twice", name, ck)
+			}
+			seen[ck] = true
+		}
+	}
 	return nil
+}
+
+// htmlHeaders returns the header fields a text/html response sets on top of
+// Common (plan §4.8.3, issue #121): every HTMLOnly header, except that one
+// Common also names is merged into the common value as
+// common + "; " + htmlOnly, so it is sent once. A browser enforces every CSP
+// field it receives as a separate policy. The keys are canonical.
+func (h Headers) htmlHeaders() map[string]string {
+	common := make(map[string]string, len(h.Common))
+	for k, v := range h.Common {
+		common[http.CanonicalHeaderKey(k)] = v
+	}
+	out := make(map[string]string, len(h.HTMLOnly))
+	for k, v := range h.HTMLOnly {
+		k = http.CanonicalHeaderKey(k)
+		if c, ok := common[k]; ok {
+			v = c + "; " + v
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // cacheControlFor returns the value of the first cacheControl rule that

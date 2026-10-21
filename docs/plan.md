@@ -417,8 +417,8 @@ stateDiagram-v2
 | 17 | Listening | `timer sleep` | — | Asleep | `anim sleep` |
 | 18 | Listening | track `mute` | — | Listening | `ui micMuted`; timers keep running |
 | 19 | Listening | track `unmute` | — | Listening | re-enter (new epoch, floor reset); `ui null` |
-| 20 | Recording | `seg.end{lastSpeechFrame, reason}` | — | Processing | `take(from = max(onsetFrame − 300 ms, armFrame), to = lastSpeechFrame + 150 ms)`, deferred by the worklet until available; `timer processing 2 s`; `anim thinking`; if `reason = maxLength`, bump the noisy counter ([§4.4](#44-feedback-loop)) |
-| 21 | Recording | `seg.misfire` | — | Listening | `anim earTwitch` ("huh?") |
+| 20 | Recording | `seg.end{lastSpeechFrame, reason}` | — | Processing | `take(from = max(onsetFrame − 300 ms, armFrame), to = lastSpeechFrame + 150 ms)`, deferred by the worklet until available; `timer processing 2 s`; `anim thinking`; if `reason = maxLength` and `voicedRatio < 0.3`, bump the noisy counter ([§4.4](#44-feedback-loop)); any other end resets it |
+| 21 | Recording | `seg.misfire` | — | Listening | `anim earTwitch` ("huh?"); if `reason = maxLength` and `voicedRatio < 0.3` (the energy backend's voicing-rule misfire), bump the noisy counter, the same as a capped end ([§4.4](#44-feedback-loop)); any other misfire leaves it unchanged |
 | 22 | Recording | track `mute` | — | Listening | abort; `anim earTwitch`; `ui micMuted` |
 | 23 | Recording | `reaction` | — | Recording | animation only; no sfx, so the take is not polluted |
 | 24 | Processing | all clip chunks received | — | Processing | `process{id, preset}` to the worker |
@@ -854,7 +854,7 @@ The default ratio is settled by the M3 listening test ([§7](#7-milestones-build
 | Case | Handling |
 |---|---|
 | User speaks during playback | Ignored by design. The bear's "talking" pose is the affordance; tapping interrupts. |
-| Background noise never falls silent | Steady noise is absorbed by the adaptive floor. If floor > −35 dBFS, show "too noisy". If 3 consecutive takes hit the cap with a low voiced ratio: raise the margins by 3 dB each time, then offer hold-to-talk. This breaks noise→replay→noise loops. |
+| Background noise never falls silent | Steady noise is absorbed by the adaptive floor. A separate too-noisy estimate, at most one per second over a window of at least 1 s, counts Listening levels, and Recording levels from 1000 ms after the epoch's first Recording level; earlier Recording levels close the window. So noise that holds the energy gate open still counts, while the child's own speech rarely does. If the estimate > −35 dBFS, show "too noisy" in Listening or Recording: the hold-to-talk button takes priority in both, and the mic-muted indicator in Listening. It is never announced. If 3 consecutive takes (or capped energy misfires, §3.4 row 21) hit the cap with a low voiced ratio: raise the margins by 3 dB each time, then offer hold-to-talk. This breaks noise→replay→noise loops. |
 | Too short (< 150 ms speech; knocks, clicks) | `misfire` → ear-twitch "huh?", no replay |
 | Too long | Hard cap at 10 s (ring buffer 12 s), then replay what was captured |
 | Clipping (shouting) | Detect ≥ 0.1 % samples at \|x\| > 0.99. Normalisation cannot fix it; optionally show a playful "too loud!" reaction (M8). |

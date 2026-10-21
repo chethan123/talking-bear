@@ -9,8 +9,9 @@
 // Each `sfx` effect the runner schedules is reported to the `addSfxListener` listeners while it runs (so before
 // that step's transition listeners), with the context time its sound ends (#93: the e2e `sfxLog`).
 //
-// Noise floor (#116): every engine `level` also goes to the effect runner's `level`, which dispatches at most one
-// `noiseFloor` per second while Listening (effects.ts).
+// Noise floor (#116, #289): every engine `level` also goes to the effect runner's `level`, which dispatches at most
+// one `noiseFloor` per second from Listening levels and from Recording levels that come at least 1000 ms after the
+// epoch's first Recording level (effects.ts `NOISE_FLOOR_RECORDING_HOLDOFF_MS`).
 //
 // Settings (plan §7 M8, #113): with `deps.settings`, every step reduces with `cfg.tSleepMs` taken from the
 // current `sleepTimeoutSec`, so a change takes effect on the next sleep-timer start; the effect runner reads
