@@ -1,13 +1,20 @@
 // The session state machine: a pure reducer `reduce(state, event, config) → { state, effects }` implementing
-// plan §3.4 (rows 1–46, 35b, 40b, entry/exit actions) with the clarifications C1–C12 of issue #28.
+// plan §3.4 (rows 1–46, 3b, 3c, 35b, 40b, entry/exit actions) with the clarifications C1–C12 of issue #28.
 // Pure: no I/O, no time, never mutates its input. Handlers return the same state object when nothing changes.
 //
 // Effect order for a transition: (1) the old state's exit actions, (2) the row's effects, (3) the new state's
 // entry actions (`disarm` first when leaving ARMED), (4) derived effects: `wakeLock` (C1), then `ui` (C2).
-// `reduce` then appends `applyUpdate` last when a hide event leaves the machine in Asleep or Paused (C11).
+// `reduce` then appends `applyUpdate` last when a hide event leaves the machine in Asleep or Paused (C11), and an
+// Asleep tap or settings retry after another tab's update emits only `applyUpdate` (#277, row 3c).
+//
+// Noisy room (#116, plan §4.4, and the ORCH-NOTE on #116): `noiseFloor` sets `tooNoisy` (floor > −35 dBFS), which
+// Listening shows as a badge. Three consecutive capped takes with a voiced ratio below 0.3 raise the worker's
+// margins by 3 dB (to 6 at most), then switch to hold-to-talk: `seg` events are ignored in Listening and
+// Recording, and the hold button's `holdStart` / `holdEnd` record instead (rows 13b, 20b, 20c). A nap clears it.
+// A capped misfire with a low voiced ratio (the energy backend's voicing rule, #289) counts as a noisy cap too, and
+// Recording also shows the too-noisy badge (#289, ORCH-ANSWER 6084880690 on #289).
 
 import { ONSET_BLOCK_MS } from '../audio/constants.ts';
-import type { SegEvent } from '../dsp/segmenter.ts';
 import { PRESETS } from '../dsp/types.ts';
 import {
   DEFAULT_CONFIG,
@@ -16,6 +23,7 @@ import {
   type EventType,
   type Overlay,
   type Permission,
+  type Priority,
   type SessionConfig,
   type SessionEvent,
   type SessionState,
@@ -49,6 +57,17 @@ export const WAKE_LOCK_HELD: ReadonlySet<StateName> = new Set<StateName>([...MIC
 
 /** Plan §3.4: the recording watchdog is `maxUtterance + 2 s`. */
 const RECORDING_WATCHDOG_EXTRA_MS = 2000;
+/** #116, plan §4.4: a `noiseFloor` above this (dBFS) means too noisy. */
+export const TOO_NOISY_FLOOR_DB = -35;
+/** #116: a capped take whose voiced ratio is below this counts as noise. */
+export const NOISY_VOICED_RATIO = 0.3;
+/** #116: this many consecutive noisy caps raise the margins (or, at the top boost, switch to hold-to-talk). */
+export const NOISY_CAPS = 3;
+/** #117 (plan §4.4, §7 M8): the reaction row 28 adds after the replay of a clipped take. */
+export const TOO_LOUD_REACTION = 'tooLoud';
+/** #117: tooLoud plays like a tap reaction (P2). */
+const TOO_LOUD_PRIORITY: Priority = 2;
+
 const HIDE_EVENTS: ReadonlySet<EventType> = new Set<EventType>(['hidden', 'pagehide', 'freeze']);
 
 export function initialSessionState(permission: Permission): SessionState {
@@ -68,17 +87,26 @@ export function initialSessionState(permission: Permission): SessionState {
     micMuted: false,
     reselectPending: false,
     workerRestarts: 0,
-    capHits: 0,
+    noisyCaps: 0,
+    tooNoisy: false,
+    marginBoostDb: 0,
+    holdToTalk: false,
     sfxSeq: 0,
     sfxEndedSeq: 0,
     micDeniedSfx: false,
     updateReady: false,
+    updateActivated: false,
     preset: PRESETS.cub,
+    lastClipped: false,
   };
 }
 
-/** The overlay a state shows (C2). */
-export function overlayFor(s: Pick<SessionState, 'name' | 'micMuted'>): Overlay {
+/**
+ * The overlay a state shows (C2). Listening: the mic-muted badge, else the hold-to-talk button in hold-to-talk
+ * mode, else the too-noisy badge (#116). Recording keeps the hold button while it is held (ORCH-NOTE on #116),
+ * else shows the too-noisy badge (#289, ORCH-ANSWER 6084880690 on #289).
+ */
+export function overlayFor(s: Pick<SessionState, 'name' | 'micMuted' | 'tooNoisy' | 'holdToTalk'>): Overlay {
   switch (s.name) {
     case 'Asleep':
       return 'tapToWake';
@@ -89,7 +117,9 @@ export function overlayFor(s: Pick<SessionState, 'name' | 'micMuted'>): Overlay 
     case 'Error':
       return 'error';
     case 'Listening':
-      return s.micMuted ? 'micMuted' : null;
+      return s.micMuted ? 'micMuted' : s.holdToTalk ? 'holdToTalk' : s.tooNoisy ? 'tooNoisy' : null;
+    case 'Recording':
+      return s.holdToTalk ? 'holdToTalk' : s.tooNoisy ? 'tooNoisy' : null;
     default:
       return null;
   }
@@ -168,15 +198,33 @@ function entryActions(to: StateName, st: SessionState, cfg: SessionConfig): [Ses
   switch (to) {
     case 'Listening': {
       const epoch = st.epoch + 1;
+      // #116: the arm carries the worker's raised margins when there are any, as it carries a known floor.
+      const boost = st.marginBoostDb;
       const arm: Effect =
-        st.floorDb === undefined ? { k: 'arm', epoch } : { k: 'arm', epoch, restoreFloorDb: st.floorDb };
+        st.floorDb === undefined
+          ? boost > 0
+            ? { k: 'arm', epoch, marginBoostDb: boost }
+            : { k: 'arm', epoch }
+          : boost > 0
+            ? { k: 'arm', epoch, restoreFloorDb: st.floorDb, marginBoostDb: boost }
+            : { k: 'arm', epoch, restoreFloorDb: st.floorDb };
       return [
         { ...st, epoch, armFrame: null, onsetFrame: null },
         [arm, timer('sleep', cfg.tSleepMs), timer('doze', cfg.tDozeMs), anim({ e: 'idle' })],
       ];
     }
     case 'Recording':
-      return [st, [timer('recording', cfg.maxUtteranceMs + RECORDING_WATCHDOG_EXTRA_MS)]];
+      // In hold-to-talk mode the timer is the cap itself (row 20c): fired 2 s later, the take would start
+      // 12.3 s back, beyond the 12 s ring (ORCH-NOTE on #116).
+      return [
+        st,
+        [
+          timer(
+            'recording',
+            st.holdToTalk ? cfg.maxUtteranceMs : cfg.maxUtteranceMs + RECORDING_WATCHDOG_EXTRA_MS,
+          ),
+        ],
+      ];
     case 'Processing':
       return [st, [timer('processing', cfg.processingMs)]];
     case 'Cooldown':
@@ -184,7 +232,8 @@ function entryActions(to: StateName, st: SessionState, cfg: SessionConfig): [Ses
     case 'Waking': {
       const micReq = st.micReq + 1;
       return [
-        { ...st, micReq, micGranted: false },
+        // #116: a new stream (or input) is a new measurement, so the too-noisy flag starts clear.
+        { ...st, micReq, micGranted: false, tooNoisy: false },
         [{ k: 'openMic', req: micReq }, timer('waking', cfg.wakingMs)],
       ];
     }
@@ -206,7 +255,22 @@ function entryActions(to: StateName, st: SessionState, cfg: SessionConfig): [Ses
         micDeniedSfx: false,
         reselectPending: false,
       };
-      return [to === 'Error' ? next : { ...next, workerRestarts: 0 }, fx];
+      // Only a nap (Asleep) resets the noisy mode (#116, ORCH-NOTE on #116: tooNoisy too).
+      return [
+        to === 'Error'
+          ? next
+          : to === 'Paused'
+            ? { ...next, workerRestarts: 0 }
+            : {
+                ...next,
+                workerRestarts: 0,
+                noisyCaps: 0,
+                marginBoostDb: 0,
+                holdToTalk: false,
+                tooNoisy: false,
+              },
+        fx,
+      ];
     }
     case 'MicDenied':
     case 'NeedsParent':
@@ -266,7 +330,16 @@ function wakeByPermission(s: SessionState, cfg: SessionConfig, p: Partial<Sessio
       return transitionTo(s, 'MicDenied', cfg, [{ k: 'resumeCtx' }, anim({ e: 'wake' })], p);
   }
 }
+/** Row 39 (Paused + visible): wake by permission (as rows 1–3). */
 const onWakeTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out => wakeByPermission(s, cfg);
+/**
+ * Asleep + tapBear (rows 1–3, 3c) and Asleep + settingsRetry (3b, 3c). If another tab activated the update, this
+ * page runs old code whose lazy URLs the new worker no longer serves, so it reloads (`applyUpdate`) instead of
+ * waking. The flag is kept until C11, so a second pointerdown before the reload commits reloads again and never
+ * wakes on old code (#277).
+ */
+const onAsleepWake = (s: SessionState, _e: unknown, cfg: SessionConfig): Out =>
+  s.updateActivated ? stay(s, {}, [{ k: 'applyUpdate' }]) : wakeByPermission(s, cfg);
 /** Row 42: tap to retry from Error starts a fresh wake, as row 1 does (approved deviations D4, D25). */
 const onErrorTap = (s: SessionState, _e: unknown, cfg: SessionConfig): Out =>
   wakeByPermission(s, cfg, { workerRestarts: 0 });
@@ -286,7 +359,11 @@ const onSfxEnded: Handler<'sfxAtSpeakerEnded'> = (s, e) =>
   stay(s, { sfxEndedSeq: Math.max(s.sfxEndedSeq, e.seq) });
 const onTrackMuted: Handler<'trackMuted'> = (s) => stay(s, { micMuted: true }); // row 18 in Listening
 const onTrackUnmuted: Handler<'trackUnmuted'> = (s) => stay(s, { micMuted: false });
-const onUpdateReady: Handler<'updateReady'> = (s) => stay(s, { updateReady: true });
+/** Row 18b (#116): every state records the flag; Listening's overlay follows it (C2). */
+const onNoiseFloor: Handler<'noiseFloor'> = (s, e) => stay(s, { tooNoisy: e.floorDb > TOO_NOISY_FLOOR_DB });
+/** C11; #277: `activated` (another tab's update) is sticky until C11, so a later plain `updateReady` keeps it. */
+const onUpdateReady: Handler<'updateReady'> = (s, e) =>
+  stay(s, e.activated === true ? { updateReady: true, updateActivated: true } : { updateReady: true });
 /** M3 settings (issue #66): the preset of the next `process`, in every state; the same state if it is equal. */
 const onSettingsChanged: Handler<'settingsChanged'> = (s, e) =>
   e.preset.id === s.preset.id && e.preset.pitchRatio === s.preset.pitchRatio
@@ -376,8 +453,13 @@ const cooldownReaction: Handler<'reaction'> = (s, e, cfg) =>
 
 // Listening (rows 13, 16–19, 40).
 const listeningSeg: Handler<'seg'> = (s, e, cfg) =>
-  e.epoch === s.epoch && e.ev.kind === 'start'
+  !s.holdToTalk && e.epoch === s.epoch && e.ev.kind === 'start'
     ? transitionTo(s, 'Recording', cfg, [anim({ e: 'attentive' })], { onsetFrame: e.ev.frame })
+    : same(s); // row 13; in hold-to-talk mode every seg is ignored (#116)
+/** Row 13b (#116): the hold button starts a take in hold-to-talk mode, as row 13 does. */
+const listeningHoldStart: Handler<'holdStart'> = (s, e, cfg) =>
+  s.holdToTalk
+    ? transitionTo(s, 'Recording', cfg, [anim({ e: 'attentive' })], { onsetFrame: e.frame })
     : same(s);
 const listeningTimer: Handler<'timer'> = (s, e, cfg) => {
   // Row 16. Re-arming doze keeps both Listening timers armed (§4.9.1; approved deviation D6).
@@ -393,31 +475,60 @@ const armedInputsChanged: Handler<'inputsChanged'> = (s, _e, cfg) =>
   transitionTo(s, 'Waking', cfg, [{ k: 'closeMic' }, { k: 'reselectInput' }], { floorDb: undefined });
 const gatedInputsChanged: Handler<'inputsChanged'> = (s) => stay(s, { reselectPending: true }); // row 40b
 
-// Recording (rows 20–22).
-function endOfSpeech(s: SessionState, ev: Extract<SegEvent, { kind: 'end' }>, cfg: SessionConfig): Out {
+// Recording (rows 20–22, 20b, 20c).
+/** Row 20's take, to Processing: `[max(onset − pre-roll, armFrame), lastSpeechFrame + tail]` (C8). */
+function takeTo(s: SessionState, lastSpeechFrame: number, cfg: SessionConfig, p: Partial<SessionState>): Out {
   const rate = s.sampleRate;
-  const onset = s.onsetFrame ?? ev.lastSpeechFrame; // Recording is only entered with an onset (row 13)
+  const onset = s.onsetFrame ?? lastSpeechFrame; // Recording is only entered with an onset (rows 13, 13b)
   const fromFrame = Math.max(
     onset - framesOf(cfg.preRollMs, rate),
     s.armFrame ?? onset - framesOf(ONSET_BLOCK_MS, rate),
   );
-  const toFrame = ev.lastSpeechFrame + framesOf(cfg.tailMs, rate);
+  const toFrame = lastSpeechFrame + framesOf(cfg.tailMs, rate);
   const id = s.takeId + 1;
   return transitionTo(
     s,
     'Processing',
     cfg,
     [{ k: 'take', epoch: s.epoch, id, fromFrame, toFrame }, anim({ e: 'thinking' })],
-    { takeId: id, capHits: ev.reason === 'maxLength' ? s.capHits + 1 : s.capHits },
-  ); // row 20, C8
+    { takeId: id, ...p },
+  );
 }
+/** #116, #289: a capped end (row 20) or capped misfire (row 21) with a voiced ratio below 0.3 is a noisy cap. */
+function isNoisyCap(ev: { reason?: 'silence' | 'maxLength'; voicedRatio?: number }): boolean {
+  return ev.reason === 'maxLength' && ev.voicedRatio !== undefined && ev.voicedRatio < NOISY_VOICED_RATIO;
+}
+/**
+ * The noisy counter (#116, plan §4.4): a noisy cap counts, any other end resets it. At NOISY_CAPS the margins
+ * rise by 3 dB (and the count restarts) up to 6 dB; then hold-to-talk.
+ */
+function noisyPatch(s: SessionState, noisy: boolean): Partial<SessionState> {
+  const noisyCaps = noisy ? s.noisyCaps + 1 : 0;
+  if (noisyCaps < NOISY_CAPS) return { noisyCaps };
+  if (s.marginBoostDb < 6) return { noisyCaps: 0, marginBoostDb: s.marginBoostDb === 0 ? 3 : 6 }; // + 3 dB
+  return { noisyCaps, holdToTalk: true };
+}
+/** The cap in ctx frames: round(maxUtteranceMs / 1000 · sampleRate). */
+const capFrames = (s: SessionState, cfg: SessionConfig): number => framesOf(cfg.maxUtteranceMs, s.sampleRate);
+/** Row 20b (#116): the release ends a hold-to-talk take, clamped to [onset, onset + cap] (ORCH-NOTE on #116). */
+const recordingHoldEnd: Handler<'holdEnd'> = (s, e, cfg) => {
+  if (!s.holdToTalk) return same(s);
+  const onset = s.onsetFrame ?? e.frame;
+  return takeTo(s, Math.min(Math.max(e.frame, onset), onset + capFrames(s, cfg)), cfg, {});
+};
 const recordingSeg: Handler<'seg'> = (s, e, cfg) => {
-  if (e.epoch !== s.epoch) return same(s);
+  if (s.holdToTalk || e.epoch !== s.epoch) return same(s); // in hold-to-talk mode every seg is ignored (#116)
   switch (e.ev.kind) {
     case 'end':
-      return endOfSpeech(s, e.ev, cfg);
-    case 'misfire':
-      return transitionTo(s, 'Listening', cfg, [anim({ e: 'earTwitch' })]); // row 21
+      return takeTo(s, e.ev.lastSpeechFrame, cfg, noisyPatch(s, isNoisyCap(e.ev))); // row 20
+    case 'misfire': // row 21; #289: the energy backend's capped unvoiced misfire is a noisy cap, as in row 20
+      return transitionTo(
+        s,
+        'Listening',
+        cfg,
+        [anim({ e: 'earTwitch' })],
+        isNoisyCap(e.ev) ? noisyPatch(s, true) : {},
+      );
     default: // a second start
       return same(s);
   }
@@ -436,6 +547,7 @@ const processingProcessed: Handler<'processed'> = (s, e, cfg) =>
   e.id === s.takeId
     ? transitionTo(s, 'Playing', cfg, [{ k: 'play', id: e.id }, anim({ e: 'talk', id: e.id })], {
         playingId: e.id,
+        lastClipped: e.clipped, // #117: set by every accepted processed, read by row 28
       })
     : same(s);
 const processingTakeFailed: Handler<'takeFailed'> = (s, e, cfg) =>
@@ -444,8 +556,19 @@ const processingFxError: Handler<'fxError'> = (s, e, cfg) =>
   e.id === s.takeId ? toCooldownConfused(s, cfg) : same(s);
 const processingTimer: Handler<'timer'> = (s, e, cfg) =>
   e.name === 'processing' ? toCooldownConfused(s, cfg) : same(s);
+/**
+ * Row 28. #117: after the replay of a clipped take (`lastClipped`), also the playful tooLoud reaction (P2). It is an
+ * `anim` effect only, with no sfx, so the gate and the cooldown (the entry's `timer cooldown`) are unchanged.
+ */
 const playingEnded: Handler<'playbackAtSpeakerEnded'> = (s, e, cfg) =>
-  e.id === s.playingId ? transitionTo(s, 'Cooldown', cfg) : same(s); // row 28
+  e.id === s.playingId
+    ? transitionTo(
+        s,
+        'Cooldown',
+        cfg,
+        s.lastClipped ? [anim({ e: 'reaction', name: TOO_LOUD_REACTION, priority: TOO_LOUD_PRIORITY })] : [],
+      )
+    : same(s);
 
 // SfxGated and Cooldown (rows 34, 35, 35b).
 const sfxGatedSfxEnded: Handler<'sfxAtSpeakerEnded'> = (s, e, cfg) => {
@@ -484,8 +607,12 @@ function workerFailure(s: SessionState, cfg: SessionConfig): Out {
   return transitionTo(s, 'Cooldown', cfg, [restart, confused], { workerRestarts }); // row 45
 }
 const onWorkerFailed: Handler<'workerFailed'> = (s, _e, cfg) => workerFailure(s, cfg);
-const recordingTimer: Handler<'timer'> = (s, e, cfg) =>
-  e.name === 'recording' ? workerFailure(s, cfg) : same(s); // rows 45/46: the recording watchdog
+const recordingTimer: Handler<'timer'> = (s, e, cfg) => {
+  if (e.name !== 'recording') return same(s);
+  // Row 20c (#116): in hold-to-talk mode the timer is the cap, a forced holdEnd: no restart, no Cooldown.
+  if (s.holdToTalk) return takeTo(s, (s.onsetFrame ?? s.armFrame ?? 0) + capFrames(s, cfg), cfg, {});
+  return workerFailure(s, cfg); // rows 45/46: the recording watchdog
+};
 
 /**
  * Every (state, event) pair, handled explicitly (plan §3.3 design rule 5). `'ignore'` returns the same state
@@ -493,9 +620,9 @@ const recordingTimer: Handler<'timer'> = (s, e, cfg) =>
  */
 export const TABLE: { readonly [S in StateName]: Row } = {
   Asleep: {
-    tapBear: onWakeTap, // rows 1–3
+    tapBear: onAsleepWake, // rows 1–3, 3c
     parentContinue: 'ignore',
-    settingsRetry: 'ignore',
+    settingsRetry: onAsleepWake, // 3b, 3c: the parent's retry wakes (or reloads) exactly as the tap does
     permissionChanged: onPermissionChanged,
     micGranted: 'ignore',
     micDenied: 'ignore',
@@ -525,6 +652,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   NeedsParent: {
     tapBear: 'ignore',
@@ -559,6 +689,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   Waking: {
     tapBear: 'ignore',
@@ -593,6 +726,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   MicDenied: {
     tapBear: 'ignore',
@@ -627,6 +763,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   Listening: {
     tapBear: 'ignore',
@@ -661,6 +800,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: listeningHoldStart, // row 13b
+    holdEnd: 'ignore',
   },
   Recording: {
     tapBear: 'ignore',
@@ -695,6 +837,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: recordingHoldEnd, // row 20b
   },
   Processing: {
     tapBear: 'ignore',
@@ -729,6 +874,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   Playing: {
     tapBear: 'ignore',
@@ -763,6 +911,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   SfxGated: {
     tapBear: 'ignore',
@@ -797,6 +948,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   Cooldown: {
     tapBear: 'ignore',
@@ -831,6 +985,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   Paused: {
     tapBear: 'ignore',
@@ -865,6 +1022,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: onWakeTap, // row 39: as rows 1 / 2 / 3
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
   Error: {
     tapBear: onErrorTap, // row 42
@@ -899,6 +1059,9 @@ export const TABLE: { readonly [S in StateName]: Row } = {
     visible: 'ignore',
     updateReady: onUpdateReady,
     settingsChanged: onSettingsChanged,
+    noiseFloor: onNoiseFloor,
+    holdStart: 'ignore',
+    holdEnd: 'ignore',
   },
 };
 
@@ -918,7 +1081,10 @@ export function reduce(
   const next = out.state;
   if (HIDE_EVENTS.has(e.t) && (next.name === 'Asleep' || next.name === 'Paused') && next.updateReady) {
     // C11 / plan §4.7: apply the update synchronously in the hide dispatch, after everything has stopped.
-    return { state: { ...next, updateReady: false }, effects: [...out.effects, { k: 'applyUpdate' }] };
+    return {
+      state: { ...next, updateReady: false, updateActivated: false },
+      effects: [...out.effects, { k: 'applyUpdate' }],
+    };
   }
   return out;
 }

@@ -234,8 +234,11 @@ function fakeEngine(timeline: string[]): FakeEngine {
       mic.close();
       processed = null;
     },
-    arm(epoch, restoreFloorDb) {
-      timeline.push(restoreFloorDb === undefined ? `arm ${epoch}` : `arm ${epoch} ${restoreFloorDb}`);
+    arm(epoch, restoreFloorDb, marginBoostDb) {
+      const boost = marginBoostDb === undefined ? '' : ` +${marginBoostDb}`;
+      timeline.push(
+        `${restoreFloorDb === undefined ? `arm ${epoch}` : `arm ${epoch} ${restoreFloorDb}`}${boost}`,
+      );
       if (hooks.armThrows > 0) {
         hooks.armThrows--;
         throw new Error('fake arm failure');
@@ -539,7 +542,7 @@ async function toListening(h: Harness): Promise<void> {
 const ramp = (n: number): Float32Array => Float32Array.from({ length: n }, (_, i) => i / n);
 
 /** From Listening: armed, seg start, seg end, clipReady, processed (with a stored result) → Playing. */
-function toPlaying(h: Harness, withResult = true): { id: number; pcm: Float32Array } {
+function toPlaying(h: Harness, withResult = true, clipped = false): { id: number; pcm: Float32Array } {
   const epoch = h.session.state().epoch;
   h.eng.emit({ t: 'armed', epoch, armFrame: 1000 });
   h.eng.emit({ t: 'seg', epoch, ev: { kind: 'start', frame: 48_000 } });
@@ -554,7 +557,7 @@ function toPlaying(h: Harness, withResult = true): { id: number; pcm: Float32Arr
   h.eng.emit({ t: 'clipReady', epoch, id });
   const pcm = ramp(4800);
   if (withResult) h.eng.finishProcess(id, pcm, 48_000);
-  h.eng.emit({ t: 'processed', id, durationSec: 0.0625 });
+  h.eng.emit({ t: 'processed', id, durationSec: 0.0625, clipped });
   return { id, pcm };
 }
 
@@ -691,6 +694,39 @@ describe('Validation 2: the full loop with fakes', () => {
     expect(h.eng.engine.getProcessed(1)).toBeUndefined();
     expect(stateOf(h)).toBe('Cooldown');
     expect(h.player.plays).toEqual([]);
+  });
+});
+
+// ---- #117: a clipped take ------------------------------------------------------------------------------------
+
+describe('#117: a clipped take', () => {
+  it('after the replay, anim talkEnd then tooLoud (P2), no sfx and no ui; the cooldown is the unclipped 250 ms; the next unclipped take plays none', async () => {
+    const h = setup();
+    await toListening(h);
+    toPlaying(h, true, true);
+    expect(stateOf(h)).toBe('Playing');
+    const n = h.anims.length;
+    at(h.player.plays, 0).done.resolve('ended');
+    await flush();
+    expect(stateOf(h)).toBe('Cooldown');
+    expect(h.anims.slice(n)).toEqual([{ e: 'talkEnd' }, { e: 'reaction', name: 'tooLoud', priority: 2 }]);
+    expect(h.sfx.plays).toEqual([]);
+    h.clock.advance(249);
+    expect(stateOf(h)).toBe('Cooldown');
+    h.clock.advance(1);
+    expect(stateOf(h)).toBe('Listening');
+    expect(h.session.state().epoch).toBe(2);
+
+    // The next take is not clipped: lastClipped resets on its processed, so its replay ends without tooLoud.
+    toPlaying(h);
+    expect(stateOf(h)).toBe('Playing');
+    const m = h.anims.length;
+    at(h.player.plays, 1).done.resolve('ended');
+    await flush();
+    expect(stateOf(h)).toBe('Cooldown');
+    expect(h.anims.slice(m)).toEqual([{ e: 'talkEnd' }]);
+    expect(h.sfx.plays).toEqual([]);
+    expect(h.violations).toEqual([]);
   });
 });
 
@@ -1001,7 +1037,7 @@ describe('a processed result the reducer does not replay is released at once', (
     h.clock.advance(DEFAULT_CONFIG.processingMs);
     expect(stateOf(h)).toBe('Cooldown');
     h.eng.finishProcess(id, ramp(4800), 48_000);
-    h.eng.emit({ t: 'processed', id, durationSec: 0.1 });
+    h.eng.emit({ t: 'processed', id, durationSec: 0.1, clipped: false });
     expect(stateOf(h)).toBe('Cooldown');
     expect(h.player.plays).toEqual([]);
     expect(h.timeline).toContain(`release ${id}`);
@@ -1013,7 +1049,7 @@ describe('a processed result the reducer does not replay is released at once', (
     await toListening(h);
     const id = toProcessing(h);
     h.eng.finishProcess(id + 100, ramp(10), 48_000);
-    h.eng.emit({ t: 'processed', id: id + 100, durationSec: 0.1 });
+    h.eng.emit({ t: 'processed', id: id + 100, durationSec: 0.1, clipped: false });
     expect(stateOf(h)).toBe('Processing');
     expect(h.timeline).toContain(`release ${id + 100}`);
     expect(h.eng.engine.getProcessed(id + 100)).toBeUndefined();
@@ -1172,6 +1208,7 @@ describe('effect mapping', () => {
       [{ k: 'restartWorker' }, 'restartWorker'],
       [{ k: 'arm', epoch: 3, restoreFloorDb: -50 }, 'arm 3 -50'],
       [{ k: 'arm', epoch: 4 }, 'arm 4'],
+      [{ k: 'arm', epoch: 5, restoreFloorDb: -50, marginBoostDb: 3 }, 'arm 5 -50 +3'], // #116
       [{ k: 'disarm', epoch: 4 }, 'disarm 4'],
       [{ k: 'take', epoch: 1, id: 2, fromFrame: 100, toFrame: 200 }, 'take 1 2 100 200'],
       [{ k: 'process', id: 5, preset: PRESETS.chipmunk }, 'process 5 chipmunk'],
@@ -1308,6 +1345,20 @@ describe('wiring', () => {
     h.eng.emit({ t: 'armed', epoch: 1, armFrame: 1234 });
     expect(h.transitions.at(-1)?.e).toEqual({ t: 'armed', epoch: 1, armFrame: 1234 });
     expect(h.session.state().armFrame).toBe(1234);
+  });
+
+  it('#116: Listening levels become one noiseFloor per second, and a loud floor shows the too-noisy badge', async () => {
+    const h = setup();
+    await toListening(h);
+    const epoch = h.session.state().epoch;
+    const count = h.transitions.length;
+    for (let i = 0; i < 40; i++) {
+      if (i > 0) h.clock.advance(30); // 1.17 s of levels, ≈ 33 per second
+      h.eng.emit({ t: 'level', epoch, frame: 480 * i, db: -24 - (i % 3), floorDb: -70 });
+    }
+    expect(h.transitions.slice(count).map((t) => t.e)).toEqual([{ t: 'noiseFloor', floorDb: -26 }]);
+    expect(h.session.state().tooNoisy).toBe(true);
+    expect(h.ui.at(-1)).toBe('tooNoisy');
   });
 
   it('visibility hidden, pagehide and freeze are dispatched; resume is ignored', async () => {

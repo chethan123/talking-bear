@@ -5,6 +5,8 @@ import {
   SILERO_SEG_PARAMS,
   initialSegState,
   segmenterStep,
+  segmenterVoicing,
+  segmentVoicedRatio,
   type SegEvent,
   type SegParams,
   type SegState,
@@ -65,7 +67,8 @@ const end = (
   lastSpeechFrame: number,
   reason: 'silence' | 'maxLength',
   frame = step,
-): Emitted => ({ step, ev: { kind: 'end', frame, lastSpeechFrame, reason } });
+  voicedRatio = Number.NaN, // no voicing fed: every end the segmenter produces still carries the field
+): Emitted => ({ step, ev: { kind: 'end', frame, lastSpeechFrame, reason, voicedRatio } });
 const misfire = (step: number, frame = step): Emitted => ({ step, ev: { kind: 'misfire', frame } });
 
 /** Frame labels that are not step indices: a ctx-rate-like ramp (1536 = 512 samples at 16 kHz, in 48 kHz frames)
@@ -264,13 +267,20 @@ function referenceEvents(p: SegParams, probs: readonly number[], frames: readonl
                   frame: at(frames, j),
                   lastSpeechFrame: at(frames, last),
                   reason: 'silence',
+                  voicedRatio: Number.NaN,
                 },
               }
             : { step: j, ev: { kind: 'misfire', frame: at(frames, j) } };
       } else if ((j - s0 + 1) * p.frameMs >= p.maxUtteranceMs) {
         closed = {
           step: j,
-          ev: { kind: 'end', frame: at(frames, j), lastSpeechFrame: at(frames, last), reason: 'maxLength' },
+          ev: {
+            kind: 'end',
+            frame: at(frames, j),
+            lastSpeechFrame: at(frames, last),
+            reason: 'maxLength',
+            voicedRatio: Number.NaN,
+          },
         };
       }
     }
@@ -373,6 +383,109 @@ describe('segmenter properties (fast-check)', () => {
     fc.assert(
       fc.property(caseArb, ({ p, probs, frames }) => {
         expect(run(p, probs, frames)).toEqual(referenceEvents(p, probs, frames));
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+});
+
+// ---- voiced ratio (#116) -----------------------------------------------------------------------------
+
+/** One step's input: its probability and the voicing of the hops recorded before it (`true` = voiced). */
+interface VoicedStep {
+  prob: number;
+  hops: boolean[];
+}
+
+/** Steps a segmenter, recording each step's hops before the step, as the worker does on Silero. */
+function runVoiced(p: SegParams, steps: readonly VoicedStep[], s: SegState = initialSegState()): Emitted[] {
+  const out: Emitted[] = [];
+  for (const [i, { prob, hops }] of steps.entries()) {
+    for (const v of hops) segmenterVoicing(s, v);
+    const ev = segmenterStep(s, p, i, prob);
+    if (ev !== null) out.push({ step: i, ev });
+  }
+  return out;
+}
+
+const steps = (prob: number, count: number, hops: boolean[] = []): VoicedStep[] =>
+  Array.from({ length: count }, () => ({ prob, hops }));
+
+describe('voicedRatio (#116)', () => {
+  const VVUU = [true, true, false, false];
+
+  it('counts only the hops recorded between a start and its end', () => {
+    // Voiced hops before the start and after the end are ignored; inside, 2 of every 4 hops are voiced.
+    const evs = runVoiced(P, [
+      ...steps(0, 3, [true, true, true, true, true]),
+      ...steps(0.9, 5, VVUU), // the start step's own hops are recorded before it opens: not counted
+      ...steps(0, 19, VVUU),
+      ...steps(0, 5, [true, true, true]),
+    ]);
+    expect(evs).toEqual([start(3), end(26, 7, 'silence', 26, 0.5)]);
+  });
+
+  it('a hop recorded after the start step counts; one before it does not', () => {
+    const s = initialSegState();
+    segmenterVoicing(s, true); // idle: ignored
+    expect(segmenterStep(s, P, 0, 0.9)).toEqual({ kind: 'start', frame: 0 });
+    segmenterVoicing(s, true); // open: counted
+    segmenterVoicing(s, false);
+    segmenterVoicing(s, false);
+    expect(s).toMatchObject({ hops: 3, voicedHops: 1 });
+    expect(segmentVoicedRatio(s)).toBeCloseTo(1 / 3, 12);
+  });
+
+  it('a new segment starts from zero, and a misfire closes the count', () => {
+    const evs = runVoiced(P, [
+      ...steps(0.9, 4, [true]),
+      ...steps(0, 19, [true]), // 128 ms of speech: a misfire at step 22
+      ...steps(0, 2, [true]),
+      ...steps(0.9, 5, [false]),
+      ...steps(0, 19, [false]),
+    ]);
+    expect(evs).toEqual([start(0), misfire(22), start(25), end(48, 29, 'silence', 48, 0)]);
+  });
+
+  it('no recorded hop gives NaN', () => {
+    expect(runVoiced(P, steps(0.9, 313))).toEqual([start(0), end(312, 312, 'maxLength', 312, Number.NaN)]);
+    expect(segmentVoicedRatio(initialSegState())).toBeNaN();
+  });
+
+  it('segmenterVoicing while idle leaves the state unchanged', () => {
+    const s = initialSegState();
+    for (let i = 0; i < 10; i++) segmenterVoicing(s, i % 2 === 0);
+    expect(s).toEqual(initialSegState());
+  });
+
+  it('a maxLength end carries the ratio too', () => {
+    const evs = runVoiced(P, [{ prob: 0.9, hops: [] }, ...steps(0.9, 400, [true, false, false, false])]);
+    expect(evs.slice(0, 2)).toEqual([start(0), end(312, 312, 'maxLength', 312, 0.25)]);
+  });
+
+  it('every end carries voiced / total of the hops recorded strictly after its start step, through its end step', () => {
+    const hopsArb = fc.array(fc.boolean(), { maxLength: 4 });
+    fc.assert(
+      fc.property(caseArb, fc.array(hopsArb, { minLength: 1, maxLength: 64 }), ({ p, probs }, pattern) => {
+        const input = probs.map((prob, i) => ({ prob, hops: at(pattern, i % pattern.length) }));
+        let startStep = -1;
+        for (const { step, ev } of runVoiced(p, input)) {
+          if (ev.kind === 'start') {
+            startStep = step;
+            continue;
+          }
+          if (ev.kind !== 'end') continue;
+          let total = 0;
+          let voiced = 0;
+          for (let i = startStep + 1; i <= step; i++) {
+            for (const v of at(input, i).hops) {
+              total++;
+              if (v) voiced++;
+            }
+          }
+          if (total === 0) expect(ev.voicedRatio).toBeNaN();
+          else expect(ev.voicedRatio).toBe(voiced / total);
+        }
       }),
       { numRuns: NUM_RUNS },
     );

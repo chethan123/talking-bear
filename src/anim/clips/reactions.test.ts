@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { BONES } from '../../art/bear-parts.gen.ts';
+import { BASE } from '../base-poses.ts';
 import { sampleClip } from '../clip.ts';
 import type { Clip } from '../clip.ts';
 import { EAR_SPRING, GAZE_SPRING } from '../layers/index.ts';
-import { Ch, CH_COUNT, createPose } from '../pose.ts';
+import { addPose, Ch, CH_COUNT, createPose } from '../pose.ts';
 import type { Pose } from '../pose.ts';
 import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT, partIndex, partMatrix } from '../rig.ts';
 import { SpringBank } from '../springs.ts';
@@ -23,7 +24,7 @@ import {
   TUFT_SPRING,
 } from '../springs-map.ts';
 import { SUBSTEP } from '../stepper.ts';
-import { GENTLE_BASES, GENTLE_SCALE, REACTION_CLIPS } from './reactions.ts';
+import { GENTLE_BASES, GENTLE_SCALE, MIME_CLIPS, REACTION_CLIPS } from './reactions.ts';
 import type { ReactionClipName } from './reactions.ts';
 
 const DEG = Math.PI / 180;
@@ -669,5 +670,225 @@ describe('REACTION_CLIPS: content (issue #89 "Clips")', () => {
     const { peak } = runSprings(c, c.duration);
     expect(peak[SPRING.kerchiefA]).toBeGreaterThan(5 * DEG);
     expect(peak[SPRING.kerchiefB]).toBeGreaterThan(5 * DEG);
+  });
+});
+
+// ---- #115: the mimes -------------------------------------------------------------------------------------------
+
+/** The cupped ear's hold, from the issue: the paw up for 1.5 s, raised in 0.4 s. */
+const CUP_HOLD = [0.4, 1.9] as const;
+/** The times the geometry is checked at: the hold's start, middle and end. */
+const CUP_TIMES = [0.4, 1.15, 1.9] as const;
+
+/** The `idle` base plus cuppedEar's sample at `t` (rest: the base alone, for null), as the director draws it. */
+function cupPose(t: number | null): Pose {
+  const base = BASE.idle;
+  if (t === null) return Float32Array.from(base);
+  return addPose(base, sampleClip(MIME_CLIPS.cuppedEar, t, createPose()), 1, createPose());
+}
+
+/** The distance (design units) from the left paw's pivot to the left ear's in `pose`. */
+function pawToEarL(pose: Pose): number {
+  const [px, py] = posedPivot(pose, 'pawL');
+  const [ex, ey] = posedPivot(pose, 'earL');
+  return Math.hypot(px - ex, py - ey);
+}
+
+/**
+ * The share of the left paw that is drawn outside the head (0–1): `pawFurL` approximated by its disc (centre
+ * (327.8, 875.8), radius 50) sampled on a 2-unit grid, each sample through the `pawL` bone matrix, then into head
+ * space through the inverse of the `head` matrix, and tested against the ellipse of `headFur`'s bbox (210–790 ×
+ * 165–635). headFur is drawn after the arm and paw, so a sample inside it is hidden.
+ */
+function pawVisibleL(pose: Pose): number {
+  boneMatrices(RIG, pose, BONE_BUF);
+  const m = BONE_BUF;
+  const p = boneIndex('pawL') * MAT;
+  const h = boneIndex('head') * MAT;
+  const [a, b, c, d, e, f] = [m[h]!, m[h + 1]!, m[h + 2]!, m[h + 3]!, m[h + 4]!, m[h + 5]!];
+  const det = a * d - b * c;
+  let total = 0;
+  let outside = 0;
+  for (let dx = -50; dx <= 50; dx += 2) {
+    for (let dy = -50; dy <= 50; dy += 2) {
+      if (dx * dx + dy * dy > 2500) continue;
+      const x0 = 327.8 + dx;
+      const y0 = 875.8 + dy;
+      const x = m[p]! * x0 + m[p + 2]! * y0 + m[p + 4]! - e;
+      const y = m[p + 1]! * x0 + m[p + 3]! * y0 + m[p + 5]! - f;
+      const u = (d * x - c * y) / det;
+      const v = (-b * x + a * y) / det;
+      total++;
+      if (((u - 500) / 290) ** 2 + ((v - 400) / 235) ** 2 >= 1) outside++;
+    }
+  }
+  return outside / total;
+}
+
+describe('MIME_CLIPS: cuppedEar (#115)', () => {
+  const c = MIME_CLIPS.cuppedEar;
+
+  it('the set is exactly cuppedEar, tooLoud and tooLoudGentle, named after their keys, sharing no name with REACTION_CLIPS', () => {
+    expect(Object.keys(MIME_CLIPS)).toEqual(['cuppedEar', 'tooLoud', 'tooLoudGentle']);
+    for (const [name, mime] of Object.entries(MIME_CLIPS)) {
+      expect(mime.name).toBe(name);
+      expect(Object.hasOwn(REACTION_CLIPS, name), name).toBe(false);
+    }
+  });
+
+  it('validation 1: keys sorted, duration ≥ the last key, valid channels, one track per channel, no kicks', () => {
+    expect(c.duration).toBeCloseTo(2.4, 12);
+    expect(c.sustained).toBeUndefined();
+    expect(c.impulses).toBeUndefined();
+    const chs = channels(c);
+    expect(new Set(chs).size).toBe(chs.length);
+    for (const tr of c.tracks) {
+      expect(Number.isInteger(tr.ch) && tr.ch >= 0 && tr.ch < CH_COUNT).toBe(true);
+      for (let i = 1; i < tr.keys.length; i++) expect(tr.keys[i]!.t).toBeGreaterThan(tr.keys[i - 1]!.t);
+      expect(c.duration).toBeGreaterThanOrEqual(tr.keys.at(-1)!.t);
+    }
+  });
+
+  it('validation 2: within 0.02 of neutral at 0 and at the duration', () => {
+    for (const t of [0, c.duration]) {
+      const pose = sampleClip(c, t, createPose());
+      for (let ch = 0; ch < CH_COUNT; ch++)
+        expect(Math.abs(pose[ch]!), `channel ${ch} at ${t}`).toBeLessThanOrEqual(NEUTRAL_TOL);
+    }
+  });
+
+  it('holds the paw up for 1.5 s: ArmRotL 145°, HeadRot −12°, EarRotL −15°, brows +4, at their peak only then', () => {
+    const [from, to] = CUP_HOLD;
+    const held = grid(c).filter((t) => t >= from && t <= to);
+    expect(held.length).toBeGreaterThan(1000);
+    for (const t of held) {
+      expect(at(c, t, Ch.ArmRotL), `at ${t}`).toBeCloseTo(145 * DEG, 6);
+      expect(at(c, t, Ch.HeadRot), `at ${t}`).toBeCloseTo(-12 * DEG, 6);
+      expect(at(c, t, Ch.EarRotL), `at ${t}`).toBeCloseTo(-15 * DEG, 6);
+      expect(at(c, t, Ch.BrowL), `at ${t}`).toBeCloseTo(4, 6);
+    }
+    for (const t of grid(c).filter((x) => x < from - 1e-9 || x > to + 1e-9)) {
+      expect(Math.abs(at(c, t, Ch.ArmRotL)), `at ${t}`).toBeLessThan(145 * DEG - 1e-6);
+      expect(Math.abs(at(c, t, Ch.HeadRot)), `at ${t}`).toBeLessThan(12 * DEG - 1e-6);
+      expect(Math.abs(at(c, t, Ch.EarRotL)), `at ${t}`).toBeLessThan(15 * DEG - 1e-6);
+    }
+  });
+
+  it('the paw is beside the ear: under half the rest distance, above the shoulder, and ≥ 90 % in front of the head', () => {
+    const rest = pawToEarL(cupPose(null));
+    expect(pawVisibleL(cupPose(null))).toBe(1); // the meter at rest: the paw hangs below the head
+    for (const t of CUP_TIMES) {
+      const pose = cupPose(t);
+      expect(pawToEarL(pose), `at ${t}`).toBeLessThan(0.5 * rest);
+      expect(posedPivot(pose, 'pawL')[1], `at ${t}`).toBeLessThan(700); // both shoulders pivot at y 700
+      expect(pawVisibleL(pose), `at ${t}`).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  it('the visibility meter has teeth: with the arm at 165° the head hides most of the paw', () => {
+    const pose = cupPose(1.15);
+    pose[Ch.ArmRotL] = BASE.idle[Ch.ArmRotL]! + 165 * DEG;
+    expect(pawVisibleL(pose)).toBeLessThan(0.9);
+  });
+
+  it('content: no stars, squash or wobble channel, and nothing on the right side', () => {
+    const chs = channels(c);
+    for (const ch of [Ch.Stars, Ch.BodySquash, Ch.HeadSquishX, Ch.HeadSquishY, Ch.ArmRotR, Ch.EarRotR])
+      expect(chs, `channel ${ch}`).not.toContain(ch);
+    expect(c.name.toLowerCase()).not.toMatch(/cry|hurt|pain|scared|fear/);
+  });
+
+  it('has no gentle variant (#115 D4): the clip is calm', () => {
+    expect(Object.hasOwn(REACTION_CLIPS, 'cuppedEarGentle')).toBe(false);
+    expect(Object.hasOwn(MIME_CLIPS, 'cuppedEarGentle')).toBe(false);
+  });
+});
+
+describe('MIME_CLIPS: tooLoud and tooLoudGentle (#117)', () => {
+  const c = MIME_CLIPS.tooLoud;
+  const g = MIME_CLIPS.tooLoudGentle;
+  const BOTH = [
+    ['tooLoud', c],
+    ['tooLoudGentle', g],
+  ] as const;
+  const EPS = 1e-9;
+  /** The grid times in [from, to] (s). */
+  const within = (from: number, to: number): number[] =>
+    grid(c).filter((t) => t >= from - EPS && t <= to + EPS);
+
+  it.each(BOTH)(
+    'validation 1, %s: 1.2 s, one-shot, no kicks, keys sorted, valid channels, one track per channel',
+    (_name, x) => {
+      expect(x.duration).toBeCloseTo(1.2, 12);
+      expect(x.sustained).toBeUndefined();
+      expect(x.impulses).toBeUndefined();
+      const chs = channels(x);
+      expect(new Set(chs).size).toBe(chs.length);
+      for (const tr of x.tracks) {
+        expect(Number.isInteger(tr.ch) && tr.ch >= 0 && tr.ch < CH_COUNT).toBe(true);
+        for (let i = 1; i < tr.keys.length; i++) expect(tr.keys[i]!.t).toBeGreaterThan(tr.keys[i - 1]!.t);
+        expect(x.duration).toBeGreaterThanOrEqual(tr.keys.at(-1)!.t);
+      }
+    },
+  );
+
+  it.each(BOTH)('validation 2, %s: within 0.02 of neutral at 0 and at the duration', (_name, x) => {
+    for (const t of [0, x.duration]) {
+      const pose = sampleClip(x, t, createPose());
+      for (let ch = 0; ch < CH_COUNT; ch++)
+        expect(Math.abs(pose[ch]!), `channel ${ch} at ${t}`).toBeLessThanOrEqual(NEUTRAL_TOL);
+    }
+  });
+
+  it('choreography: the ears fold and the eyes squint briefly, then a grin with a 0.5 blush', () => {
+    for (const t of within(0.12, 0.35)) {
+      expect(at(c, t, Ch.EarFoldL), `at ${t}`).toBeCloseTo(0.7, 6);
+      expect(at(c, t, Ch.EarFoldR), `at ${t}`).toBeCloseTo(0.7, 6);
+      expect(at(c, t, Ch.LidL), `at ${t}`).toBeCloseTo(0.6, 6);
+      expect(at(c, t, Ch.LidR), `at ${t}`).toBeCloseTo(0.6, 6);
+    }
+    for (const t of within(0.55, c.duration)) {
+      expect(at(c, t, Ch.EarFoldL), `at ${t}`).toBeCloseTo(0, 9);
+      expect(at(c, t, Ch.EarFoldR), `at ${t}`).toBeCloseTo(0, 9);
+    }
+    for (const t of within(0.55, 0.95)) {
+      expect(at(c, t, Ch.LidL), `at ${t}`).toBeCloseTo(0.3, 6);
+      expect(at(c, t, Ch.Jaw), `at ${t}`).toBeCloseTo(0.3, 6);
+      expect(at(c, t, Ch.MouthW), `at ${t}`).toBeCloseTo(0.9, 6);
+      expect(at(c, t, Ch.Teeth), `at ${t}`).toBeCloseTo(0.6, 6);
+      expect(at(c, t, Ch.Blush), `at ${t}`).toBeCloseTo(0.5, 6);
+    }
+    for (const t of within(0, 0.35))
+      for (const ch of [Ch.Jaw, Ch.MouthW, Ch.Teeth, Ch.Blush])
+        expect(at(c, t, ch), `${ch} at ${t}`).toBeCloseTo(0, 9);
+    for (const t of grid(c))
+      if (Math.abs(at(c, t, Ch.Blush) - 0.5) < 1e-6)
+        expect(at(c, t, Ch.EarFoldL), `at ${t}`).toBeCloseTo(0, 9);
+  });
+
+  it('content (plan Q3): playful, never pain: brows never down, teeth only with an open jaw, no stars or wobble', () => {
+    expect(c.name.toLowerCase()).not.toMatch(/cry|hurt|pain|scared|fear/);
+    for (const t of grid(c)) {
+      expect(at(c, t, Ch.BrowL), `at ${t}`).toBeGreaterThanOrEqual(0);
+      expect(at(c, t, Ch.BrowR), `at ${t}`).toBeGreaterThanOrEqual(0);
+      expect(at(c, t, Ch.Jaw), `at ${t}`).toBeGreaterThanOrEqual(0.4 * at(c, t, Ch.Teeth) - EPS);
+    }
+    const chs = channels(c);
+    for (const ch of [Ch.Stars, Ch.BodySquash, Ch.HeadSquishX, Ch.HeadSquishY, Ch.HeadRot, Ch.TuftRot])
+      expect(chs, `channel ${ch}`).not.toContain(ch);
+  });
+
+  it('tooLoudGentle is tooLoud × GENTLE_SCALE: same times, eases and channels, every value × 0.3, no kicks', () => {
+    expect(GENTLE_SCALE).toBe(0.3);
+    expect(g.name).toBe('tooLoudGentle');
+    expect(g.duration).toBe(c.duration);
+    expect(g.sustained).toBe(c.sustained);
+    expect(g.impulses).toBeUndefined();
+    expect(channels(g)).toEqual(channels(c));
+    c.tracks.forEach((tr, i) => {
+      const gt = g.tracks[i]!;
+      expect(gt.keys.map((key) => [key.t, key.ease])).toEqual(tr.keys.map((key) => [key.t, key.ease]));
+      gt.keys.forEach((key, j) => expect(key.v).toBeCloseTo(GENTLE_SCALE * tr.keys[j]!.v, 12));
+    });
   });
 });

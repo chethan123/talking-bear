@@ -69,7 +69,8 @@ export interface Engine {
    */
   openMic(req: number, extra?: MediaTrackConstraints): void;
   closeMic(): void;
-  arm(epoch: number, restoreFloorDb?: number): void;
+  /** Resets the worker for `epoch` and arms the worklet. `marginBoostDb`: the noisy-room raise (#116), if any. */
+  arm(epoch: number, restoreFloorDb?: number, marginBoostDb?: number): void;
   disarm(epoch: number): void;
   /**
    * Cuts `[fromFrame, toFrame)` from the capture ring; emits `clipReady{epoch, id}` or `takeFailed{epoch, id}`.
@@ -297,7 +298,8 @@ export function createEngine(opts: {
           id: m.id,
           result: { pcm: m.pcm, sampleRate, envelope: m.envelope, durationSec: m.durationSec },
         };
-        emit({ t: 'processed', id: m.id, durationSec: m.durationSec });
+        // #117: `clipped` is the worker's clipping flag of the raw take (plan §4.4), passed through to row 28.
+        emit({ t: 'processed', id: m.id, durationSec: m.durationSec, clipped: m.clipped });
         break;
       }
       case 'error':
@@ -576,7 +578,7 @@ export function createEngine(opts: {
       processed = null; // no captured audio outlives the mic
       processRates.clear(); // so a late processed reply can't bring it back
     },
-    arm(epoch: number, restoreFloorDb?: number): void {
+    arm(epoch: number, restoreFloorDb?: number, marginBoostDb?: number): void {
       // Epochs come from the reducer's integer counter. The worker's reset goes out before the worklet's arm.
       if (worker !== null) {
         postToWorker(worker, {
@@ -585,6 +587,7 @@ export function createEngine(opts: {
           vad: vadBackend,
           restoreFloorDb,
           pregate: PREGATE_ENABLED,
+          marginBoostDb,
         });
       }
       if (node !== null) postToWorklet(node, { t: 'arm', epoch });

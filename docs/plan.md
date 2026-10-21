@@ -138,6 +138,14 @@ A short parent-readable version of this lives in the settings sheet (M8).
 
 Wall-clock time is used only for UI timers (doze, sleep, processing timeout). It is injected as a `Clock` so tests are deterministic.
 
+**Capture gaps.** Chrome's `currentFrame` can jump. The capture worklet's ring zero-fills every jump. Up to 0.5 s (`Math.round(sampleRate / 2)` ctx frames), the decimator is fed the same zeros, so the frame tags stay on the ring's frames and contiguous. A longer jump, an audio-thread stall over 0.5 s, **re-anchors** the VAD feed instead: the decimator is reset, the partial VAD frame is dropped, and the next frame starts at the jump frame. In the worker, a frame whose `firstFrame` differs by more than one render quantum (`CAPTURE_GAP_SLACK`, 128 ctx frames) from the previous frame's (same epoch) `firstFrame` plus one VAD frame starts after a gap. Before consuming it, VadCore (#244, decisions D3–D5 of its approved plan):
+
+- drops the partial 10 ms hop and restarts the voicing window from zeros, as at `reset`;
+- ends a segment in progress at its last step before the gap (the last Silero frame, or the last energy hop): `end{reason: 'silence'}` with its `lastSpeechFrame` if it passes the checks a silence end faces there (the minimum speech, then the energy voicing rule or the Silero proximity gate), otherwise `misfire`. The segmenter then starts over;
+- with the trace on, ends the trace batch at the gap: the partial batch is posted, except that on Silero a partial batch without a Silero value is dropped.
+
+So no hop, segment or trace batch spans a re-anchor. A jump of up to 0.5 s is not a gap in this sense: its zeros are ordinary input, and a hop, segment or trace batch can run across it. The take of a segment ended at the gap (row 20) lies before it, apart from at most its 150 ms tail, which can reach into the ring's zero fill; the 300 ms pre-roll of a segment that starts after the gap can likewise reach back into the zeros. The epoch and its backend, the energy gate and its floor, the gate filter, the Silero LSTM state, the pre-gate, the hop count (the `level` cadence), the proximity gate's hop history and the onset block carry over. No new event or end reason is involved.
+
 ### 3.2 Audio pipeline (data flow)
 
 ```mermaid
@@ -391,6 +399,8 @@ stateDiagram-v2
 | 1 | Asleep | `tapBear` | permission `granted` | Waking | `resumeCtx`, `openMic`, `wakeLock on`, `timer waking 5 s`, `anim wake` |
 | 2 | Asleep | `tapBear` | permission `prompt` (first run, or a one-time grant expired) | NeedsParent | `resumeCtx`, `wakeLock on`, `ui parentPermission`, `timer sleep`. This is the one screen with text, for a parent ([§4.5](#45-android-chrome-specifics)). |
 | 3 | Asleep | `tapBear` | permission `denied` | MicDenied | `resumeCtx`, `ui micHelp`, `anim wake` (the bear is awake for reactions, row 11) |
+| 3b | Asleep | `settingsRetry` | — | as rows 1 / 2 / 3 by permission | (#266) |
+| 3c | Asleep | `tapBear` \| `settingsRetry` | `updateActivated`: another tab activated the update (`updateReady{activated}`) | Asleep | `applyUpdate` only: the page reloads at once instead of waking ([§4.7](#47-pwa)); checked before rows 1–3 and 3b (#277) |
 | 4 | NeedsParent | `parentContinue` | — | Waking | `openMic`: Chrome's prompt appears now, in front of the parent |
 | 5 | NeedsParent | `timer sleep` \| `hidden` | — | Asleep | — |
 | 6 | Waking | `micGranted` \| `ctxRunning` | the *other* flag is already set | Listening | `cancelTimer waking` (entry actions arm) |
@@ -407,8 +417,8 @@ stateDiagram-v2
 | 17 | Listening | `timer sleep` | — | Asleep | `anim sleep` |
 | 18 | Listening | track `mute` | — | Listening | `ui micMuted`; timers keep running |
 | 19 | Listening | track `unmute` | — | Listening | re-enter (new epoch, floor reset); `ui null` |
-| 20 | Recording | `seg.end{lastSpeechFrame, reason}` | — | Processing | `take(from = max(onsetFrame − 300 ms, armFrame), to = lastSpeechFrame + 150 ms)`, deferred by the worklet until available; `timer processing 2 s`; `anim thinking`; if `reason = maxLength`, bump the noisy counter ([§4.4](#44-feedback-loop)) |
-| 21 | Recording | `seg.misfire` | — | Listening | `anim earTwitch` ("huh?") |
+| 20 | Recording | `seg.end{lastSpeechFrame, reason}` | — | Processing | `take(from = max(onsetFrame − 300 ms, armFrame), to = lastSpeechFrame + 150 ms)`, deferred by the worklet until available; `timer processing 2 s`; `anim thinking`; if `reason = maxLength` and `voicedRatio < 0.3`, bump the noisy counter ([§4.4](#44-feedback-loop)); any other end resets it |
+| 21 | Recording | `seg.misfire` | — | Listening | `anim earTwitch` ("huh?"); if `reason = maxLength` and `voicedRatio < 0.3` (the energy backend's voicing-rule misfire), bump the noisy counter, the same as a capped end ([§4.4](#44-feedback-loop)); any other misfire leaves it unchanged |
 | 22 | Recording | track `mute` | — | Listening | abort; `anim earTwitch`; `ui micMuted` |
 | 23 | Recording | `reaction` | — | Recording | animation only; no sfx, so the take is not polluted |
 | 24 | Processing | all clip chunks received | — | Processing | `process{id, preset}` to the worker |
@@ -844,7 +854,7 @@ The default ratio is settled by the M3 listening test ([§7](#7-milestones-build
 | Case | Handling |
 |---|---|
 | User speaks during playback | Ignored by design. The bear's "talking" pose is the affordance; tapping interrupts. |
-| Background noise never falls silent | Steady noise is absorbed by the adaptive floor. If floor > −35 dBFS, show "too noisy". If 3 consecutive takes hit the cap with a low voiced ratio: raise the margins by 3 dB each time, then offer hold-to-talk. This breaks noise→replay→noise loops. |
+| Background noise never falls silent | Steady noise is absorbed by the adaptive floor. A separate too-noisy estimate, at most one per second over a window of at least 1 s, counts Listening levels, and Recording levels from 1000 ms after the epoch's first Recording level; earlier Recording levels close the window. So noise that holds the energy gate open still counts, while the child's own speech rarely does. If the estimate > −35 dBFS, show "too noisy" in Listening or Recording: the hold-to-talk button takes priority in both, and the mic-muted indicator in Listening. It is never announced. If 3 consecutive takes (or capped energy misfires, §3.4 row 21) hit the cap with a low voiced ratio: raise the margins by 3 dB each time, then offer hold-to-talk. This breaks noise→replay→noise loops. |
 | Too short (< 150 ms speech; knocks, clicks) | `misfire` → ear-twitch "huh?", no replay |
 | Too long | Hard cap at 10 s (ring buffer 12 s), then replay what was captured |
 | Clipping (shouting) | Detect ≥ 0.1 % samples at \|x\| > 0.99. Normalisation cannot fix it; optionally show a playful "too loud!" reaction (M8). |
@@ -893,7 +903,7 @@ The default ratio is settled by the M3 listening test ([§7](#7-milestones-build
 - **Handling:** `navigator.permissions.query({name:'microphone'})` (Chrome 64+) plus `onchange`, re-checked on every `visibilitychange` [V R30].
 - **Designed for a child who can't read (Q3):**
   - Chrome's prompt is text-only, so the mic is **never requested straight from a child's tap**. When permission is `prompt` (first run, or an expired one-time grant), tapping the bear opens a **parent sheet** (§3.4 `NeedsParent`). It is the only text screen in the app. It explains that the bear only listens on the device and nothing is sent anywhere, and has a Continue button that triggers Chrome's prompt.
-  - In `MicDenied`, **bear taps never re-prompt**. Repeated dismissals can put the site under Chrome's prompt embargo [M], after which only site settings can fix it. Retrying lives behind the settings long-press, which also tells a parent how to re-enable the mic in site settings.
+  - In `MicDenied`, **bear taps never re-prompt**. Repeated dismissals can put the site under Chrome's prompt embargo [M], after which only site settings can fix it. Retrying lives behind the settings long-press, which also tells a parent how to re-enable the mic in site settings; the settings retry from Asleep wakes as a tap does (§3.4 row 3b).
   - X-E7 also records whether the WebAPK shows an additional Android runtime dialog, and what three "Don't allow" dismissals in a row do.
 - **Accidental install:** listen for `beforeinstallprompt` and call `preventDefault()`, so no install UI appears in front of a child. Offer "Install" only inside settings. `beforeinstallprompt` is Chromium-only and non-standard [V R30].
 
@@ -1231,6 +1241,10 @@ VitePWA({
   - A parent can also tap "new version – restart" in settings. That control is **enabled only while `updateReady` is true**. In prompt mode, the reload listener is attached inside workbox-window's `waiting` handler, so calling `updateSW()` earlier silently does nothing [E reviewer, V R56/R57].
   - Frozen tabs run no timers, so the hourly `reg.update()` may only happen on the next `visible` [M]. That's acceptable.
   - All lazy resources (worklet, worker, weights, art) are loaded at wake, so an old page never needs old URLs after activation.
+  - **Another tab's update (#230, #277).** Another tab applying an update makes its worker take control of this page too (`clientsClaim`), and that activation deleted the old precache. This page keeps running old code, and nothing is left waiting for it to activate. A page that has woken since it loaded holds its graph, but a never-woken one would fetch old lazy URLs at its first wake (the exception to the bullet above). So the page sets `updateReady{activated}` and reloads in one of three ways:
+    - at once, if hidden;
+    - at its next hide in Asleep or Paused (C11);
+    - in Asleep, at a tap or settings retry instead of waking (§3.4 row 3c).
 - **Update checks:** browsers re-check `sw.js` on navigation, or on subresource fetches only after 24 h [V R26]. A never-navigating single-page app therefore calls `reg.update()` on `visibilitychange→visible` and hourly.
 - **HTTP caching of `sw.js`:** `updateViaCache` defaults to `'imports'`, so the top-level `sw.js` fetch always bypasses the HTTP cache [V R26]. We still serve it `no-cache`.
 
@@ -1532,7 +1546,7 @@ The production image also exposes `data-state` on the bear element, so a hook-fr
 | `sfx-gating` | a reaction sound never starts a recording |
 | `gestures` | CDP `Input.dispatchTouchEvent` for multi-touch |
 | `offline` | SW ready → `context.setOffline(true)` → reload → full loop |
-| `update` | proxy serves v1; start recording; flip the proxy to v2; `reg.update()` → no reload while `Recording`/`Playing`; `__bearTest.setVisibility('hidden')` from idle → update applied; no 404s |
+| `update` | proxy serves v1; in Asleep flip the proxy to v2 and `reg.update()`, holding v2's precache fetch; start recording; release it (#275) → no reload while `Recording`/`Playing`; `__bearTest.setVisibility('hidden')` from idle → update applied; no 404s |
 | `installability` | CDP `Page.getInstallabilityErrors` (experimental; exists in `browser_protocol.json` [V R77]) returns `[]` with `channel:'chromium'`; the negative-control manifest returns errors |
 | `csp` | zero violations over the full flow |
 

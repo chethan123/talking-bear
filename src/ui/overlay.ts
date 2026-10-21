@@ -1,24 +1,43 @@
-// The M1 text overlays (plan §7 M1 UI, §4.5 parent sheet): tap-to-wake, the parent-permission sheet, the
-// mic-denied help, the mic-muted and too-noisy badges, and the error hint. Development text only: M8 replaces it
-// with the kid-first, text-free UI. The mic-denied help has no button: a child's tap never retries the mic, and
-// retrying lives behind the settings long-press, in the sheet's "For parents" section (plan §4.5, #114).
+// The overlays (plan §4.5, §7 M1, M8; issue #115): kid-first and text-free (Q3). A child can't read, so every
+// child-facing variant is an icon and the bear's body language says the rest: tap-to-wake is a pulsing paw over the
+// sleeping bear, the mic-denied help a blocked-mic icon (the bear mimes a cupped ear, bear-view.ts), the mic-muted and
+// too-noisy badges small icons, and the error a "tap to retry" circular arrow. The parent-permission sheet is the
+// only text here (plan §4.5), and the settings sheet the only other text screen. The mic-denied help has no button:
+// a child's tap never retries the mic, and retrying lives behind the settings long-press, in the sheet's "For
+// parents" section (plan §4.5, #114).
 //
-// CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/textContent only,
-// never HTML strings, and nothing sets a `style` attribute. Every variant is built once at mount and toggled
-// with the `hidden` attribute.
+// Hold-to-talk (#116, plan §4.4): in a room too noisy for the VAD, the session shows a large text-free paw button in
+// Listening and Recording. Pressing it dispatches `holdStart{frame}` and releasing it `holdEnd{frame}`, with frames on
+// the capture worklet's clock (`nowFrame`, round(ctx.currentTime · sampleRate)). Only the first pointer counts; the
+// button captures it, so sliding off keeps recording, and a cancel, a lost capture or the view being hidden ends the
+// hold as a release does. It is the only child-facing button; its accessible name is "Hold to talk" (#118).
+//
+// Accessibility (#118, a11y.ts): every icon variant is `role="status"` with an `aria-label` and `aria-live="off"`;
+// the labels are attributes, so the variants keep an empty `textContent`. The app's one aria-live region sits outside
+// `root` (a11y.ts `liveRegion`), and `show(o)` sets it to `announcementFor(o)`: the Asleep, MicDenied or Error text
+// while `tapToWake`, `micHelp` or `error` is up, '' otherwise. So it speaks only on entering those three mic-closed
+// states and is cleared, in the same dispatch, on leaving them; nothing shown while the mic is armed ever changes
+// it, since a same-text `say` writes nothing: not the mic-muted badge (Listening), not the too-noisy badge
+// (Listening and Recording, #289; the hold button takes priority over it in Recording, `overlayFor`), and not the
+// hold button. Both badges are `aria-live="off"` and never announce. While the settings or licences sheet is open
+// (a modal dialog) the region outside it is inert and announces nothing. That is intended: a missed announcement
+// is harmless, while a region inside the dialogs could speak with the mic open. Don't move it there.
+//
+// CSP `style-src 'self'` and Trusted Types (plan §4.8.3): the DOM is built with createElement/createElementNS and
+// textContent only, never HTML strings, and nothing sets a `style` attribute; the paw's pulse is a styles.css
+// @keyframes animation that `prefers-reduced-motion: reduce` turns off. Every variant is built once at mount and
+// toggled with the `hidden` attribute.
 
 import type { Overlay, SessionEvent } from '../app/events.ts';
+import { A11Y_TEXT, announcementFor, labelStatus, liveRegion } from './a11y.ts';
+import { icon, type IconName } from './icons.ts';
 
+/** The parent-permission sheet's text: the only text among the overlays (plan §4.5). */
 export const OVERLAY_TEXT = {
-  tapToWake: 'Tap Juni to wake up',
   parentTitle: 'Before Juni can listen',
   parentLocal: 'Juni only listens on this device. Nothing you say is sent anywhere.',
   parentMicOff: 'The microphone switches off when Juni falls asleep.',
   parentContinue: 'Continue',
-  micHelp: "Microphone is blocked. To fix it, allow the microphone for this site in Chrome's site settings.",
-  micMuted: 'Mic muted',
-  tooNoisy: 'Too noisy',
-  error: 'Something went wrong. Tap to try again.',
 } as const;
 
 type View = Exclude<Overlay, null>;
@@ -34,6 +53,19 @@ function element<K extends keyof HTMLElementTagNameMap>(
   return el;
 }
 
+/** An icon-only variant: `tag.className` holding icon `name`, with no text; `role="status"` named `label` (#118). */
+function iconView<K extends 'div' | 'section'>(
+  tag: K,
+  className: string,
+  name: IconName,
+  label: string,
+): HTMLElementTagNameMap[K] {
+  const el = element(tag, className);
+  labelStatus(el, label);
+  el.append(icon(name));
+  return el;
+}
+
 function button(text: string, onClick: () => void): HTMLButtonElement {
   const b = element('button', 'sheet-button', text);
   b.type = 'button';
@@ -41,14 +73,31 @@ function button(text: string, onClick: () => void): HTMLButtonElement {
   return b;
 }
 
+/** The hold-to-talk button (#116): a paw icon, no text, named "Hold to talk"; pointer handling is in `mountOverlay`. */
+function holdButton(): HTMLButtonElement {
+  const b = element('button', 'overlay-hold');
+  b.type = 'button';
+  b.setAttribute('aria-label', A11Y_TEXT.holdToTalk);
+  b.append(icon('paw'));
+  return b;
+}
+
 /**
  * Mounts every overlay variant (all hidden) into `root` and returns `show`: `show(o)` makes variant `o` the only
  * visible one, and `show(null)` hides them all. The parent sheet's Continue dispatches `parentContinue`; nothing
- * here dispatches `settingsRetry` (the settings sheet does, #114).
- * The non-interactive variants let pointer events through to the canvas below (styles.css), so "Tap Juni…" and
- * "Tap to try again" reach it.
+ * here dispatches `settingsRetry` (the settings sheet does, #114). The hold button dispatches `holdStart` /
+ * `holdEnd` with `nowFrame()`; while `nowFrame` returns null (no audio context) a press does nothing.
+ * The icon variants are not interactive and let pointer events through to the canvas below (styles.css), so a tap
+ * on the paw or the retry arrow reaches the bear. The paw, mic-help and retry icons sit at the bottom centre, over
+ * the bear's body; the mic-muted and too-noisy badges at the top centre. The mic help stays a `section`. The hold
+ * button (#116) takes pointer events and sits at the bottom centre too. Every `show(o)` also sets the document's live
+ * region to `announcementFor(o)` (#118): the announcement of Asleep, MicDenied or Error, or '' (no write if unchanged).
  */
-export function mountOverlay(root: HTMLElement, dispatch: (e: SessionEvent) => void): (o: Overlay) => void {
+export function mountOverlay(
+  root: HTMLElement,
+  dispatch: (e: SessionEvent) => void,
+  nowFrame: () => number | null = () => null,
+): (o: Overlay) => void {
   const layer = element('div', 'overlay');
 
   const parent = element('section', 'sheet');
@@ -59,17 +108,55 @@ export function mountOverlay(root: HTMLElement, dispatch: (e: SessionEvent) => v
     button(OVERLAY_TEXT.parentContinue, () => dispatch({ t: 'parentContinue' })),
   );
 
-  const micHelp = element('section', 'sheet');
-  micHelp.append(element('p', null, OVERLAY_TEXT.micHelp));
-
   const views: Record<View, HTMLElement> = {
-    tapToWake: element('p', 'overlay-hint', OVERLAY_TEXT.tapToWake),
+    tapToWake: iconView('div', 'overlay-icon overlay-paw', 'paw', A11Y_TEXT.tapToWake),
     parentPermission: parent,
-    micHelp,
-    micMuted: element('p', 'badge', OVERLAY_TEXT.micMuted),
-    tooNoisy: element('p', 'badge', OVERLAY_TEXT.tooNoisy),
-    error: element('p', 'overlay-hint', OVERLAY_TEXT.error),
+    micHelp: iconView('section', 'overlay-icon', 'micBlocked', A11Y_TEXT.micHelp),
+    micMuted: iconView('div', 'overlay-badge', 'micMuted', A11Y_TEXT.micMuted),
+    tooNoisy: iconView('div', 'overlay-badge', 'noise', A11Y_TEXT.tooNoisy),
+    holdToTalk: holdButton(),
+    error: iconView('div', 'overlay-icon', 'retry', A11Y_TEXT.error),
   };
+  // The document's one live region (#118), shared with any other mount: outside `root`, so no overlay has text.
+  const live = liveRegion(root.ownerDocument);
+
+  // The hold: the pointer that pressed the button and the frame it pressed at; null while nothing is held.
+  const hold = views.holdToTalk;
+  let holdPointer: number | null = null;
+  let holdFrame = 0;
+  const endHold = (): void => {
+    if (holdPointer === null) return;
+    const id = holdPointer;
+    holdPointer = null;
+    hold.classList.remove('overlay-hold--pressed');
+    try {
+      if (hold.hasPointerCapture(id)) hold.releasePointerCapture(id);
+    } catch {
+      // A synthetic or already-gone pointer: nothing to release.
+    }
+    dispatch({ t: 'holdEnd', frame: nowFrame() ?? holdFrame });
+  };
+  hold.addEventListener('pointerdown', (e) => {
+    if (holdPointer !== null || e.button !== 0) return; // the first pointer only, primary button or touch
+    const frame = nowFrame();
+    if (frame === null) return;
+    holdPointer = e.pointerId;
+    holdFrame = frame;
+    try {
+      hold.setPointerCapture(e.pointerId);
+    } catch {
+      // A synthetic pointer (tests) can't be captured: the hold works without capture.
+    }
+    hold.classList.add('overlay-hold--pressed');
+    dispatch({ t: 'holdStart', frame });
+  });
+  const onRelease = (e: PointerEvent): void => {
+    if (e.pointerId === holdPointer) endHold();
+  };
+  hold.addEventListener('pointerup', onRelease);
+  hold.addEventListener('pointercancel', onRelease);
+  hold.addEventListener('lostpointercapture', onRelease);
+  hold.addEventListener('contextmenu', (e) => e.preventDefault()); // a long press must not open a menu
   const all = Object.values(views);
   for (const view of all) {
     view.hidden = true;
@@ -78,7 +165,10 @@ export function mountOverlay(root: HTMLElement, dispatch: (e: SessionEvent) => v
   root.append(layer);
 
   return (o) => {
+    // Hiding the button mid-hold (Recording ended, the page hid) ends the hold: its release would never arrive.
+    if (o !== 'holdToTalk') endHold();
     const shown = o === null ? null : views[o];
     for (const view of all) view.hidden = view !== shown;
+    live.say(announcementFor(o));
   };
 }

@@ -4,11 +4,38 @@
 //
 // Durations are counted in steps (the counter `k`), never from frame-label differences: `frame` is an
 // opaque label that is only copied into the events.
+//
+// Voiced ratio (#116, plan §4.4): the caller records the voicing of each 10 ms hop of an open segment with
+// `segmenterVoicing` (it only counts between a `start` and its `end` or `misfire`), and every `end` carries the
+// fraction of those hops that were voiced, so the session can tell a capped take of noise from a long utterance.
+// A capped energy segment that the worker's voicing rule turns into a `misfire` keeps its reason and ratio on the
+// misfire (#289).
 
 export type SegEvent =
   | { kind: 'start'; frame: number }
-  | { kind: 'end'; frame: number; lastSpeechFrame: number; reason: 'silence' | 'maxLength' }
-  | { kind: 'misfire'; frame: number };
+  | {
+      kind: 'end';
+      frame: number;
+      lastSpeechFrame: number;
+      reason: 'silence' | 'maxLength';
+      /**
+       * The fraction of the segment's recorded voicing hops (`segmenterVoicing`) that were voiced (#116). Set on
+       * every end `segmenterStep` and the worker's VadCore produce: NaN when no hop was recorded (a caller that
+       * feeds no voicing). Absent means unknown.
+       */
+      voicedRatio?: number;
+    }
+  | {
+      kind: 'misfire';
+      frame: number;
+      /**
+       * #289: set only by the worker's VadCore on the energy voicing rule's misfire of a capped segment (an `end`
+       * with reason 'maxLength' and under MIN_VOICED_MS voiced), together with that segment's voiced ratio, so
+       * the session counts it as a noisy cap (plan §4.4). Absent on every other misfire.
+       */
+      reason?: 'maxLength';
+      voicedRatio?: number;
+    };
 
 export interface SegParams {
   posThreshold: number;
@@ -50,6 +77,9 @@ export interface SegState {
   lastSpeechFrame: number;
   /** Step at which the current silence run began (first `prob < negThreshold` after speech), or null. */
   silenceStartStep: number | null;
+  /** Voicing hops recorded (`segmenterVoicing`) since the current segment's start, and how many were voiced. */
+  hops: number;
+  voicedHops: number;
 }
 
 export function initialSegState(): SegState {
@@ -61,7 +91,24 @@ export function initialSegState(): SegState {
     lastSpeechStep: 0,
     lastSpeechFrame: 0,
     silenceStartStep: null,
+    hops: 0,
+    voicedHops: 0,
   };
+}
+
+/**
+ * Records the voicing of one 10 ms hop of the open segment (#116). Only hops recorded while a segment is open
+ * (from its `start` to its `end` or `misfire`) count; outside one this is a no-op. Doesn't allocate.
+ */
+export function segmenterVoicing(s: SegState, voiced: boolean): void {
+  if (!s.inSpeech) return;
+  s.hops++;
+  if (voiced) s.voicedHops++;
+}
+
+/** voicedHops / hops of the current (or just-closed) segment; NaN when no hop was recorded. */
+export function segmentVoicedRatio(s: SegState): number {
+  return s.hops > 0 ? s.voicedHops / s.hops : Number.NaN;
 }
 
 /** Mutates s. Returns the event emitted by this step, or null. `frame` is an opaque, strictly increasing label
@@ -79,6 +126,8 @@ export function segmenterStep(s: SegState, p: SegParams, frame: number, prob: nu
       s.lastSpeechStep = k;
       s.lastSpeechFrame = frame;
       s.silenceStartStep = null;
+      s.hops = 0;
+      s.voicedHops = 0;
       return { kind: 'start', frame };
     }
     return null;
@@ -98,13 +147,25 @@ export function segmenterStep(s: SegState, p: SegParams, frame: number, prob: nu
     s.inSpeech = false;
     s.silenceStartStep = null;
     return speechMs >= p.minSpeechMs
-      ? { kind: 'end', frame, lastSpeechFrame: s.lastSpeechFrame, reason: 'silence' }
+      ? {
+          kind: 'end',
+          frame,
+          lastSpeechFrame: s.lastSpeechFrame,
+          reason: 'silence',
+          voicedRatio: segmentVoicedRatio(s),
+        }
       : { kind: 'misfire', frame };
   }
   if ((k - s.startStep + 1) * p.frameMs >= p.maxUtteranceMs) {
     s.inSpeech = false;
     s.silenceStartStep = null;
-    return { kind: 'end', frame, lastSpeechFrame: s.lastSpeechFrame, reason: 'maxLength' };
+    return {
+      kind: 'end',
+      frame,
+      lastSpeechFrame: s.lastSpeechFrame,
+      reason: 'maxLength',
+      voicedRatio: segmentVoicedRatio(s),
+    };
   }
   return null;
 }

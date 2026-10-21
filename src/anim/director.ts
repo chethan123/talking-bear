@@ -31,6 +31,21 @@
  * continuous base, it never jumps more than a plain cut would. A step that empties the slot, and the first tick
  * from `cutAt` + 100 ms, clear `prevClip`. See `crossfade`.
  *
+ * **Hidden classes** (#281). The frame reads three kinds of object the director makes per event: the playing clip
+ * (`clip`, `{ name, start }`), the active reaction (`reaction`) and the cut clip (`prevClip`). V8 holds an object's
+ * hidden class strongly only from objects that have it (and from an object literal's boilerplate once the literal has
+ * run twice); transition trees, feedback and optimized code hold it weakly. So when the last object of a class died,
+ * e.g. the session's first reaction ended or its first cut's fade was over, the next major GC cleared the class, and V8
+ * dropped every optimized function that had embedded it ("embedded weak objects cleared"): `evaluateFrom` then ran
+ * unoptimized (≈ 2–3.5 KB of boxed doubles per frame) or in the mid tier without `sampleClip` inlined (≈ 32–50 B), and
+ * `tick` (and in some runs bear-view's `applyKicks`) were dropped too, for thousands of frames. Each of the three is
+ * therefore built by one factory (`clipAt`, `activeReaction`, `cutClip`) that copies a module-level template
+ * (`CLIP_TEMPLATE`, `REACTION_TEMPLATE`, `CUT_CLIP_TEMPLATE`) and overwrites every field; a spread of a reaction keeps
+ * its class too. V8 gives a copy its template's hidden class, and the template, live for the session, keeps that class
+ * alive. The factories read their template on every call, so a bundler keeps it: anchors no live code read were dropped
+ * from the production bundle (#281). The templates' times are NaN, doubles like every director time. They are exported
+ * for director.test.ts, which checks that real objects share their template's class, and never written.
+ *
  * **Mouth.** Leaving Talking sets `mouthCloseStart = now` and clears `talk`; `talk` clears
  * `mouthCloseStart`, so every talk starts with the mouth fully open to the mouth layer. `evaluate` writes the mouth
  * channels only when asked (`mouth`, #221): bear-view lets a reaction clip's mouth tracks through while not talking.
@@ -40,13 +55,16 @@
  * - **Gates:** ignored in Asleep and Waking; in Dozing it moves to Idle first.
  * - **Refresh:** the same reaction name as the held Sustained reaction refreshes it, bypassing the cooldown:
  *   its clip keeps playing (a finite clip that has ended restarts), its escalation run goes on, and its sfx
- *   is output again only every `sfxLoopMs` (never, without it). Haptic and mood are output once per run.
+ *   is output again only every `sfxLoopMs` (never, without it). Haptic and mood are output once per run. A
+ *   refresh at the instant of the last one, with no sfx due, changes nothing (#317).
  * - **Cooldown:** 800 ms per (region, gesture kind) from the reaction that started it; inputs in it are
  *   ignored unless their priority is higher than that reaction's.
  * - **Escalation:** repeat-based (the `count`-th acceptance within `withinMs`; defaults 3 and 4 s) or
  *   duration-based (a held run, gaps ≤ `maxGapMs`, longer than `continuousMs`): `escalation.to` plays instead.
  * - **Interruption:** a reaction interrupts the active one only if its priority is ≥ the active one's;
  *   otherwise it is queued (one slot, replaced by a newer one) and dropped if it hasn't started 500 ms later.
+ *   The same reaction queued again by the same gesture (or clip input) at the instant it was queued changes
+ *   nothing (#317).
  *   A one-shot ends at its clip end, a sustained reaction 400 ms after its release; a fresh queued reaction
  *   then starts. This holds in Talking too: a P3+ below a carried-over reaction is queued, not announced.
  * - **Where it plays:** from Idle (Reacting/Sustained) a reaction is the base; in Attentive and Thinking it
@@ -60,6 +78,16 @@
  *   it also drops a queued sustained reaction of that gesture.
  * - **Gentle:** gentle clips play, and an escalation target without a gentle clip is skipped.
  * Accepted reactions output `toSession` (for `session.dispatch`), `haptic` and `mood`.
+ *
+ * **Clip input** (`{k:'clip', name}`, #115): the app asks for a clip by name. It plays like an accepted P2 reaction:
+ * - the same gates (ignored in Asleep and Waking; Dozing moves to Idle first), interruption and queue rules (it
+ *   interrupts a P1/P2 and is queued behind a P3/P4), and in Talking the P2 flinch;
+ * - its `<name>Gentle` clip when `gentle` is on and one exists;
+ * - no cooldown, no repeat count and no outputs (`toSession`, `haptic`, `mood`): its reaction has no gesture
+ *   (`region` and `gesture` null), which `start` treats as quiet;
+ * - a name the director doesn't know is ignored;
+ * - the same clip input again at the instant its reaction started or was queued changes nothing (#317).
+ * bear-view sends `cuppedEar` (a mime, `MIME_CLIPS`) in MicDenied; #117 reuses it for `tooLoud`.
  */
 import type { AnimEvent, Priority, SessionEvent, SfxId } from '../app/events.ts';
 import type { Gesture } from '../input/recognizer.ts';
@@ -70,7 +98,7 @@ import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
 import type { Clip } from './clip.ts';
-import { REACTION_CLIPS } from './clips/reactions.ts';
+import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
 import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
@@ -97,16 +125,20 @@ export interface ActiveReaction {
   sfxAt: number;
   /** When it was released (s); null while held, and always for a one-shot. */
   release: number | null;
-  /** The gesture that started it: a `release` with an identity ends only its own reaction. */
-  region: RegionId;
-  gesture: GestureKind;
+  /**
+   * The gesture that started it: a `release` with an identity ends only its own reaction. Both null for a `clip`
+   * input's reaction (#115), which no gesture started.
+   */
+  region: RegionId | null;
+  gesture: GestureKind | null;
 }
 
 /** The queued reaction (queue length 1). */
 export interface QueuedReaction {
   r: Reaction;
-  region: RegionId;
-  gesture: GestureKind;
+  /** The gesture that queued it; both null for a `clip` input (#115). */
+  region: RegionId | null;
+  gesture: GestureKind | null;
   dirX: -1 | 1 | null;
   /** When it was queued (s); it is dropped if it hasn't started by `at` + 500 ms. */
   at: number;
@@ -183,11 +215,22 @@ export interface ReleaseInput {
   gesture?: GestureKind;
 }
 
+/**
+ * A clip asked for by name (#115): plays like an accepted P2 reaction, with no cooldown and no outputs (see the
+ * module comment). bear-view sends `cuppedEar` in MicDenied.
+ */
+export interface ClipInput {
+  k: 'clip';
+  name: string;
+  now: number;
+}
+
 export type DirInput =
   | { k: 'anim'; ev: AnimEvent; now: number }
   | { k: 'tick'; now: number }
   | GestureInput
   | ReleaseInput
+  | ClipInput
   | { k: 'setGentle'; on: boolean };
 
 /** What a step outputs: a reaction for `session.dispatch`, a haptic pattern, a mood bump. */
@@ -219,6 +262,8 @@ const REPEAT_COUNT = 3;
 const REPEAT_WITHIN_MS = 4000;
 /** Below this priority a reaction while Talking is a flinch only (session row 31). */
 const STOPS_PLAYBACK = 3;
+/** A `clip` input plays like an accepted reaction of this priority (#115). */
+const CLIP_PRIORITY = 2;
 
 /** The base pose of each state (#79 "Base mapping"; Reacting and Sustained are Idle's, #91). */
 const BASE_OF: { readonly [S in DirState]: BaseName } = {
@@ -264,16 +309,17 @@ const PET_MIRRORED: Clip = mirrored(REACTION_CLIPS.pet);
 /** The clips with a mirrored variant, by name: played for a stroke with `dirX` −1. */
 const MIRRORED: ReadonlyMap<string, string> = new Map([[REACTION_CLIPS.pet.name, PET_MIRRORED.name]]);
 
-/** The clips the director plays, by name: session, reaction, the flinch and the mirrored pet. */
+/** The clips the director plays, by name: session, reaction and mime (#115), the flinch and the mirrored pet. */
 const CLIPS: ReadonlyMap<string, Clip> = new Map<string, Clip>([
   ...Object.entries(SESSION_CLIPS),
   ...Object.entries(REACTION_CLIPS),
+  ...Object.entries(MIME_CLIPS),
   [FLINCH.name, FLINCH],
   [PET_MIRRORED.name, PET_MIRRORED],
 ]);
 
 /**
- * The clip the director plays under `name` (a `clip.name` or `prevClip.name`): a session or reaction clip, the
+ * The clip the director plays under `name` (a `clip.name` or `prevClip.name`): a session, reaction or mime clip, the
  * flinch or the mirrored pet; undefined for a name it doesn't know. bear-view applies its `impulses` (#221).
  */
 export function clipByName(name: string): Clip | undefined {
@@ -316,19 +362,45 @@ type Row = { readonly [K in AnimKind]: Handler<K> | 'ignore' };
 /** Where a step's outputs go; null when the caller (`directorReduce`) drops them. */
 type Out = DirOut[] | null;
 
+/** Where `writeClipEnd` puts its result (#229). */
+const END = new Float64Array(1);
 /**
- * End of `clip` on the director clock. A clip the director doesn't know has already ended. The active
- * reaction's clip ends 400 ms after its release; while held, a sustained clip never ends.
+ * The time of the tick in progress: `tick` writes it and `crossfade` reads it for that tick's `prevClip` expiry.
+ * `crossfade` sees every input kind, and reading the time from the input there makes V8 box it as a new heap number
+ * on every substep of a cut fade (#229).
  */
-function clipEnd(s: DirectorState, clip: { name: string; start: number }): number {
+const TICK_NOW = new Float64Array(1);
+
+/**
+ * Writes the end of `clip` on the director clock to `END[0]`. A clip the director doesn't know has already ended.
+ * The active reaction's clip ends 400 ms after its release; while held, a sustained clip never ends. The tick runs
+ * it every substep, so the end goes through a slot rather than a return value, which V8's mid tier boxes as a new
+ * heap number at a call it doesn't inline (#229).
+ */
+function writeClipEnd(s: DirectorState, clip: { name: string; start: number }): void {
   const c = CLIPS.get(clip.name);
-  if (c === undefined) return clip.start;
+  if (c === undefined) {
+    END[0] = clip.start;
+    return;
+  }
   const a = s.reaction;
   if (a !== null && clip.name === a.clip) {
-    if (a.release !== null) return a.release + RELEASE_S;
-    if (c.sustained === true && a.r.sustained) return Number.POSITIVE_INFINITY;
+    if (a.release !== null) {
+      END[0] = a.release + RELEASE_S;
+      return;
+    }
+    if (c.sustained === true && a.r.sustained) {
+      END[0] = Number.POSITIVE_INFINITY;
+      return;
+    }
   }
-  return clip.start + c.duration;
+  END[0] = clip.start + c.duration;
+}
+
+/** End of `clip` on the director clock (`writeClipEnd`), for the event paths. */
+function clipEnd(s: DirectorState, clip: { name: string; start: number }): number {
+  writeClipEnd(s, clip);
+  return END[0]!;
 }
 
 /**
@@ -368,8 +440,8 @@ type Transition = (s: DirectorState, _ev: unknown, now: number) => DirectorState
 const calm = (s: DirectorState): DirectorState =>
   s.reaction === null && s.queued === null ? s : { ...s, reaction: null, queued: null };
 
-const toWaking: Transition = (s, _ev, now) => enter(calm(s), 'Waking', now, { name: 'wake', start: now });
-const toAsleep: Transition = (s, _ev, now) => enter(calm(s), 'Asleep', now, { name: 'sleep', start: now });
+const toWaking: Transition = (s, _ev, now) => enter(calm(s), 'Waking', now, clipAt('wake', now));
+const toAsleep: Transition = (s, _ev, now) => enter(calm(s), 'Asleep', now, clipAt('sleep', now));
 /**
  * To Idle, or to the reaction going on there: a reaction handed to the session while Talking (queued,
  * announced) starts at `talkEnd`; an active reaction (additive until now) becomes Reacting or Sustained.
@@ -409,7 +481,7 @@ const additive = (
 ): DirectorState =>
   s.reaction !== null || (s.clip !== null && now < clipEnd(s, s.clip))
     ? s
-    : { ...s, clip: { name: ev.e, start: now } };
+    : { ...s, clip: clipAt(ev.e, now) };
 
 /** Every (state, anim event) pair (plan §3.3 design rule 5). `'ignore'` returns the same state object. */
 const TABLE: { readonly [S in DirState]: Row } = {
@@ -625,36 +697,28 @@ function isOver(s: DirectorState, a: ActiveReaction, now: number): boolean {
 /**
  * Starts `r` at `now`: outputs it (unless the session already has it), starts its cooldown, counts it, and
  * plays its clip. From the Idle family it becomes the base (Reacting/Sustained); in Attentive and Thinking it
- * is additive.
+ * is additive. A `clip` input's reaction (#115: no gesture, `region` and `gesture` null) is quiet like an announced
+ * one: no outputs, no cooldown, not counted.
  */
 function start(
   s: DirectorState,
   r: Reaction,
-  region: RegionId,
-  gesture: GestureKind,
+  region: RegionId | null,
+  gesture: GestureKind | null,
   dirX: -1 | 1 | null,
   now: number,
   out: Out,
   announced: boolean,
 ): DirectorState {
-  if (!announced) accept(out, r, r.sfx);
+  const quiet = announced || region === null || gesture === null;
+  if (!quiet) accept(out, r, r.sfx);
   const clipName = clipFor(r, s.gentle, dirX);
-  const clip = { name: clipName, start: now };
+  const clip = clipAt(clipName, now);
   const next: DirectorState = {
     ...s,
-    cooldowns: announced ? s.cooldowns : withCooldown(s.cooldowns, region, gesture, r.priority, now),
-    repeats: announced ? s.repeats : withRepeat(s.repeats, r, now),
-    reaction: {
-      r,
-      clip: clipName,
-      start: now,
-      last: now,
-      runStart: now,
-      sfxAt: now,
-      release: null,
-      region,
-      gesture,
-    },
+    cooldowns: quiet ? s.cooldowns : withCooldown(s.cooldowns, region, gesture, r.priority, now),
+    repeats: quiet ? s.repeats : withRepeat(s.repeats, r, now),
+    reaction: activeReaction(r, clipName, now, region, gesture),
   };
   if (s.name === 'Attentive' || s.name === 'Thinking') return { ...next, clip };
   return enter(next, r.sustained ? 'Sustained' : 'Reacting', now, clip);
@@ -700,14 +764,34 @@ function refresh(s: DirectorState, a: ActiveReaction, i: GestureInput, out: Out)
     def !== undefined &&
     (clip === null || clip.name !== a.clip || (def.sustained !== true && now >= clip.start + def.duration))
   )
-    clip = { name: a.clip, start: now };
+    clip = clipAt(a.clip, now);
   let sfxAt = a.sfxAt;
   const loop = a.r.sfxLoopMs;
   if (!talking && a.r.sfx !== null && loop !== undefined && now >= a.sfxAt + loop / 1000) {
     toSession(out, a.r, a.r.sfx);
     sfxAt = now;
   }
+  // A refresh at the instant of the last one changes nothing: `s` itself (#317).
+  if (clip === s.clip && now === a.last && runStart === a.runStart && sfxAt === a.sfxAt) return s;
   return { ...s, clip, reaction: { ...a, last: now, runStart, sfxAt } };
+}
+
+/**
+ * `s` with `q` queued, or `s` itself when an equal reaction is already queued at the same instant (#317): a repeated
+ * input then changes nothing. The reaction is equal when it is the same object, or, for two clip inputs (no
+ * gesture), has the same name, as `clipReaction` builds it from the name alone.
+ */
+function withQueued(s: DirectorState, q: QueuedReaction): DirectorState {
+  const o = s.queued;
+  const same =
+    o !== null &&
+    (o.r === q.r || (o.region === null && q.region === null && o.r.name === q.r.name)) &&
+    o.region === q.region &&
+    o.gesture === q.gesture &&
+    o.dirX === q.dirX &&
+    o.at === q.at &&
+    o.announced === q.announced;
+  return same ? s : { ...s, queued: q };
 }
 
 /** A gesture's reaction (see the module comment for the rules, in this order). */
@@ -736,21 +820,70 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
   const st = repeats === s.repeats ? s : { ...s, repeats };
   if (st.name === 'Talking') {
     if (live !== null && r.priority >= STOPS_PLAYBACK && r.priority < live.r.priority)
-      return { ...st, queued: { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false } };
+      return withQueued(st, { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false });
     const cooldowns = withCooldown(st.cooldowns, i.region, i.gesture, r.priority, now);
     const counted = withRepeat(st.repeats, r, now);
     if (r.priority < STOPS_PLAYBACK) {
       accept(out, r, null);
       const free = st.clip === null || now >= clipEnd(st, st.clip);
-      return { ...st, cooldowns, repeats: counted, clip: free ? { name: FLINCH.name, start: now } : st.clip };
+      return { ...st, cooldowns, repeats: counted, clip: free ? clipAt(FLINCH.name, now) : st.clip };
     }
     accept(out, r, r.sfx);
     const queued = { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: true };
     return { ...st, cooldowns, repeats: counted, queued };
   }
   if (live !== null && r.priority < live.r.priority)
-    return { ...st, queued: { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false } };
+    return withQueued(st, { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false });
   return start(st, r, i.region, i.gesture, dirX, now, out, false);
+}
+
+/** The reaction a `clip` input plays (#115): P2, one-shot, silent; with its `<name>Gentle` clip when there is one. */
+function clipReaction(name: string): Reaction {
+  const r: Reaction = { name, priority: CLIP_PRIORITY, sfx: null, clip: name, sustained: false };
+  const gentle = `${name}Gentle`;
+  if (CLIPS.has(gentle)) r.gentleClip = gentle;
+  return r;
+}
+
+/**
+ * A `clip` input (#115; the module comment has the rules): gated like a gesture, then a flinch while Talking, queued
+ * behind a higher priority, otherwise started; `start` keeps it quiet (no gesture), so nothing reaches `out`.
+ */
+function onClip(s0: DirectorState, i: ClipInput, out: Out): DirectorState {
+  if (s0.name === 'Asleep' || s0.name === 'Waking' || !CLIPS.has(i.name)) return s0;
+  const now = i.now;
+  const s = s0.name === 'Dozing' ? enter(s0, 'Idle', now) : s0;
+  if (s.name === 'Talking') {
+    const free = s.clip === null || now >= clipEnd(s, s.clip);
+    return free ? { ...s, clip: clipAt(FLINCH.name, now) } : s;
+  }
+  const r = clipReaction(i.name);
+  const live = s.reaction !== null && !isOver(s, s.reaction, now) ? s.reaction : null;
+  if (live !== null && r.priority < live.r.priority)
+    return withQueued(s, { r, region: null, gesture: null, dirX: null, at: now, announced: false });
+  return playsFrom(s, i.name, clipFor(r, s.gentle, null), now)
+    ? s
+    : start(s, r, null, null, null, now, out, false);
+}
+
+/**
+ * Whether `s` already plays the reaction of a `clip` input for `name` (clip `clipName`) from `now` (#317): `start`
+ * would then build a new state equal to `s`, so a repeated clip input at the same instant returns `s` itself.
+ */
+function playsFrom(s: DirectorState, name: string, clipName: string, now: number): boolean {
+  const a = s.reaction;
+  const c = s.clip;
+  return (
+    a !== null &&
+    a.region === null &&
+    a.r.name === name &&
+    a.clip === clipName &&
+    a.start === now &&
+    c !== null &&
+    c.name === clipName &&
+    c.start === now &&
+    (s.name === 'Attentive' || s.name === 'Thinking' || (s.name === 'Reacting' && s.since === now))
+  );
 }
 
 /**
@@ -782,28 +915,47 @@ function release(s: DirectorState, i: ReleaseInput, out: Out): DirectorState {
  * It runs once per 120 Hz substep, so it takes the input itself rather than its time: the smoke's path (no
  * reaction, no clip) passes no double across a call, which V8's mid tier would box (#229, the frame-allocation
  * smoke of #214). A non-finite time changes nothing: `t − t` is 0 for every finite `t` and NaN otherwise, a check
- * that, unlike `Number.isFinite`, needs no call.
+ * that, unlike `Number.isFinite`, needs no call. With a clip in the slot or a one-shot reaction on, no double crosses a
+ * call either: the clip end comes back through `END`, `isOver` is written out, and the time reaches `crossfade`
+ * through `TICK_NOW` (#229).
  */
 function tick(s: DirectorState, i: { readonly now: number }, out: Out): DirectorState {
   const now = i.now;
+  TICK_NOW[0] = now;
   if (now - now !== 0) return s;
   const a = s.reaction;
-  if (a !== null && (a.release !== null ? now >= a.release + RELEASE_S : !a.r.sustained && isOver(s, a, now)))
-    return endReaction(s, a, now, out);
+  if (a !== null) {
+    // isOver(s, a, now), written out: a call V8 doesn't inline boxes the double `now` (#229).
+    let over = false;
+    if (a.release !== null) over = now >= a.release + RELEASE_S;
+    else if (!a.r.sustained) {
+      const c = s.clip;
+      if (c === null || c.name !== a.clip) over = true;
+      else {
+        writeClipEnd(s, c);
+        over = now >= END[0]!;
+      }
+    }
+    if (over) return endReaction(s, a, now, out);
+  }
   const q = s.queued;
   if (q !== null && now > q.at + QUEUE_S) return { ...s, queued: null };
-  if (s.clip !== null && now < clipEnd(s, s.clip)) return s;
+  const c = s.clip;
+  if (c !== null) {
+    writeClipEnd(s, c);
+    if (now < END[0]!) return s;
+  }
   if (s.name === 'Waking') return enter(s, 'Idle', now, null);
   return s.clip === null ? s : { ...s, clip: null };
 }
 
 /**
  * One step of the director. Pure: it never mutates `s`, and returns `s` itself when nothing changes. A tick,
- * gesture or release at a non-finite time changes nothing (a NaN release would otherwise never end; `tick`
+ * gesture, release or clip at a non-finite time changes nothing (a NaN release would otherwise never end; `tick`
  * checks its own).
  */
 function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
-  if ((i.k === 'gesture' || i.k === 'release') && i.now - i.now !== 0) return s;
+  if ((i.k === 'gesture' || i.k === 'release' || i.k === 'clip') && i.now - i.now !== 0) return s;
   switch (i.k) {
     case 'tick':
       return tick(s, i, out);
@@ -816,11 +968,75 @@ function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
       return onGesture(s, i, out);
     case 'release':
       return release(s, i, out);
+    case 'clip':
+      return onClip(s, i, out);
     case 'setGentle':
       return s.gentle === i.on ? s : { ...s, gentle: i.on };
     default:
       return s; // an input kind the types don't know
   }
+}
+
+// ---- hidden classes (#281; see the module doc) ------------------------------------------------------------
+/** Every `clip` slot object is a copy of this, so they all share its hidden class, which it keeps alive. */
+export const CLIP_TEMPLATE: Readonly<NonNullable<DirectorState['clip']>> = { name: '', start: Number.NaN };
+
+/** Every `reaction` is a copy of this (or a spread of one), so they all share its hidden class: a real reaction. */
+export const REACTION_TEMPLATE: Readonly<ActiveReaction> = {
+  r: REACTIONS['tuftBoing']!,
+  clip: '',
+  start: Number.NaN,
+  last: Number.NaN,
+  runStart: Number.NaN,
+  sfxAt: Number.NaN,
+  release: null,
+  region: null,
+  gesture: null,
+};
+
+/** Every `prevClip` is a copy of this, so they all share its hidden class, which it keeps alive. */
+export const CUT_CLIP_TEMPLATE: Readonly<NonNullable<DirectorState['prevClip']>> = {
+  name: '',
+  start: Number.NaN,
+  cutAt: Number.NaN,
+  release: null,
+};
+
+/** A `clip` slot object: `CLIP_TEMPLATE` with both fields set. */
+function clipAt(name: string, clipStart: number): NonNullable<DirectorState['clip']> {
+  return { ...CLIP_TEMPLATE, name, start: clipStart };
+}
+
+/** A started reaction: `REACTION_TEMPLATE` with every field set. */
+function activeReaction(
+  r: Reaction,
+  clipName: string,
+  now: number,
+  region: RegionId | null,
+  gesture: GestureKind | null,
+): ActiveReaction {
+  return {
+    ...REACTION_TEMPLATE,
+    r,
+    clip: clipName,
+    start: now,
+    last: now,
+    runStart: now,
+    sfxAt: now,
+    release: null,
+    region,
+    gesture,
+  };
+}
+
+/** A `prevClip` (#240): `CUT_CLIP_TEMPLATE` with every field set. */
+function cutClip(
+  name: string,
+  clipStart: number,
+  cutAt: number,
+  releasedAt: number | null,
+): NonNullable<DirectorState['prevClip']> {
+  return { ...CUT_CLIP_TEMPLATE, name, start: clipStart, cutAt, release: releasedAt };
 }
 
 /** Scratch poses for `crossfade`'s choice at a second cut (#240): the pose before it, and with each choice. */
@@ -856,7 +1072,7 @@ function poseJump(a: Pose, b: Pose): number {
  *   (1 − k)·|cut − incoming|, never more than a plain cut, so the choice never pops worse than no crossfade.
  * - **Expiry:** the first tick at or after `cutAt` + 100 ms clears `prevClip`.
  * Otherwise it returns `next` itself. A step that changes nothing, with no `prevClip`, returns at the first line
- * and reads no time (the frame's quiet tick, #229).
+ * and reads no time (the frame's quiet tick, #229). The expiry reads a tick's time from `TICK_NOW`, not `i.now`.
  */
 function crossfade(s: DirectorState, next: DirectorState, i: DirInput): DirectorState {
   if (next === s && s.prevClip === null) return s;
@@ -868,15 +1084,16 @@ function crossfade(s: DirectorState, next: DirectorState, i: DirInput): Director
     const a = s.reaction;
     const releasedAt = a !== null && a.release !== null && a.clip === old.name ? a.release : null;
     const now = i.now;
-    const cut = { ...next, prevClip: { name: old.name, start: old.start, cutAt: now, release: releasedAt } };
+    const cut = { ...next, prevClip: cutClip(old.name, old.start, now, releasedAt) };
     const q = s.prevClip;
     if (q === null || now >= q.cutAt + CUT_S) return cut;
     evaluate(s, now, CUT_FROM);
     const keepJump = poseJump(evaluate(next, now, CUT_KEEP), CUT_FROM);
     return keepJump <= poseJump(evaluate(cut, now, CUT_NEW), CUT_FROM) ? next : cut;
   }
+  // A tick's time is `TICK_NOW[0]`: `tick` has just written it (directorStep and directorReduce run it first).
   const p = next.prevClip;
-  return p !== null && i.k === 'tick' && i.now >= p.cutAt + CUT_S ? { ...next, prevClip: null } : next;
+  return p !== null && i.k === 'tick' && TICK_NOW[0]! >= p.cutAt + CUT_S ? { ...next, prevClip: null } : next;
 }
 
 /** The outputs of the step in progress (`directorStep` is not re-entrant). */
@@ -905,6 +1122,9 @@ export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
   return crossfade(s, i.k === 'tick' ? tick(s, i, null) : step(s, i, null), i);
 }
 
+/** `evaluate`'s time, for `evaluateFrom`. */
+const EVAL_NOW = new Float64Array(1);
+
 /**
  * Writes the director's pose at `now` into `out` and returns `out`: the crossfade
  * `prevBase + (base − prevBase)·t`, `t = clamp((now − fadeStart)/0.15, 0, 1)`, plus the active clip's sample;
@@ -920,6 +1140,23 @@ export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
  * Never allocates.
  */
 export function evaluate(s: DirectorState, now: number, out: Pose, mouth = false): Pose {
+  EVAL_NOW[0] = now;
+  return evaluateFrom(s, EVAL_NOW, 0, out, mouth);
+}
+
+/**
+ * `evaluate(s, clock[at], out, mouth)`: the time is read from a `Float64Array` slot rather than passed, because
+ * V8's mid tier boxes a double passed to a call it doesn't inline (#229). bear-view calls it every frame with its
+ * director clock slot. Never allocates.
+ */
+export function evaluateFrom(
+  s: DirectorState,
+  clock: Readonly<Float64Array>,
+  at: number,
+  out: Pose,
+  mouth = false,
+): Pose {
+  const now = clock[at]!;
   const a = BASE[s.prevBase];
   const b = BASE[s.base];
   const f = (now - s.fadeStart) / CROSSFADE_S;

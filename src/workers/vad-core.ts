@@ -6,7 +6,8 @@
 // - energy (M1, and the fallback): the frames are band-limited and carved into 10 ms hops across frame
 //   boundaries; each hop steps the adaptive energy gate and the segmenter. A segment ends as a `misfire`
 //   instead of an `end` unless at least 60 ms of its hops were voiced (normalised autocorrelation over the
-//   last 512 band-limited samples, plan §4.2.1 step 5).
+//   last 512 band-limited samples, plan §4.2.1 step 5); a capped one keeps reason 'maxLength' and its voiced
+//   ratio (#289), so the session counts it as a noisy cap.
 // - Silero (once `setModel` has handed over the model): each raw frame's speech probability steps the
 //   segmenter. The energy gate still runs on every hop, for `level`, the floor and `floorSnapshot`. A model
 //   that throws switches the epoch to energy (an open segment ends as a `misfire`). The optional pre-gate
@@ -15,6 +16,15 @@
 //   Proximity gate (plan §4.2.2): a Silero `end` (silence or maxLength) becomes a `misfire` unless the power
 //   mean of the band-limited hop levels over the segment's speech frames is at least X dB (`proximityDb`,
 //   default PROXIMITY_DB) above the floor its `floorSnapshot` carried at the onset.
+//
+// Voiced ratio (#116, plan §4.4): the voicing score is computed only for hops inside a segment (and for every hop
+// while the trace is on), never on idle hops, and recorded with the segmenter's `segmenterVoicing`, so every `end`
+// carries the fraction of voiced hops. Energy: the hops from the start hop to the end hop, inclusive (the same
+// hops the ≥ 60 ms voiced rule counts). Silero: a frame's hops are stepped before its Silero step (the pre-gate
+// needs them), so the hops of the segment's frames after its start frame, through its end frame.
+//
+// Noisy room (#116, plan §4.4): `reset`'s `marginBoostDb` (0 when omitted) raises the energy gate's onset and
+// offset margins and the proximity X by that many dB for the epoch.
 //
 // Feature trace (`setTrace`, for lab/vad-trace and the debug overlay; plan §7 M2): while it is on, every hop's
 // raw (unfiltered) and band-limited dB and voicing score, and every Silero frame's p (the model's output, before
@@ -56,6 +66,7 @@ import {
   energyGateStep,
   frameDb,
   initialEnergyGateState,
+  type EnergyGateParams,
   type EnergyGateState,
   type FrameFeatures,
 } from '../dsp/energy-gate.ts';
@@ -64,6 +75,8 @@ import {
   ENERGY_SEG_PARAMS,
   initialSegState,
   segmenterStep,
+  segmenterVoicing,
+  segmentVoicedRatio,
   SILERO_SEG_PARAMS,
   type SegEvent,
   type SegState,
@@ -119,6 +132,8 @@ const HOP_MS = (ENERGY_HOP * 1000) / VAD_RATE;
 export interface VadCoreOptions {
   /** Clock for the inference timings, in ms (default `performance.now()`). */
   now?: () => number;
+  /** The voicing scorer (default `createVoicing(VAD_RATE)`); a test seam that can count its calls. */
+  voicing?: Voicing;
 }
 
 const defaultNow = (): number => performance.now();
@@ -144,7 +159,9 @@ export class VadCore {
   private readonly rawHop = new Float32Array(ENERGY_HOP);
   /** Reused per hop; the gate reads `db` only. */
   private readonly features: FrameFeatures = { frame: 0, db: 0, floorDb: Number.NaN };
-  private readonly voicing: Voicing = createVoicing(VAD_RATE);
+  private readonly voicing: Voicing;
+  /** The energy gate's parameters for this epoch: DEFAULT_ENERGY_PARAMS with the margins raised by the boost. */
+  private readonly gateParams: EnergyGateParams = { ...DEFAULT_ENERGY_PARAMS };
   /** The most recent VOICING_WINDOW gate-filtered samples, oldest first (zeros at the start of an epoch). */
   private readonly voiceWin = new Float32Array(VOICING_WINDOW);
   /** Pre-gate ring of skipped raw frames: PREGATE_WARMUP_FRAMES views over one buffer. */
@@ -202,8 +219,6 @@ export class VadCore {
   private lastFirstFrame = 0;
   /** Hops (energy) or frames (Silero) starting before this ctx frame get prob 0 (onset block). */
   private onsetBlockEnd = 0;
-  /** Energy path: voiced hops of the current segment, from its `start` hop on. */
-  private voicedHops = 0;
   /** Pre-gate ring: index of the oldest skipped frame, and how many are held. */
   private ringStart = 0;
   private ringCount = 0;
@@ -219,6 +234,7 @@ export class VadCore {
     this.ctxRate = ctxRate;
     this.post = post;
     this.now = opts?.now ?? defaultNow;
+    this.voicing = opts?.voicing ?? createVoicing(VAD_RATE);
     this.onsetBlockFrames = Math.round((ONSET_BLOCK_MS / 1000) * ctxRate);
     this.frameCtx = (VAD_FRAME * ctxRate) / VAD_RATE;
     this.filter = createGateFilter(VAD_RATE);
@@ -245,7 +261,6 @@ export class VadCore {
       m.reset();
       this.silero = m;
       this.seg = initialSegState(); // Silero steps are 32 ms, energy steps 10 ms: the step count can't carry
-      this.voicedHops = 0;
       this.ringStart = 0;
       this.ringCount = 0;
       this.closedFrames = 0;
@@ -268,8 +283,9 @@ export class VadCore {
    * and so is the model's LSTM state. The epoch runs on Silero iff `vad === 'silero'` and a model is set; a
    * Silero request without a model posts SILERO_NOT_READY_MESSAGE and runs on energy. `pregate === true`
    * enables the pre-gate. `proximityDb` is the proximity gate's X for the epoch's Silero segments
-   * (PROXIMITY_DB when undefined or NaN). With the trace on, the previous epoch's partial batch is flushed
-   * first.
+   * (PROXIMITY_DB when undefined or NaN). `marginBoostDb` (#116; 0 when undefined or not finite) is added to the
+   * energy gate's onset and offset margins and to X. With the trace on, the previous epoch's partial batch is
+   * flushed first.
    */
   reset(
     epoch: number,
@@ -277,6 +293,7 @@ export class VadCore {
     restoreFloorDb?: number,
     pregate?: boolean,
     proximityDb?: number,
+    marginBoostDb?: number,
   ): void {
     if (this.traceOn) this.flushTrace();
     this.epoch = epoch;
@@ -289,10 +306,13 @@ export class VadCore {
     this.epochStartFrame = null;
     this.onsetBlockEnd = 0;
     this.voiceWin.fill(0);
-    this.voicedHops = 0;
     this.requested = vad;
     this.pregate = pregate === true;
-    this.proximityDb = proximityDb === undefined || Number.isNaN(proximityDb) ? PROXIMITY_DB : proximityDb;
+    const boost = marginBoostDb !== undefined && Number.isFinite(marginBoostDb) ? marginBoostDb : 0;
+    this.gateParams.onsetMarginDb = DEFAULT_ENERGY_PARAMS.onsetMarginDb + boost;
+    this.gateParams.offsetMarginDb = DEFAULT_ENERGY_PARAMS.offsetMarginDb + boost;
+    this.proximityDb =
+      (proximityDb === undefined || Number.isNaN(proximityDb) ? PROXIMITY_DB : proximityDb) + boost;
     this.onsetFloorDb = Number.NaN;
     this.failed = false;
     this.ringStart = 0;
@@ -365,9 +385,16 @@ export class VadCore {
       const speechMs = (s.lastSpeechStep - s.startStep + 1) * params.frameMs;
       const passes =
         speechMs >= params.minSpeechMs &&
-        (silero ? this.nearEnough(s.lastSpeechFrame) : this.voicedHops * HOP_MS >= MIN_VOICED_MS);
+        (silero ? this.nearEnough(s.lastSpeechFrame) : s.voicedHops * HOP_MS >= MIN_VOICED_MS);
+      // The voiced ratio of the hops recorded before the gap (the dropped partial hop never counts).
       const ev: SegEvent = passes
-        ? { kind: 'end', frame, lastSpeechFrame: s.lastSpeechFrame, reason: 'silence' }
+        ? {
+            kind: 'end',
+            frame,
+            lastSpeechFrame: s.lastSpeechFrame,
+            reason: 'silence',
+            voicedRatio: segmentVoicedRatio(s),
+          }
         : { kind: 'misfire', frame };
       this.emit(epoch, ev, this.gate.initialized ? this.gate.floorDb : Number.NaN);
     }
@@ -390,7 +417,7 @@ export class VadCore {
     const f = this.features;
     f.frame = ctxFrame;
     f.db = db;
-    energyGateStep(gate, f, DEFAULT_ENERGY_PARAMS);
+    energyGateStep(gate, f, this.gateParams);
     const floorDb = gate.initialized ? gate.floorDb : Number.NaN;
     f.floorDb = floorDb;
     const j = this.hopCount % PROXIMITY_HISTORY_HOPS;
@@ -400,8 +427,14 @@ export class VadCore {
     win.copyWithin(0, ENERGY_HOP);
     win.set(this.hop, VOICING_WINDOW - ENERGY_HOP);
     const energyPath = this.silero === null;
-    // The trace needs the score on the Silero path too; it is the same score the energy path uses.
-    const score = energyPath || this.traceOn ? this.voicing.score(win) : 0;
+    const seg = this.seg;
+    const prob = energyPath && gate.active && ctxFrame >= this.onsetBlockEnd ? 1 : 0;
+    // Voicing is scored only for hops inside a segment (#116): on energy the hop that starts one (prob ≥ the
+    // threshold while idle) and every hop of an open one; on Silero the hops of an open one. The trace needs the
+    // score on every hop of both backends; it is the same score.
+    const inSegment = seg.inSpeech || (energyPath && prob >= ENERGY_SEG_PARAMS.posThreshold);
+    const score = inSegment || this.traceOn ? this.voicing.score(win) : 0;
+    const voiced = score > VOICED_THRESHOLD;
     if (this.traceOn) {
       const k = this.trHops;
       this.trRaw[k] = frameDb(this.rawHop, 0, ENERGY_HOP);
@@ -411,16 +444,22 @@ export class VadCore {
       this.trHops = k + 1;
     }
     if (energyPath) {
-      const voiced = score > VOICED_THRESHOLD;
-      const prob = gate.active && ctxFrame >= this.onsetBlockEnd ? 1 : 0;
-      const wasInSpeech = this.seg.inSpeech;
-      let ev: SegEvent | null = segmenterStep(this.seg, ENERGY_SEG_PARAMS, ctxFrame, prob);
-      if (ev !== null && ev.kind === 'start') this.voicedHops = voiced ? 1 : 0;
-      else if (wasInSpeech && voiced) this.voicedHops++;
-      if (ev !== null && ev.kind === 'end' && this.voicedHops * HOP_MS < MIN_VOICED_MS) {
-        ev = { kind: 'misfire', frame: ev.frame }; // plan §4.2.1 step 5: an utterance needs ≥ 60 ms voiced
+      // A continuing or ending hop is recorded before the step, so the end's ratio counts it; the start hop
+      // after the step that opens the segment.
+      if (seg.inSpeech) segmenterVoicing(seg, voiced);
+      let ev: SegEvent | null = segmenterStep(seg, ENERGY_SEG_PARAMS, ctxFrame, prob);
+      if (ev !== null && ev.kind === 'start') segmenterVoicing(seg, voiced);
+      if (ev !== null && ev.kind === 'end' && seg.voicedHops * HOP_MS < MIN_VOICED_MS) {
+        // plan §4.2.1 step 5: an utterance needs ≥ 60 ms voiced. #289: a capped one keeps its reason and voiced
+        // ratio, so the session counts it as a noisy cap (plan §4.4); every other misfire carries neither.
+        ev =
+          ev.reason === 'maxLength'
+            ? { kind: 'misfire', frame: ev.frame, reason: 'maxLength', voicedRatio: segmentVoicedRatio(seg) }
+            : { kind: 'misfire', frame: ev.frame };
       }
       if (ev !== null) this.emit(epoch, ev, floorDb);
+    } else if (inSegment) {
+      segmenterVoicing(seg, voiced); // Silero: a hop of a frame after the start frame, through the end frame
     }
     if (this.hopCount % LEVEL_EVERY_HOPS === 0) {
       this.post({ t: 'level', epoch, frame: ctxFrame, db, floorDb });
@@ -460,7 +499,6 @@ export class VadCore {
       this.silero = null;
       this.failed = true;
       this.seg = initialSegState();
-      this.voicedHops = 0;
       this.ringStart = 0;
       this.ringCount = 0;
       return;

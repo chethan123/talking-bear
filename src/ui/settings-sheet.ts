@@ -18,8 +18,8 @@
 //
 // "For parents" (#114, plan §7 M8, §4.5, §2, §11), the section before Close, holds the sheet's only text:
 // - "Try the microphone again", which closes the sheet and then dispatches `settingsRetry` (the session acts on it
-//   only in MicDenied, plan §3.4 row 10; retrying lives here, never on the child-facing mic help), and how to allow
-//   the microphone in Chrome's site settings, as plain text;
+//   in MicDenied, plan §3.4 row 10, and in Asleep, where it wakes as a tap does, #266; retrying lives here, never
+//   on the child-facing mic help), and how to allow the microphone in Chrome's site settings, as plain text;
 // - M6's Install (issue #98, plan §4.5, §4.7), shown only while an install prompt is available, and
 //   "New version – restart", enabled only while an update is ready (and ignored while Recording, Processing or
 //   Playing, like the gear);

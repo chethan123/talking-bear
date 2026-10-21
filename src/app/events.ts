@@ -36,7 +36,15 @@ export type AnimEvent =
   | { e: 'earTwitch' }
   | { e: 'shrug' }
   | { e: 'reaction'; name: string; priority: Priority };
-export type Overlay = 'tapToWake' | 'parentPermission' | 'micHelp' | 'micMuted' | 'tooNoisy' | 'error' | null;
+export type Overlay =
+  | 'tapToWake'
+  | 'parentPermission'
+  | 'micHelp'
+  | 'micMuted'
+  | 'tooNoisy'
+  | 'holdToTalk' // #116: the hold-to-talk button (Listening and Recording in hold-to-talk mode)
+  | 'error'
+  | null;
 
 export type SessionEvent =
   | { t: 'tapBear' }
@@ -54,7 +62,8 @@ export type SessionEvent =
   | { t: 'floorSnapshot'; epoch: number; floorDb: number }
   | { t: 'clipReady'; epoch: number; id: number }
   | { t: 'takeFailed'; epoch: number; id: number }
-  | { t: 'processed'; id: number; durationSec: number }
+  // `clipped`: the worker's clipping flag (plan §4.4): the take had ≥ 0.1 % of its samples at |x| > 0.99 (#117).
+  | { t: 'processed'; id: number; durationSec: number; clipped: boolean }
   | { t: 'fxError'; id: number }
   | { t: 'playbackAtSpeakerEnded'; id: number }
   | { t: 'sfxAtSpeakerEnded'; seq: number }
@@ -69,9 +78,15 @@ export type SessionEvent =
   | { t: 'pagehide' }
   | { t: 'freeze' }
   | { t: 'visible' }
-  | { t: 'updateReady' }
+  | { t: 'updateReady'; activated?: true } // activated: another tab activated the update (#277)
   // M3 settings (issue #66): the voice preset the next `process` uses. Every state updates `preset`, no effects.
-  | { t: 'settingsChanged'; preset: VoicePreset };
+  | { t: 'settingsChanged'; preset: VoicePreset }
+  // #116, #289, plan §4.4: the background level estimate (effects.ts: at most once per second, from Listening
+  // levels and from Recording levels after NOISE_FLOOR_RECORDING_HOLDOFF_MS); every state updates `tooNoisy`.
+  | { t: 'noiseFloor'; floorDb: number }
+  // #116: the hold-to-talk button pressed / released, at ctx frame `frame` (the capture worklet's frame clock).
+  | { t: 'holdStart'; frame: number }
+  | { t: 'holdEnd'; frame: number };
 export type EventType = SessionEvent['t'];
 
 // Plan §3.3, plus `seq` on sfx and `applyUpdate`.
@@ -81,7 +96,7 @@ export type Effect =
   | { k: 'resumeCtx' }
   | { k: 'suspendCtx' }
   | { k: 'restartWorker' }
-  | { k: 'arm'; epoch: number; restoreFloorDb?: number }
+  | { k: 'arm'; epoch: number; restoreFloorDb?: number; marginBoostDb?: number } // marginBoostDb: only when > 0
   | { k: 'disarm'; epoch: number }
   | { k: 'take'; epoch: number; id: number; fromFrame: number; toFrame: number }
   | { k: 'process'; id: number; preset: VoicePreset }
@@ -112,13 +127,30 @@ export interface SessionState {
   micMuted: boolean;
   reselectPending: boolean;
   workerRestarts: number;
-  capHits: number;
+  /**
+   * #116, plan §4.4: consecutive capped takes with a low voiced ratio (row 20's noisy counter), and capped energy
+   * misfires with one (row 21, #289). At 3 the margins rise (`marginBoostDb`), then hold-to-talk takes over.
+   */
+  noisyCaps: number;
+  /** #116: the latest `noiseFloor` was above −35 dBFS; Listening and Recording show the too-noisy badge (#289). */
+  tooNoisy: boolean;
+  /** #116: the dB the worker adds to its energy margins and proximity X, carried by every Listening `arm`. */
+  marginBoostDb: 0 | 3 | 6;
+  /** #116: hold-to-talk mode: `seg` events are ignored and the hold button records. Entering Asleep clears it. */
+  holdToTalk: boolean;
   sfxSeq: number;
   sfxEndedSeq: number;
   /** A MicDenied reaction played an sfx since the last Waking completion (D22). */
   micDeniedSfx: boolean;
   updateReady: boolean;
+  /**
+   * Another tab activated the update: this page runs old code, so an Asleep wake reloads it instead (#277).
+   * Implies `updateReady`; only C11 clears it.
+   */
+  updateActivated: boolean;
   preset: VoicePreset;
+  /** #117: the latest accepted `processed` take was clipped; row 28 then adds the tooLoud reaction. */
+  lastClipped: boolean;
 }
 
 export interface SessionConfig {

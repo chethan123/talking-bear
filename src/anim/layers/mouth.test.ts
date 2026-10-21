@@ -330,6 +330,20 @@ describe('MouthLayer sync (Validation 2)', () => {
     expect(layer.clipTime).toBeCloseTo(-0.86, 12);
   });
 
+  it('readClipTime copies clipTime into a slot: NaN before the first update, the clip time after (#229)', () => {
+    const layer = new MouthLayer();
+    const out = new Float64Array(3);
+    layer.setClip(ENV, 9.9);
+    layer.readClipTime(out, 1);
+    expect(out[1]).toBeNaN();
+    for (const t of [9.0, 10.0, 10.25, 13.0]) {
+      layer.update(createPose(), fakeClock(t).ctx, () => 1000);
+      layer.readClipTime(out, 2);
+      expect(Object.is(out[2], layer.clipTime)).toBe(true);
+    }
+    expect([out[0], out[1]]).toEqual([0, Number.NaN]);
+  });
+
   it('L moves the whole sample, head bob and brows included: L = 40 at T is L = 0 at T + 0.04', () => {
     const env = makeEnv({ jaw: BROW_JAW });
     const withL = new MouthLayer(40);

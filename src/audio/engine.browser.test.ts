@@ -621,6 +621,10 @@ describe('engine (Browser Mode, fake media)', () => {
     await rec.waitFor('micGranted', 0, 5000);
     e.arm(1);
     await rec.waitFor('armed', 0, 3000, (ev) => ev.epoch === 1);
+    // `armed` comes from the worklet. The 1 s (#49 Validation 2) is the trace's own latency, so it starts once the
+    // worker is live too (a level of epoch 1: init and reset handled, frames consumed). A new worker's startup
+    // (its module graph from the dev server) gets the 3 s that test 13 gives a restarted one.
+    await rec.waitFor('level', 0, 3000, (ev) => ev.epoch === 1);
 
     let from = rec.log.length;
     const t0 = performance.now();
@@ -640,14 +644,18 @@ describe('engine (Browser Mode, fake media)', () => {
     expect(b.inferMs).toHaveLength(b.sileroP.length);
     expect(Number.isNaN(b.sil0Frame)).toBe(b.sileroP.length === 0);
     const second = await rec.waitFor('traceBatch', first.index + 1, 1000, (ev) => ev.epoch === 1);
-    const hops25 = (25 * sr) / 100;
+    // This engine's own rate, so the test also runs alone (`-t "20:"`) without test 1 setting `sr`.
+    const rate = e.context()?.sampleRate ?? 0;
+    expect(rate).toBeGreaterThan(0);
+    const hops25 = (25 * rate) / 100;
     expect(Math.abs(second.event.hop0Frame - b.hop0Frame - hops25)).toBeLessThanOrEqual(1);
 
     // A new worker gets the setting after its init: no second setTrace(true).
     from = rec.log.length;
     e.restartWorker();
     e.arm(2);
-    await rec.waitFor('traceBatch', from, 1500, (ev) => ev.epoch === 2);
+    await rec.waitFor('level', from, 3000, (ev) => ev.epoch === 2); // the new worker is live (test 13's budget)
+    await rec.waitFor('traceBatch', from, 1000, (ev) => ev.epoch === 2);
 
     // Off: the partial batch (and any batch already on its way) may still arrive, then nothing.
     e.setTrace(false);
@@ -655,5 +663,5 @@ describe('engine (Browser Mode, fake media)', () => {
     from = rec.log.length;
     await sleep(600);
     expect(rec.count('traceBatch', from)).toBe(0);
-  }, 15_000);
+  }, 20_000);
 });

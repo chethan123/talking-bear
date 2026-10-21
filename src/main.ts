@@ -3,7 +3,8 @@
 // (BearView: Juni on the canvas stage, driven by the session's `anim` effects and the replay's processed envelope,
 // and touched through the pointer input: adapter → recogniser → reactions table → director → session), the M1 text
 // overlays and the settings sheet (M3, M8: behind a 1 s press of the gear), with `data-state` on main#app for
-// hook-free smoke tests (plan §4.9.3).
+// hook-free smoke tests (plan §4.9.3), and the §4.10 performance marks (#122, src/perf.ts).
+import './security/tt-policy.ts'; // first: the Trusted Types default policy must exist before any sink call
 import './ui/styles.css';
 import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
 import type { Overlay, SessionState, StateName } from './app/events.ts';
@@ -23,6 +24,11 @@ import { createWakeLock } from './platform/wake-lock.ts';
 import { setupPwa } from './pwa/register.ts';
 import { mountOverlay } from './ui/overlay.ts';
 import { mountSettingsSheet, type SettingsSheet } from './ui/settings-sheet.ts';
+import { markBootStart, readPerfMeasures } from './perf.ts';
+
+// #122: the start of `first-frame`, the first statement of this module's body (its static imports, hoisted, have
+// already been fetched and evaluated).
+markBootStart();
 
 const noop = (): void => {};
 
@@ -164,8 +170,10 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     onApplyUpdate: () => pwa.applyUpdate(),
   });
   opts.onSession?.(session);
-  // An update found before the session existed (its relayed dispatch was dropped).
-  if (pwa.updateReady()) session.dispatch({ t: 'updateReady' });
+  // An update found before the session existed (its relayed dispatch was dropped), with its activated flag (#277).
+  if (pwa.updateReady()) {
+    session.dispatch(pwa.activatedElsewhere() ? { t: 'updateReady', activated: true } : { t: 'updateReady' });
+  }
 
   // E2E hooks (plan §4.9.3): dead-code-eliminated from production builds, where the flag is unset. Installed
   // before the UI is mounted, so no pointer input can reach the session before the hooks are listening.
@@ -211,7 +219,16 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     applyMotion();
   });
 
-  showOverlay = mountOverlay(app, (e) => s.dispatch(e));
+  // The hold-to-talk button (#116) stamps its holdStart / holdEnd with the context's frame clock, the capture
+  // worklet's `currentFrame` domain the takes are cut in (plan §3.1); before the context exists it does nothing.
+  showOverlay = mountOverlay(
+    app,
+    (e) => s.dispatch(e),
+    () => {
+      const ctx = engine.context();
+      return ctx === null ? null : Math.round(ctx.currentTime * ctx.sampleRate);
+    },
+  );
   sheet = mountSettingsSheet(app, {
     store: settings,
     bus: { setQuiet: (on) => engine.setQuiet(on) },
@@ -227,16 +244,19 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     },
   });
 
-  // Developer overlay (plan §7 M2, M4, M5, M6): the frame loop's p95 frame time and fps, storage persistence and
-  // usage, the device lines (#93: the latest vibrate result, ctx.state, the mic track's events, the audio inputs),
-  // and the live VAD plot and lines (#56; the worker's feature trace is on while it is mounted). It is loaded on
-  // demand and nothing waits for it (#57): its code, and the energy gate it replays, stay out of the initial bundle.
+  // Developer overlay (plan §7 M2, M4, M5, M6, M8): the frame loop's p95 frame time and fps, the §4.10 performance
+  // measures (#122), storage persistence and usage, the device lines (#93: the latest vibrate result, ctx.state, the
+  // mic track's events, the audio inputs), and the live VAD plot and lines (#56; the worker's feature trace is on
+  // while it is mounted). It is loaded on demand and nothing waits for it (#57): its code, and the energy gate it
+  // replays, stay out of the initial bundle.
   if (overlayModule !== null) {
     mountDebugOverlayWhenLoaded(
       overlayModule,
       (m) =>
         m.mountDebugOverlay(app, {
           frameStats: (out) => view.frameStats(out),
+          // #122: the last first-frame and tap-to-listening measures.
+          perf: readPerfMeasures,
           clock,
           storage,
           device: {

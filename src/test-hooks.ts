@@ -3,7 +3,8 @@
 // dead-code-eliminate (`pnpm check:no-hooks` proves `__bearTest` is absent from dist/).
 //
 // - `log` / `events`: one entry per event the session reduced, including those that keep the state
-//   (from === to), so specs can also check effects such as "no `arm` while Playing".
+//   (from === to), so specs can also check effects such as "no `arm` while Playing". Each `log` entry also carries
+//   the step's anim events, so a spec can see a reaction's name (#117, ORCH-NOTE 6074844540 on #117).
 // - `setVisibility` drives the app's single visibility source (platform/visibility.ts).
 // - `maxLevelDb` / `levels`: the input level probe, from the engine's `level` events (frames and dB only, never
 //   audio). `levels` lets the loop specs tell a capture gap of the fake mic (digital silence) from a VAD result.
@@ -17,10 +18,12 @@
 // - Interactions (#93): `sfxLog` records every scheduled sfx with the context time its sound ends (`sfx.play`'s
 //   `endCtxTime`), and `regionCenter(id)` gives a hit region's centre in viewport CSS px, from the bear's current
 //   bone matrices (the CDP touch points of the `gestures` spec).
+// - Accessibility (#118): `pose()` names the director's base pose and the clip in its slot, so the `a11y` spec can
+//   check that reduced motion and Gentle mode play the gentle clips.
 
 import type { BearView, FrameLogEntry } from './anim/bear-view.ts';
 import { POSES, type PoseName } from './anim/poses.ts';
-import type { Effect, SessionEvent, SfxId, StateName } from './app/events.ts';
+import type { AnimEvent, Effect, SessionEvent, SfxId, StateName } from './app/events.ts';
 import type { LevelEvent, Session } from './app/session.ts';
 import tapUrl from './audio/test-tap.worklet.ts?worker&url';
 import { DEFAULT_VAD_BACKEND } from './audio/constants.ts';
@@ -37,6 +40,8 @@ export interface TransitionLogEntry {
   to: StateName;
   event: SessionEvent['t'];
   effects: Effect['k'][];
+  /** #117: the step's anim effects' events, in order (a reaction's name included). */
+  anims: AnimEvent[];
 }
 
 export interface EventLogEntry {
@@ -108,6 +113,12 @@ export interface BearTestApi {
    * matrices. Throws before the bear is mounted, and for `background`.
    */
   regionCenter(id: RegionId): { x: number; y: number };
+  /**
+   * The director's current base pose and the name of the clip in its slot (a session clip, a reaction clip or the
+   * flinch), or null when none plays; a clip fading out under a cut is not reported. Throws before the bear is
+   * mounted.
+   */
+  pose(): { base: string; clip: string | null };
 }
 
 declare global {
@@ -121,7 +132,7 @@ export interface TestHookDeps {
   engine: Pick<Engine, 'context'> & OutputTapHost & VadBackendHost;
   visibility: Visibility;
   /** The bear, once main.ts has mounted it (after the hooks are installed). */
-  bear: () => Pick<BearView, 'showPose' | 'frameLog' | 'regionCenter'> | null;
+  bear: () => Pick<BearView, 'showPose' | 'frameLog' | 'regionCenter' | 'director'> | null;
 }
 
 /** Default canvas size of `showPose`: the renderer screenshots' 500 × 700 CSS px (#75). */
@@ -238,7 +249,15 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
 
   session.addTransitionListener((from, to, e, effects) => {
     const t = performance.now();
-    log.push({ t, frame: frameNow(), from, to, event: e.t, effects: effects.map((fx) => fx.k) });
+    log.push({
+      t,
+      frame: frameNow(),
+      from,
+      to,
+      event: e.t,
+      effects: effects.map((fx) => fx.k),
+      anims: effects.flatMap((fx) => (fx.k === 'anim' ? [fx.ev] : [])),
+    });
     events.push({ t, e });
     if (e.t === 'ctxRunning' && !tapStarted) {
       tapStarted = true;
@@ -298,6 +317,12 @@ export function installTestHooks(deps: TestHookDeps): BearTestApi {
       const bear = deps.bear();
       if (bear === null) throw new Error('regionCenter: the bear is not mounted yet');
       return bear.regionCenter(id);
+    },
+    pose() {
+      const bear = deps.bear();
+      if (bear === null) throw new Error('pose: the bear is not mounted yet');
+      const dir = bear.director();
+      return { base: dir.base, clip: dir.clip?.name ?? null };
     },
   };
   window.__bearTest = api;

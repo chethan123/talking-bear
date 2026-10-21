@@ -9,6 +9,10 @@
 // Each `sfx` effect the runner schedules is reported to the `addSfxListener` listeners while it runs (so before
 // that step's transition listeners), with the context time its sound ends (#93: the e2e `sfxLog`).
 //
+// Noise floor (#116, #289): every engine `level` also goes to the effect runner's `level`, which dispatches at most
+// one `noiseFloor` per second from Listening levels and from Recording levels that come at least 1000 ms after the
+// epoch's first Recording level (effects.ts `NOISE_FLOOR_RECORDING_HOLDOFF_MS`).
+//
 // Settings (plan §7 M8, #113): with `deps.settings`, every step reduces with `cfg.tSleepMs` taken from the
 // current `sleepTimeoutSec`, so a change takes effect on the next sleep-timer start; the effect runner reads
 // `noisyRoomNs` at each `openMic` (effects.ts).
@@ -93,7 +97,8 @@ export interface Session {
   subscribeLevel(cb: (e: LevelEvent) => void): () => void;
   /**
    * The engine's event sink: `level`, `vadError`, `vadReady`, `vadStats` and `traceBatch` go to the
-   * `subscribeLevel` listeners, every other engine event is dispatched. `createEngine` takes its `onEvent`
+   * `subscribeLevel` listeners (a `level` feeds the effect runner's noise floor estimate first, #116), every other
+   * engine event is dispatched. `createEngine` takes its `onEvent`
    * before the session exists, so main.ts relays to it:
    *
    * ```ts
@@ -258,6 +263,7 @@ export function createSession(initial: SessionState, deps: SessionDeps): Session
     addSfxListener: (cb) => sfxListeners.add(cb),
     subscribeLevel: (cb) => levelListeners.add(cb),
     onEngineEvent(e) {
+      if (e.t === 'level') runner.level(e); // #116: the noise floor estimate, before the level listeners
       if (
         e.t === 'level' ||
         e.t === 'vadError' ||

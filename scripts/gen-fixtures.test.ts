@@ -5,6 +5,7 @@ import { describe, expect, test } from 'vitest';
 
 import { mulberry32, rmsDb, toneLevelDb } from '../test/dsp-helpers.ts';
 import { readWav } from '../test/wav.ts';
+import { clipDetect } from '../src/dsp/voice.ts';
 import type { FixtureSidecar } from './gen-fixtures.ts';
 import {
   LEAD_SAMPLES,
@@ -13,6 +14,7 @@ import {
   SEED,
   TAIL_SAMPLES,
   buildFixtures,
+  CLIP_GAIN,
   encodeFixture,
 } from './gen-fixtures.ts';
 
@@ -58,6 +60,18 @@ const EXPECTED: ExpectedFixture[] = [
     sound: 4_800,
     tail: 14_400,
     total: 67_200,
+    speech: true,
+    f0: 140,
+  },
+  // #116: the noisy.spec fake mic (e2e only).
+  { name: 'noise_pink_-20dbfs_20s', targets: ['e2e'], sound: 960_000, tail: 14_400, total: 1_022_400 },
+  // #117: the too-loud.spec fake mic (e2e only).
+  {
+    name: 'vowel_clipped',
+    targets: ['e2e'],
+    sound: 72_000,
+    tail: 14_400,
+    total: 134_400,
     speech: true,
     f0: 140,
   },
@@ -150,6 +164,11 @@ describe.each(FILES)('$target/fixtures/$name', (e) => {
   });
 });
 
+/** The directory a fixture is loaded from: test/fixtures, or e2e/fixtures for an e2e-only one. */
+function targetOf(name: string): string {
+  return EXPECTED.find((e) => e.name === name)!.targets[0]!;
+}
+
 /** End (exclusive) of a fixture's sound span. */
 function soundEnd(name: string): number {
   return LEAD_SAMPLES + EXPECTED.find((e) => e.name === name)!.sound;
@@ -238,8 +257,9 @@ describe('signal levels', () => {
     ['noise_white_-60dbfs_3s', -60],
     ['noise_pink_-40dbfs_5s', -40],
     ['sine_1k_-20dbfs_1s', -20],
+    ['noise_pink_-20dbfs_20s', -20],
   ])('%s has RMS %d dBFS over the sound span', (name, db) => {
-    const x = load(name);
+    const x = load(name, targetOf(name));
     expect(Math.abs(rmsDb(x, LEAD_SAMPLES, soundEnd(name)) - db)).toBeLessThanOrEqual(0.05);
   });
 
@@ -283,12 +303,33 @@ describe('signal levels', () => {
   test.each([
     ['noise_pink_-40dbfs_5s', 10],
     ['noise_white_-60dbfs_3s', 0],
+    ['noise_pink_-20dbfs_20s', 10],
   ])('%s: PSD in 100–200 Hz is %d ± 2 dB above 1–2 kHz', (name, db) => {
-    const x = load(name);
+    const x = load(name, targetOf(name));
     const slope =
       bandDensityDb(x, LEAD_SAMPLES, soundEnd(name), 100, 200) -
       bandDensityDb(x, LEAD_SAMPLES, soundEnd(name), 1000, 2000);
     expect(Math.abs(slope - db)).toBeLessThanOrEqual(2);
+  });
+
+  test('vowel_clipped is vowel_f0-140 at full scale × 4, hard-clipped to ±1.0, and clipDetect flags it (#117)', () => {
+    const v = built.find((f) => f.name === 'vowel_f0-140')!.samples;
+    const x = load('vowel_clipped', 'e2e');
+    const end = soundEnd('vowel_clipped');
+    let peak = 0;
+    for (let i = LEAD_SAMPLES; i < end; i++) peak = Math.max(peak, Math.abs(v[i]!));
+    let worst = 0;
+    let over = 0;
+    for (let i = 0; i < x.length; i++) {
+      const want = i < LEAD_SAMPLES || i >= end ? 0 : Math.max(-1, Math.min(1, (CLIP_GAIN * v[i]!) / peak));
+      worst = Math.max(worst, Math.abs(x[i]! - want));
+      if (Math.abs(x[i]!) > 0.99) over++;
+    }
+    // PCM16: +1.0 encodes as 32767, exactly one step below.
+    expect(worst).toBeLessThanOrEqual(1 / 32768);
+    expect(over).toBeGreaterThan(0.001 * x.length);
+    expect(clipDetect(x)).toBe(true);
+    expect(clipDetect(load('vowel_f0-140'))).toBe(false);
   });
 
   test('knock has three 40 ms bursts peaking at −12 dBFS, 1.5 s apart, and zeros elsewhere', () => {
@@ -312,14 +353,16 @@ describe.each(EXPECTED.filter((e) => e.speech === true))('$name voice', (e) => {
   const f0 = e.f0!;
 
   test('f0 by autocorrelation is within ±2 % of the sidecar f0', () => {
-    expect(Math.abs(autocorrelationF0(load(e.name), from, to) / f0 - 1)).toBeLessThanOrEqual(0.02);
+    expect(
+      Math.abs(autocorrelationF0(load(e.name, targetOf(e.name)), from, to) / f0 - 1),
+    ).toBeLessThanOrEqual(0.02);
   });
 
   // F1 is 700 Hz. The spectrum has lines at the harmonics of f0 only, so the strongest line in
   // 300–1000 Hz is the harmonic nearest F1: 700 Hz itself for f0 140 (inside 630–770 Hz), 600 Hz for f0 300.
   test('the spectral peak in 300–1000 Hz is the harmonic of f0 nearest F1 (700 Hz)', () => {
     const nearest = Math.round(700 / f0) * f0;
-    const peak = spectralPeakHz(load(e.name), from, to, 300, 1000, 5);
+    const peak = spectralPeakHz(load(e.name, targetOf(e.name)), from, to, 300, 1000, 5);
     expect(Math.abs(peak - nearest)).toBeLessThanOrEqual(0.02 * nearest);
   });
 });

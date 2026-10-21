@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
-import type { Effect, SessionEvent, StateName } from '../../src/app/events.ts';
+import type { AnimEvent, Effect, SessionEvent, StateName } from '../../src/app/events.ts';
 import { ENERGY_HOP, VAD_RATE } from '../../src/audio/constants.ts';
 import { PRESETS } from '../../src/dsp/types.ts';
 import { yinF0 } from '../../src/dsp/yin.ts';
@@ -21,6 +21,8 @@ export interface LogEntry {
   to: StateName;
   event: SessionEvent['t'];
   effects: Effect['k'][];
+  /** #117: the step's anim effects' events, in order (a reaction's name included). */
+  anims: AnimEvent[];
 }
 
 /** A log entry together with the event that caused it: `log[i]` and `events[i]` are pushed by the same call. */
@@ -296,14 +298,21 @@ export async function lastTake(page: Page): Promise<Take> {
 }
 
 /**
- * The take's length in seconds: from 300 ms of pre-roll before the onset, clamped to the arm frame, to 150 ms
- * of tail after the last speech frame (plan §4.2.3, §4.4, §7 M1).
+ * The take's first and last ctx frames: from 300 ms of pre-roll before the onset, clamped to the arm frame, to
+ * 150 ms of tail after the last speech frame (plan §4.2.3, §4.4, §7 M1).
  */
-export function takeSeconds(take: Take): number {
+export function takeFrames(take: Take): { fromFrame: number; toFrame: number } {
   const { sr } = take;
-  const fromFrame = Math.max(take.startFrame - Math.round(0.3 * sr), take.armFrame);
-  const toFrame = take.lastSpeechFrame + Math.round(0.15 * sr);
-  return (toFrame - fromFrame) / sr;
+  return {
+    fromFrame: Math.max(take.startFrame - Math.round(0.3 * sr), take.armFrame),
+    toFrame: take.lastSpeechFrame + Math.round(0.15 * sr),
+  };
+}
+
+/** The take's length in seconds: takeFrames(take)'s span. */
+export function takeSeconds(take: Take): number {
+  const { fromFrame, toFrame } = takeFrames(take);
+  return (toFrame - fromFrame) / take.sr;
 }
 
 /**
@@ -413,6 +422,183 @@ export async function expectNoCaptureGap(page: Page, take: Take, speechSec: numb
   ).toBeUndefined();
 }
 
+/**
+ * One level interval in ctx frames at context rate `sr`. The worker tags each `level` with the first ctx frame of
+ * its 10 ms hop and posts one on every LEVEL_EVERY_HOPS-th hop of an epoch (src/workers/vad-core.ts `stepHop`), so
+ * an epoch's consecutive levels are this far apart, ±1 for rounding: 1440 frames at 48 kHz, 1323 at 44.1 kHz. The
+ * hop count carries on across a capture re-anchor (#244), so the cadence does too.
+ */
+export function levelIntervalFrames(sr: number): number {
+  return (LEVEL_EVERY_HOPS * ENERGY_HOP * sr) / VAD_RATE;
+}
+
+/**
+ * The largest step between consecutive level frames of one epoch that isn't a capture re-anchor: one level
+ * interval plus Math.round(sr / 2), the longest gap the capture worklet zero-feeds (its `#maxZeroFeed`). A gap up to
+ * that is fed to the decimator as zeros, so the frame tags, and the levels, stay contiguous. A longer one makes the
+ * worklet re-anchor its VAD feed at the new frame (#244), and then the levels around the gap step by one interval
+ * plus the gap, plus the decimator's lookahead and the dropped partial frame and hop: always over this limit.
+ */
+export function captureJumpLimit(sr: number): number {
+  return levelIntervalFrames(sr) + Math.round(sr / 2);
+}
+
+/** A capture re-anchor in one epoch's level stream: consecutive level events at ctx frames `from` and `to`. */
+export interface CaptureJump {
+  from: number;
+  to: number;
+}
+
+/**
+ * The first capture re-anchor among `levels` (one epoch's level events, oldest first) that falls inside the
+ * window [from, until) of ctx frames: consecutive levels a, b with b − a > captureJumpLimit(sr), a < until and
+ * b > from. Pure.
+ */
+export function findCaptureJump(
+  levels: readonly { frame: number }[],
+  sr: number,
+  from: number,
+  until: number,
+): CaptureJump | undefined {
+  const limit = captureJumpLimit(sr);
+  for (let i = 1; i < levels.length; i++) {
+    const a = levels[i - 1]!.frame;
+    const b = levels[i]!.frame;
+    if (b - a > limit && a < until && b > from) return { from: a, to: b };
+  }
+  return undefined;
+}
+
+/**
+ * The failure message for capture re-anchor `jump` at context rate `sr`: the jump in frames and ms, where it was
+ * (`at`), and what it did to the run (`so`).
+ */
+function captureReanchorMessage(jump: CaptureJump, sr: number, at: string, so: string): string {
+  const ms = (frames: number): string => `${((frames / sr) * 1000).toFixed(0)} ms`;
+  const step = jump.to - jump.from;
+  const interval = levelIntervalFrames(sr);
+  return (
+    `capture re-anchor in the test environment, not a VAD failure: consecutive level events jumped ${step} ` +
+    `frames (${ms(step)}), from frame ${jump.from} (${at}) to frame ${jump.to}, where one level interval is ` +
+    `${interval} frames. About ${ms(step - interval)} of capture is missing: the audio thread stalled for over ` +
+    `0.5 s and the capture worklet re-anchored its VAD feed (#244), so ${so}`
+  );
+}
+
+/**
+ * The window expectNoCaptureJump checks, in ctx frames: from the take's first frame (takeFrames: the pre-roll
+ * included) to the later of its last frame and the end of the fixture's speech as the onset places it
+ * (startFrame + speechSec). A re-anchor that cuts the speech ends the segment at its last step before the gap, so
+ * the take can end before the gap; the fixture's speech still spans it.
+ */
+export function captureJumpWindow(take: Take, speechSec: number): { from: number; until: number } {
+  const { fromFrame, toFrame } = takeFrames(take);
+  return { from: fromFrame, until: Math.max(toFrame, take.startFrame + Math.round(speechSec * take.sr)) };
+}
+
+/**
+ * Fails, naming a capture re-anchor, when the level events of the take's epoch jump inside captureJumpWindow(take,
+ * speechSec): two consecutive ones more than captureJumpLimit(take.sr) frames apart (findCaptureJump). `levels` are
+ * `__bearTest.levels` entries, oldest first; those of the take's epoch are the ones from take.armFrame up to
+ * `epochEnd` (the next epoch's armFrame), since every epoch's frames follow the previous one's. That is an
+ * audio-thread stall of over 0.5 s in the test environment: the capture worklet re-anchored its VAD feed, so the
+ * segment ended at the gap (#244) and the take misses the speech after it. It is not a VAD or voice-chain result, and
+ * the duration and VAD span checks after it would fail without saying why. Since no level event exists inside a
+ * re-anchored gap, expectNoCaptureGap can't see one. Pure: e2e/capture-reanchor.spec.ts unit-tests it.
+ */
+export function expectNoCaptureJump(
+  levels: readonly { frame: number }[],
+  take: Take,
+  speechSec: number,
+  epochEnd = Number.POSITIVE_INFINITY,
+): void {
+  const { sr, startFrame } = take;
+  const ofEpoch = levels.filter((l) => l.frame >= take.armFrame && l.frame < epochEnd);
+  const { from, until } = captureJumpWindow(take, speechSec);
+  const ms = (frames: number): string => `${((frames / sr) * 1000).toFixed(0)} ms`;
+  let widest = 0;
+  for (let i = 1; i < ofEpoch.length; i++) {
+    widest = Math.max(widest, ofEpoch[i]!.frame - ofEpoch[i - 1]!.frame);
+  }
+  console.log(
+    `capture re-anchor check: ${ofEpoch.length} levels of epoch ${take.epoch}, window [${from}, ${until}); ` +
+      `widest step ${widest} frames (${ms(widest)}); a re-anchor is > ${captureJumpLimit(sr)} frames`,
+  );
+  const jump = findCaptureJump(ofEpoch, sr, from, until);
+  expect(
+    jump,
+    jump === undefined
+      ? 'no capture re-anchor'
+      : captureReanchorMessage(
+          jump,
+          sr,
+          `${((jump.from - startFrame) / sr).toFixed(3)} s from the onset`,
+          'the segment ended at the gap and the take no longer measures the VAD or the voice chain',
+        ),
+  ).toBeUndefined();
+}
+
+/** The page's level events of the last 2 minutes (`__bearTest.levels`), oldest first. */
+async function recentLevels(page: Page): Promise<{ frame: number; db: number }[]> {
+  return page.evaluate(() => {
+    const h = window.__bearTest;
+    if (h === undefined) throw new Error('window.__bearTest is missing');
+    return h.levels(120_000);
+  });
+}
+
+/**
+ * After a failed loop wait (expectLoop): the re-anchor message for the first capture re-anchor in any epoch armed
+ * since wake, or undefined. A re-anchor that ends the take as a `misfire` re-arms the listen, and the rest of the
+ * phrase makes a second take, so the loop check fails before expectNoCaptureReanchor can name the cause. The epochs
+ * are those of the `armed` steps after `wokeIndex` (the wake's own `armed` comes after its step into Listening), each
+ * up to the next one's armFrame; the window is unbounded; the rate is the latest `ctxRunning`'s. Pure:
+ * e2e/capture-reanchor.spec.ts unit-tests it.
+ */
+export function reanchorAfterLoop(
+  levels: readonly { frame: number }[],
+  all: readonly Step[],
+  wokeIndex: number,
+): string | undefined {
+  const running = all.findLast((s) => s.e.t === 'ctxRunning')?.e;
+  if (running?.t !== 'ctxRunning') return undefined;
+  const sr = running.sampleRate;
+  const arms: number[] = [];
+  all.forEach((s, i) => {
+    if (i > wokeIndex && s.e.t === 'armed') arms.push(s.e.armFrame);
+  });
+  for (let k = 0; k < arms.length; k++) {
+    const lo = arms[k]!;
+    const hi = arms[k + 1] ?? Number.POSITIVE_INFINITY;
+    const ofEpoch = levels.filter((l) => l.frame >= lo && l.frame < hi);
+    const jump = findCaptureJump(ofEpoch, sr, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
+    if (jump !== undefined) {
+      return captureReanchorMessage(
+        jump,
+        sr,
+        `${((jump.from - lo) / sr).toFixed(3)} s after the arm at frame ${lo}`,
+        "the segment in progress ended at the gap, and the loop's state changes no longer measure the VAD",
+      );
+    }
+  }
+  return undefined;
+}
+
+/**
+ * expectNoCaptureJump on the page's level events (`__bearTest.levels`), with the take's epoch ending at the next
+ * `armed` event's armFrame, if there is one.
+ */
+export async function expectNoCaptureReanchor(page: Page, take: Take, speechSec: number): Promise<void> {
+  const levels = await recentLevels(page);
+  const next = (await steps(page)).find((s) => s.e.t === 'armed' && s.e.epoch > take.epoch)?.e;
+  expectNoCaptureJump(
+    levels,
+    take,
+    speechSec,
+    next?.t === 'armed' ? next.armFrame : Number.POSITIVE_INFINITY,
+  );
+}
+
 /** The largest |sample| of `samples` in dBFS (−Infinity when all are zero or there are none). */
 export function peakDbfs(samples: readonly number[]): number {
   let peak = 0;
@@ -480,12 +666,31 @@ export async function expectLoop(
   // 1–2. Wake, a non-silent mic, then one loop within 15 s of wake.
   const woke = await wake(page, vad === undefined ? {} : { vad });
   await expectMicSignal(page);
-  const ended = await waitForLoop(page, woke, 15_000);
+  let ended: number;
+  try {
+    ended = await waitForLoop(page, woke, 15_000);
+  } catch (err) {
+    // A capture re-anchor that cut the take as a misfire fails the loop check first: name it (#268). The levels are
+    // read before the steps, so every level's epoch has its `armed` step in the snapshot (as in
+    // expectNoCaptureReanchor). If the page can't be read any more, the original failure stands.
+    let why: string | undefined;
+    try {
+      const levels = await recentLevels(page);
+      const all = await steps(page);
+      why = reanchorAfterLoop(levels, all, woke.index);
+    } catch {
+      why = undefined;
+    }
+    if (why !== undefined) throw new Error(why, { cause: err });
+    throw err;
+  }
 
   // 3. The replay's length: the take trimmed by processVoice, then divided by p (issue #66). First the input
-  //    itself: a capture gap inside the fixture's speech would fail steps 3–4 for a reason they can't name.
+  //    itself: a capture gap inside the fixture's speech, or a capture re-anchor inside the take's window, would
+  //    fail steps 3–4 for a reason they can't name.
   const take = await lastTake(page);
   await expectNoCaptureGap(page, take, speechSec);
+  await expectNoCaptureReanchor(page, take, speechSec);
   expect(take.reason, 'the speech ended in silence').toBe('silence');
   const processed = await processedDuration(page);
   expectProcessedDuration(processed, take, speechSec, PITCH_RATIO);

@@ -1,6 +1,7 @@
 /**
  * Juni on screen (plan §4.6, §7 M4; issue #81): the full-viewport canvas stage that replaced the M1 circle. It
- * owns the canvas, the rig, the pose buffers, the director, the layers, the springs and the frame loop.
+ * owns the canvas, the rig, the pose buffers, the director, the layers, the springs and the frame loop. The canvas
+ * is `role="img"` named "Juni the bear" (`A11Y_TEXT.stage`, plan §7 M8, #118).
  *
  * **Per frame** (loop.ts drives it):
  * - `substep(dt)`, at 120 Hz: director tick, the playing clip's spring kicks that are due (#221), `springs.step(dt)`,
@@ -17,8 +18,9 @@
  * clock is seconds on the `performance.now()` timebase, which rAF timestamps share; it never steps back. `anim`
  * inputs output nothing, so `onAnim` keeps `directorReduce`.
  *
- * **Director → session** (#93). Every other director input goes through `directorStep`: the 120 Hz tick in
- * `substep` (a queued reaction starts on a tick), and the gestures and releases of the pointer input below. The
+ * **Director → session** (#93). Every other director input goes through `directorStep`, except the MicDenied mime's
+ * `clip` input, which outputs nothing, so it uses `directorReduce`: the 120 Hz tick in `substep` (a queued reaction
+ * starts on a tick), and the gestures and releases of the pointer input below. The
  * step's new state is stored first, then its outputs are routed: `toSession` → `deps.dispatch`
  * (`session.dispatch`), `haptic` → `deps.haptics.play`, `mood` → the mood layer's `bump`. `session.dispatch` can
  * feed `anim` effects (`talkEnd`) straight back into the director, which must see the new state.
@@ -28,6 +30,10 @@
  * `anim talk{id}`. When the director has accepted `talk{id}` and that start is known, the mouth layer gets
  * `engine.getProcessed(id).envelope` and the start. It keeps its own reference to the envelope (mouth features,
  * not audio) until the mouth has closed after talkEnd, then drops it.
+ *
+ * **Performance marks** (#122, src/perf.ts): `first-bear-frame` right after the frame loop's first `render`
+ * (a closure flag: later frames test it and call nothing), and `tap` as a wake tap dispatches `tapBear`, kept
+ * pending only when the session went to Waking (the granted path).
  *
  * **Throttling** (`minFrameMs`): 30 fps while the director is Idle or Dozing and nothing moves but breathing and
  * blinks, 15 fps while Asleep and nothing moves but breathing; every frame otherwise. "Moves" is: a clip, a
@@ -56,6 +62,22 @@
  *   close)). `mouthCloseScale` applies to the replay's mouth only: `mouthCloseStart` stays set until the next talk,
  *   so it would close every later reaction's mouth.
  *
+ * **MicDenied mime** (#115, plan §4.5, §7 M8): while the session is in MicDenied the bear mimes a cupped ear, the
+ * director's `{k:'clip', name: MIC_DENIED_MIME}`, on entering MicDenied and every `MIC_DENIED_MIME_S` after each
+ * play. `substep` polls `deps.state()` and keeps the time the next mime is due in a `T` slot, on the director clock:
+ * no timers. A mime is due at once on entry, but it waits until the director is ready: past Asleep and Waking (a
+ * defensive check: in Waking the wake clip already fills the slot, and the director would drop a clip there) and with
+ * no session clip playing (the wake clip, MicDenied's `shrug`), so it never cuts one. With a reaction active the
+ * director's P2 rules decide (it interrupts a P1/P2, waits in the queue behind a P3/P4). Leaving MicDenied clears the
+ * slot. In Dozing (the session sends `doze` once in MicDenied) the next mime wakes the bear to Idle, as any accepted
+ * P2 does, so he stays awake while the help is up.
+ *
+ * **Too loud** (#117, plan §4.4, §7 M8): row 28 follows the replay of a clipped take with `anim reaction{name:
+ * TOO_LOUD_REACTION}`. The director's table ignores the session's reactions (#91), so `onAnim` asks for it as the
+ * director's `{k:'clip', name: TOO_LOUD_CLIP}` instead (a reused input, through `directorReduce`: a clip outputs
+ * nothing). Row 28's `talkEnd` comes first, so the director has left Talking and plays the whole clip as a P2
+ * reaction (`tooLoudGentle` in Gentle mode and under reduced motion); no other session reaction is mapped.
+ *
  * **Input** (#93): the pointer adapter (#87) on the canvas, with `hit` = `hitTest` (#85) over the bone matrices
  * of the last drawn pose and the view in **CSS px** (`fitView` of the canvas's CSS size: the adapter's points
  * are CSS px relative to the canvas, never backing-store px). `adapter.tick()` runs in every drawn frame, so a
@@ -75,14 +97,19 @@
  * callbacks are created once, and the doubles kept between frames live in a `Float64Array`. A quiet director tick
  * returns `directorStep`'s shared frozen result (no outputs, nothing to route); `adapter.tick()` returns at once
  * with no pointer down; the hit-test bone matrices are only marked stale per frame and recomputed on the next
- * pointer sample. Director transitions (events, gestures, a clip's end) allocate a new director state and their
- * outputs; that is per event, not per frame. Not free yet: once a reaction has bumped the mood, `mood.ts` boxes
- * ≈ 48 B per frame until it decays, which #229 fixes (`mood.ts` is outside #93). The reaction clips' parts (#221)
- * are preallocated too: the springs' previous positions, the clip's mouth, and the kick cursor, an index into the
- * clip's own `impulses`.
+ * pointer sample. The MicDenied mime's poll reads the session state (a string) per substep and, outside MicDenied,
+ * only writes NaN to its slot; its NaN test is inline and its time stays in `T`, so no double crosses a call (#115).
+ * Director transitions (events, gestures, a clip's end) allocate a new director state and their
+ * outputs; that is per event, not per frame. The reaction clips' parts (#221) are preallocated too: the springs'
+ * previous positions, the clip's mouth, and the kick cursor, an index into the clip's own `impulses`.
+ * No per-frame double crosses a call V8 may leave un-inlined, since V8 boxes those as new heap numbers (#229): the
+ * director clock and alpha reach `compose` and `evaluateFrom` through `T`, the mouth's clip time reaches the frame
+ * log through `readClipTime`, and `minFrameMs` returns precomputed constants. Left per event: a firing kick
+ * (`springs.impulse`) and the layers' random draws. `mouthCloseScale(now, …)` takes and returns a double; V8 inlines
+ * it into `compose`, so it measures 0.
  */
 import type { AnimEvent, SessionEvent, StateName } from '../app/events.ts';
-import { AWAKE } from '../app/machine.ts';
+import { AWAKE, TOO_LOUD_REACTION } from '../app/machine.ts';
 import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import { attachPointerAdapter } from '../input/pointer-adapter.ts';
@@ -91,22 +118,25 @@ import type { RegionId } from '../input/region-ids.ts';
 import { hitTest, REGIONS } from '../input/regions.ts';
 import type { Haptics } from '../platform/haptics.ts';
 import type { Visibility } from '../platform/visibility.ts';
+import { cancelTap, markFirstBearFrame, markTap } from '../perf.ts';
 import { reactionFor } from '../reactions/table.ts';
+import { A11Y_TEXT } from '../ui/a11y.ts';
 import type { Clip } from './clip.ts';
+import type { MimeClipName } from './clips/reactions.ts';
 import { DISPLAY_LATENCY_MS } from './constants.ts';
 import {
   clipByName,
   directorReduce,
   directorStep,
-  evaluate,
+  evaluateFrom,
   initialDirector,
   mouthCloseScale,
 } from './director.ts';
-import type { DirectorState, DirInput, DirOut, GestureInput } from './director.ts';
+import type { ClipInput, DirectorState, DirInput, DirOut, GestureInput } from './director.ts';
 import { createBlink, createBreathing, createEarTwitch, createGaze, createMood } from './layers/index.ts';
 import type { AnimContext, LayerWeights, LookAt } from './layers/index.ts';
 import { MouthLayer } from './layers/mouth.ts';
-import { ASLEEP_FPS, createFrameLoop, IDLE_FPS } from './loop.ts';
+import { ASLEEP_FPS, createFrameLoop, FRAME_ALPHA, IDLE_FPS } from './loop.ts';
 import type { FrameStats } from './loop.ts';
 import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
@@ -132,12 +162,24 @@ export const LAYER_REST_DELTA = 1e-4;
 const BASE_FADE_S = 0.15;
 /** Layer weights ramp to a new state's values over this long, like the base crossfade. */
 export const WEIGHT_RAMP_S = 0.15;
+/** The clip the bear mimes while the session is in MicDenied (#115): a paw to the ear, "I can't hear you". */
+export const MIC_DENIED_MIME = 'cuppedEar';
+/** The clip the session's too-loud reaction plays (#117): row 28's `anim reaction{name: TOO_LOUD_REACTION}`. */
+export const TOO_LOUD_CLIP: MimeClipName = 'tooLoud';
+/** The MicDenied mime repeats this long after each play (s, #115). */
+export const MIC_DENIED_MIME_S = 10;
 /** Frames `frameLog()` keeps (X-A2 logging). */
 export const FRAME_LOG_SIZE = 600;
 /** How long the gaze holds a background touch's point (s): a tap's, or a background stroke's latest move (#93). */
 export const LOOK_HOLD_S = 2;
 /** The X-A2 override `?L=<ms>` is clamped to this range. */
 export const LATENCY_OVERRIDE_MAX_MS = 200;
+/**
+ * `minFrameMs` while throttled, ms, computed once: returning `1000 / IDLE_FPS` computed per call boxed a new heap
+ * number on every rAF at Idle (#229).
+ */
+const IDLE_FRAME_MS = 1000 / IDLE_FPS;
+const ASLEEP_FRAME_MS = 1000 / ASLEEP_FPS;
 /** Default seed of the layers' RNG; main.ts passes a random one. */
 const DEFAULT_SEED = 0x5eed;
 /** The mouth channels: the mouth layer's while a replay's mouth runs, a clip's otherwise (#221). */
@@ -279,6 +321,8 @@ const LOOK_UNTIL = 4;
 /** The latest pointer sample's position, CSS px relative to the canvas. */
 const SAMPLE_X = 5;
 const SAMPLE_Y = 6;
+/** Director time (s) at which the next MicDenied mime is due; NaN outside MicDenied (#115). */
+const MIME_AT = 7;
 /** The session states in which any `pointerdown` wakes the bear (Paused never sees one while visible). */
 const TAP_TO_WAKE: ReadonlySet<StateName> = new Set<StateName>(['Asleep', 'Error', 'Paused']);
 
@@ -288,6 +332,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   const canvas = document.createElement('canvas');
   canvas.className = 'stage';
+  canvas.setAttribute('role', 'img');
+  canvas.setAttribute('aria-label', A11Y_TEXT.stage);
   root.append(canvas);
   const g = createContext(canvas);
   const rig = createRig();
@@ -295,12 +341,17 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   /** `view` in CSS px of the canvas: hit tests, `regionCenter` and the gaze map pointer points through it. */
   const cssView: View = { scale: 1, ox: 0, oy: 0 };
 
-  const T = new Float64Array(7);
+  const T = new Float64Array(8);
   T[NOW] = deps.now() / 1000;
+  T[MIME_AT] = Number.NaN;
 
   // ---- director, layers, springs, mouth ------------------------------------------------------------------
   let dir: DirectorState = initialDirector(T[NOW]);
   const tickIn: { k: 'tick'; now: number } = { k: 'tick', now: 0 };
+  /** The MicDenied mime's director input, reused (#115). */
+  const mimeIn: ClipInput = { k: 'clip', name: MIC_DENIED_MIME, now: 0 };
+  /** The too-loud reaction's director input, reused (#117). */
+  const tooLoudIn: ClipInput = { k: 'clip', name: TOO_LOUD_CLIP, now: 0 };
   const springs = new SpringBank(SPRING_COUNT);
   configureSprings(springs);
   const weights: LayerWeights = { ...WEIGHTS_ASLEEP };
@@ -429,6 +480,23 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     }
   }
 
+  /**
+   * The MicDenied mime (#115; see the module comment): due at once on entry, then `MIC_DENIED_MIME_S` after each
+   * play; sent once the director is ready. Called per substep while the session is in MicDenied. The NaN test is
+   * inline (`due !== due`) and no double crosses a call (#229).
+   */
+  function micDeniedMime(): void {
+    const now = T[NOW]!;
+    const due = T[MIME_AT]!;
+    if (due !== due) T[MIME_AT] = now;
+    if (now < T[MIME_AT]!) return;
+    const d = dir;
+    if (d.name === 'Asleep' || d.name === 'Waking' || (d.clip !== null && d.reaction === null)) return;
+    mimeIn.now = now;
+    dir = directorReduce(d, mimeIn);
+    T[MIME_AT] = now + MIC_DENIED_MIME_S;
+  }
+
   // ---- the frame -------------------------------------------------------------------------------------------
   function substep(dt: number): void {
     tickIn.now = T[NOW]!;
@@ -437,6 +505,9 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     const r = directorStep(dir, tickIn);
     dir = r.state;
     if (r.out.length !== 0) route(r.out);
+    // #115: the cupped-ear mime while the session is in MicDenied.
+    if (deps.state() === 'MicDenied') micDeniedMime();
+    else T[MIME_AT] = Number.NaN;
     // #221: the clip's kicks due by now, then the step from the positions the frame interpolates from.
     applyKicks();
     prevSprings.set(springs.pos);
@@ -451,11 +522,18 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     mood.update(dt, curLayers, ctx);
   }
 
-  /** Writes the frame's pose at director time `now` with layer interpolation `alpha` into `pose`. */
-  function compose(now: number, alpha: number): void {
-    evaluate(dir, now, pose, true);
+  /**
+   * Writes the frame's pose at director time `T[NOW]` with layer interpolation `T[ALPHA]` into `pose`. Neither
+   * double crosses a call: `compose` reads both from their slots, and `evaluateFrom` reads the clock slot itself.
+   * V8 inlines neither `compose` nor `evaluate`, and boxes a double passed to a call it doesn't inline as a new heap
+   * number (#229).
+   */
+  function compose(): void {
+    const now = T[NOW]!;
+    const alpha = T[ALPHA]!;
+    evaluateFrom(dir, T, NOW, pose, true);
     if (reduced && dir.clip !== null) {
-      evaluate(withoutClip(dir), now, noClipPose);
+      evaluateFrom(withoutClip(dir), T, NOW, noClipPose);
       const base = noClipPose[Ch.HeadRot]!;
       pose[Ch.HeadRot] = base + (pose[Ch.HeadRot]! - base) * REDUCED_MOTION_SCALE;
     }
@@ -506,25 +584,37 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   function logFrame(t: number): void {
     const slot = logged % FRAME_LOG_SIZE;
     logT[slot] = t;
-    logClip[slot] = mouthId === -1 ? Number.NaN : mouth.clipTime;
+    // The clip time is copied slot to slot (`readClipTime`): the `clipTime` getter's double return is boxed (#229).
+    if (mouthId === -1) logClip[slot] = Number.NaN;
+    else mouth.readClipTime(logClip, slot);
     logIndex[slot] = mouthId === -1 ? -1 : mouth.envIndex;
     logged++;
   }
+
+  /** #122: the frame loop has drawn its first frame (`first-bear-frame` is marked). */
+  let firstFrameMarked = false;
 
   const loop = createFrameLoop(
     {
       beginFrame(t) {
         T[FRAME_T] = t;
-        advanceNow(t / 1000);
+        // advanceNow(t / 1000), written out: a call V8 doesn't inline boxes its double argument and return (#229).
+        const sec = t / 1000;
+        if (sec > T[NOW]!) T[NOW] = sec;
         if (ctx.lookAt !== null && T[NOW]! >= T[LOOK_UNTIL]!) ctx.lookAt = null;
         adapter.tick();
       },
       substep,
-      draw(t, alpha) {
-        T[ALPHA] = alpha;
-        compose(T[NOW]!, alpha);
+      draw(t, frame) {
+        T[ALPHA] = frame[FRAME_ALPHA]!;
+        compose();
         bonesStale = true;
         render(g, rig, pose, view);
+        // #122: the first frame ends `first-frame`; after it the rAF path does this one test, no call.
+        if (!firstFrameMarked) {
+          firstFrameMarked = true;
+          markFirstBearFrame();
+        }
         logFrame(t);
       },
       minFrameMs() {
@@ -537,8 +627,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
           layersMoving() ||
           weightsRamping();
         if (moving) return 0;
-        if (s.name === 'Asleep') return 1000 / ASLEEP_FPS;
-        if (s.name === 'Idle' || s.name === 'Dozing') return 1000 / IDLE_FPS;
+        if (s.name === 'Asleep') return ASLEEP_FRAME_MS;
+        if (s.name === 'Idle' || s.name === 'Dozing') return IDLE_FRAME_MS;
         return 0;
       },
     },
@@ -555,7 +645,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   function redraw(): void {
     const t = deps.now();
     T[FRAME_T] = t;
-    compose(advanceNow(t / 1000), T[ALPHA]!);
+    advanceNow(t / 1000);
+    compose();
     bonesStale = true;
     render(g, rig, pose, view);
   }
@@ -666,7 +757,12 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     onGesture,
     onRawDown() {
       deps.haptics?.noteActivation('down');
-      if (TAP_TO_WAKE.has(deps.state())) deps.dispatch({ t: 'tapBear' });
+      if (TAP_TO_WAKE.has(deps.state())) {
+        // #122: `tap-to-listening` starts here and stays pending only if the tap woke the mic (granted: Waking).
+        markTap();
+        deps.dispatch({ t: 'tapBear' });
+        if (deps.state() !== 'Waking') cancelTap();
+      }
     },
     onRawUp(e) {
       if (!e.cancel) deps.haptics?.noteActivation('up');
@@ -701,8 +797,14 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     canvas,
     onAnim(ev) {
       const now = advanceNow(deps.now() / 1000);
-      const input: DirInput = { k: 'anim', ev, now };
-      dir = directorReduce(dir, input);
+      if (ev.e === 'reaction' && ev.name === TOO_LOUD_REACTION) {
+        // #117: the director's table ignores the session's reactions; this one is asked for as its clip.
+        tooLoudIn.now = now;
+        dir = directorReduce(dir, tooLoudIn);
+      } else {
+        const input: DirInput = { k: 'anim', ev, now };
+        dir = directorReduce(dir, input);
+      }
       if (ev.e === 'talk') startMouth();
       loop.invalidate();
     },

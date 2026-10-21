@@ -183,6 +183,15 @@ function mixAtSnr(signal: Float64Array, noise: Float64Array, snrDb: number): Flo
   return out;
 }
 
+/** #117: the gain of the shouted vowel over full scale (×4, +12 dB) before it is hard-clipped. */
+export const CLIP_GAIN = 4;
+
+/** `x` × `gain`, hard-clipped to [−1, 1], in place. */
+function hardClip(x: Float64Array, gain: number): Float64Array {
+  for (let i = 0; i < x.length; i++) x[i] = Math.max(-1, Math.min(1, gain * x[i]!));
+  return x;
+}
+
 const KNOCK_BURST_SAMPLES = 1920; // 40 ms
 const KNOCK_BURST_OFFSETS = [0, 72_000, 144_000]; // 1.0, 2.5 and 4.0 s in the file
 const KNOCK_TAU_S = 0.008;
@@ -215,6 +224,7 @@ interface FixtureSpec {
 }
 
 const TEST: FixtureTarget[] = ['test'];
+const E2E: FixtureTarget[] = ['e2e'];
 const BOTH: FixtureTarget[] = ['test', 'e2e'];
 
 const seconds = (s: number): number => Math.round(s * SAMPLE_RATE);
@@ -277,6 +287,27 @@ const FIXTURE_SPECS: FixtureSpec[] = [
     name: 'vowel_short_100ms',
     targets: TEST,
     build: (rng) => ({ sound: vowel(rng, 140, 0.1), speech: true, f0: 140 }),
+  },
+  {
+    // The fake mic of e2e/noisy.spec.ts (#116): a room whose background never falls silent. Full-band pink noise
+    // at −20 dBFS RMS reads well above the −35 dBFS too-noisy threshold in the VAD's 200–3400 Hz gate band (at
+    // −30 dBFS it would read ≈ −34, too close to trip it reliably).
+    name: 'noise_pink_-20dbfs_20s',
+    targets: E2E,
+    build: (rng) => ({ sound: scaleToRmsDb(pinkNoise(rng, seconds(20)), -20) }),
+  },
+  {
+    // The fake mic of e2e/too-loud.spec.ts (#117, plan §4.4 "Clipping (shouting)"): a shouted take. The vowel is
+    // drawn first (sample-identical to vowel_f0-140), brought to full scale (peak 0 dBFS), × CLIP_GAIN and
+    // hard-clipped to ±1.0: ≈ 15 % of the sound span is at |x| > 0.99, far above the 0.1 % that flags a take.
+    // (×4 on the −12 dBFS vowel itself would put only 8 samples, 0.011 %, above 0.99: ORCH-NOTE 6074844540 on #117.)
+    name: 'vowel_clipped',
+    targets: E2E,
+    build: (rng) => ({
+      sound: hardClip(scaleToPeakDb(vowel(rng, 140, 1.5), 0), CLIP_GAIN),
+      speech: true,
+      f0: 140,
+    }),
   },
 ];
 

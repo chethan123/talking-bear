@@ -3,11 +3,14 @@
 // above a tally panel. It covers what feature traces can't: the whole loop on the device, the LSTM reset at every
 // re-arm and the pre-gate warm-up. Dev-only: `pnpm dev`, then /lab/vad-live.html (docs/lab.md).
 //
-// Privacy (plan Q2): aggregate counts only. The tally is 3 × 9 integers in this page's memory (plus the last mark,
-// for Undo). The transition listener reads the two state names and the seg event's kind and reason, nothing else:
-// no audio, no levels, no frames, no times. Nothing is stored in the browser or sent anywhere; Copy summary puts
-// the counts on the clipboard, and reloading the page resets them. The app keeps each take in memory only until
-// its replay ends.
+// Privacy (plan Q2): aggregate counts only. The tally is 3 × 10 integers in this page's memory (plus the last mark,
+// for Undo). The transition listener reads the two state names, the `ctxRunning` sample rate, and the seg event's
+// epoch, kind, reason and onset frame; the level listener reads each `level` event's epoch and frame, never its dB.
+// No audio, no wall-clock times and no per-phrase record are kept. For the jump rule below the page holds two ctx
+// frame indices (the previous level's and the latest jump's), the sample rate, the previous level's epoch and the
+// current take's epoch, in memory only, never shown or exported. Nothing is stored in the browser or sent anywhere;
+// Copy summary puts the counts on the clipboard, and reloading the page resets them. The app keeps each take in
+// memory only until its replay ends.
 //
 // The debug overlay turns the worker's feature trace on while it is mounted, and the trace suspends the Silero
 // pre-gate's skipping: Silero runs on every frame (src/workers/vad-core.ts). The status line and the summary
@@ -26,14 +29,33 @@
 // unarmed take is the latest phrase. A failed boot is terminal: nothing is tallied, the status line says so, and the
 // summary carries `app: "failed"`.
 //
+// Capture jumps (#268): when the audio thread stalls for over 0.5 s, the capture worklet re-anchors its VAD feed and
+// the segment in progress ends at the gap as an `end` or a `misfire` (#244), which the tally can't tell from a normal
+// end. So the page applies the e2e helpers' rule (e2e/helpers/app.ts `findCaptureJump`) to the session's level
+// stream: two consecutive `level` events of one epoch more than one level interval plus Math.round(sampleRate / 2)
+// ctx frames apart are a capture jump. While `tallying()`, each one is counted per condition (`captureJumps`). A take
+// that straddles one is excluded like an unarmed take (D16): its auto counts are taken back (it counts neither as
+// `recordings` nor as `completed`), it is disarmed, and the marks close until the next armed onset. A take straddles
+// a jump of its epoch if the jump comes while it is open (from its onset until the first level of its epoch after its
+// segment ended: the worker posts a gap end just before the first level after the gap), or if its pre-roll reaches
+// back over the latest jump on the ctx timeline, in any epoch (onset − PREROLL_MS before the first level after the
+// jump). The latter is also the rest of a phrase cut as a misfire: the misfire re-arms at once, and the phrase goes on
+// as a new take in the new epoch. Only a jump seen while `tallying()` is remembered for this, and only for the current
+// arm cycle: every `arm` effect forgets it, as does a new AudioContext (`ctxRunning`, which restarts the frame count).
+// The misfire's remainder is still caught, because the worker posts the gap misfire before the first post-gap level,
+// and the session runs the misfire's transition (with its `arm`) before that level reaches this page: the jump is
+// seen, and remembered, after the re-arm. A take armed later, after an unmute or an input reselection, is clamped to
+// its own arm frame and can't reach an earlier gap.
+//
 // Layout: all of the app's layers are position: fixed, so the app root gets a height and `contain: strict`, which
 // makes it their containing block, and the tally panel follows it. The rules come from a constructed stylesheet
 // that this module adopts: no style attribute, no <style>, no new CSS file. The same sheet restores lab.css's
 // centred body, which src/ui/styles.css (imported by main.ts) overrides.
 
 import type { SessionEvent, StateName } from '../src/app/events.ts';
-import { PREGATE_ENABLED } from '../src/audio/constants.ts';
+import { ENERGY_HOP, PREGATE_ENABLED, PREROLL_MS, VAD_RATE } from '../src/audio/constants.ts';
 import { boot } from '../src/main.ts';
+import { LEVEL_EVERY_HOPS } from '../src/workers/vad-core.ts';
 import { el } from './common.ts';
 
 /** The app's height: this share of the small viewport (Chrome's toolbars shown), the tally panel below it. */
@@ -47,13 +69,14 @@ type Mark = (typeof MARKS)[number];
 /** The counters taken from the session's transitions. */
 const AUTOS = ['recordings', 'completed', 'misfires', 'maxLength'] as const;
 type Auto = (typeof AUTOS)[number];
-type Counter = Mark | Auto;
+/** The capture jumps counted from the session's level stream (#268). */
+type Counter = Mark | Auto | 'captureJumps';
 type Counts = Record<Counter, number>;
 type OverlayState = 'off' | 'loading' | 'on' | 'failed';
 type AppState = 'booting' | 'ok' | 'failed';
 /** A table row: a counter, or `phrases` (derived: hits + misses + splits). */
 type Row = 'phrases' | Counter;
-const ROWS: readonly Row[] = ['phrases', ...MARKS, ...AUTOS];
+const ROWS: readonly Row[] = ['phrases', ...MARKS, ...AUTOS, 'captureJumps'];
 
 const MARK_LABELS: Readonly<Record<Mark, string>> = {
   hit: 'Hit',
@@ -70,6 +93,7 @@ const ROW_LABELS: Readonly<Record<Row, string>> = {
   completed: 'completed',
   misfires: 'misfires',
   maxLength: 'maxLength ends',
+  captureJumps: 'capture jumps',
 };
 
 /**
@@ -97,6 +121,7 @@ function zero(): Counts {
     completed: 0,
     misfires: 0,
     maxLength: 0,
+    captureJumps: 0,
   };
 }
 
@@ -140,6 +165,27 @@ let takeCondition: Condition = 'quiet';
  */
 const TAKE_ENDS: ReadonlySet<StateName> = new Set<StateName>(['Listening', 'Asleep', 'Paused', 'Error']);
 
+/** The latest `ctxRunning`'s sample rate: the level frames' rate (null until the context first runs). */
+let sampleRate: number | null = null;
+/** The previous `level` event's epoch (null before the first) and ctx frame: the jump rule compares the two. */
+let levelEpoch: number | null = null;
+let levelFrame = 0;
+/**
+ * The ctx frame of the first level after the latest capture jump seen while tallying (null: none since the latest
+ * `arm` effect or `ctxRunning`).
+ */
+let jumpFrame: number | null = null;
+/** The latest armed take can still be excluded by a capture jump (#268): see the header. */
+let takeOpen = false;
+/** The epoch of the latest take's onset (null if the onset carried none). */
+let takeEpoch: number | null = null;
+/** The latest take's segment has ended (it left Recording). */
+let segEnded = false;
+/** The auto counts the latest armed take has added to counts[takeCondition], which an exclusion takes back. */
+const takeAdded: Record<Auto, number> = { recordings: 0, completed: 0, misfires: 0, maxLength: 0 };
+/** The latest phrase was excluded by a capture jump, not by D16: the status line says which. */
+let jumpExcluded = false;
+
 /** D15: marks and new takes are tallied only once the app has booted and the overlay's trace state is settled. */
 function tallying(): boolean {
   return app === 'ok' && overlay !== 'loading';
@@ -169,6 +215,9 @@ function statusText(): string {
     off: `Debug overlay off (?debug=0): no feature trace, so the pre-gate runs as built. ${built}`,
   };
   if (overlay === 'loading') return text.loading;
+  if (marksBlocked && jumpExcluded) {
+    return `${text[overlay]} A capture jump (the audio stalled for over 0.5 s) cut into the latest phrase: it isn't counted or marked. The marks reopen when the bear hears the next phrase.`;
+  }
   if (marksBlocked) {
     return `${text[overlay]} A phrase was in flight when the tally started: it isn't counted or marked. Counting starts with the next listen.`;
   }
@@ -302,6 +351,58 @@ function render(): void {
 }
 render();
 
+// ---- capture jumps (#268) ------------------------------------------------------------------------------------------
+
+/**
+ * The jump rule, as the e2e helpers have it (e2e/helpers/app.ts `findCaptureJump`): consecutive level frames of one
+ * epoch more than one level interval plus Math.round(sr / 2) apart. The worker tags each `level` with its 10 ms hop's
+ * first ctx frame, one every LEVEL_EVERY_HOPS-th hop (1440 frames at 48 kHz, ±1). The capture worklet zero-feeds a
+ * gap of up to Math.round(sr / 2) frames, so the levels stay contiguous; a longer gap re-anchors the feed (#244) and
+ * steps them by more than the gap.
+ */
+function isCaptureJump(prevFrame: number, frame: number, sr: number): boolean {
+  return frame - prevFrame > (LEVEL_EVERY_HOPS * ENERGY_HOP * sr) / VAD_RATE + Math.round(sr / 2);
+}
+
+/** Excludes the latest armed take, like an unarmed one (D16): its auto counts are taken back, and the marks close. */
+function excludeTake(): void {
+  for (const k of AUTOS) {
+    counts[takeCondition][k] -= takeAdded[k];
+    takeAdded[k] = 0;
+  }
+  takeArmed = false;
+  takeOpen = false;
+  marksBlocked = true;
+  jumpExcluded = true;
+}
+
+/** A `level` event: the jump rule against the previous one. Only frames and epochs are read. */
+function onLevel(epoch: number, frame: number): void {
+  const jump = sampleRate !== null && levelEpoch === epoch && isCaptureJump(levelFrame, frame, sampleRate);
+  levelEpoch = epoch;
+  levelFrame = frame;
+  const ofTake = takeOpen && epoch === takeEpoch;
+  if (!jump) {
+    if (ofTake && segEnded) takeOpen = false; // its segment ended before any gap: it no longer straddles one
+    return;
+  }
+  if (!tallying()) return;
+  jumpFrame = frame;
+  const c = ofTake ? takeCondition : condition;
+  if (ofTake) excludeTake();
+  counts[c].captureJumps++;
+  render();
+}
+
+/**
+ * The onset of a take at ctx `frame`: does its pre-roll reach back over the latest capture jump? Any epoch: the rest
+ * of a phrase cut as a misfire starts a take in the new epoch, just after the jump.
+ */
+function preRollStraddlesJump(frame: number): boolean {
+  if (sampleRate === null || jumpFrame === null) return false;
+  return frame - Math.round((PREROLL_MS * sampleRate) / 1000) < jumpFrame;
+}
+
 // ---- the app -----------------------------------------------------------------------------------------------------
 
 boot(appRoot, {
@@ -309,21 +410,35 @@ boot(appRoot, {
   onSession: (s) => {
     s.addTransitionListener((from, to, e, effects) => {
       let changed = false;
+      if (e.t === 'ctxRunning') {
+        sampleRate = e.sampleRate;
+        jumpFrame = null; // a new context restarts the frame count
+      }
       if (from === 'Listening' && to === 'Recording') {
-        takeArmed = cleanArm && tallying();
+        const clean = cleanArm && tallying();
+        const straddles = e.t === 'seg' && preRollStraddlesJump(e.ev.frame);
+        takeArmed = clean && !straddles;
         takeCondition = condition;
         marksBlocked = !takeArmed;
+        jumpExcluded = clean && straddles;
+        takeOpen = takeArmed;
+        takeEpoch = e.t === 'seg' ? e.epoch : null;
+        segEnded = false;
+        for (const a of AUTOS) takeAdded[a] = 0;
         changed = true;
       }
       const k = autoCounter(from, to, e);
       if (k !== null && takeArmed) {
         counts[takeCondition][k]++;
+        takeAdded[k]++;
         changed = true;
       }
+      if (from === 'Recording' && to !== 'Recording') segEnded = true;
       if (TAKE_ENDS.has(to)) takeArmed = false;
       // The `arm` effect (the worker's `reset`) starts a listen; a Listening → Listening stay has none.
       for (const fx of effects) {
         if (fx.k !== 'arm') continue;
+        jumpFrame = null; // a new arm cycle: its takes can't reach back before its arm frame
         cleanArm = tallying();
         if (cleanArm && !cleanEpochSeen) {
           cleanEpochSeen = true;
@@ -331,6 +446,9 @@ boot(appRoot, {
         }
       }
       if (changed) render();
+    });
+    s.subscribeLevel((e) => {
+      if (e.t === 'level') onLevel(e.epoch, e.frame);
     });
   },
   onDebugOverlay: (mounted) => {

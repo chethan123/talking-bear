@@ -12,7 +12,18 @@
  *   new precache. The plugin's own reload only fires when workbox-window's `isUpdate` is true, which it fixes
  *   when it registers: a first-visit page (controlled later by `clientsClaim`) would never reload. So the
  *   plugin's reload is turned off (`onNeedReload`) and `applyUpdate()` arms a one-time `controllerchange`
- *   reload itself; the first `clientsClaim` takeover happens before that and never reloads.
+ *   reload itself; the first `clientsClaim` takeover happens before that and never reloads. The reload stays
+ *   armed for `RELOAD_ARM_MS` only: if SKIP_WAITING found no waiting worker, a later activation must not
+ *   reload the page in whatever state it is in by then.
+ * - **Another tab's update (#230):** when another tab of the app applies an update, the new worker takes
+ *   control of this page too (`clientsClaim`), and its activation deleted the old precache entries. This page
+ *   runs old code that loads old lazy URLs at its next wake, so it must reload too, but never mid-take: the
+ *   `controllerchange` it didn't arm sets `updateReady()` and dispatches `updateReady`. A hidden page is
+ *   already in Asleep or Paused, so it reloads at once; a visible one waits for the session's C11 path, which
+ *   calls `applyUpdate()` at the next hide in Asleep or Paused and so reloads it (there is no waiting worker
+ *   left to activate). That dispatch carries `activated: true`, so a visible page in Asleep also reloads at its
+ *   next tap or settings retry instead of waking on old lazy URLs (#277, plan §3.4 row 3c). The first
+ *   `clientsClaim` takeover of an uncontrolled page (a first visit) is not an update and changes nothing.
  * - **Update checks:** a single-page app never navigates, so `reg.update()` runs on every `visible` and hourly
  *   (frozen tabs run no timers; the next `visible` catches up).
  * - **Offline:** after the first `offlineReady`, ask for persistent storage.
@@ -28,6 +39,13 @@ import type { Visibility } from '../platform/visibility.ts';
 
 /** How often a page that stays open asks for a new sw.js, in ms (plan §4.7 update checks). */
 export const UPDATE_CHECK_MS = 60 * 60 * 1000;
+
+/**
+ * How long `applyUpdate()`'s reload stays armed, in ms, counted from the latest `applyUpdate()` (each one sends
+ * SKIP_WAITING again) (#230 Decision 1). The new worker takes control well within it; a `controllerchange`
+ * after it is handled as another tab's update.
+ */
+export const RELOAD_ARM_MS = 10_000;
 
 /** Chromium's non-standard `beforeinstallprompt` event (plan §4.5); it isn't in the DOM lib. */
 interface BeforeInstallPromptEvent extends Event {
@@ -48,24 +66,38 @@ export interface PwaDeps {
 }
 
 export interface Pwa {
-  /** If an update is ready, activates it now (`updateSW(true)`); the page reloads once it takes control. */
+  /**
+   * If an update is ready, activates it now (`updateSW(true)`); the page reloads once it takes control. If
+   * another tab already activated it, reloads the page now.
+   */
   applyUpdate(): void;
   /** Shows the kept install prompt, if any; never rejects. Call it from a click handler (user activation). */
   promptInstall(): Promise<void>;
-  /** True once a new service worker is waiting (`onNeedRefresh`). */
+  /** True once a new service worker is waiting (`onNeedRefresh`), or another tab activated one. */
   updateReady(): boolean;
+  /** True once another tab activated a new version: this page runs old code until it reloads (#277). */
+  activatedElsewhere(): boolean;
 }
 
 const warn = (what: string, err: unknown): void => {
   console.warn(`pwa: ${what} failed`, err);
 };
 
+/** The `controllerchange` reload `applyUpdate()` arms: the worker it activated took control. */
+const reloadOnOwnUpdate = (): void => {
+  location.reload();
+};
+
 export function setupPwa(deps: PwaDeps): Pwa {
   let ready = false;
-  /** The one-time `controllerchange` reload is attached (by the first `applyUpdate()` after `onNeedRefresh`). */
+  /** `applyUpdate()`'s one-time `controllerchange` reload is attached (for `RELOAD_ARM_MS`). */
   let reloadArmed = false;
+  /** The pending disarm of that reload, restarted by every `applyUpdate()`. */
+  let disarmTimer: number | null = null;
   let reg: ServiceWorkerRegistration | undefined;
   let installEvent: BeforeInstallPromptEvent | null = null;
+  /** Another tab activated a new version: this page runs old code until it reloads. */
+  let activatedElsewhere = false;
 
   const updateSW = registerSW({
     onNeedRefresh() {
@@ -85,6 +117,23 @@ export function setupPwa(deps: PwaDeps): Pwa {
       warn('service worker registration', err);
     },
   });
+
+  if ('serviceWorker' in navigator) {
+    let controlled = navigator.serviceWorker.controller !== null;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!controlled) {
+        controlled = true; // the first clientsClaim takeover of a first visit, not an update
+        return;
+      }
+      if (reloadArmed) return; // our own applyUpdate(): its listener reloads
+      activatedElsewhere = true;
+      ready = true;
+      // The session reloads at an Asleep tap or settings retry (#277), or at the next hide in Asleep or Paused.
+      deps.dispatch({ t: 'updateReady', activated: true });
+      // Already hidden: every hide leaves the session in Asleep or Paused (rows 5, 38, 43), so this is C11's moment.
+      if (deps.visibility.current() === 'hidden') location.reload();
+    });
+  }
 
   /** Asks the browser to re-check sw.js; offline, that rejects, which is expected. */
   const check = (): void => {
@@ -116,9 +165,23 @@ export function setupPwa(deps: PwaDeps): Pwa {
   return {
     applyUpdate() {
       if (!ready) return;
-      if (!reloadArmed && 'serviceWorker' in navigator) {
-        reloadArmed = true;
-        navigator.serviceWorker.addEventListener('controllerchange', () => location.reload(), { once: true });
+      if (activatedElsewhere) {
+        location.reload(); // the new worker already controls this page; nothing is waiting
+        return;
+      }
+      if ('serviceWorker' in navigator) {
+        const container = navigator.serviceWorker;
+        if (!reloadArmed) {
+          reloadArmed = true;
+          container.addEventListener('controllerchange', reloadOnOwnUpdate, { once: true });
+        }
+        // Every SKIP_WAITING gets the full window, so a retry near the deadline still reloads on its own path.
+        if (disarmTimer !== null) deps.clock.clearTimeout(disarmTimer);
+        disarmTimer = deps.clock.setTimeout(() => {
+          container.removeEventListener('controllerchange', reloadOnOwnUpdate);
+          reloadArmed = false;
+          disarmTimer = null;
+        }, RELOAD_ARM_MS);
       }
       updateSW(true).catch((err: unknown) => warn('update', err));
     },
@@ -136,5 +199,6 @@ export function setupPwa(deps: PwaDeps): Pwa {
       }
     },
     updateReady: () => ready,
+    activatedElsewhere: () => activatedElsewhere,
   };
 }

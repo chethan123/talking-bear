@@ -1,13 +1,30 @@
 // The effect runner's `onPlayStarted` report (issue #81): a `play{id}` effect that starts a replay reports the
-// player's scheduled start, synchronously, before the transition's next effect (`anim talk{id}`). Node, with
-// minimal fakes; the rest of the runner is covered through the session in session.test.ts.
+// player's scheduled start, synchronously, before the transition's next effect (`anim talk{id}`). The noise floor
+// estimate (#116): engine `level`s become at most one `noiseFloor` per second while Listening, or Recording after its
+// hold-off (#289), checked over every fixture and a sustained vowel on both VAD backends. The cooldown timer
+// (#286) also waits on the context clock; other timers stay on the wall clock. Node, with minimal fakes; the rest of
+// the runner is covered through the session in session.test.ts.
+import { readdirSync, readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '../../test/fake-clock.ts';
+import { readWav } from '../../test/wav.ts';
 import type { Engine } from '../audio/engine.ts';
+import type { WorkerToMain } from '../audio/messages.ts';
 import type { PlayHandle } from '../audio/player.ts';
+import { resampleOffline } from '../dsp/resample.ts';
+import { createSilero } from '../dsp/silero/model.ts';
+import { decodeWeights } from '../dsp/silero/weights.ts';
 import { emptyEnvelope } from '../dsp/types.ts';
-import { createEffectRunner, type EffectDeps } from './effects.ts';
-import type { SessionEvent } from './events.ts';
+import { VadCore } from '../workers/vad-core.ts';
+import {
+  COOLDOWN_CTX_WAIT_MAX_MS,
+  createEffectRunner,
+  NOISE_FLOOR_RECORDING_HOLDOFF_MS,
+  NOISE_FLOOR_WINDOW_MS,
+  type EffectDeps,
+  type EffectRunner,
+} from './effects.ts';
+import type { SessionEvent, SessionState } from './events.ts';
 import { initialSessionState } from './machine.ts';
 import type { Player, Sfx } from './session.ts';
 
@@ -177,4 +194,527 @@ describe('onPlayStarted (#81)', () => {
     runner.run({ k: 'play', id: 9 });
     expect(player.plays).toBe(1);
   });
+});
+
+/** A runner whose session sits in `state` (mutable through the returned object), with a FakeClock. */
+function harness(initial: Partial<SessionState> = {}): {
+  runner: EffectRunner;
+  clock: FakeClock;
+  floors: number[];
+  times: number[];
+  set(p: Partial<SessionState>): void;
+} {
+  const clock = new FakeClock();
+  const floors: number[] = [];
+  const times: number[] = [];
+  let state: SessionState = { ...initialSessionState('granted'), name: 'Listening', epoch: 4, ...initial };
+  const { engine } = fakeEngine(null);
+  const runner = createEffectRunner(deps(engine, fakePlayer(0), { clock }), {
+    dispatch: (e) => {
+      if (e.t !== 'noiseFloor') throw new Error(`unexpected ${e.t}`);
+      floors.push(e.floorDb);
+      times.push(clock.now());
+    },
+    state: () => state,
+  });
+  return {
+    runner,
+    clock,
+    floors,
+    times,
+    set: (p) => {
+      state = { ...state, ...p };
+    },
+  };
+}
+
+/** Feeds `n` levels 30 ms apart (the worker's ≈ 33 Hz), the clock advancing before each but the first. */
+function feedLevels(
+  h: ReturnType<typeof harness>,
+  n: number,
+  db: (i: number) => number,
+  floorDb = -60,
+  epoch = 4,
+) {
+  for (let i = 0; i < n; i++) {
+    if (i > 0) h.clock.advance(30);
+    h.runner.level({ epoch, db: db(i), floorDb });
+  }
+}
+
+describe('noise floor estimate (#116)', () => {
+  it('dispatches nothing before a window spans 1 s, then max(window minimum, gate floor) once', () => {
+    expect(NOISE_FLOOR_WINDOW_MS).toBe(1000);
+    const h = harness();
+    feedLevels(h, 34, (i) => -24 - (i % 4), -60); // 33 · 30 ms = 990 ms: still open
+    expect(h.floors).toEqual([]);
+    h.clock.advance(10);
+    h.runner.level({ epoch: 4, db: -25, floorDb: -60 }); // 1000 ms after the window opened
+    expect(h.floors).toEqual([-27]);
+    // A gate floor above the window minimum wins.
+    feedLevels(h, 35, () => -30, -28);
+    expect(h.floors).toEqual([-27, -28]);
+  });
+
+  it('a NaN gate floor (not initialised yet) leaves the window minimum', () => {
+    const h = harness();
+    feedLevels(h, 35, (i) => -40 + i / 10, Number.NaN);
+    expect(h.floors).toEqual([-40]);
+  });
+
+  it('digital silence counts as −100 dBFS: a silent input after noise clears the flag', () => {
+    const h = harness();
+    feedLevels(h, 35, () => -24);
+    expect(h.floors).toEqual([-24]);
+    h.clock.advance(30);
+    feedLevels(h, 41, () => -120, -60); // 1.2 s of digital silence
+    expect(h.floors).toHaveLength(2);
+    expect(h.floors[1]).toBeLessThanOrEqual(-35);
+    expect(h.floors[1]).toBe(-100); // #288: a window of nothing but digital silence dispatches its minimum, not N
+    h.clock.advance(30);
+    feedLevels(h, 35, () => Number.NaN, Number.NaN);
+    expect(h.floors[2]).toBe(-100);
+  });
+
+  it('#288: digital silence clears the flag even when the frozen gate floor is above −35 dBFS', () => {
+    const h = harness();
+    feedLevels(h, 70, () => -24, -30); // 2.07 s of loud noise, ending on a dispatch; N is −30
+    expect(h.floors).toEqual([-24, -24]); // max(window minimum −24, N −30)
+    h.clock.advance(30);
+    feedLevels(h, 41, () => -120, -30); // 1.2 s of digital silence: the gate freezes N at −30
+    expect(h.floors).toHaveLength(3);
+    expect(h.floors[2]).toBeLessThanOrEqual(-35);
+    expect(h.floors[2]).toBe(-100); // a fully silent window dispatches its minimum, not max(−100, N) = −30
+  });
+
+  it('#288: a capture glitch inside a loud window keeps the gate floor (only a fully silent window wins)', () => {
+    const h = harness();
+    feedLevels(h, 35, () => -24, -30);
+    h.clock.advance(30);
+    feedLevels(h, 35, (i) => (i >= 10 && i < 13 ? -120 : -24), -30); // a 90 ms zero-fed stall
+    expect(h.floors).toEqual([-24, -30]);
+  });
+
+  it('#288: a capture glitch that opens a loud window keeps the gate floor (the window maximum tracks later levels)', () => {
+    const h = harness();
+    feedLevels(h, 35, () => -24, -30);
+    h.clock.advance(30);
+    feedLevels(h, 35, (i) => (i < 3 ? -120 : -24), -30); // the window opens on a 90 ms zero-fed stall
+    expect(h.floors).toEqual([-24, -30]);
+  });
+
+  it('#288: ±Infinity levels are digital silence, as in the energy gate', () => {
+    const h = harness();
+    feedLevels(h, 35, () => Number.POSITIVE_INFINITY, -30);
+    expect(h.floors).toEqual([-100]); // not max(Infinity, N)
+    h.clock.advance(30);
+    feedLevels(h, 35, () => Number.NEGATIVE_INFINITY, -30);
+    expect(h.floors).toEqual([-100, -100]);
+  });
+
+  it('only Listening and Recording levels of the current epoch count; another state or a new epoch restarts the window', () => {
+    const h = harness();
+    feedLevels(h, 20, () => -24); // 570 ms
+    h.set({ name: 'Processing' });
+    feedLevels(h, 40, () => -24); // never counted, and the window closes
+    h.set({ name: 'Listening' });
+    feedLevels(h, 20, () => -24); // a fresh window: 570 ms only
+    expect(h.floors).toEqual([]);
+    feedLevels(h, 40, () => -24, -60, 3); // a stale epoch closes it again
+    expect(h.floors).toEqual([]);
+    h.set({ epoch: 5 });
+    feedLevels(h, 20, () => -24, -60, 4); // the old epoch's levels: ignored
+    feedLevels(h, 20, () => -24, -60, 5); // 570 ms of the new epoch
+    expect(h.floors).toEqual([]);
+    h.clock.advance(30);
+    feedLevels(h, 15, () => -24, -60, 5); // now 1.02 s
+    expect(h.floors).toEqual([-24]);
+  });
+
+  it("#310: a new epoch restarts the window at its first level, even straight after the old epoch's levels", () => {
+    const h = harness(); // Listening, epoch 4
+    feedLevels(h, 20, () => -50); // 570 ms of epoch 4: the window is open
+    h.set({ epoch: 5 }); // re-armed into Listening, with no level of another state or epoch in between
+    h.clock.advance(30);
+    const t1 = h.clock.now();
+    feedLevels(h, 34, () => -24, -60, 5); // t1 … t1 + 990 ms of epoch 5: no window spans 1 s yet
+    expect(h.floors).toEqual([]);
+    h.clock.advance(10);
+    h.runner.level({ epoch: 5, db: -24, floorDb: -60 }); // t1 + 1000: the window that opened at t1 closes
+    expect(h.floors).toEqual([-24]); // epoch 5's levels only: no −50 from epoch 4
+    expect(h.times).toEqual([t1 + 1000]);
+  });
+
+  it("#289: Recording levels count from NOISE_FLOOR_RECORDING_HOLDOFF_MS after the epoch's first one; earlier ones close the window", () => {
+    expect(NOISE_FLOOR_RECORDING_HOLDOFF_MS).toBe(1000);
+    const h = harness();
+    feedLevels(h, 20, () => -24); // 570 ms in Listening: the window is open
+    h.set({ name: 'Recording' });
+    h.clock.advance(30);
+    const t0 = h.clock.now();
+    feedLevels(h, 34, () => -26); // t0 … t0 + 990: inside the hold-off
+    h.clock.advance(9);
+    h.runner.level({ epoch: 4, db: -26, floorDb: -60 }); // t0 + 999: still inside
+    expect(h.floors).toEqual([]); // the Listening window was closed; nothing carried over
+    h.clock.advance(1);
+    h.runner.level({ epoch: 4, db: -22, floorDb: -60 }); // t0 + 1000: the first counted level opens a window
+    h.clock.advance(30);
+    feedLevels(h, 34, () => -22); // the window spans 30 + 33 · 30 = 1020 ms
+    expect(h.floors).toEqual([-22]);
+    expect(h.times[0]! - t0).toBeGreaterThanOrEqual(2000);
+  });
+
+  it("#289: the hold-off restarts with each epoch's first Recording level", () => {
+    const h = harness({ name: 'Recording' });
+    feedLevels(h, 70, () => -24); // 2070 ms of epoch 4: counted from 1000 ms, one window closes at ≥ 2000 ms
+    expect(h.floors).toEqual([-24]);
+    h.set({ epoch: 5 });
+    h.clock.advance(30);
+    feedLevels(h, 60, () => -24, -60, 5); // 1770 ms of epoch 5: 1000 ms of hold-off, then only 770 ms counted
+    expect(h.floors).toEqual([-24]);
+  });
+
+  it('#289: stale-epoch Recording levels are ignored and close the window', () => {
+    const h = harness();
+    feedLevels(h, 20, () => -24); // 570 ms in Listening
+    h.set({ name: 'Recording' });
+    feedLevels(h, 20, () => -24, -60, 3); // a stale epoch: ignored, and the window closes
+    feedLevels(h, 20, () => -24); // the current epoch's Recording levels: inside the hold-off
+    expect(h.floors).toEqual([]);
+  });
+
+  it('at most one noiseFloor per second over a steady stream', () => {
+    const h = harness();
+    feedLevels(h, 167, () => -24); // 4.98 s of levels
+    expect(h.floors.length).toBe(4);
+    for (let i = 1; i < h.times.length; i++) {
+      expect(h.times[i]! - h.times[i - 1]!).toBeGreaterThanOrEqual(NOISE_FLOOR_WINDOW_MS);
+    }
+  });
+
+  it('the arm effect passes marginBoostDb to engine.arm', () => {
+    const calls: unknown[][] = [];
+    const { engine } = fakeEngine(null);
+    const withArm: Engine = { ...engine, arm: (...a: unknown[]) => void calls.push(a) };
+    const runner = createEffectRunner(deps(withArm, fakePlayer(0), {}), {
+      dispatch: noop,
+      state: () => initialSessionState('granted'),
+    });
+    runner.run({ k: 'arm', epoch: 3, restoreFloorDb: -50, marginBoostDb: 6 });
+    runner.run({ k: 'arm', epoch: 4 });
+    expect(calls).toEqual([
+      [3, -50, 6],
+      [4, undefined, undefined],
+    ]);
+  });
+});
+
+/** A context whose `state` and `currentTime` the test sets; the timers read only those two. */
+interface FakeAudioClock {
+  state: AudioContextState;
+  currentTime: number;
+}
+
+/** An engine whose context() is `audio` (null: no context yet), with the play-path methods stubbed. */
+function clockedEngine(audio: FakeAudioClock | null): Engine {
+  const ctx =
+    audio === null
+      ? null
+      : {
+          createBuffer: () => {
+            throw new Error('unused');
+          },
+          get state() {
+            return audio.state;
+          },
+          get currentTime() {
+            return audio.currentTime;
+          },
+        };
+  if (ctx !== null && !isAudioContext(ctx)) throw new Error('unreachable');
+  const bus = fakeBus();
+  const engine = {
+    getProcessed: () => undefined,
+    releaseProcessed: noop,
+    context: () => ctx,
+    masterBus: () => bus,
+  };
+  if (!isEngine(engine)) throw new Error('unreachable');
+  return engine;
+}
+
+/** A runner on a FakeClock (t = 0) whose context clock starts at 10 s and runs; records what it dispatches. */
+function timerHarness(withContext = true): {
+  clock: FakeClock;
+  audio: FakeAudioClock;
+  runner: EffectRunner;
+  dispatched: SessionEvent[];
+} {
+  const clock = new FakeClock();
+  const audio: FakeAudioClock = { state: 'running', currentTime: 10 };
+  const dispatched: SessionEvent[] = [];
+  const runner = createEffectRunner(
+    deps(clockedEngine(withContext ? audio : null), fakePlayer(0), { clock }),
+    {
+      dispatch: (e) => dispatched.push(e),
+      state: () => initialSessionState('granted'),
+    },
+  );
+  return { clock, audio, runner, dispatched };
+}
+
+const COOLDOWN_FIRED: SessionEvent[] = [{ t: 'timer', name: 'cooldown' }];
+
+describe('timer cooldown: also on the context clock (#286, plan §3.1, §4.4 point 5)', () => {
+  it('(a) fires after 250 ms when the context clock kept up with the wall clock', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.249;
+    clock.advance(249);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.25;
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(b) a stall left the context clock 60 ms behind: it waits, and fires only once it reaches ctxDue', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.19;
+    clock.advance(250);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.249;
+    clock.advance(59);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.25;
+    clock.advance(2);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(b2) the re-arm waits at least 1 ms, even for a sub-millisecond rest', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.2499999;
+    clock.advance(250);
+    audio.currentTime = 10.25;
+    clock.advance(0.5);
+    expect(dispatched).toEqual([]);
+    clock.advance(0.5);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+  });
+
+  it('(c) a cancelled cooldown never fires, even while it waits on the context clock', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.1;
+    clock.advance(250);
+    runner.run({ k: 'cancelTimer', name: 'cooldown' });
+    audio.currentTime = 11;
+    clock.advance(1000);
+    expect(dispatched).toEqual([]);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(c2) cancelTimer * (clearAllTimers) also stops a cooldown waiting on the context clock', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.1;
+    clock.advance(250);
+    runner.run({ k: 'cancelTimer', name: '*' });
+    audio.currentTime = 11;
+    clock.advance(1000);
+    expect(dispatched).toEqual([]);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(c3) a new cooldown (row 45) replaces one waiting on the context clock, and fires once', () => {
+    const { clock, audio, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    audio.currentTime = 10.1;
+    clock.advance(250); // waiting: ctxDue 10.25
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 }); // ctxDue 10.35
+    audio.currentTime = 10.3;
+    clock.advance(249);
+    expect(dispatched).toEqual([]);
+    audio.currentTime = 10.35;
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    clock.advance(1000);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+  });
+
+  it.each(['suspended', 'closed', 'interrupted'] as const)(
+    '(d) with the context %s it fires on the wall clock alone',
+    (state) => {
+      const { clock, audio, runner, dispatched } = timerHarness();
+      runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+      audio.state = state;
+      clock.advance(250);
+      expect(dispatched).toEqual(COOLDOWN_FIRED);
+    },
+  );
+
+  it('(f) a context that says running but whose clock froze: it fires at ms + COOLDOWN_CTX_WAIT_MAX_MS', () => {
+    const { clock, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 }); // currentTime stays 10 s
+    clock.advance(250 + COOLDOWN_CTX_WAIT_MAX_MS - 1);
+    expect(dispatched).toEqual([]);
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(f2) the last re-arm is clamped to the wall cap, not the whole context rest', () => {
+    const { clock, runner, dispatched } = timerHarness();
+    runner.run({ k: 'timer', name: 'cooldown', ms: 300 }); // frozen: re-arms at 300 and 600 for 300 ms each
+    clock.advance(300 + COOLDOWN_CTX_WAIT_MAX_MS - 1);
+    expect(dispatched).toEqual([]);
+    clock.advance(1);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('(d2) with no context yet it fires on the wall clock alone', () => {
+    const { clock, runner, dispatched } = timerHarness(false);
+    runner.run({ k: 'timer', name: 'cooldown', ms: 250 });
+    clock.advance(250);
+    expect(dispatched).toEqual(COOLDOWN_FIRED);
+  });
+
+  it.each(['processing', 'doze', 'sleep', 'waking', 'recording'] as const)(
+    '(e) timer %s ignores the context clock (wall clock only, §3.1)',
+    (name) => {
+      const { clock, runner, dispatched } = timerHarness();
+      runner.run({ k: 'timer', name, ms: 250 }); // the context clock stays at 10 s: 250 ms behind
+      clock.advance(249);
+      expect(dispatched).toEqual([]);
+      clock.advance(1);
+      expect(dispatched).toEqual([{ t: 'timer', name }]);
+    },
+  );
+});
+
+// ---- #289: the estimate over real VAD levels ----------------------------------------------------------------------
+
+/** weights.bin as a fresh ArrayBuffer (a copy: never the Node Buffer, whose memory may be a shared pool). */
+function weightsBuffer(): ArrayBuffer {
+  const bytes = readFileSync(new URL('../dsp/silero/weights.bin', import.meta.url));
+  const buf = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buf).set(bytes);
+  return buf;
+}
+const W = decodeWeights(weightsBuffer());
+
+/** Every WAV directly in test/fixtures and e2e/fixtures (48 kHz), found at collection time. */
+const FIXTURES: string[] = ['../../test/fixtures/', '../../e2e/fixtures/']
+  .flatMap((dir) =>
+    readdirSync(new URL(dir, import.meta.url))
+      .filter((f) => f.endsWith('.wav'))
+      .map((f) => `${dir.slice('../../'.length)}${f}`),
+  )
+  .toSorted();
+const NOISE_FIXTURE = 'e2e/fixtures/noise_pink_-20dbfs_20s.wav';
+const BACKENDS = ['silero', 'energy'] as const;
+type Backend = (typeof BACKENDS)[number];
+
+/**
+ * The noise floor values the real runner dispatches for `x48` (48 kHz, then 1.5 s of zeros) on `backend`: one VadCore
+ * listen (epoch 1, never re-armed, so every level counts and no floor is restored), with the session in Recording
+ * while a segment is open and Listening otherwise. `times` are ms from the start of the input.
+ */
+function floorsOf(x48: Float32Array, backend: Backend): { floors: number[]; times: number[] } {
+  const x16 = resampleOffline(x48, 1 / 3);
+  const pcm = new Float32Array(x16.length + 24_000);
+  pcm.set(x16);
+  const h = harness({ epoch: 1, name: 'Listening' });
+  const t0 = h.clock.now();
+  let last: number | null = null;
+  const core = new VadCore(48_000, (m: WorkerToMain) => {
+    if (m.t === 'level') {
+      if (last !== null) h.clock.advance((m.frame - last) / 48);
+      last = m.frame;
+      h.runner.level(m);
+    } else if (m.t === 'seg') {
+      h.set({ name: m.ev.kind === 'start' ? 'Recording' : 'Listening' });
+    }
+  });
+  if (backend === 'silero') core.setModel(createSilero(W));
+  core.reset(1, backend);
+  for (let i = 0; i + 512 <= pcm.length; i += 512) core.frame(1, i * 3, pcm.subarray(i, i + 512));
+  return { floors: h.floors, times: h.times.map((t) => t - t0) };
+}
+
+/**
+ * The plan review's sustained /a/ (#289): f0 with ±3 % 5 Hz vibrato, harmonics shaped by formants at 800, 1200 and
+ * 2500 Hz, ±3 dB 4 Hz amplitude modulation, 60 ms attack and release, after 1 s of silence; scaled to `rmsDb`
+ * active RMS.
+ */
+function vowel(rate: number, durS: number, f0: number, rmsDb: number): Float32Array {
+  const n = Math.round(durS * rate);
+  const lead = rate;
+  const x = new Float32Array(lead + n);
+  const formants = [800, 1200, 2500];
+  const widths = [80, 90, 120];
+  const amp = (f: number): number =>
+    formants.reduce((a, fc, i) => a + 1 / (1 + ((f - fc) / widths[i]!) ** 2), 0) / (1 + f / 1000);
+  let ph = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / rate;
+    const f = f0 * (1 + 0.03 * Math.sin(2 * Math.PI * 5 * t));
+    ph += (2 * Math.PI * f) / rate;
+    let v = 0;
+    for (let k = 1; k * f0 < 4000; k++) v += amp(k * f0) * Math.sin(k * ph);
+    const env = Math.min(1, t / 0.06, (durS - t) / 0.06) * 10 ** ((3 * Math.sin(2 * Math.PI * 4 * t)) / 20);
+    x[lead + i] = v * env;
+  }
+  let sum = 0;
+  for (let i = lead; i < x.length; i++) sum += x[i]! * x[i]!;
+  const g = 10 ** (rmsDb / 20) / Math.sqrt(sum / n);
+  for (let i = 0; i < x.length; i++) x[i] = x[i]! * g;
+  return x;
+}
+
+describe('#289: the noise floor estimate over the fixtures and a sustained vowel, on both backends', () => {
+  it('finds the fixtures', () => {
+    expect(FIXTURES.length).toBeGreaterThanOrEqual(20);
+    expect(FIXTURES).toContain(NOISE_FIXTURE);
+  });
+
+  const cases = FIXTURES.flatMap((f) => BACKENDS.map((b): [string, Backend] => [f, b]));
+  it.each(cases)('%s on %s', { timeout: 120_000 }, (path, backend) => {
+    const wav = readWav(readFileSync(new URL(`../../${path}`, import.meta.url)));
+    expect(wav.sampleRate).toBe(48_000);
+    const { floors, times } = floorsOf(wav.channels[0]!, backend);
+    if (path === NOISE_FIXTURE) {
+      // The −20 dBFS pink noise reads above −35 dBFS within 5 s (#289 Validation; plan §4.4).
+      const i = floors.findIndex((v) => v > -35);
+      expect(i, `floors ${floors.join(', ')}`).toBeGreaterThanOrEqual(0);
+      expect(times[i]).toBeLessThanOrEqual(5000);
+    } else {
+      // No false positive (#289 spec).
+      expect(
+        Math.max(Number.NEGATIVE_INFINITY, ...floors),
+        `floors ${floors.join(', ')}`,
+      ).toBeLessThanOrEqual(-35);
+    }
+  });
+
+  // Up to 1.5 s: the hold-off leaves no full counted window of vowel. The measured residual is energy-only: a voiced
+  // sound held ≥ 2.1 s at ≥ −30 dBFS sets the flag from Recording at about 3.06 s; 1.8 and 2.0 s don't. On Silero,
+  // the −23.8 dBFS reading for a 2 s vowel at −20 dBFS is set in Listening at 2790 ms, the same as on main before
+  // #309, so #289 doesn't cause it (code review 6086706417 on #309).
+  const vowels = [1.2, 1.5].flatMap((d) => BACKENDS.map((b): [number, number, Backend] => [d, -20, b]));
+  it.each(vowels)(
+    'a sustained /a/ of %f s at %f dBFS RMS on %s never sets the flag (ORCH-NOTE 6085389040)',
+    { timeout: 120_000 },
+    (durS, rmsDb, backend) => {
+      const { floors } = floorsOf(vowel(48_000, durS, 260, rmsDb), backend);
+      expect(
+        Math.max(Number.NEGATIVE_INFINITY, ...floors),
+        `floors ${floors.join(', ')}`,
+      ).toBeLessThanOrEqual(-35);
+    },
+  );
 });
