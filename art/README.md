@@ -2,6 +2,8 @@
 
 `bear.svg` is the text source of truth for Juni (plan §4.6.1 and §4.6.5). `scripts/gen-bear-parts.ts` compiles it into `src/art/bear-parts.gen.ts`, and `scripts/bear-svg.test.ts` checks the rules below. Keep to them when you edit the file, or it stops compiling.
 
+The generator compiles every character listed in its `CHARACTER_ART` table (`scripts/gen-bear-parts.ts`); `pnpm gen:bear` regenerates all of them, `pnpm gen:bear --character <id>` one, and `node scripts/gen-bear-parts.ts --check` verifies them all. The `viewBox` and mirror rules are shared by every character.
+
 ## Authoring rules
 
 ### The file
