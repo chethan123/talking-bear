@@ -1,7 +1,7 @@
 // Node timing of the voice chain (src/dsp/voice.ts processVoice; plan §4.3.4, budget §4.10: p95 ≤ 15 ms per
 // second of audio on D1). Duck plan T114: run it before and after a voice-chain change on the same machine.
 //
-// For each rate (48 and 44.1 kHz), clip length (1, 5 and 10 s) and preset (cub, chipmunk, bigbear), it calls
+// For each rate (48 and 44.1 kHz), clip length (1, 5 and 10 s) and preset (cub, chipmunk, bigbear, duck), it calls
 // processVoice(clip, rate, preset) WARMUPS times untimed, then RUNS times with performance.now() around each
 // call, and prints the median and p95 (nearest rank) in ms and in ms per second of input audio. Each row also
 // prints the output length and an FNV-1a hash of the output's float32 bits, so the outputs of two runs (before
@@ -24,7 +24,7 @@ const WARMUPS = 4;
 const RUNS = 30;
 const RATES: readonly number[] = [48000, 44100];
 const CLIPS_S: readonly number[] = [1, 5, 10];
-const VOICE_PRESETS: readonly VoicePreset[] = [PRESETS.cub, PRESETS.chipmunk, PRESETS.bigbear];
+const VOICE_PRESETS: readonly VoicePreset[] = [PRESETS.cub, PRESETS.chipmunk, PRESETS.bigbear, PRESETS.duck];
 
 // ---- copied verbatim from lab/bench.worker.ts ---------------------------------------------------------------
 

@@ -1,16 +1,26 @@
-// The app's single settings model (plan §7 M3, §7 M8): the shape and defaults, a tolerant validator, the
-// voice preset a setting selects, and a store that persists to an injected `Storage` (`localStorage` in
+// The app's single settings model (plan §7 M3, §7 M8, §4.3.5): the shape and defaults, a tolerant validator, the
+// voice preset the settings select for the active character, and a store that persists to an injected `Storage` (`localStorage` in
 // the app). Pure at import: no DOM or global access; `storage` is passed in by the caller.
 //
 // Every storage access is inside try/catch. The first exception (private mode, blocked storage,
 // thumbnail capture, quota) switches the store to in-memory only for the rest of its life, as if it had
 // been created with `storage = null`. Nothing here throws.
 
-import { PRESETS, type VoicePreset } from '../dsp/types.ts';
+import { PRESETS, type VoiceId, type VoicePreset } from '../dsp/types.ts';
+
+/** The characters (duck plan Q9, Q12): Juni the bear and Fenn the duckling. */
+export type CharacterId = 'juni' | 'fenn';
 
 export interface Settings {
-  /** The voice preset; `'custom'` plays at `customPitch`. Default `'cub'` (plan §4.3.4, §7 M8). */
-  voice: 'cub' | 'chipmunk' | 'bigbear' | 'custom';
+  /**
+   * Juni's voice preset; `'custom'` plays at `customPitch`. Default `'cub'` (plan §4.3.4, §7 M8). Stored v1 data
+   * keeps its meaning: it always was Juni's voice.
+   */
+  voice: VoiceId;
+  /** Fenn's voice preset, the same choices as `voice`. Default `'duck'` (duck plan Q11). */
+  fennVoice: VoiceId;
+  /** The character on stage. Default `'juni'`. */
+  character: CharacterId;
   /** Pitch ratio p of the custom voice, `CUSTOM_PITCH_MIN`–`CUSTOM_PITCH_MAX` (plan §4.3.4). */
   customPitch: number;
   /** Another −6 dB on the master bus (plan §4.3.4). Default true. */
@@ -29,7 +39,7 @@ export const CUSTOM_PITCH_MIN = 0.7;
 export const CUSTOM_PITCH_MAX = 2.2;
 export const SLEEP_TIMEOUT_MIN_SEC = 60;
 export const SLEEP_TIMEOUT_MAX_SEC = 600;
-/** The `localStorage` key; the version suffix changes only with an incompatible format. */
+/** The `localStorage` key; the version suffix changes only with an incompatible format (new keys are additive). */
 export const SETTINGS_KEY = 'bear.settings.v1';
 
 /**
@@ -38,6 +48,8 @@ export const SETTINGS_KEY = 'bear.settings.v1';
  */
 export const DEFAULT_SETTINGS: Settings = Object.freeze<Settings>({
   voice: 'cub',
+  fennVoice: 'duck',
+  character: 'juni',
   customPitch: PRESETS.cub.pitchRatio,
   quietMode: true,
   gentleMode: false,
@@ -46,14 +58,22 @@ export const DEFAULT_SETTINGS: Settings = Object.freeze<Settings>({
   sleepTimeoutSec: 120,
 });
 
-const VOICES: readonly string[] = ['cub', 'chipmunk', 'bigbear', 'custom'] satisfies Settings['voice'][];
+const VOICES: readonly string[] = ['cub', 'chipmunk', 'bigbear', 'duck', 'custom'] satisfies VoiceId[];
+const CHARACTERS: readonly string[] = ['juni', 'fenn'] satisfies CharacterId[];
+
+/** The settings field that holds `character`'s voice: `voice` for Juni, `fennVoice` for Fenn. */
+export function voiceKey(character: CharacterId): 'voice' | 'fennVoice' {
+  return character === 'fenn' ? 'fennVoice' : 'voice';
+}
 
 /**
- * The preset a setting selects: the shared `PRESETS` entry for a named voice (callers must not mutate
- * it), or a new `{ id: 'custom', pitchRatio: customPitch }` for Custom.
+ * The preset the settings select: the active character's voice (`voice` for Juni, `fennVoice` for Fenn), as
+ * the shared `PRESETS` entry for a named voice (callers must not mutate it), or a new
+ * `{ id: 'custom', pitchRatio: customPitch }` for Custom (both characters share `customPitch`).
  */
 export function presetFor(s: Settings): VoicePreset {
-  return s.voice === 'custom' ? { id: 'custom', pitchRatio: s.customPitch } : PRESETS[s.voice];
+  const voice = s[voiceKey(s.character)];
+  return voice === 'custom' ? { id: 'custom', pitchRatio: s.customPitch } : PRESETS[voice];
 }
 
 /**
@@ -72,8 +92,10 @@ function read(o: unknown, k: keyof Settings): unknown {
 
 // Validators: the value (numbers clamped) if valid, else `undefined`. No coercion: `'true'` is not a
 // boolean and `'1.8'` is not a number. NaN and ±Infinity are invalid, not clamped to a range edge.
-const isVoice = (v: unknown): v is Settings['voice'] => typeof v === 'string' && VOICES.includes(v);
-const asVoice = (v: unknown): Settings['voice'] | undefined => (isVoice(v) ? v : undefined);
+const isVoice = (v: unknown): v is VoiceId => typeof v === 'string' && VOICES.includes(v);
+const asVoice = (v: unknown): VoiceId | undefined => (isVoice(v) ? v : undefined);
+const isCharacter = (v: unknown): v is CharacterId => typeof v === 'string' && CHARACTERS.includes(v);
+const asCharacter = (v: unknown): CharacterId | undefined => (isCharacter(v) ? v : undefined);
 const asBool = (v: unknown): boolean | undefined => (typeof v === 'boolean' ? v : undefined);
 const asNumber = (v: unknown, min: number, max: number): number | undefined =>
   typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : undefined;
@@ -98,6 +120,8 @@ function merge(base: Settings, patch: unknown): Settings {
   };
   return {
     voice: pick('voice', asVoice),
+    fennVoice: pick('fennVoice', asVoice),
+    character: pick('character', asCharacter),
     customPitch: pick('customPitch', asPitch),
     quietMode: pick('quietMode', asBool),
     gentleMode: pick('gentleMode', asBool),

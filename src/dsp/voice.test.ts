@@ -7,11 +7,12 @@ import { describe, expect, it } from 'vitest';
 import { mulberry32, rmsDb, sine } from '../../test/dsp-helpers.ts';
 import { readWav } from '../../test/wav.ts';
 import { butterworthHighpass } from './biquad.ts';
+import { DUCK, duckStage } from './duck.ts';
 import { analyzeEnvelope } from './envelope.ts';
 import { applyFades } from './fades.ts';
 import { integratedLoudness, LOUDNESS, truePeakDbtp, voiceGainDb } from './normalize.ts';
 import { resampleOffline } from './resample.ts';
-import { PRESETS, type Envelope, type VoicePreset } from './types.ts';
+import { DUCK_PITCH_RATIO, PRESETS, type Envelope, type VoicePreset } from './types.ts';
 import {
   applyGain,
   clipDetect,
@@ -201,19 +202,28 @@ interface ChainRun {
 
 /**
  * processVoice's composition written out stage by stage (plan S1). `voicedOverride` forces the voicing
- * decision (used to build the unvoiced path).
+ * decision (used to build the unvoiced path). `duck` adds the duck stage after the voiced decision, as
+ * processVoice does for the duck preset (duck plan §3.1.2).
  */
-function chain(pcm: Float32Array, fs: number, p: number, noTrim = false, voicedOverride?: boolean): ChainRun {
+function chain(
+  pcm: Float32Array,
+  fs: number,
+  p: number,
+  noTrim = false,
+  voicedOverride?: boolean,
+  duck = false,
+): ChainRun {
   const clipped = clipDetect(pcm);
   const x = hpfTrim(pcm, fs, !noTrim);
   const y = resample(x, p);
   const resampled = y.slice();
   const voiced = voicedOverride ?? isVoiced(y, fs);
-  const gainDb = applyGain(y, fs, voiced);
-  fades(y, fs);
-  const env = envelope(y, fs, p);
+  const z = duck ? duckStage(y, fs, DUCK) : y;
+  const gainDb = applyGain(z, fs, voiced);
+  fades(z, fs);
+  const env = envelope(z, fs, p);
   return {
-    result: { pcm: y, envelope: env, durationSec: y.length / fs, clipped },
+    result: { pcm: z, envelope: env, durationSec: z.length / fs, clipped },
     voiced,
     gainDb,
     resampled,
@@ -400,12 +410,13 @@ describe('fades and envelope (stages 7 and 8)', () => {
 });
 
 describe('voiceStages', () => {
-  it('holds exactly the seven stages, in order', () => {
+  it('holds exactly the eight stages, in order (duck after isVoiced)', () => {
     expect(Object.keys(voiceStages)).toEqual([
       'clipDetect',
       'hpfTrim',
       'resample',
       'isVoiced',
+      'duck',
       'applyGain',
       'fades',
       'envelope',
@@ -414,6 +425,7 @@ describe('voiceStages', () => {
     expect(voiceStages.hpfTrim).toBe(hpfTrim);
     expect(voiceStages.resample).toBe(resample);
     expect(voiceStages.isVoiced).toBe(isVoiced);
+    expect(voiceStages.duck).toBe(duckStage);
     expect(voiceStages.applyGain).toBe(applyGain);
     expect(voiceStages.fades).toBe(fades);
     expect(voiceStages.envelope).toBe(envelope);
@@ -435,6 +447,24 @@ describe('processVoice is exactly the composition of voiceStages', () => {
       expectSameResult(processVoice(x, FS, preset(p)), chain(x, FS, p).result);
       expectSameResult(processVoice(x, FS, preset(p), { noTrim: true }), chain(x, FS, p, true).result);
     }
+  });
+
+  it.each(Object.keys(inputs))(
+    '%s, the duck preset: the duck stage runs after isVoiced and before the gain, with and without trim',
+    (name) => {
+      const x = inputs[name]!();
+      const p = PRESETS.duck.pitchRatio;
+      expectSameResult(processVoice(x, FS, PRESETS.duck), chain(x, FS, p, false, undefined, true).result);
+      expectSameResult(
+        processVoice(x, FS, PRESETS.duck, { noTrim: true }),
+        chain(x, FS, p, true, undefined, true).result,
+      );
+    },
+  );
+
+  it('only the id duck runs the duck stage: a custom preset at the duck ratio is the plain chain', () => {
+    const x = steadyVowel(140, 1, -12);
+    expectSameResult(processVoice(x, FS, preset(DUCK_PITCH_RATIO)), chain(x, FS, DUCK_PITCH_RATIO).result);
   });
 
   it('takes the clipping flag from the raw input (a 50 Hz full-scale sine loses its peaks in the high-pass)', () => {
@@ -1101,5 +1131,113 @@ describe('T114: isVoiced early exit and true-peak block skip are exact', () => {
       }),
       { numRuns: 200 },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Duck plan T116: the Duckling preset (plan §4.3.5).
+
+describe('T116: processVoice with PRESETS.duck', () => {
+  const p = PRESETS.duck.pitchRatio;
+  const fixtureNames = readdirSync(FIXTURES)
+    .filter((f) => f.endsWith('.wav'))
+    .toSorted()
+    .map((f) => f.slice(0, -'.wav'.length));
+
+  it('is the duck id at DUCK_PITCH_RATIO', () => {
+    expect(PRESETS.duck).toStrictEqual({ id: 'duck', pitchRatio: DUCK_PITCH_RATIO });
+  });
+
+  it('finds the fixture WAVs', () => {
+    expect(fixtureNames.length).toBeGreaterThanOrEqual(11);
+  });
+
+  it.each(fixtureNames)(
+    '%s: acceptance 1, loudness or ceiling (the smaller gain), true peak ≤ −3 dBTP, length and envelope',
+    (name) => {
+      const x = fixture(name);
+      const out = processVoice(x, FS, PRESETS.duck);
+      const trimmed = hpfTrim(x, FS);
+      const y = resample(trimmed, p);
+      const voiced = isVoiced(y, FS);
+      if (voiced) {
+        // The gain voiceGainDb picks on the duck output: the loudness gain unless the ceiling's is smaller.
+        const z = duckStage(y, FS, DUCK);
+        const loudGain = LOUDNESS.targetLufs - integratedLoudness(z, FS);
+        const ceilGain = LOUDNESS.ceilingDbtp - truePeakDbtp(z);
+        // No fixture is so quiet that the +12 dB make-up cap binds (then neither target would be met).
+        expect(Math.min(loudGain, ceilGain), name).toBeLessThanOrEqual(LOUDNESS.maxMakeupDb);
+        if (loudGain <= ceilGain) {
+          expect(Math.abs(integratedLoudness(out.pcm, FS) - LOUDNESS.targetLufs), name).toBeLessThanOrEqual(
+            0.5,
+          );
+        } else {
+          expect(Math.abs(truePeakDbtp(out.pcm) - LOUDNESS.ceilingDbtp), name).toBeLessThanOrEqual(0.1);
+        }
+      }
+      expect(truePeakDbtp(out.pcm), name).toBeLessThanOrEqual(LOUDNESS.ceilingDbtp);
+      // durationSec = round(n_trim / p) / fs ± 1 sample.
+      expect(Math.abs(out.durationSec * FS - Math.round(trimmed.length / p)), name).toBeLessThanOrEqual(1);
+      expect(out.durationSec).toBe(out.pcm.length / FS);
+      // Envelope tracks of ceil(duration / 10 ms) ± 1 frames, every value finite and in [0, 1].
+      const frames = Math.ceil(out.durationSec / 0.01 - 1e-9);
+      for (const track of [out.envelope.jaw, out.envelope.width, out.envelope.round, out.envelope.teeth]) {
+        expect(Math.abs(track.length - frames), name).toBeLessThanOrEqual(1);
+        expect(
+          track.every((v) => Number.isFinite(v) && v >= 0 && v <= 1),
+          name,
+        ).toBe(true);
+      }
+    },
+  );
+
+  it('acceptance 1: the voiced fixtures are the speech-like ones (the loudness branch is exercised)', () => {
+    const voiced = fixtureNames.filter((name) => isVoiced(resample(hpfTrim(fixture(name), FS), p), FS));
+    expect(voiced).toEqual(expect.arrayContaining(['vowel_f0-140', 'vowel_f0-300', 'long_12s']));
+    expect(voiced).not.toContain('knock');
+    expect(voiced).not.toContain('silence_2s');
+  });
+
+  it('acceptance 2: a whisper-level vowel (−45 dBFS) comes out ≥ 6 dB quieter than a normal one (−25 dBFS)', () => {
+    const vowel = steadyVowel(140, 1, -12);
+    const whisper = atRmsDb(vowel, -45);
+    const normal = atRmsDb(vowel, -25);
+    // Both are voiced, so the difference comes from the +12 dB make-up cap.
+    expect(chain(whisper, FS, p, false, undefined, true).voiced).toBe(true);
+    expect(chain(normal, FS, p, false, undefined, true).voiced).toBe(true);
+    const whisperOut = processVoice(whisper, FS, PRESETS.duck).pcm;
+    const normalOut = processVoice(normal, FS, PRESETS.duck).pcm;
+    expect(rmsDb(whisperOut)).toBeLessThanOrEqual(rmsDb(normalOut) - 6);
+  });
+
+  it('acceptance 3: the knock fixture (unvoiced) gets a gain ≤ 0 dB', () => {
+    const run = chain(fixture('knock'), FS, p, false, undefined, true);
+    expect(run.voiced).toBe(false);
+    expect(run.gainDb).toBeLessThanOrEqual(0);
+    expectSameResult(processVoice(fixture('knock'), FS, PRESETS.duck), run.result);
+  });
+
+  it('acceptance 4: the output differs from a custom preset at the same pitch ratio', () => {
+    const x = fixture('vowel_f0-140');
+    const duck = processVoice(x, FS, PRESETS.duck).pcm;
+    const plain = processVoice(x, FS, { id: 'custom', pitchRatio: DUCK_PITCH_RATIO }).pcm;
+    expect(duck.length).toBe(plain.length);
+    let maxDiff = 0;
+    for (let i = 0; i < duck.length; i++) maxDiff = Math.max(maxDiff, Math.abs(duck[i]! - plain[i]!));
+    expect(maxDiff).toBeGreaterThan(0.01);
+  });
+
+  it('decides voicing on the pitch-up, before the duck stage (a quiet 80 Hz tone the duck high-pass removes)', () => {
+    // 150 ms of an 80 Hz sine at amplitude 0.001: voiced after the plain pitch-up, but the duck stage's 320 Hz
+    // high-pass leaves too little energy for a voiced window. processVoice must keep the pitch-up's decision.
+    const n = Math.round(0.15 * FS);
+    const x = Float32Array.from({ length: n }, (_, i) => 0.001 * Math.sin((2 * Math.PI * 80 * i) / FS));
+    const y = resample(hpfTrim(x, FS), p);
+    expect(isVoiced(y, FS)).toBe(true);
+    expect(isVoiced(duckStage(y, FS, DUCK), FS)).toBe(false);
+    const voicedRun = chain(x, FS, p, false, true, true);
+    const unvoicedRun = chain(x, FS, p, false, false, true);
+    expect(voicedRun.gainDb).toBeGreaterThan(unvoicedRun.gainDb);
+    expectSameResult(processVoice(x, FS, PRESETS.duck), voicedRun.result);
   });
 });

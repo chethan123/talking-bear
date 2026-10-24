@@ -96,6 +96,7 @@ const VOICE_NAMES: Readonly<Record<Settings['voice'], string>> = {
   cub: 'Bear cub',
   chipmunk: 'Chipmunk',
   bigbear: 'Big bear',
+  duck: 'Duckling',
   custom: 'Custom',
 };
 /** The table's columns, which Copy table copies too. */
@@ -290,7 +291,7 @@ const holdButton = el('button', { type: 'button' }, 'Hold to talk');
 const voiceSelect = el(
   'select',
   {},
-  ...(['cub', 'chipmunk', 'bigbear'] as const).map((v) =>
+  ...(['cub', 'chipmunk', 'bigbear', 'duck'] as const).map((v) =>
     el('option', { value: v }, `${VOICE_NAMES[v]} (p = ${PRESETS[v].pitchRatio})`),
   ),
   el('option', { value: 'custom' }, VOICE_NAMES.custom),
@@ -374,7 +375,7 @@ function render(): void {
 }
 
 function isVoice(v: string): v is Settings['voice'] {
-  return v === 'cub' || v === 'chipmunk' || v === 'bigbear' || v === 'custom';
+  return v === 'cub' || v === 'chipmunk' || v === 'bigbear' || v === 'duck' || v === 'custom';
 }
 
 /** The selected voice's preset (the app's presetFor), or null for a Custom p outside its range. */
