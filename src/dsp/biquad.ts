@@ -3,7 +3,8 @@
 // (2x HPF 200 Hz + LPF 3.4 kHz at 16 kHz, plan §4.2.1). Pure: no DOM, no globals; Float32Array in and out,
 // float64 coefficients and state.
 // Also the ITU-R BS.1770 K-weighting forms (as in libebur128), plan §4.3.4: highShelf (pre-filter shelf)
-// and highpassQ (RLB high-pass), with their coefficient functions.
+// and highpassQ (RLB high-pass), and the RBJ peaking EQ of the duck stage (plan §4.3.5), each with its
+// coefficient function.
 
 /** Q of a second-order Butterworth section. */
 const BUTTERWORTH_Q = Math.SQRT1_2;
@@ -72,26 +73,46 @@ function checkCutoff(fs: number, fc: number): void {
   }
 }
 
-/** Second-order Butterworth high-pass (-3.01 dB at fc). Throws RangeError unless 0 < fc < fs/2. */
-export function butterworthHighpass(fs: number, fc: number): Biquad {
+/**
+ * Coefficients of the second-order Butterworth high-pass (RBJ cookbook, Q = √½; −3.01 dB at fc).
+ * Throws RangeError unless 0 < fc < fs/2.
+ */
+export function butterworthHighpassCoefficients(fs: number, fc: number): BiquadCoefficients {
   checkCutoff(fs, fc);
   const w0 = (2 * Math.PI * fc) / fs;
   const cosw = Math.cos(w0);
   const alpha = Math.sin(w0) / (2 * BUTTERWORTH_Q);
   const a0 = 1 + alpha;
   const b0 = (1 + cosw) / 2 / a0;
-  return new Section(b0, -(1 + cosw) / a0, b0, (-2 * cosw) / a0, (1 - alpha) / a0);
+  return { b0, b1: -(1 + cosw) / a0, b2: b0, a1: (-2 * cosw) / a0, a2: (1 - alpha) / a0 };
 }
 
-/** Second-order Butterworth low-pass (-3.01 dB at fc). Throws RangeError unless 0 < fc < fs/2. */
-export function butterworthLowpass(fs: number, fc: number): Biquad {
+/**
+ * Coefficients of the second-order Butterworth low-pass (RBJ cookbook, Q = √½; −3.01 dB at fc).
+ * Throws RangeError unless 0 < fc < fs/2.
+ */
+export function butterworthLowpassCoefficients(fs: number, fc: number): BiquadCoefficients {
   checkCutoff(fs, fc);
   const w0 = (2 * Math.PI * fc) / fs;
   const cosw = Math.cos(w0);
   const alpha = Math.sin(w0) / (2 * BUTTERWORTH_Q);
   const a0 = 1 + alpha;
   const b0 = (1 - cosw) / 2 / a0;
-  return new Section(b0, (1 - cosw) / a0, b0, (-2 * cosw) / a0, (1 - alpha) / a0);
+  return { b0, b1: (1 - cosw) / a0, b2: b0, a1: (-2 * cosw) / a0, a2: (1 - alpha) / a0 };
+}
+
+function section(c: BiquadCoefficients): Biquad {
+  return new Section(c.b0, c.b1, c.b2, c.a1, c.a2);
+}
+
+/** Second-order Butterworth high-pass (-3.01 dB at fc). Throws RangeError unless 0 < fc < fs/2. */
+export function butterworthHighpass(fs: number, fc: number): Biquad {
+  return section(butterworthHighpassCoefficients(fs, fc));
+}
+
+/** Second-order Butterworth low-pass (-3.01 dB at fc). Throws RangeError unless 0 < fc < fs/2. */
+export function butterworthLowpass(fs: number, fc: number): Biquad {
+  return section(butterworthLowpassCoefficients(fs, fc));
 }
 
 /** Runs stages in order; process() calls each stage in place on `out`. */
@@ -166,12 +187,34 @@ export function highpassQCoefficients(fs: number, f0: number, q: number): Biquad
 
 /** High shelf in libebur128's BS.1770 form; see highShelfCoefficients. */
 export function highShelf(fs: number, f0: number, gainDb: number, q: number): Biquad {
-  const c = highShelfCoefficients(fs, f0, gainDb, q);
-  return new Section(c.b0, c.b1, c.b2, c.a1, c.a2);
+  return section(highShelfCoefficients(fs, f0, gainDb, q));
 }
 
 /** Second-order high-pass in the BS.1770 RLB form; see highpassQCoefficients. */
 export function highpassQ(fs: number, f0: number, q: number): Biquad {
-  const c = highpassQCoefficients(fs, f0, q);
-  return new Section(c.b0, c.b1, c.b2, c.a1, c.a2);
+  return section(highpassQCoefficients(fs, f0, q));
+}
+
+/**
+ * Peaking-EQ coefficients from the RBJ Audio-EQ-Cookbook (duck plan §3.1.2): A = 10^(gainDb/40),
+ * w0 = 2π·f0/fs, α = sin(w0)/(2q); b = [1 + α·A, −2·cos w0, 1 − α·A], a = [1 + α/A, −2·cos w0, 1 − α/A],
+ * normalised by a0. The gain at f0 is exactly gainDb, and DC and Nyquist are 0 dB. Arguments in
+ * highShelfCoefficients' order. Throws RangeError unless 0 < f0 < fs/2, q > 0 and gainDb is finite.
+ */
+export function peakingCoefficients(fs: number, f0: number, gainDb: number, q: number): BiquadCoefficients {
+  checkCutoff(fs, f0);
+  checkQ(q);
+  if (!Number.isFinite(gainDb)) throw new RangeError(`gainDb must be finite (gainDb = ${gainDb})`);
+  const w0 = (2 * Math.PI * f0) / fs;
+  const cosw = Math.cos(w0);
+  const alpha = Math.sin(w0) / (2 * q);
+  const A = 10 ** (gainDb / 40);
+  const a0 = 1 + alpha / A;
+  const b1 = (-2 * cosw) / a0;
+  return { b0: (1 + alpha * A) / a0, b1, b2: (1 - alpha * A) / a0, a1: b1, a2: (1 - alpha / A) / a0 };
+}
+
+/** RBJ peaking EQ (gainDb at f0, Q q); see peakingCoefficients. */
+export function peaking(fs: number, f0: number, gainDb: number, q: number): Biquad {
+  return section(peakingCoefficients(fs, f0, gainDb, q));
 }

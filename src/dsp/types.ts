@@ -14,6 +14,13 @@ export const PRESETS: Record<'cub' | 'chipmunk' | 'bigbear', VoicePreset> = {
   bigbear: { id: 'bigbear', pitchRatio: 0.75 },
 };
 
+/**
+ * The Duckling voice's pitch ratio p (plan §4.3.5): the plain sinc pitch-up at ×1.45 (+6.4 st, tempo ×1.45),
+ * followed by the duck stage (src/dsp/duck.ts). It lives here, not in duck.ts, so the main thread can read it
+ * without importing the stage code.
+ */
+export const DUCK_PITCH_RATIO = 1.45;
+
 /** Mouth-shape tracks sampled every `hopMs` over the exact buffer that plays (plan §4.3.4, §4.6.2). */
 export interface Envelope {
   hopMs: 10;
