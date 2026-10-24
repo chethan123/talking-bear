@@ -1,8 +1,8 @@
 # Talking Bear: implementation plan
 
 **Status:** plan only. No application code exists yet.
-**Date:** 2026-09-26.
-**Scope:** a client-side-only, installable, offline PWA. You talk to an original bear character, and it repeats what you said in a high voice. You can also poke, pet and tickle it.
+**Date:** 2026-09-26. **Amended 2026-10-25:** the duck plan (Q9–Q17): a second character, Fenn the duckling, and the Duckling voice (M9–M11).
+**Scope:** a client-side-only, installable, offline PWA. You talk to one of two original characters (Juni the bear, Fenn the duckling), and it repeats what you said in a high voice. You can also poke, pet and tickle it.
 **Targets:** Android Chrome first, desktop Chrome second. iOS/Safari is out of scope, but blockers found along the way are listed in [§4.11](#411-ios-blockers-noted-not-designed-around).
 
 ---
@@ -17,6 +17,7 @@ Every non-obvious factual claim carries one of these tags.
 |---|---|
 | **[V]** | Read in the primary source during this planning session: spec source, Chromium/AOSP source, MDN content or browser-compat-data, library source/README, or the npm registry. |
 | **[E]** | Measured or reproduced **in this sandbox**: headless Chromium 141 via Playwright 1.56, or Node 22 on a 2.1 GHz Xeon VM. These are *not* phone measurements. |
+| **[E N1]** | Measured in the duck research on an **aarch64 Neoverse-N1 VM (4 vCPU), Node 24.21.0, 2026-10-24**, with the throwaway spike `docs/research/spikes/09-duck-voice/`. This is a second [E] sandbox: not the Xeon above, and not D1. |
 | **[S]** | Seen only in a search-result snippet. Treat as a lead, not a fact. |
 | **[M]** | From memory, reasoning or estimation. Unverified. Every [M] that matters has an experiment in [§5](#5-risks-unknowns-and-the-experiments-that-settle-them). |
 
@@ -59,9 +60,9 @@ The research scripts behind the `[E]` results are committed as throwaway spikes 
 | Capture constraints | `echoCancellation:false, noiseSuppression:false, autoGainControl:false`; own high-pass + loudness normalisation with a hard ceiling | Browser defaults: on Android they put the device in call mode with call-volume routing; noise-suppression artefacts get amplified by pitch-up; AGC pumping on desktop | [§4.1](#41-audio-capture) |
 | Sample rate | Native context rate (usually 48 kHz), `latencyHint:'interactive'`; never force a rate | Forced 16/44.1 kHz context (extra resampling and latency) | [§4.1](#41-audio-capture) |
 | VAD | **Silero VAD v6 (16 kHz) via a hand-written TypeScript port** in a Worker. Weights are extracted from the pinned upstream ONNX file, and ONNX Runtime is kept only as a CI parity oracle. An **energy VAD** in the same worker is the level meter, the fallback and an optional CPU pre-gate. | WebRTC VAD (collapses at SNR ≤ 10 dB); `@ricky0123/vad-web` as-is (main-thread inference, 16 kHz-only audio, anti-aliasing-free resampler); onnxruntime-web at runtime (14.2 MB wasm); TEN VAD (licence) | [§4.2](#42-speech-detection-vad) |
-| Voice effect | **Offline windowed-sinc resampling in TypeScript** (pitch and tempo move together: the authentic "Talking Tom" sound). Presets: Bear cub ×1.6, Chipmunk ×2.0, Big bear ×0.75. | Raw `playbackRate` (Chromium uses linear interpolation with **no anti-aliasing**); SoundTouchJS (slow, aliasing, licence provenance); phase vocoder (slow, phasey); Rubber Band (GPL) | [§4.3](#43-voice-transformation) |
+| Voice effect | **Offline windowed-sinc resampling in TypeScript** (pitch and tempo move together: the authentic "Talking Tom" sound). Presets: Bear cub ×1.6, Chipmunk ×2.0, Big bear ×0.75, Duckling ×1.45 + duck stage (AM, nasal EQ, cubic). | Raw `playbackRate` (Chromium uses linear interpolation with **no anti-aliasing**); SoundTouchJS (slow, aliasing, licence provenance); phase vocoder (slow, phasey); Rubber Band (GPL) | [§4.3](#43-voice-transformation), [§4.3.5](#435-duck-voice) |
 | Feedback loop | **Half-duplex.** The mic stays open, but capture is disarmed from end-of-speech until the playback's last sample has left the speaker plus a cooldown. Barge-in is by touch only. | Relying on AEC: on Android, Chrome does not cancel Web Audio playback unless the OEM platform echo canceller happens to | [§4.4](#44-feedback-loop) |
-| Rendering | **Procedural Canvas 2D.** Art is authored as SVG path data, a 2D rig with springs, and geometric hit regions. | Rive (proprietary editor/CLI, 360–900 KB gzip wasm, paid export); Lottie (timeline-first, stale player); sprites / three.js (non-code art pipelines) | [§4.6](#46-character-and-animation) |
+| Rendering | **Procedural Canvas 2D.** Art is authored as SVG path data, a 2D rig with springs, and geometric hit regions. One engine, one `CharacterSpec` per character (art, drives, regions, reactions). | Rive (proprietary editor/CLI, 360–900 KB gzip wasm, paid export); Lottie (timeline-first, stale player); sprites / three.js (non-code art pipelines) | [§4.6](#46-character-and-animation) |
 | Mouth | RMS envelope plus a 2-band spectral ratio, precomputed from the **processed** buffer and synced via `getOutputTimestamp()` | Visemes (wLipSync needs Unity-calibrated profiles and breaks on pitch-shifted formants; Rhubarb is a 42 MB wasm port) | [§4.6](#46-character-and-animation) |
 | Gestures | Hand-rolled Pointer Events recogniser, with thresholds from Android `ViewConfiguration` | Hammer.js (last release 2016), `@use-gesture` (no region/tickle semantics) | [§4.6](#46-character-and-animation) |
 | PWA | `vite-plugin-pwa` 1.3.0 in `generateSW` mode, `registerType:'prompt'`, everything precached (with `clientsClaim`), updates applied only when the page is hidden in `Asleep`/`Paused` | `autoUpdate` (reloads mid-recording); `injectManifest` / hand-written service worker (no custom fetch logic needed) | [§4.7](#47-pwa) |
@@ -77,6 +78,7 @@ The research scripts behind the `[E]` results are committed as throwaway spikes 
 - **The loop:** speak, then the bear listens, then replays you pitched up, with its mouth in sync.
 - **Touch:** reactions to poke, pet, tickle, long-press and multi-touch.
 - **Idle life:** blinking, breathing and gaze.
+- **Character choice:** two characters, Juni the bear and Fenn the duckling. A swap button, shown only while the character sleeps, switches between them (Q12). Each has its own look, reactions and remembered voice.
 - **Privacy:** fully client-side. Audio never leaves the device: no network I/O apart from fetching the app itself.
 - **Install:** installable PWA that works fully offline after the first load.
 
@@ -235,7 +237,7 @@ export function segmenterStep(s: SegState, p: SegParams, frame: number, prob: nu
 export interface SileroModel { reset(): void; process(frame16k: Float32Array /* 512 */): number /* p(speech) */ }
 export function createSilero(weights: SileroWeights): SileroModel;   // TS port, fp16/fp32→fp32 weights at load
 
-export interface VoicePreset { id: 'cub' | 'chipmunk' | 'bigbear' | 'custom'; pitchRatio: number }
+export interface VoicePreset { id: 'cub' | 'chipmunk' | 'bigbear' | 'duck' | 'custom'; pitchRatio: number }  // 'duck': sinc + duck stage (§4.3.5)
 export interface Envelope { hopMs: 10; jaw: Float32Array; width: Float32Array; round: Float32Array; teeth: Float32Array }
 export function processVoice(pcm: Float32Array, fs: number, preset: VoicePreset):
   { pcm: Float32Array; envelope: Envelope; durationSec: number };
@@ -299,6 +301,155 @@ export type Pose = Float32Array; // length Ch.Count, preallocated
 export interface Layer { update(dt: number, pose: Pose, ctx: AnimContext): void }
 export function directorReduce(s: DirectorState, e: AnimEvent): DirectorState;   // pure, testable
 export function render(g: CanvasRenderingContext2D, rig: Rig, pose: Pose): void; // no allocation
+```
+
+**Additions for the second character and the duck voice (M9–M11).** These amend the signatures above: `duckStage` and the peaking biquad, `VoiceId` and the settings fields, `CharacterSpec`, `createRig(spec)`, `hitTest(…, table)`, `DirectorCast` and the director signatures.
+
+```ts
+// ---- src/dsp/types.ts (changed) -----------------------------------------------------------------
+export type VoiceId = 'cub' | 'chipmunk' | 'bigbear' | 'duck' | 'custom';
+export interface VoicePreset { id: VoiceId; pitchRatio: number }
+export const DUCK_PITCH_RATIO = 1.45; // added in T115 (no stage code in types.ts, so the main thread doesn't import duck.ts); T119 changes it
+export const PRESETS: Record<Exclude<VoiceId, 'custom'>, VoicePreset>; // + duck: { id: 'duck', pitchRatio: DUCK_PITCH_RATIO } (T116)
+
+// ---- src/dsp/biquad.ts (changed: new) -----------------------------------------------------------
+export function peakingCoefficients(fs: number, f0: number, gainDb: number, q: number): BiquadCoefficients; // RBJ; highShelf's order
+export function peaking(fs: number, f0: number, gainDb: number, q: number): Biquad;
+export function butterworthHighpassCoefficients(fs: number, fc: number): BiquadCoefficients; // the existing sections' coefficients,
+export function butterworthLowpassCoefficients(fs: number, fc: number): BiquadCoefficients;  // exposed for the EQ-response test
+
+// ---- src/dsp/duck.ts (new; pure, erasable syntax, .ts imports) ----------------------------------
+export interface DuckParams {
+  amHz: number; amMix: number;
+  hpHz: number;
+  dipHz: number; dipQ: number; dipDb: number;
+  peak1Hz: number; peak1Q: number; peak1Db: number;
+  peak2Hz: number; peak2Q: number; peak2Db: number;
+  lpHz: number;           // four cascaded butterworthLowpass sections (LP_SECTIONS = 4, a constant)
+  shapeMix: number;       // 0 = no cubic, 1 = full
+}
+export const DUCK: Readonly<DuckParams>;        // { 70, 0.35, 320, 700, 1.4, −9, 1600, 3, 10, 3100, 2.5, 6, 5000, 1 }
+export const LP_SECTIONS = 4;
+/** X-F4 fallback 1: amMix = max(0.05, d.amMix − 0.15), peak1Db = max(2, d.peak1Db − 4), the rest of d. New frozen object. */
+export function softenDuck(d: Readonly<DuckParams>): Readonly<DuckParams>;
+/** Pre-tune bounds (T117 sliders; T115 tests cover the corners): p 1.30–1.60, amHz 60–80, amMix 0.20–0.40, peak1Db 6–12. */
+export const DUCK_TUNE_BOUNDS: Readonly<Record<'p' | 'amHz' | 'amMix' | 'peak1Db', readonly [number, number]>>;
+/** New buffer, same length as y. Throws RangeError unless fs is finite and ≥ 16000. Never modifies y. */
+export function duckStage(y: Float32Array, fs: number, d?: Readonly<DuckParams>): Float32Array;
+
+// ---- src/dsp/voice.ts (changed) -----------------------------------------------------------------
+// processVoice: … y = resample(x, p); voiced = isVoiced(y, fs);
+//   z = preset.id === 'duck' ? duckStage(y, fs, DUCK) : y; applyGain(z, fs, voiced); fades(z, fs); envelope(z, fs, p)
+export const voiceStages: { clipDetect; hpfTrim; resample; isVoiced; duck: typeof duckStage; applyGain; fades; envelope };
+
+// ---- src/app/settings.ts (changed; key stays 'bear.settings.v1', fields are additive) -----------
+export type CharacterId = 'juni' | 'fenn';
+export interface Settings {
+  voice: VoiceId;        // Juni's voice (default 'cub'; meaning unchanged for stored v1 data)
+  fennVoice: VoiceId;    // Fenn's voice (default 'duck')
+  character: CharacterId; // default 'juni'
+  customPitch: number; quietMode: boolean; gentleMode: boolean; haptics: boolean; noisyRoomNs: boolean; sleepTimeoutSec: number;
+}
+export function presetFor(s: Settings): VoicePreset; // voice of s.character; 'custom' → { id: 'custom', pitchRatio: customPitch }
+
+// ---- src/characters/types.ts (new) --------------------------------------------------------------
+import type { Bone, Part } from '../art/bear-parts.gen.ts';
+export interface CharacterArt {
+  readonly BONES: readonly Bone[]; readonly PARTS: readonly Part[];
+  readonly BONE: Readonly<Record<string, number>>; readonly PART: Readonly<Record<string, number>>;
+}
+export type Term = readonly [ch: number, k: number];
+export interface Drive { readonly rot?: Term; readonly tx?: Term; readonly ty?: Term; readonly sx?: Term; readonly sy?: Term }
+export type MouthSpec =
+  | { readonly kind: 'lips'; readonly bone: string /* Juni: 'jaw' */; readonly afterSubtree: string /* Juni: 'muzzle' */;
+      readonly x: number; readonly y: number; // Juni: MOUTH.x/y (500, 525), renderer.ts
+      readonly minWidth: number; readonly widthRange: number; readonly openRange: number; readonly tongueJaw: number;
+      readonly teethMin: number; readonly interior: string; readonly tongue: string; readonly teeth: string }
+  | { readonly kind: 'parts' }; // the beak is ordinary parts on bones driven by Jaw/MouthW; nothing parametric
+export interface StarsSpec { readonly bone: string; readonly cx: number; readonly cy: number; readonly radius: number;
+  readonly count: number; readonly outer: number; readonly inner: number; readonly fill: string }
+export interface CharacterNames {
+  readonly name: string;      // 'Juni' | 'Fenn'
+  readonly stage: string;     // 'Juni the bear' | 'Fenn the duckling'
+  readonly switchTo: string;  // the swap button's label when this is the *other* character: 'Switch to Fenn the duckling'
+}
+export interface CharacterSpec {
+  readonly id: CharacterId;
+  readonly art: CharacterArt;
+  readonly drives: Readonly<Record<string, Drive>>;
+  readonly gazeParts: readonly string[];          // iris, pupil, highlight of the left eye, then the right
+  readonly lidParts: { readonly L: string; readonly R: string };
+  readonly blushParts: readonly string[];
+  readonly mouth: MouthSpec;
+  readonly stars: StarsSpec;
+  readonly background: { readonly top: string; readonly bottom: string };
+  readonly eyesCenter: { readonly x: number; readonly y: number };
+  readonly regions: readonly RegionDef[];        // priority order
+  readonly names: CharacterNames;
+  readonly cast: DirectorCast;                    // added in T122
+  readonly reactionFor: (g: Gesture) => Reaction | null; // added in T122
+}
+export const CHARACTERS: Readonly<Record<CharacterId, CharacterSpec>>; // src/characters/index.ts
+export const JUNI: CharacterSpec;   // src/characters/juni.ts
+export const FENN: CharacterSpec;   // src/characters/fenn.ts
+export const FENN_CLIPS: Readonly<Record<string, Clip>>;        // src/anim/clips/fenn.ts
+export const FENN_REACTIONS: Readonly<Record<string, Reaction>>; // src/reactions/fenn-table.ts
+
+// ---- src/anim/rig.ts (changed) ------------------------------------------------------------------
+export interface Rig {
+  readonly spec: CharacterSpec; readonly boneCount: number;
+  readonly paths: readonly Path2D[]; readonly kind: Uint8Array;
+  readonly mouthSlot: number;   // −1 for mouth kind 'parts' (the renderer's slot test is then never true)
+  readonly jaw: number; readonly head: number; // bone indices (jaw −1 for 'parts'); head = stars.bone
+  readonly parent: Int32Array; readonly pivotX: Float64Array; readonly pivotY: Float64Array;
+  readonly driveCh: Int8Array; readonly driveK: Float64Array; readonly irisSide: Int8Array;
+  readonly stack: Float64Array; readonly boneBuf: Float32Array; // boneBuf: the renderer's per-frame scratch
+}
+/** Allocates; setup only. `paths: false` leaves `paths` empty (no Path2D, for Node: scripts/gesture-eval.ts); every other field is built. */
+export function createRig(spec: CharacterSpec, opts?: { paths?: boolean }): Rig;
+export function boneMatrices(rig: Rig, pose: Pose, out: Float32Array): Float32Array; // unchanged signature
+export function partMatrix(rig: Rig, pose: Pose, bones: Float32Array, part: number, out: Float32Array | Float64Array, o?: number): void;
+export function boneIndex(rig: Rig, id: string): number; export function partIndex(rig: Rig, id: string): number;
+// removed exports: BONE_COUNT (use rig.boneCount)
+
+// ---- src/input/regions.ts (changed) -------------------------------------------------------------
+export interface RegionTable { readonly defs: readonly RegionDef[]; readonly offset: Int32Array;
+  readonly cx: Float64Array; readonly cy: Float64Array; readonly rx: Float64Array; readonly ry: Float64Array; readonly id: readonly RegionId[] }
+export function compileRegions(rig: Rig): RegionTable; // from rig.spec.regions
+export function hitTest(x: number, y: number, boneMatrices: Float32Array, view: View, table: RegionTable, padCssPx?: number): RegionId;
+
+// ---- src/input/region-ids.ts (changed) ----------------------------------------------------------
+// REGION_IDS += 'beak', 'wingL', 'wingR', 'tail' (appended before 'background')
+
+// ---- src/anim/layers/gaze.ts (changed) ----------------------------------------------------------
+// createGaze(…, eyesCenter) and createEarTwitch(…, eyesCenter), eyesCenter: { x: number; y: number }: EYES_CENTER becomes
+// Juni's spec value, passed by bear-view from rig.spec.eyesCenter
+
+// ---- src/anim/director.ts (changed) -------------------------------------------------------------
+export interface DirectorCast {
+  readonly clips: ReadonlyMap<string, Clip>;          // session + reaction + mime + character clips + flinch + mirrored
+  readonly mirrored: ReadonlyMap<string, string>;     // clip name → mirrored clip name (today: pet → petMirrored)
+  readonly reactions: Readonly<Record<string, Reaction>>; // escalation targets by name
+}
+export function createDirectorCast(clipSets: readonly Readonly<Record<string, Clip>>[],
+  reactions: Readonly<Record<string, Reaction>>): DirectorCast; // adds FLINCH and the mirrored pet
+// every listed function gains a trailing, non-optional `cast: DirectorCast`; `mouth` loses its default (`= false`
+// today, director.ts:1142 and :1157) and every caller passes it:
+// directorStep(s, i, cast), directorReduce(s, i, cast), evaluate(s, now, out, mouth, cast),
+// evaluateFrom(…, cast), clipByName(name, cast). initialDirector(now) and mouthCloseScale are unchanged.
+
+// ---- src/anim/bear-view.ts (changed) ------------------------------------------------------------
+export interface BearViewDeps { /* … existing … */ character: CharacterSpec }
+
+// ---- src/ui/character-switch.ts (new) -----------------------------------------------------------
+export interface CharacterSwitchDeps {
+  state(): StateName;                       // shown only while 'Asleep'
+  current(): CharacterId;
+  choose(id: CharacterId): void;            // main.ts: settings.set({ character: id })
+  thumbnail(id: CharacterId, size: number): HTMLCanvasElement; // the other character's head, drawn once
+}
+export interface CharacterSwitch { refresh(): void; dispose(): void } // refresh on every session state change
+export function mountCharacterSwitch(root: HTMLElement, deps: CharacterSwitchDeps): CharacterSwitch;
 ```
 
 **Refinements settled while writing the M1 tasks** (the sketch above stays illustrative):
@@ -456,6 +607,13 @@ stateDiagram-v2
 - **When "playback ended" fires:** `playbackAtSpeakerEnded` is **not** `AudioBufferSourceNode.onended`, which fires when rendering stops. The player waits for `onended`, then polls `getOutputTimestamp()` until `contextTime ≥ startTime + duration`, and waits at least `max(outputLatency, 50 ms)` in case the timestamp reports zero delay ([§4.4](#44-feedback-loop)).
 - **Taking the clip at the cap:** with `reason: 'maxLength'`, `toFrame` is ~150 ms in the future. The worklet keeps writing the ring and serves the take when `currentFrame ≥ toFrame`.
 
+**Character swap (M10–M11): no new state, event, row, timer or effect.**
+
+- The swap button exists only in `Asleep`, where the mic is closed and the context is suspended (entry actions), so no gating question arises. A tap swaps the sleeping character and never wakes it or opens the mic.
+- `main.ts` applies a character change by disposing the view and mounting the new one, outside the reducer, **only while the session is `Asleep`**. A change seen in any other state (only possible through the test hooks) is applied on the next entry into `Asleep`.
+- The voice follows through the existing `settings.subscribe → settingsChanged{preset}` path in every state. `settingsChanged{preset}` already carries any preset in every state.
+- The [§4.9.1](#491-unit-tests-vitest-5-environment-node) property "no `arm` while any gated state is active or any sfx or playback is audible" is untouched.
+
 ### 3.5 Animation director (separate from, and driven by, the session)
 
 This machine only consumes events from the session:
@@ -498,6 +656,7 @@ stateDiagram-v2
 - **Cooldown:** 800 ms per (region, gesture).
 - **Escalation:** by default, the same reaction ×3 within 4 s escalates to its P4 variant. The specific windows in [§4.6.4](#464-gesture--region--reaction) take precedence: a head flick ×3 in 3 s → dizzy, and a belly tickle continuous for > 3 s → laugh fit. The nose's big sneeze comes from the recogniser's multi-poke count. A higher-priority reaction is never blocked by the 800 ms cooldown.
 - **While `Talking`:** P2 is additive flinch only; P3 and above emit `requestStopPlayback` (session rows 29–30).
+- **Cast (M10):** the director takes an explicit `DirectorCast` (clip book, mirrored-clip map, escalation targets) instead of module-level tables, so each character brings its own. Fenn's cast holds every Juni clip, so the session clips (`wake`, `sleep`, `confused`, `earTwitch`, `shrug`), the mimes (`cuppedEar`, `tooLoud`, `tooLoudGentle`) and `FLINCH` play on Fenn by name. On Fenn, `EarRot` moves the fluff tufts and `ArmRot` the wings. Fenn adds the clips `quack`, `bigQuack`, `bigQuackGentle`, `beakNibble`, `fluffRuffle`, `wingFlapL`, `wingFlapR` and `tailWiggle` ([§4.6.7](#467-concrete-duckling-design-fenn)). States, transitions, priorities, cooldowns, escalation, queue and release rules are unchanged. A remount starts the director in `Asleep`, matching the session.
 
 ---
 
@@ -791,7 +950,10 @@ Perceived size is driven jointly by glottal pulse rate and vocal-tract length [S
 - Polyphase table cached per ratio.
 - **The same kernel** as the streaming VAD decimator.
 
-Chain: `clip → HPF 80 Hz (2nd-order Butterworth) → resample (ratio 1/p) → loudness normalise → true-peak ceiling → 8 ms raised-cosine fades → envelope analysis`.
+Chain: `clip → HPF 80 Hz (2nd-order Butterworth) → resample (ratio 1/p) → [duck stage, Duckling only] → loudness normalise → true-peak ceiling → 8 ms raised-cosine fades → envelope analysis`.
+
+- **Duckling:** `isVoiced` runs on the pitch-shifted clip **before** the duck stage, so the AM can't change the make-up-gain decision. Loudness and the ceiling then run on the duck output, so the stage can never raise the level ([§4.3.5](#435-duck-voice)).
+- **`DUCK` parameters:** AM 70 Hz at mix 0.35; HPF 320 Hz; −9 dB at 700 Hz (Q 1.4); +10 dB at 1.6 kHz (Q 3); +6 dB at 3.1 kHz (Q 2.5); four low-pass sections at 5 kHz; cubic shaper mix 1. X-F4 may retune them, and the ADR then records the values.
 
 **Loudness safety for small ears (Q3).** Peak normalisation would make a whisper as loud as a shout, so it's rejected. Instead:
 
@@ -813,6 +975,7 @@ The result plays through an `AudioBufferSourceNode` at rate 1. Fades and envelop
 | **Bear cub** (default, [M] ≈ Talking Tom) | 1.6 (+8.1 st) | ×1.6 | sinc | MVP |
 | Chipmunk | 2.0 (+12 st) | ×2.0 | sinc | MVP |
 | Big bear | 0.75 (−5 st) | ×0.75 | sinc (upsampling, so no aliasing) | MVP |
+| **Duckling** (Fenn's default, Q10–Q11) | 1.45 (+6.4 st) | ×1.45 | sinc + duck stage (AM, nasal EQ, cubic; [§4.3.5](#435-duck-voice)) | MVP+1 (`v1.1.0`) |
 | Custom slider | 0.7–2.2 | coupled | sinc | MVP (settings) |
 | Tiny & clear | 1.8 | ×1.25 | WSOLA stretch + sinc | later |
 | Cartoon cub | 1.7, formants ×1.3 | = | Signalsmith (`formantSemitones` + compensation) or own PSOLA | later |
@@ -828,6 +991,97 @@ The default ratio is settled by the M3 listening test ([§7](#7-milestones-build
 - Rubber Band and `pitchfinder`: GPL.
 - WORLD vocoder: CPU and complexity.
 - Tone.js `PitchShift`: delay-line artefacts [M].
+
+#### 4.3.5 Duck voice
+
+The **Duckling** preset (Q10) is the plain sinc pitch-up (p = 1.45) followed by a **duck stage**: a 70 Hz amplitude modulation (the rasp), a nasal EQ and a cubic shaper. It is Fenn's default voice and is selectable for Juni too (Q11). It adds no dependency (Q14) and needs no pitch tracker. It ships in M9–M11 as `v1.1.0` (Q13). Numbers here are [E N1] ([§0](#evidence-tags)) unless tagged.
+
+IP rule: no Disney name or asset appears in the UI, code, manifest, screenshots or sfx.
+
+**Target sound** [M]: the voice is raspy (rough amplitude fluctuation, 30–150 Hz), nasal and pinched (energy pushed into 1–3 kHz, little below 400 Hz), bright and high. It must stay intelligible: a child must recognise their own words.
+
+**Method** [E N1]. The input is the committed espeak-ng TTS corpus (`test/corpus/speech`, 40 sentence renders, 10 of them at the "child-like" pitch 99; synthetic, Q2), upsampled to 48 kHz with the production sinc kernel. Each candidate D(x) is compared with a timing-matched clean reference R(x):
+
+- for pitch-up chains, R(x) is the plain sinc pitch-up at the same p (the Juni-style replay, assumed intelligible);
+- for tempo-preserving PSOLA, R(x) is the input.
+
+The intelligibility proxy is STOI (Taal et al. 2011), simplified: silent frames are dropped in the STFT domain instead of by time-domain overlap-add. STOI measures only the extra damage a duck stage does on top of the pitch-up. It is a proxy, not a child listening test, which is X-F4.
+
+In this table, CPU is the median of 11 runs after 3 warm-ups on one 5 s clip at 48 kHz (`bench.mjs`, `bench2.mjs`). The recommended stage's final numbers (§4.3.5, Chosen chain) are medians and p95s of 30 runs (`bench4.mjs`).
+
+**Comparison (all [E N1] unless tagged):**
+
+| # | Family (configuration) | CPU / 5 s clip, stage only | Code size (gzip) [M] | STOI mean / min (n = 40) | Aliasing | Fit with resampler / YIN | Verdict |
+|---|---|---|---|---|---|---|---|
+| 1 | Pitch-up + formant shift: TD-PSOLA pitch 1.8, formant 1.35 (`lab/algos/psola.ts`) | 94.5 ms, including its pitch track | 1.6 KB (§4.3.2 [E]) | 0.773 / 0.581, vs the unshifted input | grain resampling has no anti-alias filter [M] | needs pitch marks (a per-frame YIN track, which `src/dsp` lacks); preserves tempo, so it breaks the coupled-tempo style; X-F1 already tests PSOLA | rejected |
+| 2 | Ring / amplitude modulation: `y·(1 − m + m·sin 2π·fc·t)`, fc 90 Hz, m 1.0 / 0.5 | 3.6 ms | 0.1 KB | 0.870 / 0.767 (m 1.0); 0.937 / 0.889 (m 0.5) | none: a linear time-varying gain moves content by ±fc, and nothing reaches Nyquist after the resample's 0.9 cutoff [arithmetic] | trivial | **kept, at fc 70 Hz, m 0.35** |
+| 3 | Band-pass / nasal resonance EQ: HPF 320, −9 dB at 700, +10 dB at 1.6 k, +6 dB at 3.1 k, LPF 5.6 k (5 biquads; the final stage uses 4 LPF sections at 5 kHz, §4.3.5, Chosen chain) | 3.8 ms | 0.3 KB | 0.993 / 0.989 | none (linear) | reuses `biquad.ts`; needs a peaking section | **kept** |
+| 4 | Waveshaping: tanh, drive 3, at 1× / 2× / 4× (production sinc for over-sampling) | 4.1 / 54.7 / 108.9 ms | 0.2 KB | 0.963 / 0.920 at every rate (STOI's 10 kHz band hides the aliases) | 7 kHz tone: −21.5 / −39.9 / −40.6 dB re total; ADAA-1 at 1× is 6.8 ms and −18.8 dB at 9 kHz; a 31-tap half-band 2× is 41.8 ms and −29 dB | 2× with the production kernel blows the budget | replaced by a cubic shaper after the LPF (§4.3.5, Chosen chain) |
+| 5 | Subharmonic: pitch-synchronous AM at f0/2, depth 0.5 (period doubling); pulse buzz at f0, depth 0.6 | 7.7 ms, plus a pitch track: 47.7 ms (lab YIN-lite) or 22.9 ms (YIN at 8 kHz, 10 ms hop) | 0.2 KB + 0.6 KB tracker | 0.976 / 0.878 (sub); 0.951 / 0.860 (pulse) | none: the gain is smooth | needs a new per-frame YIN track (`src/dsp/yin.ts` has only a single-f0 estimate, used by tests [V]) | **fallback** (§4.3.5, Fallback) |
+| 6 | Source-filter: LPC order 18 at 16 kHz, 70 % of the voiced residual replaced by a pulse train at the tracked f0 | 35.4 ms, plus the track | 1.2 KB | 0.925 / 0.832 | the output is band-limited to 7.2 kHz by the 16 kHz path; the impulse train is quantised to 16 kHz samples (≤ 1 % period jitter at 300 Hz) | decimates and interpolates with the production resampler; Levinson-Durbin is ≈ 60 lines | rejected: worst STOI per ms |
+| A | 5 + 3 + tanh 2× | 113.4 ms | — | 0.957 / 0.866 | as 4 | as 5 | rejected (CPU) |
+| B | 6 + 3 | 35.4 ms + track | — | 0.920 / 0.841 | as 6 | as 6 | rejected |
+| C | 2 + 3 + tanh 2× | 61.5 ms | — | 0.948 / 0.850 | as 4 | none needed | became the recommendation, once its 2× tanh was replaced by a cubic shaper |
+
+##### Chosen chain, with exact parameters
+
+Pitch-up (unchanged code): `resampleOffline(x, 1/p)`, with **p = 1.45** (+6.4 st, tempo ×1.45). Then `duckStage(y, fs, DUCK)`, in this order:
+
+1. **AM:** `z[i] = y[i] · (1 − 0.35 + 0.35 · sin(2π · 70 · i / fs))`, with i counting from 0 at the first output sample.
+2. **Nasal EQ**, in place, in this order:
+   1. `butterworthHighpass(fs, 320)`;
+   2. `peaking(fs, 700, −9, 1.4)`;
+   3. `peaking(fs, 1600, +10, 3)`;
+   4. `peaking(fs, 3100, +6, 2.5)`;
+   5. `butterworthLowpass(fs, 5000)` **four times**: four cascaded RBJ 2nd-order sections, each Q √½, so −12 dB at 5 kHz and 48 dB/octave above it. This is not a Butterworth of order 8. Everywhere this section says "the LPF", it means these four sections.
+
+   `peaking(fs, f0, gainDb, q)` is the RBJ cookbook peaking EQ, new in `biquad.ts`, with `highShelf`'s argument order [V `biquad.ts:136` `highShelfCoefficients`, `:168` `highShelf`].
+3. **Cubic shaper:** with `peak = max|z|` (if peak = 0, return z unchanged), `u = z[i] / peak`, `c = 1.5 · peak · (u − u³/3)`, set `z[i] = clamp((1 − shapeMix) · z[i] + shapeMix · c, −peak, peak)`. `DUCK.shapeMix` = 1. The clamp only removes float rounding at the peak sample (u can differ from ±1 by an ulp).
+   - It is a pure cubic, so it adds only third-order products: 3f and the AM-sideband combinations k·f ± j·amHz, with k ≤ 3 and j ≤ 3.
+   - Peak normalisation makes the third harmonic of a lone tone 19 dB below it whatever its level. A product folds back only from content above fs/6, so the alias level is set by how far the LPF has already cut that content. With two sections at 5.5 kHz (an earlier design), 8 kHz tones aliased at −44.6 dBFS. With four sections at 5 kHz, the worst case is −67.5 dBFS (table below).
+   - |output| ≤ peak.
+
+**Measured** (all [E N1]; `bench4.mjs`, `alias-onset.mjs`, `corners2.mjs`, `golden.mjs`; earlier runs in `bench*.mjs`):
+
+| Property | Result |
+|---|---|
+| Stage CPU, 5 s clip at 48 kHz, median / p95 of 30 | 10.4 / 13.5 ms (2.1 / 2.7 ms per second of audio) |
+| Whole chain, 5 s clip, median / p95 of 30 (ms; ms/s) | duck p 1.45: **67.2 / 97.0 (13.4 / 19.4)**; plain sinc p 1.45: 56.7 / 62.4 (11.3 / 12.5); Bear cub 1.6: 53.6 / 55.2 (10.7 / 11.0); Chipmunk 2.0: 45.6 / 52.2 (9.1 / 10.4); Big bear 0.75: 98.6 / 110.9 (**19.7 / 22.2**). The §4.10 budget is a p95: the duck and Big bear are over it on this machine. The p95 of a 30-run series moves by ±25 % between runs on this VM (an earlier run measured the duck at 82.3 ms) |
+| Aliasing: tone at −6 dBFS with a 2048-sample raised-cosine onset; 65 536-point 4-term Blackman-Harris window from sample 8192; energy outside ±8 bins of k·f ± j·amHz (j = 0…3) | worst **−67.5 dBFS** over 13 tones (1130, 2310, 3710, 4930, 6130, 7310, 8000, 8500, 9000, 10000, 11330, 13700, 17990 Hz) × fs {44 100, 48 000} × amHz {60, 70, 80} × amMix {0.2, 0.35, 0.4} × peak1Db {6, 10, 12}; at 44.1 kHz, 8 kHz, amHz 80, amMix 0.2, peak1Db 10 |
+| STOI vs plain sinc at the same p (40 sentences; the pitch-99 subset of 10) | p 1.30: 0.958 (min 0.894), pitch-99 0.947. **p 1.45: 0.960 (min 0.919), pitch-99 0.948 (min 0.919)**. p 1.60: 0.959 (min 0.930), pitch-99 0.946 |
+| STOI on T115's 10 sentences | `DUCK`: mean 0.960, min 0.945. Worst over the 36 corners p {1.30, 1.45, 1.60} × amHz {60, 70, 80} × amMix {0.20, 0.40} × peak1Db {6, 12}: lowest mean 0.939 (p 1.30, amHz 60, amMix 0.40, peak1Db 12), lowest min 0.885 (p 1.30, amHz 80, amMix 0.40, peak1Db 12) |
+| STOI port golden (`sentence-00-r0` at 48 kHz, plain = sinc p 1.45) | `stoi(plain, plain)` = 1.000000; `stoi(plain, y·(0.5 + 0.5·sin(2π·90·i/fs)))` = 0.939072 |
+| Spectral centroid shift vs plain sinc (40 sentences) | +156 Hz at p 1.45 (+280 at p 1.30, +24 at p 1.60) |
+| Added inharmonic energy on a steady harmonic complex (the AM sidebands are the rasp) | −9.8 dB re total at f0 200 Hz, −10.2 dB at 420 Hz; with the AM off, −92.4 dB (the cubic adds only harmonics) |
+| Loudness after the unchanged §4.3.4 gain rule (5 s clip) | normal −20.00 LUFS, −5.61 dBTP; shouted (×4, clipped) −20.00 LUFS, −5.90 dBTP; whisper (×0.03) −39.61 LUFS vs plain −38.79 (the make-up cap holds) |
+| Determinism | bit-identical on two runs (no RNG; the AM phase starts at sample 0) |
+| Mouth envelope (`sentence-00-r0`, `sentence-03-r1`; plain → duck) | jaw max 1.00 → 1.00 and 0.96 → 0.97; mean width 0.13 → 0.30 and 0.17 → 0.28; mean round 0.49 → 0.41 and 0.54 → 0.48; teeth max 0.00 → 0.00 and 1.00 → 0.00 (the LPF empties the > 5 kHz × p band). **Decision:** accepted. Fenn has no teeth. Juni with the Duckling voice shows a wider mouth and never teeth; X-A8 checks it by eye |
+| YIN f0 of the output (`yinF0`) | **unusable**: measured f0 ratio 0.650×, NaN and 0.533× on the 140 Hz vowel at p 1.30/1.45/1.60, and 2.606×, 1.935× and 1.600× on the 300 Hz vowel (`f0check.mjs`, final stage). AM plus the 320 Hz HPF break the periodicity YIN looks for, so the duck e2e cannot use plan §4.9.3's "f0 × p ± 3 %" assertion |
+| e2e marker: 70 Hz line in the 1 kHz envelope spectrum, vs the median of 40–100 Hz excluding ±3 Hz | duck 33.2–46.4 dB; plain sinc −0.9 to 3.9 dB, on 3 vowel fixtures at 44.1 and 48 kHz |
+
+**Where it sits in §4.3.4's chain** (the only change is step 4b):
+
+`clip → clipping flag → HPF 80 Hz → trim → sinc resample (ratio 1/p) → `**`[duck stage, preset duck only]`**` → loudness normalise to −20 LUFS (make-up ≤ +12 dB, skipped if unvoiced) → true-peak ceiling −3 dBTP → 8 ms fades → envelope analysis`
+
+- The voiced decision `isVoiced` runs on the pitch-shifted clip **before** the duck stage. The AM must not change the make-up-gain decision.
+- The loudness and ceiling then run on the duck output, so the rasp and the EQ gain can never raise the level.
+- The fades and the envelope come from exactly the buffer that plays.
+- Quiet mode (−6 dB), the 0.7 master gain and the route-independent protection are unchanged (they sit on the bus, not in the chain).
+- Sound effects stay ≥ 6 dB below the −3 dBTP ceiling.
+
+**Fit with the resampler and YIN plans:**
+
+- The recommended chain reuses `resampleOffline` unchanged and needs **no pitch tracker**.
+- `PRESETS.cub` and ADR 0002 (#71) are independent of it: the duck preset always uses sinc plus the duck stage, whatever ADR 0002 decides for Juni's presets.
+- The fallback (§4.3.5, Fallback) would add a per-frame `yinTrack` to `src/dsp/yin.ts`.
+
+##### Fallback
+
+If X-F4 rejects the frozen parameters, T119 applies the first variant that passes, in this order:
+
+1. **"duckSoft" = `softenDuck(DUCK)`:** `amMix = max(0.05, DUCK.amMix − 0.15)`, `peak1Db = max(2, DUCK.peak1Db − 4)`, everything else unchanged. With the T115 defaults that is AM mix 0.2 and +6 dB at 1.6 kHz. It is tested in the same X-F4 session, always relative to the frozen pre-tune values.
+2. **Pitch-synchronous rasp:** the AM replaced by a pitch-synchronous gain `1 − 0.45·(½ + ½·cos(φ/2))`, with φ the integrated phase of a YIN track (8 kHz, 32 ms windows, 10 ms hop, 100–1000 Hz). STOI 0.974 (min 0.887); stage CPU 33.2 ms per 5 s [E N1]. This needs a new task, filed by T119.
+3. Neither passes: T119 stops and comments for an owner decision.
 
 ### 4.4 Feedback loop
 
@@ -957,8 +1211,9 @@ Notes on the alternatives:
 
 **Decision: procedural Canvas 2D.**
 
-- **Source of truth:** `art/bear.svg`, one file with an `id` per part, `data-pivot` and `data-parent` attributes. Agents and humans can both edit it and preview it in any browser.
-- **Generated module:** `scripts/gen-bear-parts.ts` compiles it to `src/art/bear-parts.gen.ts`, containing path strings, fills, pivots and a parent tree.
+- **Source of truth:** one SVG per character: `art/bear.svg` for Juni and `art/duck.svg` for Fenn. Each has an `id` per part, `data-pivot` and `data-parent` attributes. Agents and humans can both edit it and preview it in any browser.
+- **Generated module:** `scripts/gen-bear-parts.ts` compiles each SVG through a per-character table (`art/<file>.svg` → `src/art/<file>-parts.gen.ts`: `bear-parts.gen.ts` and `duck-parts.gen.ts`), containing path strings, fills, pivots and a parent tree.
+- **One engine, one spec per character:** the rig, renderer, hit regions, gaze, director, reaction table and view take a `CharacterSpec` ([§3.3](#33-module-map-and-interfaces)) instead of importing a character's modules.
 - **Rendering:**
   - Build `Path2D` objects once from the SVG path strings [V R31].
   - Each frame, walk the rig with `setTransform`.
@@ -1059,6 +1314,30 @@ All sound effects are **synthesised with Web Audio** (oscillators, filtered nois
 | Neckerchief | Paw adjusts the knot; tails swing | — | — | — | — |
 | Background | Gaze to the point; ears orient | — | Eyes track the finger | — | — |
 
+**Fenn's table.** The content rules above apply to Fenn unchanged. The recogniser ([§4.6.3](#463-gestures)) is character-agnostic: Fenn reuses the region ids it gives meaning to (`cheekL/R`, `flankL/R`, `belly`, `footL/R`, `headTop`) and adds `beak`, `wingL/R` and `tail`. Fenn's hit regions are in [§4.6.7](#467-concrete-duckling-design-fenn).
+
+- "Juni's" means the existing frozen `REACTIONS` entry, reused as is.
+- New entries are built by a local `defClip(name, clip, priority, sfx, sustained, extras)`, where the clip may differ from the name.
+- Haptics and mood use table.ts's constants (`HAPTIC_TAP`, `HAPTIC_PURR`, `HAPTIC_TICKLE`, `JOY`, `ANNOY`), module-private today (`table.ts:55-64` [V]) and exported unchanged in T122.
+- Content stays within Q3: surprise, ticklishness, delight and mild grumpiness only.
+
+| Region | Tap | Long-press | Stroke | Tickle | Other |
+|---|---|---|---|---|---|
+| `beak` | `quack`: P2, sfx `quack`, clip `quack`, haptic tap. Multi-poke `count ≥ 3` → `bigQuack`: P4, sfx `bigQuack`, clip `bigQuack`, `gentleClip` `bigQuackGentle`, haptic tap | `beakNibble`: P3, sustained, sfx `nibble`, `sfxLoopMs` 600, clip `beakNibble` | — | — | — |
+| `headTop` | Juni's `tuftBoing` | Juni's `headPress` | update with `pathPx ≥ STROKE_MIN_PATH`: `petTrill` (P3, sustained, sfx `trill`, clip `pet`, haptic purr, mood joy, `sfxLoopMs` 1200); against: `fluffRuffle` (P3, sustained, sfx `hmph`, clip `fluffRuffle`, mood annoy) | — | flick: Juni's `wobble` (×3 in 3 s → `dizzy`) |
+| `eyeL` / `eyeR` | `blinkPeepL/R`: P2, sfx `peep`, clip `hardBlinkL/R`, haptic tap, mood annoy | — | — | — | — |
+| `cheekL` / `cheekR` | Juni's `cheekPuffL/R` | — | Juni's `blush` | — | pinch: Juni's `squish` |
+| `wingL` / `wingR` | `wingFlapL/R`: P2, sfx `flap`, clip `wingFlapL/R`, haptic tap | `wingHighFiveL/R`: P3, sustained, sfx none, `sfxOnRelease` `peep`, clip `highFiveL/R` | — | — | — |
+| `belly` | Juni's `bellyBoing` | `bellyRubTrill`: P3, sustained, sfx `trill`, clip `bellyRub` | `petTrill` (update, `pathPx ≥ STROKE_MIN_PATH`) | Juni's `giggle` (> 3 s → `laughFit`) | hug (flanks): Juni's `hug` |
+| `footL` / `footR` | `footPatL/R`: P2, sfx `pat`, clip `footPullL/R`, haptic tap | — | — | Juni's `kickGiggle` | — |
+| `tail` | `tailWiggle`: P2, sfx `rustle`, clip `tailWiggle`, haptic tap | — | — | — | — |
+| `background` | gaze (as Juni) | — | eyes track | — | — |
+| any 3 pointers | — | — | — | — | Juni's `giggle` |
+
+- Every other (region, gesture) pair maps to `null`.
+- Fenn's `cast.reactions` = `{ ...REACTIONS, ...FENN_REACTIONS }`, and the new names don't collide.
+- Fenn's `cast.clips` = Juni's session, reaction and mime clips plus `FENN_CLIPS`, via `createDirectorCast`.
+
 #### 4.6.5 Concrete bear design: Juni
 
 **Status: approved as the working design (Q4, 2026-09-26).** You review the first render in M4; the name stays a working name until M8.
@@ -1149,6 +1428,159 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
   - spring damping ζ ≥ 0.9;
   - blinks, mouth and gaze kept.
 
+#### 4.6.7 Concrete duckling design: Fenn
+
+**Status: working design (Q9, decided 2026-10-25).** The name stays a working name until the first render is reviewed (T124), like Juni's under Q4. The reaction table is in [§4.6.4](#464-gesture--region--reaction).
+
+**Silhouette.** A seated chibi duckling in the same 1000 × 1400 design box as Juni:
+
+- a round head wider than the body (head:body ≈ 1:1.2);
+- an egg-shaped body;
+- two big webbed feet forward;
+- stubby wings;
+- two tail feathers peeking out behind the right hip.
+
+**Signature traits:**
+
+- a single curled down feather on the crown (the `tuft` bone, so tuft boing and the spring work unchanged);
+- a brown cap and a dark eye stripe over a butter face;
+- a flat two-tone bill with a darker nail at the tip;
+- a Juni-teal stripe (speculum) on each wing;
+- fluffy down tufts at the sides of the head (the `fluffL/R` bones, driven by the ear channels).
+
+No clothing, no hat, no bow, no emblem.
+
+**Palette** (the only fills allowed in `art/duck.svg`):
+
+| Role | Colour |
+|---|---|
+| Down: cap, back, wings, fluff | `#7A5A3A` (shade `#5E4329`, highlight `#94714C`) |
+| Face, belly, cheeks | `#F4D27A` (shade `#DDB65A`) |
+| Bill | `#F09A4A` (shade `#D67C30`), nail and nostrils `#8A4A20` |
+| Feet | `#E8893A` (shade `#C46F26`) |
+| Wing stripe | `#2F7A6D` |
+| Sclera / iris / pupil / eye highlight | `#FFFFFF` / `#3A2A1E` / `#1A1216` / `#FFFFFF` |
+| Bill interior / tongue | `#5A1E2E` / `#E07A7A` |
+| Blush | `#F2A07B`, `fill-opacity="0"`, reactions only (α ≤ 0.35) |
+| Background (renderer) | `#E9F5F0` → `#C9E6DC` |
+
+**Why it's distinct** [M]:
+
+- It is not white (Donald, Daisy), not black (Daffy), and not all-yellow with a three-hair tuft (Psyduck).
+- It is not bath-toy shaped (rubber ducks), has no eggshell (Calimero), and wears no sailor shirt, hat or bow.
+- Its colouring is a real mallard duckling's.
+- The name and the art never reference any Disney character; X-L2 is an optional reverse-image search.
+
+**Rig** (document order; pivots in design units; `~` marks a spring):
+
+```
+root(500,1340) └ body(500,1250; ~squash)
+  ├ tailA(770,1060)~, tailB(782,1050)~        drawn first: behind the body
+  ├ legL(400,1160) → footL(370,1275)          ├ legR(600,1160) → footR(630,1275)
+  ├ belly(500,960; ~jiggle)                    ├ wingL(290,720), wingR(710,720)
+  └ neck(500,640) → head(500,600; ~rot, tilt, squish)
+      ├ fluffL(230,330)~, fluffR(770,330)~     ├ tuft(500,160)~
+      ├ browL(400,312), browR(600,312)         ├ eyeL(400,380), eyeR(600,380): sclera(clip) → iris+pupil → highlight; lidUpper, lidLower
+      ├ cheekBlushL(330,470), cheekBlushR(670,470)
+      └ bill(500,505; ~bob) → jaw(500,540)
+```
+
+**Drives** (Fenn's `drives`; same `Term` semantics as Juni's table, §3.3):
+
+| Bone | Drives |
+|---|---|
+| `head` | rot `HeadRot`; tx `HeadX`; ty `HeadY`; sx `HeadSquishX`; sy `HeadSquishY` (all ×1) |
+| `neck` | rot `HeadTilt` |
+| `fluffL` / `fluffR` | rot `EarRotL` / `EarRotR`; sy `EarFoldL` / `EarFoldR` × −0.5 |
+| `tuft` | rot `TuftRot` |
+| `body` | rot `BodyLean`; sx `BodySquash` × −0.5; sy `BodySquash` × 1 |
+| `belly` | sx, sy `BellyJiggle` |
+| `wingL` / `wingR` | rot `ArmRotL` / `ArmRotR` |
+| `footL` / `footR` | tx `FootL` × −30 / `FootR` × 30 |
+| `tailA` / `tailB` | rot `KerchiefA` / `KerchiefB` |
+| `bill` | ty `NoseY` × 1; sy `NoseWrinkle` × −0.1 |
+| `jaw` | ty `Jaw` × 60; sx `MouthW` × 0.12 |
+| `cheekBlushL/R` | sx, sy `CheekPuff` |
+| `browL` / `browR` | ty `BrowL` / `BrowR` × −1 |
+
+`MouthRound` and `Teeth` drive nothing on Fenn.
+
+**Geometry:**
+
+| Part | Shape and position |
+|---|---|
+| Head | ellipse rx 290, ry 250 at (500, 400): brown cap over the top half; butter face patch rx 230, ry 170 at (500, 470); eye stripe from each eye to the head edge |
+| Fluff tufts | 3-lobed tufts ≈ 120 × 100 at (230/770, 330), behind the head outline |
+| Crown curl | single curled feather in bbox [450, 60, 590, 170] |
+| Eyes | sclera rx 44, ry 50 at (400/600, 380); iris r 32; pupil r 18; highlight r 9 offset (−11, −13); lids as Juni's (upper drawn closed, lower static) |
+| Brows | feather strokes 60 × 14 at (400/600, 312) |
+| Cheeks | blush rx 55, ry 35 at (330/670, 470) |
+| Bill | upper bill bbox [385, 470, 615, 548] with nail and 2 nostrils (on `bill`); interior ellipse rx 85, ry 34 at (500, 548) on `bill`, drawn before the lower bill; tongue ellipse rx 40, ry 14 at (500, 566) and lower bill bbox [405, 536, 595, 590] on `jaw`. Draw order: interior, tongue, lower bill, upper bill, nostrils |
+| Body | egg from y 640 to y 1250, half-width 280 at y 1000; belly patch rx 200, ry 220 at (500, 960) |
+| Wings | teardrops ≈ 120 × 270 from the shoulder pivots down-outward to tips near (230/770, 980), teal stripe near the tip; left drawn, right mirrored |
+| Feet | webbed paddles rx 120, ry 55 at (370/630, 1275), 3 toe scallops; mirrored |
+| Tail | two feathers in bbox [745, 950, 875, 1080], behind the body, peeking out past the right hip |
+
+Target: 40–80 drawn parts (Juni: 54 [V]).
+
+Other spec constants:
+
+- `eyesCenter` = (500, 380);
+- `stars` = head bone, centre (500, 400), radius 330, 3 stars, outer 26, inner 11, `#E2B33C`;
+- `mouth` = `{ kind: 'parts' }`;
+- `names` = `{ name: 'Fenn', stage: 'Fenn the duckling', switchTo: 'Switch to Fenn the duckling' }`. Juni's `switchTo` is `'Switch to Juni the bear'`.
+
+**Hit regions** (priority order; ellipses in the bone's rest-pose design space; 12 px padding as today)
+
+| # | id | bone | cx | cy | rx | ry |
+|---|---|---|---|---|---|---|
+| 1 | `eyeL` | head | 400 | 380 | 50 | 56 |
+| 2 | `eyeR` | head | 600 | 380 | 50 | 56 |
+| 3 | `beak` | bill | 500 | 528 | 120 | 65 |
+| 4 | `cheekL` | head | 330 | 470 | 65 | 50 |
+| 5 | `cheekR` | head | 670 | 470 | 65 | 50 |
+| 6 | `wingL` | wingL | 255 | 860 | 70 | 140 |
+| 7 | `wingR` | wingR | 745 | 860 | 70 | 140 |
+| 8 | `footL` | footL | 370 | 1275 | 120 | 70 |
+| 9 | `footR` | footR | 630 | 1275 | 120 | 70 |
+| 10 | `tail` | tailA | 815 | 1015 | 55 | 55 |
+| 11 | `belly` | belly | 500 | 960 | 200 | 220 |
+| 12 | `headTop` | head | 500 | 400 | 290 | 250 |
+| 13 | `headTop` | tuft | 520 | 115 | 70 | 60 |
+| 14 | `flankL` | body | 275 | 1115 | 80 | 135 |
+| 15 | `flankR` | body | 725 | 1115 | 80 | 135 |
+
+- `headTop` (290 × 250) and `belly` (200 × 220) are at least Juni's size (290 × 235 and 190 × 220 [V]). So a pet stroke covers at least Juni's path lengths (#95/#96 note), and T85's tuned `STROKE_MIN_PATH` transfers.
+- Pinch (cheeks), hug (flanks), the belly and feet tap-tickle groups, and "against" on `headTop` work through the unchanged recogniser.
+- Checked [E N1, arithmetic on this table]: at the neutral pose, with padding 0, 24 or 31.6 design units (12 CSS px at view scale 0.5 or 0.38), every region's centre hits that region first. Juni's flanks (300/700, 1050, 90 × 150) would lose their centres to Fenn's larger belly, hence the lower flank position.
+
+**New clips** (`src/anim/clips/fenn.ts`; every track starts at 0, and a non-sustained clip also ends at 0; signs follow the rig convention):
+
+| Clip | Duration | Tracks and kicks |
+|---|---|---|
+| `quack` | 0.45 s | `Jaw` 0 → 0.8 @0.06 → 0.1 @0.16 → 0.6 @0.24 → 0 @0.40; `HeadY` 0 → −6 @0.06 → 0 @0.40; kick `SPRING.nose` peak 3 at t 0 |
+| `bigQuack` | 1.2 s | three `quack` jaw shapes at 0, 0.35, 0.70 s (last peak 1.0); `BodySquash` 0 → −0.06 @0.1 → 0.04 @0.5 → 0 @1.1; `HeadRot` 0 → −0.05 @0.35 → 0.05 @0.7 → 0 @1.1; kicks `SPRING.tuft` and `SPRING.nose` at 0, 0.35, 0.70 |
+| `bigQuackGentle` | `gentle(bigQuack)` (amplitudes × 0.3, as for Juni's gentle variants) | |
+| `beakNibble` | 0.2 s, sustained | `Jaw` 0 → 0.25; `IrisConverge` 0 → 4; `LidL`/`LidR` 0 → 0.2 |
+| `fluffRuffle` | 0.95 s | `BodySquash` 0, −0.03, 0.03, −0.02, 0 at 0, 0.1, 0.2, 0.3, 0.45; `EarRotL` 0 → −0.3 @0.15 → 0 @0.6; `EarRotR` 0 → +0.3 @0.15 → 0 @0.6; `BrowL`/`BrowR` 0 → −4 @0.2 → 0 @0.9; kick `SPRING.tuft` peak 0.3 at 0 |
+| `wingFlapL` | 0.6 s | `ArmRotL` 0 → 0.6 @0.1 → 0 @0.2 → 0.6 @0.3 → 0 @0.4 → 0.4 @0.5 → 0 @0.6 |
+| `wingFlapR` | 0.6 s | as `wingFlapL` on `ArmRotR` with negated values |
+| `tailWiggle` | 0.8 s | `BodyLean` 0, +2°, −2°, +1°, 0 at 0, 0.15, 0.3, 0.45, 0.6; kicks `SPRING.kerchiefA` peak 0.35 and `SPRING.kerchiefB` peak −0.3 at 0 |
+
+**New sound effects** (`SfxId` += `quack`, `bigQuack`, `nibble`, `trill`, `peep`, `flap`, `pat`).
+
+Every recipe obeys the `sfx-synths.ts` rules and its browser test [V `sfx-synths.browser.test.ts:23-27` thresholds, `:121` the `tight` rule]: sample peak ≤ −9 dBFS and ≥ −30 dBFS, no rise faster than 5 ms, an exact duration (the sound is still above −60 dBFS within 30 ms before it), its last node into `out`, nothing that suggests pain, fear or crying. **Level:** each recipe has one named gain constant, set so that its sample peak, rendered alone at 48 kHz, is −10 ± 1 dBFS (like `BEEP_PEAK`, `sfx-synths.ts:255`). In the envelopes below, 1 means that peak. Every noise burst or click has a 5 ms linear attack and a linear decay to 0 over the rest of its length.
+
+| Id | Duration | Recipe |
+|---|---|---|
+| `quack` | 0.22 s | sawtooth, exponential glide 620 → 440 Hz; band-pass 1.6 kHz Q 3; AM 70 Hz depth 0.35; envelope 0 → 1 @6 ms → 0.8 @160 ms → 0 @220 ms |
+| `bigQuack` | 0.85 s | three `quack`s at 0, 0.28 and 0.56 s; the third glides 560 → 380 Hz, its envelope stretched to 0.29 s (0 → 1 @6 ms → 0.8 @0.23 s → 0 @0.29 s) |
+| `nibble` | 0.29 s | four 12 ms band-passed noise clicks (2.5 kHz, Q 2) at 0, 0.09, 0.18 and 0.27 s |
+| `trill` | 0.5 s | sine 1.4 kHz, frequency-modulated at 18 Hz by ±80 Hz, low-pass 3 kHz; envelope 0 → 1 @20 ms → 0.7 @400 ms → 0 @500 ms |
+| `peep` | 0.12 s | sine glide 1.8 → 2.3 kHz; envelope 0 → 1 @8 ms → 0 @120 ms |
+| `flap` | 0.28 s | three 40 ms noise bursts low-passed at 1.2 kHz at 0, 0.11, 0.22 s |
+| `pat` | 0.12 s | sine 180 → 90 Hz plus noise low-passed at 400 Hz; envelope 0 → 1 @6 ms → 0 @120 ms |
+
 ### 4.7 PWA
 
 **Installability (current Chromium `main`)** [V R13]
@@ -1170,7 +1602,7 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
 {
   "id": "/", "start_url": "/", "scope": "/",
   "name": "Talking Bear", "short_name": "Talking Bear", "lang": "en",
-  "description": "Talk to Juni the bear and hear yourself back in a funny bear voice. Works offline; audio never leaves your device.",
+  "description": "Talk to Juni the bear or Fenn the duckling and hear yourself back in a funny voice. Works offline; audio never leaves your device.",
   "display": "standalone", "orientation": "portrait",
   "theme_color": "#2F7A6D", "background_color": "#FFF4E0",
   "launch_handler": { "client_mode": "focus-existing" },
@@ -1182,6 +1614,7 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
   "screenshots": [
     { "src": "/screenshots/phone-1.webp", "sizes": "1080x1920", "type": "image/webp", "form_factor": "narrow", "label": "The bear listening" },
     { "src": "/screenshots/phone-2.webp", "sizes": "1080x1920", "type": "image/webp", "form_factor": "narrow", "label": "The bear talking back" },
+    { "src": "/screenshots/phone-3.webp", "sizes": "1080x1920", "type": "image/webp", "form_factor": "narrow", "label": "The duckling talking back" },
     { "src": "/screenshots/desktop-1.webp", "sizes": "1920x1080", "type": "image/webp", "form_factor": "wide", "label": "Desktop" }
   ]
 }
@@ -1189,7 +1622,7 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
 
 Field notes:
 
-- **`name`: "Talking Bear"** (Q8: this is personal-use software). `short_name` is the same; at 12 characters it fits under the launcher icon. The character inside the app is Juni.
+- **`name`: "Talking Bear"** (Q8: this is personal-use software). `short_name` is the same; at 12 characters it fits under the launcher icon. The characters inside the app are Juni and Fenn (Q9). The description and the screenshots are not WebAPK update fields (above), so installed apps don't update when they change (Q16); the icons, name and colours stay as they are.
 - **`launch_handler: focus-existing`** avoids a second window holding the mic. Support is Chrome 110 on desktop [V R30]; Android support is unverified.
 - **Left out:**
   - `shortcuts`: any change forces a WebAPK update.
@@ -1466,6 +1899,9 @@ The Caddy constraints have two causes:
 | Ring buffer | model-based test against an array model across wrap-around |
 | Session reducer | on random event sequences with an injected clock: **no `arm` while any gated state is active or any sfx or playback is audible**; no `sfx` effect outside transitions into `SfxGated` or within `MicDenied`; in `Listening` the sleep and doze timers are always armed; with no `seg.start` or `reaction`, every trace reaches `Asleep` within `T_sleep` + maximum utterance + processing timeout + playback + cooldown; stale-epoch events and stale-`req` mic results never change state; a worker failure in any mic-open state leads to `Cooldown` or `Error`, never a stall; no `arm` happens while a `reselectPending` input change is outstanding; the mic stream is open iff the state is mic-open; the full (state × event) cross product is handled explicitly |
 | Recogniser | `pointercancel` never yields a reaction; taps are position-invariant within slop |
+| Duck stage (`duckStage`) and the peaking biquad | **alias:** the energy outside ±8 bins of k·f ± j·amHz (k ≥ 1, j = 0…3) is ≤ −60 dBFS for 13 tones from 1130 to 17990 Hz at 44.1 and 48 kHz, at `DUCK`, `softenDuck(DUCK)` and the 8 corners of `DUCK_TUNE_BOUNDS` (worst −67.5 dBFS [E N1]); **EQ response** equals the product of the 8 sections' analytic magnitudes ±0.1 dB; **AM** sidebands at 2000 ± amHz equal 20·log10((amMix/2)/(1 − amMix)) ± 0.3 dB; the shaper never exceeds the peak after the EQ; zero in gives zero out; same length; bit-identical on a second run; `RangeError` for fs < 16 000; the peaking section gives its gain ±0.05 dB |
+| Duck intelligibility (STOI) | regression floors only; X-F4 is the gate. Over 10 TTS sentences at `DUCK`: mean ≥ 0.93, min ≥ 0.88. At the 8 corners (p 1.30 / 1.60, amHz 60 / 80, peak1Db 6 / 12, amMix 0.40): mean ≥ 0.92, min ≥ 0.87. A port golden: `stoi(plain, plain)` = 1 ± 1e-6, and 0.9391 ± 1e-3 for a 90 Hz AM of depth 0.5 |
+| Settings and character specs | defaults `character 'juni'`, `fennVoice 'duck'`; a stored v1 object parses; `presetFor`; per spec, every drive and region bone exists, the neutral pose is the identity, and `hitTest` at each region's centre (padding 12 CSS px, view scales 0.5 and 0.38) returns that region's own id; Fenn's `headTop` and `belly` are at least Juni's size |
 
 **Worklet code in Node.** `class X extends AudioWorkletProcessor` runs at import time, so the scope has to exist *before* the module is evaluated.
 
@@ -1481,7 +1917,8 @@ The Caddy constraints have two causes:
 
 - Run the **real** worklet module in an `OfflineAudioContext`: `AudioBufferSource(fixture) → capture worklet → destination`, then `startRendering()`.
 - That is deterministic and faster than real time, and covers message framing, decimation and gating without a mic. A reviewer verified this in headless Chromium 141 [E]: `OfflineAudioContext.audioWorklet` works, and a processor's transferred `port.postMessage` arrives during `startRendering()`. 5 s rendered in 16–20 ms.
-- Renderer smoke test: draw a set of poses to a canvas and compare pixels against committed PNGs (tolerance-based).
+- Renderer smoke test: draw a set of poses to a canvas and compare pixels against committed PNGs (tolerance-based). Each character has its own baselines (`fenn-<pose>`); Juni's stay unchanged.
+- **Characters (M10–M11):** the frame-allocation smoke runs on both rigs (≤ 24 B/frame); a remount heap test (20 swaps retain ≤ the baseline after 1 swap + 64 KB); the swap button is hidden in every state except `Asleep` and its pointerdown never dispatches `tapBear`.
 
 #### 4.9.3 End-to-end: Playwright + Chromium fake media
 
@@ -1562,6 +1999,11 @@ The production image also exposes `data-state` on the bear element, so a hook-fr
   - So `platform/visibility.ts` is the only visibility source in the app, and the e2e build adds `__bearTest.setVisibility('hidden'|'visible')` for it.
   - Real hide, freeze and lock behaviour stays a device check (X-E6).
 - **Service-worker updates at one origin.** The `update` spec runs v1 and v2 containers behind a small Node proxy in `e2e/`. The proxy flips its upstream on a test-controlled endpoint, and Playwright talks only to the proxy's port, so the origin never changes.
+- **Character (M11, `character` spec).** All with the CSP-violation guard:
+  - in `Asleep`, a tap on the swap button makes the canvas label "Fenn the duckling" and leaves the state `Asleep`; a reload keeps Fenn; after waking, the button is hidden;
+  - a 300 Hz vowel loop on Fenn: the last `settingsChanged` before the wake carries preset `duck`, and the played length is (speech + pre-roll + tail) / `PRESETS.duck.pitchRatio` ± 2 VAD frames;
+  - **the duck replay is asserted by its 70 Hz envelope line, not by YIN.** The 1 kHz envelope spectrum of the output tap has a line at `DUCK.amHz` ≥ 20 dB over the median of its neighbours (duck 33.2–46.4 dB, plain sinc −0.9 to 3.9 dB [E N1]; the same measure on a Juni loop is ≤ 10 dB). YIN is unusable on the duck output: the AM and the 320 Hz HPF break the periodicity it looks for, so the "f0 × p ± 3 %" check is skipped for it;
+  - after the replay, a beak tap plays `quack` and no `Recording` follows within 3 s.
 - **Installability.** The spec includes a **negative control**: a manifest without a 144 px `any` icon must produce a non-empty error list. That proves the check isn't vacuous.
 
 **Where e2e runs before M7.** From M1, e2e runs against `vite preview` with `preview.headers` loaded from the shared `server/headers.json`. The Go server's `headers.go` tests assert the same file. So CSP and worklet regressions surface from M1, not M7. At M7 the CI target becomes the e2e-mode image, and `vite preview` remains the local path.
@@ -1580,10 +2022,10 @@ Nothing here has been measured on a phone yet, so every budget is an estimate [M
 | Silero TS port, continuous | p95 ≤ 8 ms per 32 ms frame (**X-V2 gate**), i.e. ≤ 25 % of one core while running | ~1 ms on x86 [E] × 1.5–8 [M] | `lab/bench` + Perfetto |
 | Idle listening, **quiet room** | ≤ 5 % of one core | Continuous Silero at 1.5 ms per frame is already ≈ 4.7 %. **If this fails, the pre-gate ([§4.2.3](#423-decision)) becomes mandatory.** | `adb shell dumpsys cpuinfo` deltas; Perfetto per-process CPU |
 | Listening **in noise** (gate open) | ≤ 30 % of one core | Silero effectively continuous | same |
-| Main thread while talking | p95 ≤ 4 ms/frame at 60 fps; 30 fps when only idle layers move; ~0 in `Asleep`/hidden | headroom for GC and compositor | DevTools Performance (remote), Long Animation Frames API |
+| Main thread while talking | p95 ≤ 4 ms/frame at 60 fps; 30 fps when only idle layers move; ~0 in `Asleep`/hidden | headroom for GC and compositor. Fenn has ≤ 80 parts (target ≈ 55, like Juni's 54) and no parametric mouth, so it should cost no more than Juni [M]. | DevTools Performance (remote), Long Animation Frames API; Fenn: X-A8 |
 | End-of-speech latency (definition in [§4.2.3](#423-decision); includes hangover) | ≤ hangover + 200 ms for a 5 s clip | take + processing + 50 ms margin + output latency | e2e frame log; traces |
-| Voice processing | ≤ 15 ms **per second of audio**, p95, in the worker on D1 (≤ 150 ms for a 10 s clip) | 2.4–3 ms/s on x86 [E] × 1.5–10 depending on core [M]. The Worker may land on a little core. | `lab/bench` |
-| Initial JS / CSS | ≤ 60 KB / 10 KB brotli | no framework | `size-limit` (brotli default [V R78]) |
+| Voice processing | ≤ 15 ms **per second of audio**, p95, in the worker on D1 (≤ 150 ms for a 10 s clip), for **every preset including Duckling** | 2.4–3 ms/s on x86 [E] × 1.5–10 depending on core [M]. The Worker may land on a little core. On the N1 sandbox the p95 is already 19.4 ms/s for Duckling and 22.2 for Big bear [E N1], so the chain is sped up first (T114) and X-F5 measures every preset on D1. | `lab/bench` (X-F5) |
+| Initial JS / CSS | ≤ 60 KB / 10 KB brotli | no framework. With Fenn the initial JS is estimated at ≈ 52.5 kB (42.62 kB now) [M]. | `size-limit` (brotli default [V R78]) |
 | Total precache | ≤ 1 MB brotli **over the precache manifest's URLs** (screenshots are not precached), including ~680 KB of Silero weights (#182) | | `size-limit` fed the manifest list |
 | LCP / TBT (Lighthouse mobile preset) | ≤ 2.0 s / ≤ 150 ms | Lighthouse emulates a moto g power (2022), 4× CPU, slow 4G [V R63] | LHCI on `main` (optional) |
 | First bear frame, warm start (SW cache) | ≤ 500 ms on device | | `performance.mark` + remote trace |
@@ -1657,6 +2099,8 @@ The lab pages are **dev-only Vite entry points** under `lab/`, never shipped in 
 | X-F1 | Which pitch ratio and algorithm people like | `lab/voices.html`: A/B/X of linear `playbackRate`, sinc, (optional) Signalsmith with formant compensation, and PSOLA, at 1.4, 1.7 and 2.0, on the phone speaker and headphones, ≥ 5 listeners including children. **Live input only**: each listener speaks and hears it back; only votes are kept, never audio (Q2). | Default preset; whether formant presets are worth it | M3 |
 | X-F2 | Real high-frequency content of Android captures (how audible aliasing would be) | `lab/spectrum`: speak 20 sibilant-rich phrases on D1–D3; the page computes the > 8 kHz energy share **in memory** and shows only the statistics (no audio stored, Q2). | Confidence in the sinc choice (low stakes) | M3 |
 | X-F3 | Voice-chain time on the phone | `lab/bench` with 1/5/10 s clips | 150 ms budget | M3 |
+| X-F4 | The duck voice is unintelligible to children, or doesn't sound like a duck | `lab/duck`: owner pre-tune, then ≥ 5 listeners (≥ 2 children aged 4–8), ≥ 10 trials per listener per condition (`cub`, `duck`, `duckSoft`), word-correct and duck-like votes, phone speaker; live input only, votes only (Q2) | `DUCK` values and `PRESETS.duck.pitchRatio`; fallback order in [§4.3.5](#435-duck-voice) | M9 (T118, T119) |
+| X-F5 | The voice chain is over 15 ms/s on D1 (already likely for Big bear: p95 22.2 ms/s on the N1 sandbox [E N1]) | `lab/bench` voice-chain rows for every preset including the duck, 1/5/10 s, on D1 after T114 | the [§4.10](#410-performance-and-battery-budget-reference-device-d1-the-mid-range-pixel-q7) voice row for every preset; a follow-up issue if over | M9 (T118, T119), M11 (T128) |
 | X-A1 | Canvas cost at DPR 2–2.6 | Render the ~60-path rig with all springs active; remote DevTools trace; ≤ 4 ms main thread per frame and 0 dropped frames over 60 s; DPR cap 2 vs native. | Renderer choice holds; DPR cap | M4 |
 | X-A2 | A/V sync (visual side) | Log each rAF's timestamp against `performance.now()` and the envelope index used, and check it against the X-E5 audio-side validation. Then fit the display-latency constant `L` ([§4.6.2](#462-mouth-movement)) by a subjective check with a click-train clip. *Optional:* a 240 fps film with a borrowed phone, target mouth lead 0–40 ms. | `L` | M4 |
 | X-A3 | Spectral mouth features after pitch-shift | Plot width/round tracks for 10 phrases; check vowels separate; decide whether band edges scale with p. | Mouth mapping | M4 |
@@ -1664,6 +2108,7 @@ The lab pages are **dev-only Vite entry points** under `lab/`, never shipped in 
 | X-A5 | Long-press side effects | On device: no context menu, selection handles or system haptic with `contextmenu` `preventDefault` + `user-select:none` + `touch-action:none`. | DOM hygiene | M5 |
 | X-A6 | Vibrate activation | Log `navigator.vibrate()` return values for the first down and the first up. | Haptics UX | M5 |
 | X-A7 | Gesture thresholds | Record pointer traces from ≥ 5 people (incl. children); replay through the recogniser; confusion matrix ≥ 90 % correct for tap, pet, tickle and long-press. | Thresholds | M5 |
+| X-A8 | Fenn's canvas cost, allocation or beak sync differ from Juni's | The X-A1, X-A4 and X-A2 methods with Fenn | the §4.10 main-thread row for Fenn | M11 (T128) |
 | X-P1 | Installability regressions | CI: CDP `Page.getInstallabilityErrors` against the built image on `http://localhost` (a secure context). | Manifest validity | M6/M7 |
 | X-P2 | WebAPK update propagation | On device: install, change `theme_color`, deploy, `chrome://webapks` → Update; also time natural propagation. | Release notes / expectations | M6 |
 | X-P3 | Persistence | Log `storage.persisted()` and `estimate()` on a fresh profile, installed vs not. | Offline guarantee | M6 |
@@ -1674,6 +2119,8 @@ The lab pages are **dev-only Vite entry points** under `lab/`, never shipped in 
 | X-T2 | Rolldown output for `?worker&url` worklets | Build and assert the worklet chunk has no `import`, `import.meta`, `document` or `self` references; load it with `addModule` in Browser Mode. | Worklet bundling | M1 |
 | X-D1 | Only one test device (Pixel). OEM audio behaviour (routing, input processing, Bluetooth) and low-end CPU are unverified. | Before v1.0, repeat X-E1, X-E2, X-E4, X-V2 and the §10 checklist on at least one non-Pixel phone (borrowed, or a cheap second-hand Galaxy A-series). Until then: CPU-throttle proxy, and field reports from anyone who tries the app. | Confidence beyond Pixel | M8 (recommended) |
 | X-L1 | Character looks too close to an existing character (low stakes: personal use, Q8) | Optional: a reverse-image search of the first render. | Peace of mind | M4 (optional) |
+| X-U1 | Children can't find or understand the swap button, or swap in confusion | ≥ 3 children aged 4–7, 5 min of free play each from `Asleep`; count unaided swaps and unintended swaps | Q12 stays or changes | M11 (T128) |
+| X-L2 | Fenn looks like an existing duck character (low stakes, Q8 personal use) | Optional: a reverse-image search of `fenn-neutral` | Peace of mind | M11 (T124, optional) |
 
 ---
 
@@ -1696,6 +2143,7 @@ talking-bear/
 ├── index.html
 ├── art/
 │   ├── bear.svg                    # source art: one id per part, data-pivot, data-parent
+│   ├── duck.svg                    # source art for Fenn, same rules
 │   └── icon.svg                    # icon source → generated PNGs committed in public/icons
 ├── public/
 │   ├── icons/                      # generated once by @vite-pwa/assets-generator
@@ -1706,17 +2154,18 @@ talking-bear/
 │   ├── audio/   engine.ts capture.worklet.ts player.ts output-clock.ts sfx.ts messages.ts
 │   ├── workers/ dsp.worker.ts
 │   ├── dsp/     biquad.ts ring-buffer.ts resample.ts energy-gate.ts voicing.ts segmenter.ts
-│   │            envelope.ts fft.ts normalize.ts fades.ts yin.ts
+│   │            envelope.ts fft.ts normalize.ts fades.ts yin.ts duck.ts
 │   │            silero/{model.ts,weights.ts,weights.bin,weights.provenance.json}
 │   ├── anim/    rig.ts pose.ts springs.ts director.ts renderer.ts loop.ts layers/*.ts clips/*.ts
-│   ├── art/     bear-parts.gen.ts      # generated from art/bear.svg (committed)
+│   ├── art/     bear-parts.gen.ts duck-parts.gen.ts   # generated from art/bear.svg, art/duck.svg (committed)
+│   ├── characters/ types.ts index.ts juni.ts fenn.ts   # one CharacterSpec per character
 │   ├── input/   recognizer.ts pointer-adapter.ts regions.ts
 │   ├── reactions/ table.ts
 │   ├── platform/ wake-lock.ts visibility.ts permissions.ts storage.ts
 │   ├── pwa/     register.ts
 │   ├── ui/      overlay.ts debug-overlay.ts styles.css
 │   └── test-hooks.ts               # only reachable when VITE_BEAR_TEST_HOOKS==='1'
-├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures
+├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures, duck
 │                                   #   (no page ever stores or downloads captured audio: Q2)
 ├── scripts/
 │   ├── gen-bear-parts.ts   extract-silero-weights.ts   gen-fixtures.ts   gen-corpus.ts
@@ -1734,7 +2183,7 @@ talking-bear/
 ├── tsconfig.json                   # references: app, worklet, worker, node, test
 ├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json  tsconfig.test.json
 ├── vite.config.ts  vitest.config.ts  playwright.config.ts
-├── .oxlintrc.json  .prettierrc  .size-limit.json
+├── .oxlintrc.json  .prettierrc  .size-limit.cjs
 └── LICENSE  README.md  THIRD_PARTY_NOTICES.md   # Silero (MIT) weights notice, etc.
 ```
 
@@ -2024,6 +2473,56 @@ Every milestone ends in something runnable, with CI green. "Device" means the D1
 - Every [§4.10](#410-performance-and-battery-budget-reference-device-d1-the-mid-range-pixel-q7) budget met or explicitly waived in an ADR.
 - `v1.0.0` tagged.
 
+### M9 — Plan and the duck voice
+
+Ships after `v1.0.0` as `v1.1.0` (Q13). Only T114 may land before it.
+
+**Build**
+
+- **T113** Amend `docs/plan.md` with the duck plan
+- **T114** Voice chain under budget: `isVoiced` early exit, exact true-peak block skip
+- **T115** DSP: `duckStage` and the RBJ peaking biquad
+- **T116** Duckling preset wiring: types, `processVoice`, settings, sheet, bench row
+- **T117** `lab/duck`: owner pre-tune and the X-F4 listening test
+- **T118** Owner: X-F4 duck listening test and X-F5 voice-chain time on D1
+- **T119** ADR: Duckling voice parameters; apply them
+
+**Exit criteria**
+
+- X-F4: the chosen condition passes (pooled word-correct ≥ 80 % and within 10 points of `cub`, children ≥ 70 %, duck-like ≥ 70 %), or the fallback in [§4.3.5](#435-duck-voice) applies.
+- X-F5 recorded for every preset; a follow-up issue for any preset over 15 ms/s p95.
+
+### M10 — Character-agnostic engine (no visible change)
+
+**Build**
+
+- **T120** Generator per character
+- **T121** `CharacterSpec`: rig, renderer, regions, gaze and texts take the character
+- **T122** Director, reactions and BearView take the cast
+
+**Exit criteria**
+
+- Every Juni baseline (renderer and e2e screenshots) passes without regeneration.
+- Both frame-allocation numbers stay ≤ 24 B/frame; initial JS grows by ≤ 1 kB.
+
+### M11 — Fenn the duckling
+
+**Build**
+
+- **T123** Fenn art, spec and renderer baselines
+- **T124** Owner: review the first Fenn render
+- **T125** Fenn reactions, clips and sound effects
+- **T126** Character selection: swap button, persistence, remount, e2e
+- **T127** PWA: manifest description and the Fenn installer screenshot
+- **T128** Owner: Fenn device checks on D1, then `v1.1.0`
+
+**Exit criteria**
+
+- X-A8: main-thread p95 ≤ 4 ms, 0 dropped frames over 60 s, a flat heap, beak sync signed off.
+- X-U1: at least ⅔ of the children (n ≥ 3) swap without help.
+- [§10](#10-manual-device-checklist) rows 19–21 pass on D1; initial JS ≤ 60 kB.
+- `v1.1.0` tagged.
+
 ---
 
 ## 8. Dependencies
@@ -2215,7 +2714,9 @@ Run on D1 (plus any borrowed device, X-D1) and desktop Chrome before each minor 
 | 16 | Reduced motion enabled (Android "Remove animations"); Gentle mode on | gentle variants |
 | 17 | Loudness: whisper vs shout at max media volume; Quiet mode on/off; wired and Bluetooth headset | whisper replay stays quieter than shout; nothing startling; headset output is attenuated |
 | 18 | Chrome shows no install UI in front of the child; Install works from settings | `beforeinstallprompt` suppressed |
-| 19 | Repeated taps and tickles during and right after playback (sfx storm) | the bear never records its own sounds (no replayed giggles) |
+| 19 | Repeated taps and tickles during and right after playback (sfx storm), on Juni and on Fenn | the character never records its own sounds (no replayed giggles or quacks) |
+| 20 | Character swap: in `Asleep` tap the swap button; wake the character; put it to sleep again; reload | the button shows only in `Asleep` and a tap swaps without waking (mic indicator stays off); it is hidden while awake; the choice survives a reload; children find it without help (X-U1) |
+| 21 | Fenn loop and reactions: say a word; poke the beak, wings, feet, tail, belly and head | the duck voice replays, the beak moves with it, and the reactions follow [§4.6.4](#464-gesture--region--reaction) with no pain, fear or crying sounds |
 
 **Useful commands** [M]:
 
@@ -2243,7 +2744,7 @@ The M2 corpus uses espeak-ng output (the tool is GPL-3.0 [V R75]). Program outpu
 
 ## 12. Open questions (asked one at a time)
 
-These are decisions that are yours and that change the plan. Each has my recommendation first. **All eight are decided and folded into the plan:** Q1–Q7 on 2026-09-26, and Q8, which came out of the adversarial review, on 2026-09-27.
+These are decisions that are yours and that change the plan. Each has my recommendation first. **All seventeen are decided and folded into the plan:** Q1–Q7 on 2026-09-26, Q8, which came out of the adversarial review, on 2026-09-27, and Q9–Q17, which came out of the duck plan, on 2026-10-25 (every recommendation accepted).
 
 | # | Question | My recommendation | Affects |
 |---|---|---|---|
@@ -2255,6 +2756,15 @@ These are decisions that are yours and that change the plan. Each has my recomme
 | **Q6** ✅ | Should the **GHCR package be public or private**? | **Decided 2026-09-26: public.** The image only contains the web bundle that `bear.<domain>` serves publicly anyway, and it saves managing pull tokens on the host. The source repo stays private. | release.yml, host pull config |
 | **Q7** ✅ | Which **Android phone(s)** can you test on? The plan assumes D1 = a Pixel-class mid-range phone. | **Decided 2026-09-26: a mid-range Pixel (6a/7a/8a class) is D1.** No second device yet, so OEM variance is open risk X-D1. | M1+ exit criteria |
 | **Q8** ✅ | What should the **user-facing product name** be (manifest `name`/`short_name`, launcher label)? The review flagged that "Talking Bear" sits near Outfit7's "TALKING …" marks (search snippets only). | **Decided 2026-09-27: "Talking Bear".** This is personal-use software, so the trademark concern doesn't apply. The character stays Juni; the repo and image stay `talking-bear`. *(My earlier default had been "Juni".)* | §4.7 manifest, X-L1 (reduced to optional), M6 |
+| **Q9** ✅ | What should the second character's **name and design** be? | **Decided 2026-10-25: "Fenn"**, a mallard-style duckling as in [§4.6.7](#467-concrete-duckling-design-fenn): brown down cap and back, butter face and belly, peach-orange bill with a darker nail, a single curl on the head, teal wing stripe, no clothing. Not taken: the names "Wick" or "Dabble"; an all-yellow duckling (too close to common cartoon ducks and bath toys [M]). The name stays a working name until T124, like Juni's under Q4. | §4.6.7, T113, T123, T124, every `names` string, manifest description |
+| **Q10** ✅ | What should the new voice preset be called (parent settings label and code id)? | **Decided 2026-10-25: label "Duckling", id `duck`.** Not taken: "Quacky"; "Squawk". Never a trademarked duck's name or a studio's name, anywhere (the IP rule, [§4.3.5](#435-duck-voice)). | T116 (`SETTINGS_TEXT`, `PRESETS`) |
+| **Q11** ✅ | Is the duck voice also selectable for Juni? | **Decided 2026-10-25: yes.** Every character offers the same five voices (Bear cub, Chipmunk, Big bear, Duckling, Custom), and each character remembers its own (`voice` for Juni, default `cub`; `fennVoice` for Fenn, default `duck`). It is one more radio on one code path, with zero DSP cost, and a quacking bear is harmless slapstick under Q3. Not taken: the duck voice for Fenn only (one more conditional in the sheet, and no benefit). | T116, settings schema |
+| **Q12** ✅ | How does the user choose a character? | **Decided 2026-10-25: a swap button in `Asleep` only** (72 px, bottom-left, with the other character's face; [§3.4](#34-session-conversation-state-machine)). Not taken: B, the settings sheet only (parent-gated by the 1 s gear hold; a child can never switch); C, both; D, two large thumbnails while `Asleep`, where a tap wakes the chosen one (conflicts with "a tap anywhere wakes", §3.4 rows 1–3); E, a swipe or carousel while awake (pet strokes are swipes). | T126, M8 overlay rules, X-U1 |
+| **Q13** ✅ | Before or after `v1.0.0`? | **Decided 2026-10-25: after, as `v1.1.0`.** T114 may land before `v1.0.0`. #123 is waiting on owner device runs (#84, #95, #102, #70), and the refactor (T121–T122) touches the rAF hot path that #214/#229/#281 stabilised. Landing it first would invalidate X-A1/X-A4 results and widen the release gate. Not taken: before `v1.0.0` (re-runs #84 and parts of #123). | T128 release, #123 |
+| **Q14** ✅ | Any new dependencies? | **Decided 2026-10-25: none.** Everything is own code ([§4.3.5](#435-duck-voice), [§8](#8-dependencies)). Rejected: Signalsmith Stretch (MIT, 44.4 KB gzip, needs `'wasm-unsafe-eval'`, [§4.3.2](#432-candidates)). | §8, CSP |
+| **Q15** ✅ | Do T114 (voice-chain speed-up) now, or wait for X-F3 on D1 (#70)? | **Decided 2026-10-25: now.** On the N1 sandbox the p95 per second of audio is already over the 15 ms/s budget for Big bear (22.2 ms/s) and for the duck (19.4 ms/s) [E N1], and #70's ORCH-NOTE saw Big bear at 16–20 ms/s on the plan sandbox [V]. T114 is the "Optimise processVoice" issue #70 tells you to file, filed early. Not taken: wait for #70 and file it then. | T114, #70 step 3, X-F5 |
+| **Q16** ✅ | What changes in the manifest and icons? | **Decided 2026-10-25: the description mentions Fenn; add one narrow screenshot `phone-3.webp`; icons unchanged.** Description and screenshots are not WebAPK update fields ([§4.7](#47-pwa) [V]), so installed apps don't update. Not taken: a two-character icon (changes the icons, so a WebAPK update; needs new icon art). | T127, §4.7, `scripts/manifest.test.ts` |
+| **Q17** ✅ | Keep the duck's pitch and tempo coupled (×1.45 faster)? | **Decided 2026-10-25: yes**, as all MVP presets do ([§4.3.4](#434-decision-and-the-voice-knob)). Rejected: tempo-preserving PSOLA with a formant shift (STOI 0.773, 94.5 ms per 5 s [E N1]). | T115 |
 
 ---
 
