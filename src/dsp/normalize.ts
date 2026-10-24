@@ -134,33 +134,78 @@ const TRUE_PEAK_FIR = new Float64Array([
   0.1373291015625, -0.0594482421875, 0.033203125, -0.0196533203125, 0.010986328125, 0.001708984375,
 ]);
 
+/** truePeakDbtp walks its outputs in blocks of this many (each phase's output m is one step). */
+const TP_BLOCK = 64;
+
+/**
+ * The largest per-phase sum of |TRUE_PEAK_FIR| coefficients (≈ 2.02, phases 1 and 2): |y_p[m]| ≤ TP_L1 ·
+ * max |x[m − 11 … m]| for every phase p and output m. Every coefficient is a multiple of 2^-13, so the sums are
+ * exact.
+ */
+const TP_L1 = maxPhaseL1(TRUE_PEAK_FIR);
+
+/**
+ * Relative margin on the block bound of truePeakDbtp. A phase output is a float64 sum of 12 products, so its
+ * computed magnitude exceeds the exact bound by at most a relative 12·2^-53 ≈ 1.3e-15 (products of float32
+ * samples and these coefficients neither overflow nor underflow in float64); 1e-9 covers that and the rounding
+ * of the bound itself.
+ */
+const TP_SKIP_MARGIN = 1 + 1e-9;
+
+function maxPhaseL1(fir: Float64Array): number {
+  let best = 0;
+  for (let p = 0; p < 4; p++) {
+    let sum = 0;
+    for (let k = 0; k < TP_TAPS; k++) sum += Math.abs(fir[p * TP_TAPS + k]!);
+    if (sum > best) best = sum;
+  }
+  return best;
+}
+
 /**
  * True peak of x in dBTP (ITU-R BS.1770-4 Annex 2): 4× oversampling with the 48-tap interpolation FIR, run
  * as 4 polyphase branches of 12 taps, y_p[m] = Σ_k h_p[k]·x[m−k]; returns 20·log10(max |y| over all phases).
  * The whole zero-extended convolution is scanned (m = 0 … n + 10), including the filter's drain after the
  * last sample, because the clip plays followed by silence. Returns -Infinity for silent or empty input.
  * Does not allocate.
+ *
+ * The outputs are walked in blocks of 64 (duck plan T114). Block [b, b + 64) reads x[b − 11 … b + 63] (clamped to
+ * x), so none of its outputs can exceed B = max|x| over that span × TP_L1 × (1 + 1e-9); the block is skipped
+ * when B ≤ the running peak. The skip is exact: the result is the same number as scanning every output. (A NaN
+ * sample makes every output that reads it NaN, which the peak ignores, so the span's maximum ignores NaN too.)
  */
 export function truePeakDbtp(x: Float32Array): number {
   const n = x.length;
   const f = TRUE_PEAK_FIR;
+  const end = n + TP_TAPS - 1;
   let peak = 0;
-  for (let m = 0; m < n + TP_TAPS - 1; m++) {
-    const kLo = m >= n ? m - n + 1 : 0;
-    const kHi = m < TP_TAPS - 1 ? m : TP_TAPS - 1;
-    let y0 = 0;
-    let y1 = 0;
-    let y2 = 0;
-    let y3 = 0;
-    for (let k = kLo; k <= kHi; k++) {
-      const v = x[m - k]!;
-      y0 += f[k]! * v;
-      y1 += f[TP_TAPS + k]! * v;
-      y2 += f[2 * TP_TAPS + k]! * v;
-      y3 += f[3 * TP_TAPS + k]! * v;
+  for (let b = 0; b < end; b += TP_BLOCK) {
+    const bEnd = Math.min(b + TP_BLOCK, end);
+    const lo = b > TP_TAPS - 1 ? b - (TP_TAPS - 1) : 0;
+    const hi = bEnd < n ? bEnd : n;
+    let amax = 0;
+    for (let i = lo; i < hi; i++) {
+      const a = Math.abs(x[i]!);
+      if (a > amax) amax = a;
     }
-    const a = Math.max(Math.abs(y0), Math.abs(y1), Math.abs(y2), Math.abs(y3));
-    if (a > peak) peak = a;
+    if (amax * TP_L1 * TP_SKIP_MARGIN <= peak) continue;
+    for (let m = b; m < bEnd; m++) {
+      const kLo = m >= n ? m - n + 1 : 0;
+      const kHi = m < TP_TAPS - 1 ? m : TP_TAPS - 1;
+      let y0 = 0;
+      let y1 = 0;
+      let y2 = 0;
+      let y3 = 0;
+      for (let k = kLo; k <= kHi; k++) {
+        const v = x[m - k]!;
+        y0 += f[k]! * v;
+        y1 += f[TP_TAPS + k]! * v;
+        y2 += f[2 * TP_TAPS + k]! * v;
+        y3 += f[3 * TP_TAPS + k]! * v;
+      }
+      const a = Math.max(Math.abs(y0), Math.abs(y1), Math.abs(y2), Math.abs(y3));
+      if (a > peak) peak = a;
+    }
   }
   return 20 * Math.log10(peak);
 }

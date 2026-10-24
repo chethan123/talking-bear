@@ -1,13 +1,15 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// `fc` is taken by highpassFir's cutoff parameter below.
+import fastCheck from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { mulberry32, rmsDb, sine } from '../../test/dsp-helpers.ts';
 import { readWav } from '../../test/wav.ts';
 import { butterworthHighpass } from './biquad.ts';
 import { analyzeEnvelope } from './envelope.ts';
 import { applyFades } from './fades.ts';
-import { truePeakDbtp, voiceGainDb } from './normalize.ts';
+import { integratedLoudness, LOUDNESS, truePeakDbtp, voiceGainDb } from './normalize.ts';
 import { resampleOffline } from './resample.ts';
 import { PRESETS, type Envelope, type VoicePreset } from './types.ts';
 import {
@@ -20,9 +22,11 @@ import {
   processVoice,
   resample,
   trimRange,
+  VOICING_HOP,
   voiceStages,
   type VoiceResult,
 } from './voice.ts';
+import { createVoicing, VOICED_THRESHOLD } from './voicing.ts';
 
 const FS = 48000;
 const FIXTURES = join(fileURLToPath(new URL('../../', import.meta.url)), 'test', 'fixtures');
@@ -909,5 +913,193 @@ describe('Validation 7: timing (informational)', () => {
         `(${(total / seconds).toFixed(2)} ms per second of audio, median of ${runs}); stages ms/s: ${stages}`,
     );
     expect(Number.isFinite(total)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Duck plan T114: the isVoiced early exit and the true-peak block skip change no output bit.
+
+/** isVoiced as it was before T114 (the whole 8 kHz copy made offline), kept verbatim as the reference. */
+function isVoicedBeforeT114(y: Float32Array, fs: number): boolean {
+  const z = resampleOffline(y, 8000 / fs);
+  const voicing = createVoicing(8000);
+  let count = 0;
+  for (let s = 0; s + 256 <= z.length; s += 160) {
+    if (voicing.score(z.subarray(s, s + 256)) > VOICED_THRESHOLD) {
+      count++;
+      if (count >= 3) return true;
+    }
+  }
+  return false;
+}
+
+/** BS.1770-4 Annex 2 true-peak FIR, phase-major (tap k of phase p at p·12 + k), as normalize.ts holds it. */
+const TRUE_PEAK_FIR_BEFORE = new Float64Array([
+  0.001708984375, 0.010986328125, -0.0196533203125, 0.033203125, -0.0594482421875, 0.1373291015625,
+  0.97216796875, -0.102294921875, 0.047607421875, -0.026611328125, 0.014892578125, -0.00830078125,
+  -0.0291748046875, 0.029296875, -0.0517578125, 0.089111328125, -0.16650390625, 0.465087890625, 0.77978515625,
+  -0.2003173828125, 0.1015625, -0.0582275390625, 0.0330810546875, -0.0189208984375, -0.0189208984375,
+  0.0330810546875, -0.0582275390625, 0.1015625, -0.2003173828125, 0.77978515625, 0.465087890625,
+  -0.16650390625, 0.089111328125, -0.0517578125, 0.029296875, -0.0291748046875, -0.00830078125,
+  0.014892578125, -0.026611328125, 0.047607421875, -0.102294921875, 0.97216796875, 0.1373291015625,
+  -0.0594482421875, 0.033203125, -0.0196533203125, 0.010986328125, 0.001708984375,
+]);
+
+/** truePeakDbtp as it was before T114 (every output scanned), kept verbatim as the reference. */
+function truePeakDbtpBeforeT114(x: Float32Array): number {
+  const TP_TAPS = 12;
+  const n = x.length;
+  const f = TRUE_PEAK_FIR_BEFORE;
+  let peak = 0;
+  for (let m = 0; m < n + TP_TAPS - 1; m++) {
+    const kLo = m >= n ? m - n + 1 : 0;
+    const kHi = m < TP_TAPS - 1 ? m : TP_TAPS - 1;
+    let y0 = 0;
+    let y1 = 0;
+    let y2 = 0;
+    let y3 = 0;
+    for (let k = kLo; k <= kHi; k++) {
+      const v = x[m - k]!;
+      y0 += f[k]! * v;
+      y1 += f[TP_TAPS + k]! * v;
+      y2 += f[2 * TP_TAPS + k]! * v;
+      y3 += f[3 * TP_TAPS + k]! * v;
+    }
+    const a = Math.max(Math.abs(y0), Math.abs(y1), Math.abs(y2), Math.abs(y3));
+    if (a > peak) peak = a;
+  }
+  return 20 * Math.log10(peak);
+}
+
+/**
+ * processVoice as it was before T114: the same stages, with isVoicedBeforeT114 and voiceGainDb's rule written
+ * out on truePeakDbtpBeforeT114. Also asserts that the new isVoiced and truePeakDbtp agree on the stage inputs.
+ */
+function processVoiceBeforeT114(pcm: Float32Array, fs: number, p: number, label: string): VoiceResult {
+  const clipped = clipDetect(pcm);
+  const y = resample(hpfTrim(pcm, fs), p);
+  const voiced = isVoicedBeforeT114(y, fs);
+  expect(isVoiced(y, fs), label).toBe(voiced);
+  const l = integratedLoudness(y, fs);
+  let loudGain = 0;
+  if (l !== -Infinity) {
+    loudGain = voiced
+      ? Math.min(LOUDNESS.targetLufs - l, LOUDNESS.maxMakeupDb)
+      : Math.min(0, LOUDNESS.targetLufs - l);
+  }
+  const tp = truePeakDbtpBeforeT114(y);
+  expect(truePeakDbtp(y), label).toBe(tp);
+  const g = Math.min(loudGain, LOUDNESS.ceilingDbtp - tp);
+  const k = 10 ** (g / 20);
+  for (let i = 0; i < y.length; i++) y[i] = y[i]! * k;
+  applyFades(y, fs, 8);
+  const env = analyzeEnvelope(y, fs, p);
+  return { pcm: y, envelope: env, durationSec: y.length / fs, clipped };
+}
+
+const PRESET_LIST: readonly VoicePreset[] = [PRESETS.cub, PRESETS.chipmunk, PRESETS.bigbear];
+
+describe('T114: isVoiced early exit and true-peak block skip are exact', () => {
+  const fixtureNames = readdirSync(FIXTURES)
+    .filter((f) => f.endsWith('.wav'))
+    .toSorted()
+    .map((f) => f.slice(0, -'.wav'.length));
+  const CORPUS = join(FIXTURES, '..', 'corpus', 'speech');
+  const corpusFiles = readdirSync(CORPUS)
+    .filter((f) => f.endsWith('.wav'))
+    .toSorted();
+
+  it('finds the fixture and corpus WAVs', () => {
+    expect(fixtureNames.length).toBeGreaterThanOrEqual(11);
+    expect(corpusFiles.length).toBeGreaterThanOrEqual(100);
+  });
+
+  it.each(fixtureNames)(
+    '%s: processVoice is bit-identical to the pre-T114 chain for every preset, and isVoiced agrees',
+    (name) => {
+      const x = fixture(name);
+      for (const pr of PRESET_LIST) {
+        const label = `${name} ${pr.id}`;
+        expectSameResult(processVoice(x, FS, pr), processVoiceBeforeT114(x, FS, pr.pitchRatio, label));
+      }
+      // isVoiced on the raw fixture, after the chain at the other test pitch ratio, and at 44.1 kHz for cub.
+      expect(isVoiced(x, FS), name).toBe(isVoicedBeforeT114(x, FS));
+      const y22 = resample(hpfTrim(x, FS), 2.2);
+      expect(isVoiced(y22, FS), name).toBe(isVoicedBeforeT114(y22, FS));
+      const y441 = resample(hpfTrim(resampleOffline(x, 44100 / FS), 44100), PRESETS.cub.pitchRatio);
+      expect(isVoiced(y441, 44100), `${name} 44.1 kHz cub`).toBe(isVoicedBeforeT114(y441, 44100));
+    },
+  );
+
+  it('isVoiced returns the same boolean as before on every test/corpus/speech WAV', () => {
+    let voiced = 0;
+    for (const file of corpusFiles) {
+      const { sampleRate, channels } = readWav(readFileSync(join(CORPUS, file)));
+      const x = channels[0]!;
+      expect(isVoiced(x, sampleRate), file).toBe(isVoicedBeforeT114(x, sampleRate));
+      // Through the chain's pitch shift as processVoice calls it, at the corpus rate (16 kHz), for every preset.
+      // (The fixtures above cover 48 and 44.1 kHz; a 48 kHz pass over the corpus would add about 2 s.)
+      const trimmed = hpfTrim(x, sampleRate);
+      for (const pr of PRESET_LIST) {
+        const y = resample(trimmed, pr.pitchRatio);
+        const before = isVoicedBeforeT114(y, sampleRate);
+        expect(isVoiced(y, sampleRate), `${file} ${pr.id}`).toBe(before);
+        if (before) voiced++;
+      }
+    }
+    // Most takes are voiced, so the early exit is exercised (the whisper renders are not).
+    expect(voiced).toBeGreaterThan(0.75 * PRESET_LIST.length * corpusFiles.length);
+  });
+
+  it('isVoiced agrees with the pre-T114 function when only the flushed tail completes the third window', () => {
+    // A 200 Hz tone over the last 50, 55 or 60 ms of 0.25 s of silence, for 8 kHz copy lengths across one hop:
+    // only the last few windows are voiced, and in some cases the third one ends in the samples that only
+    // flush() emits (an isVoiced that skipped the windows after flush() fails some of these cases).
+    let voiced = 0;
+    let cases = 0;
+    for (const fs of [8000, 16000, 44100, 48000]) {
+      for (const ms of [50, 55, 60]) {
+        for (let extra = 0; extra < VOICING_HOP; extra += 3) {
+          const n = Math.round(((2000 + extra) * fs) / 8000);
+          const y = new Float32Array(n);
+          const len = Math.round((ms / 1000) * fs);
+          for (let i = 0; i < len; i++) y[n - len + i] = 0.5 * Math.sin((2 * Math.PI * 200 * i) / fs);
+          const before = isVoicedBeforeT114(y, fs);
+          expect(isVoiced(y, fs), `fs ${fs}, ${ms} ms, n ${n}`).toBe(before);
+          if (before) voiced++;
+          cases++;
+        }
+      }
+    }
+    expect(voiced).toBeGreaterThan(0);
+    expect(voiced).toBeLessThan(cases);
+  });
+
+  it('isVoiced returns the same boolean as before on random bursts (property)', () => {
+    const input = fastCheck.record({
+      fs: fastCheck.constantFrom(8000, 16000, 44100, 48000),
+      sec: fastCheck.double({ min: 0, max: 1.2, noNaN: true }),
+      bursts: fastCheck.array(
+        fastCheck.tuple(
+          fastCheck.oneof(fastCheck.constant(1), fastCheck.double({ min: 0, max: 1, noNaN: true })),
+          fastCheck.integer({ min: 4, max: 80 }),
+        ),
+        { maxLength: 4 },
+      ),
+    });
+    fastCheck.assert(
+      fastCheck.property(input, ({ fs, sec, bursts: list }) => {
+        const n = Math.round(sec * fs);
+        const y = new Float32Array(n);
+        // Short 200 Hz bursts (`ms` long) at fractional positions; position 1 puts one at the very end.
+        for (const [at, ms] of list) {
+          const len = Math.min(n, Math.round((ms / 1000) * fs));
+          const from = Math.round(at * (n - len));
+          for (let i = 0; i < len; i++) y[from + i] = 0.5 * Math.sin((2 * Math.PI * 200 * i) / fs);
+        }
+        return isVoiced(y, fs) === isVoicedBeforeT114(y, fs);
+      }),
+      { numRuns: 200 },
+    );
   });
 });

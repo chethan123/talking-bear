@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { mulberry32, rmsDb, sine } from '../../test/dsp-helpers.ts';
 import { readWav } from '../../test/wav.ts';
@@ -408,5 +409,126 @@ describe('6: true-peak ceiling on every test/fixtures WAV', () => {
         expect(truePeakDbtp(applyGain(ch, g))).toBeLessThanOrEqual(-3.0 + 0.05);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Duck plan T114: the true-peak block skip is exact.
+
+/** TRUE_PEAK_FIR as normalize.ts holds it (phase-major: tap k of phase p at p·12 + k), from ANNEX2_TABLE. */
+const PHASE_MAJOR = Float64Array.from({ length: 48 }, (_, i) => ANNEX2_TABLE[i % 12]![Math.floor(i / 12)]!);
+
+/** truePeakDbtp as it was before T114 (every output scanned), kept verbatim as the reference. */
+function truePeakDbtpBeforeT114(x: Float32Array): number {
+  const TP_TAPS = 12;
+  const n = x.length;
+  const f = PHASE_MAJOR;
+  let peak = 0;
+  for (let m = 0; m < n + TP_TAPS - 1; m++) {
+    const kLo = m >= n ? m - n + 1 : 0;
+    const kHi = m < TP_TAPS - 1 ? m : TP_TAPS - 1;
+    let y0 = 0;
+    let y1 = 0;
+    let y2 = 0;
+    let y3 = 0;
+    for (let k = kLo; k <= kHi; k++) {
+      const v = x[m - k]!;
+      y0 += f[k]! * v;
+      y1 += f[TP_TAPS + k]! * v;
+      y2 += f[2 * TP_TAPS + k]! * v;
+      y3 += f[3 * TP_TAPS + k]! * v;
+    }
+    const a = Math.max(Math.abs(y0), Math.abs(y1), Math.abs(y2), Math.abs(y3));
+    if (a > peak) peak = a;
+  }
+  return 20 * Math.log10(peak);
+}
+
+/**
+ * One segment of a structured random input: `kind` 0 seeded uniform noise, 1 the worst case of phase `phase`
+ * (x[m − k] = gain · sign(h_p[k]), so |y_p[m]| reaches gain · Σ|h_p|), repeated, 2 a constant, 3 zeros.
+ */
+interface Segment {
+  kind: number;
+  length: number;
+  gain: number;
+  phase: number;
+  seed: number;
+}
+
+function buildSegments(segments: readonly Segment[]): Float32Array {
+  const parts = segments.map(({ kind, length, gain, phase, seed }) => {
+    const y = new Float32Array(length);
+    const rng = mulberry32(seed);
+    for (let i = 0; i < length; i++) {
+      if (kind === 0) y[i] = gain * (2 * rng() - 1);
+      else if (kind === 1) y[i] = gain * Math.sign(PHASE_MAJOR[phase * 12 + 11 - (i % 12)]!);
+      else if (kind === 2) y[i] = gain;
+    }
+    return y;
+  });
+  const x = new Float32Array(parts.reduce((sum, y) => sum + y.length, 0));
+  let at = 0;
+  for (const y of parts) {
+    x.set(y, at);
+    at += y.length;
+  }
+  return x;
+}
+
+describe('truePeakDbtp block skip (duck plan T114)', () => {
+  it('the worst-case pattern reaches max per-phase Σ|h| (the skip bound is tight)', () => {
+    const l1 = [0, 1, 2, 3].map((p) => ANNEX2_TABLE.reduce((sum, row) => sum + Math.abs(row[p]!), 0));
+    const x = buildSegments([{ kind: 1, length: 240, gain: 0.25, phase: 1, seed: 1 }]);
+    expect(truePeakDbtp(x)).toBe(truePeakDbtpBeforeT114(x));
+    expect(Math.abs(10 ** (truePeakDbtp(x) / 20) - 0.25 * Math.max(...l1))).toBeLessThanOrEqual(1e-12);
+  });
+
+  const root = join(fileURLToPath(new URL('../../', import.meta.url)), 'test');
+  const files = ['fixtures', join('corpus', 'speech')].flatMap((sub) =>
+    readdirSync(join(root, sub))
+      .filter((f) => f.endsWith('.wav'))
+      .toSorted()
+      .map((f) => join(sub, f)),
+  );
+
+  it('finds every test/fixtures and test/corpus/speech WAV', () => {
+    expect(files.filter((f) => f.startsWith('fixtures')).length).toBeGreaterThanOrEqual(11);
+    expect(files.filter((f) => !f.startsWith('fixtures')).length).toBeGreaterThanOrEqual(100);
+  });
+
+  it('returns the same number as before on every test/fixtures and test/corpus/speech WAV', () => {
+    for (const file of files) {
+      const { channels } = readWav(readFileSync(join(root, file)));
+      for (const ch of channels) {
+        expect(truePeakDbtp(ch), file).toBe(truePeakDbtpBeforeT114(ch));
+        // Reversed: the loud part comes first, so the running peak and the skipped blocks differ.
+        const reversed = ch.toReversed();
+        expect(truePeakDbtp(reversed), file).toBe(truePeakDbtpBeforeT114(reversed));
+      }
+    }
+  });
+
+  it('returns the same number as before on 1000 random inputs (property)', () => {
+    const gain = fc.oneof(
+      fc.constantFrom(1, 0.5, 0.25, 1 / 2.02, 0.4950495, 1e-3, 1e-30, 3.4e38),
+      fc.double({ min: 0, max: 1, noNaN: true }),
+    );
+    const segment = fc.record({
+      kind: fc.integer({ min: 0, max: 3 }),
+      length: fc.integer({ min: 1, max: 200 }),
+      gain,
+      phase: fc.integer({ min: 0, max: 3 }),
+      seed: fc.integer({ min: 0, max: 0xffff }),
+    });
+    const input = fc.oneof(
+      fc.float32Array({ minLength: 0, maxLength: 600, size: 'max' }),
+      fc.float32Array({ minLength: 0, maxLength: 600, size: 'max', noNaN: true, min: -1, max: 1 }),
+      fc.array(segment, { minLength: 1, maxLength: 12 }).map(buildSegments),
+    );
+    fc.assert(
+      fc.property(input, (x) => Object.is(truePeakDbtp(x), truePeakDbtpBeforeT114(x))),
+      { numRuns: 1000 },
+    );
   });
 });

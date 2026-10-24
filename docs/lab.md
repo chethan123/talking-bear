@@ -11,6 +11,8 @@ The `lab/` pages are dev-only experiment pages for the plan §5 experiments (X-E
 | `lab/gestures.html` | X-A7 labelled pointer traces (tap, long-press, pet, tickle) for the recogniser's confusion matrix (`scripts/gesture-eval.ts`); exports them as JSON |
 | `lab/vad-trace.html` | M2 real-voice feature traces on D1 (listen-only, Silero on every frame, hold-to-talk labels); exports `trace.json` and `trace.bin`, never audio |
 
+The voice chain also has a Node benchmark outside the lab pages: `node scripts/bench-voice.ts` prints the median and p95 of `processVoice` for every preset at 1, 5 and 10 s and 44.1 and 48 kHz (duck plan T114).
+
 ## Privacy rule (plan Q2)
 
 **No lab page may store or download captured audio.** This is a hard rule (CLAUDE.md rule 5):

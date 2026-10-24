@@ -9,7 +9,7 @@ import { butterworthHighpass } from './biquad.ts';
 import { analyzeEnvelope } from './envelope.ts';
 import { applyFades } from './fades.ts';
 import { voiceGainDb } from './normalize.ts';
-import { resampleOffline } from './resample.ts';
+import { createResampler, resampleOffline } from './resample.ts';
 import type { Envelope, VoicePreset, VoiceResult } from './types.ts';
 import { createVoicing, VOICED_THRESHOLD } from './voicing.ts';
 
@@ -35,6 +35,8 @@ export const VOICING_FS = 8000;
 export const VOICING_WINDOW = 256;
 export const VOICING_HOP = 160;
 export const VOICED_MIN_WINDOWS = 3;
+/** isVoiced feeds its streaming 8 kHz resampler input chunks of round(0.25·fs) samples. */
+export const VOICING_CHUNK_SEC = 0.25;
 /** Raised-cosine fade length in ms at each end. */
 export const FADE_MS = 8;
 
@@ -135,18 +137,41 @@ export function resample(x: Float32Array, pitchRatio: number): Float32Array {
  * createVoicing(8000) on 256-sample windows starting every 160 samples (20 ms) at 0, 160, 320, … that lie
  * wholly inside the copy, and returns true as soon as 3 windows score above VOICED_THRESHOLD. A copy shorter
  * than 256 samples has no window and is unvoiced.
+ *
+ * The copy is made by the streaming resampler createResampler(fs, 8000), fed input chunks of round(0.25·fs)
+ * samples and flushed at the end, which gives the offline copy bit for bit; each window is scored as soon as
+ * its last sample has arrived, so a voiced clip stops resampling at its third voiced window (duck plan T114).
  */
 export function isVoiced(y: Float32Array, fs: number): boolean {
-  const z = resampleOffline(y, VOICING_FS / fs);
+  const resampler = createResampler(fs, VOICING_FS);
   const voicing = createVoicing(VOICING_FS);
+  const n = y.length;
+  const chunk = Math.max(1, Math.round(VOICING_CHUNK_SEC * fs));
+  const z = new Float32Array(Math.round(n * resampler.ratio));
+  const out = new Float32Array(Math.ceil(chunk * resampler.ratio) + 2);
+  let filled = 0;
+  let start = 0;
   let count = 0;
-  for (let s = 0; s + VOICING_WINDOW <= z.length; s += VOICING_HOP) {
-    if (voicing.score(z.subarray(s, s + VOICING_WINDOW)) > VOICED_THRESHOLD) {
-      count++;
-      if (count >= VOICED_MIN_WINDOWS) return true;
+  /** Scores every complete window not yet scored; true once VOICED_MIN_WINDOWS have scored above threshold. */
+  const scoreReady = (): boolean => {
+    for (; start + VOICING_WINDOW <= filled; start += VOICING_HOP) {
+      if (voicing.score(z.subarray(start, start + VOICING_WINDOW)) > VOICED_THRESHOLD) {
+        count++;
+        if (count >= VOICED_MIN_WINDOWS) return true;
+      }
     }
+    return false;
+  };
+  for (let off = 0; off < n; off += chunk) {
+    const k = resampler.processInto(y.subarray(off, Math.min(off + chunk, n)), out);
+    z.set(out.subarray(0, k), filled);
+    filled += k;
+    if (scoreReady()) return true;
   }
-  return false;
+  const tail = resampler.flush();
+  z.set(tail, filled);
+  filled += tail.length;
+  return scoreReady();
 }
 
 /**
