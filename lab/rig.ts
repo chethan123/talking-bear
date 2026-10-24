@@ -7,11 +7,11 @@
 // the canvas: its tracks on top of the sliders' pose, and its spring kicks through the page's own SpringBank
 // (the app's springs-map.ts constants), every spring added to its channel. Dev-only: `pnpm dev`, then
 // /lab/rig.html (docs/lab.md). No audio is involved; the log is text only. Lab pages set no CSS `style`: SVG
-// geometry and sizes are attributes.
+// geometry and sizes are attributes. The character picker reloads the page with `?character=<id>` (Juni by default),
+// so every table the page builds at load is the picked character's.
 
 import { el, fmt, logPanel } from './common.ts';
 import type { Attrs } from './common.ts';
-import { BONES, PARTS } from '../src/art/bear-parts.gen.ts';
 import { sampleClip } from '../src/anim/clip.ts';
 import type { Clip } from '../src/anim/clip.ts';
 import { REACTION_CLIPS } from '../src/anim/clips/reactions.ts';
@@ -43,6 +43,7 @@ import {
 import type { View } from '../src/anim/renderer.ts';
 import { boneMatrices, createRig, MAT, PartKind, partMatrix } from '../src/anim/rig.ts';
 import { CHARACTERS } from '../src/characters/index.ts';
+import type { CharacterId } from '../src/characters/index.ts';
 import { mulberry32 } from '../src/anim/rng.ts';
 import { SpringBank } from '../src/anim/springs.ts';
 import {
@@ -67,8 +68,6 @@ const VIEW_H = 504;
 const SAMPLE_MS = 1000;
 /** A pixel whose largest channel |Δ| (of 255) exceeds this is counted as a real disagreement, not anti-aliasing. */
 const DIFF_COUNT_MIN = 64;
-/** The channels only the canvas draws (the mouth and the stars): zero in the parts-only reference. */
-const CANVAS_ONLY = [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth, Ch.Stars] as const;
 /** Stress: every spring gets a random impulse every 200 ms of simulated time, i.e. every 24 substeps. */
 const KICK_S = 0.2;
 const KICK_STEPS = Math.round(KICK_S / SUBSTEP);
@@ -337,7 +336,18 @@ function summarize(): Summary | null {
 
 // ---- rig, views and page ------------------------------------------------------------------------------------
 
-const rig = createRig(CHARACTERS.juni);
+/** The character the page shows: `?character=<id>`, Juni when absent or unknown. */
+const CHARACTER_IDS = Object.keys(CHARACTERS).filter((id): id is CharacterId => id in CHARACTERS);
+const characterParam = new URLSearchParams(window.location.search).get('character');
+const characterId: CharacterId = CHARACTER_IDS.find((id) => id === characterParam) ?? 'juni';
+const rig = createRig(CHARACTERS[characterId]);
+const { BONES, PARTS } = rig.spec.art;
+/**
+ * The channels only the canvas draws: the stars, and for a parametric mouth (Juni's `'lips'`) the mouth channels.
+ * Zero in the parts-only reference. A `'parts'` mouth (Fenn's beak) is bones and parts, so the SVG view shows it.
+ */
+const CANVAS_ONLY: readonly number[] =
+  rig.spec.mouth.kind === 'lips' ? [Ch.Jaw, Ch.MouthW, Ch.MouthRound, Ch.Teeth, Ch.Stars] : [Ch.Stars];
 /** The sliders' pose: what both views show, and the stress run's base pose. */
 const base = createPose();
 /** Bumped by every change of `base`. */
@@ -433,6 +443,18 @@ const imgG = readbackContext();
 
 const root = document.getElementById('lab');
 if (!(root instanceof HTMLElement)) throw new Error('lab/rig: missing #lab');
+
+const characterSelect = el(
+  'select',
+  {},
+  ...CHARACTER_IDS.map((id) => el('option', { value: id }, CHARACTERS[id].names.stage)),
+);
+characterSelect.value = characterId;
+characterSelect.addEventListener('change', () => {
+  const url = new URL(window.location.href);
+  url.searchParams.set('character', characterSelect.value);
+  window.location.assign(url);
+});
 
 const poseSelect = el(
   'select',
@@ -547,6 +569,13 @@ const clipFieldset = el(
 );
 
 root.append(
+  el(
+    'fieldset',
+    {},
+    el('legend', {}, 'Character'),
+    el('label', {}, 'Character: ', characterSelect),
+    ' (reloads the page)',
+  ),
   el('fieldset', {}, el('legend', {}, 'Pose'), el('label', {}, 'Key pose: ', poseSelect), ' ', resetButton),
   clipFieldset,
   stressFieldset,
@@ -557,7 +586,7 @@ root.append(
     'dl',
     { class: 'lab-values' },
     ...row('Max pixel difference (views)', show.diff),
-    ...row('Max pixel difference (parts only: mouth and stars excluded)', show.diffParts),
+    ...row('Max pixel difference (parts only: canvas-only channels at 0)', show.diffParts),
   ),
   el('h2', {}, 'Channels'),
   el(
@@ -1101,5 +1130,5 @@ show.backing.textContent = '(stress off)';
 show.clip.textContent = '(none played yet)';
 changed();
 log(
-  `lab/rig ready: ${PARTS.length} parts, ${BONES.length} bones, ${CH_COUNT} channels; devicePixelRatio ${window.devicePixelRatio}, viewport ${window.innerWidth} × ${window.innerHeight}; ${navigator.userAgent}`,
+  `lab/rig ready: ${rig.spec.names.stage}, ${PARTS.length} parts, ${BONES.length} bones, ${CH_COUNT} channels; devicePixelRatio ${window.devicePixelRatio}, viewport ${window.innerWidth} × ${window.innerHeight}; ${navigator.userAgent}`,
 );

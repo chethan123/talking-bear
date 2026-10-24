@@ -1,7 +1,7 @@
 /**
  * A character's data (duck plan §4.1): everything the rig, the renderer, the hit regions, the gaze, the director, the
  * reactions and the texts read about one character. The engine code is character-agnostic; each character is a `CharacterSpec` value
- * (`src/characters/juni.ts`), listed in `CHARACTERS` (`src/characters/index.ts`).
+ * (`src/characters/juni.ts`, `src/characters/fenn.ts`), listed in `CHARACTERS` (`src/characters/index.ts`).
  *
  * Node scripts import this module (scripts/gesture-eval.ts), so its relative imports end in `.ts` and it uses
  * erasable syntax only.
@@ -12,8 +12,8 @@ import type { Gesture } from '../input/recognizer.ts';
 import type { RegionDef } from '../input/regions.ts';
 import type { Reaction } from '../reactions/table.ts';
 
-/** The characters there are. */
-export type CharacterId = 'juni';
+/** The characters there are: Juni the bear and Fenn the duckling. */
+export type CharacterId = 'juni' | 'fenn';
 
 /** A character's generated art module (`src/art/*-parts.gen.ts`). */
 export interface CharacterArt {

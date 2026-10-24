@@ -16,7 +16,7 @@ import { AWAKE, TOO_LOUD_REACTION } from '../app/machine.ts';
 import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import type { Gesture } from '../input/recognizer.ts';
-import { REGION_IDS, type RegionId } from '../input/region-ids.ts';
+import type { RegionId } from '../input/region-ids.ts';
 import { compileRegions, hitTest } from '../input/regions.ts';
 import type { VisEvent } from '../platform/visibility.ts';
 import { DEBUG_REFRESH_MS, formatFrameStats, mountDebugOverlay } from '../ui/debug-overlay.ts';
@@ -1696,8 +1696,10 @@ describe('pointer input and reactions (#93)', () => {
   test('regionCenter: every region centre, in viewport CSS px, hits that region; background has none', () => {
     const h = awake();
     h.run(30);
-    const ids = REGION_IDS.filter((id) => id !== 'background');
-    expect(ids).toHaveLength(16);
+    // Per character (duck plan T123): the ids the mounted character (Juni) has a region for.
+    const ids = new Set(JUNI.regions.map((r) => r.id));
+    expect(ids.size).toBe(16);
+    expect(ids.has('background')).toBe(false);
     for (const id of ids) expect(hitAt(h, h.view.regionCenter(id)), id).toBe(id);
     expect(() => h.view.regionCenter('background')).toThrow(RangeError);
   });

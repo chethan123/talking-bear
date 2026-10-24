@@ -21,6 +21,8 @@ import {
 const JUNI = CHARACTER_ART.find((e) => e.id === 'juni') ?? { id: 'juni', svg: '', out: '' };
 const SVG_FILE = JUNI.svg;
 const OUT_FILE = JUNI.out;
+/** A table of Juni alone: the CLI tests' temporary root holds Juni's fixture SVG only. */
+const ONE: readonly CharacterArt[] = [JUNI];
 
 // A tiny SVG in the art/README.md subset: a mirrored part whose right bone exists (furL → armR), one whose
 // right bone does not (padL stays on pawL), a skipped path, bones without data-pivot (pawL inherits from
@@ -460,16 +462,16 @@ describe('main: the gen:bear CLI', () => {
 
   it('writes the module; --check then passes, and fails once a colour changes, never writing', () => {
     const out = join(root, OUT_FILE);
-    expect(main(['--check'], root)).toBe(1);
+    expect(main(['--check'], root, ONE)).toBe(1);
     expect(errors.join('\n')).toContain(`${OUT_FILE} (character juni) is missing`);
     expect(existsSync(out)).toBe(false);
-    expect(main([], root)).toBe(0);
+    expect(main([], root, ONE)).toBe(0);
     expect(readFileSync(out, 'utf8')).toBe(generate(FIXTURE, JUNI));
-    expect(main([], root)).toBe(0);
-    expect(main(['--check'], root)).toBe(0);
+    expect(main([], root, ONE)).toBe(0);
+    expect(main(['--check'], root, ONE)).toBe(0);
     writeFileSync(join(root, SVG_FILE), FIXTURE.replace('#2F7A6D', '#3F9282'));
     errors = [];
-    expect(main(['--check'], root)).toBe(1);
+    expect(main(['--check'], root, ONE)).toBe(1);
     expect(errors.join('\n')).toMatch(/is stale[\s\S]*committed: {5}fill: '#2F7A6D',[\s\S]*pnpm gen:bear/);
     expect(readFileSync(out, 'utf8')).toBe(generate(FIXTURE, JUNI));
   });
@@ -516,20 +518,29 @@ describe('main: the gen:bear CLI', () => {
   });
 
   it('exits 1 on an unknown --character, writing nothing, and 2 on a --character without an id', () => {
-    expect(main(['--character', 'nobody'], root)).toBe(1);
+    expect(main(['--character', 'nobody'], root, ONE)).toBe(1);
     expect(errors.join('\n')).toContain('unknown character "nobody" (known: juni)');
-    expect(main(['--check', '--character', 'nobody'], root)).toBe(1);
+    expect(main(['--check', '--character', 'nobody'], root, ONE)).toBe(1);
     expect(existsSync(join(root, OUT_FILE))).toBe(false);
-    expect(main(['--character'], root)).toBe(2);
+    expect(main(['--character'], root, ONE)).toBe(2);
   });
 
   it('exits 1 on an invalid SVG and 2 on unknown arguments', () => {
     writeFileSync(join(root, SVG_FILE), FIXTURE.replace('<g id="armR"', '<circle/><g id="armR"'));
-    expect(main([], root)).toBe(1);
+    expect(main([], root, ONE)).toBe(1);
     expect(errors.join('\n')).toContain('<circle> is not allowed');
     expect(existsSync(join(root, OUT_FILE))).toBe(false);
-    expect(main(['--fix'], root)).toBe(2);
-    expect(main(['--check', '--check'], root)).toBe(2);
+    expect(main(['--fix'], root, ONE)).toBe(2);
+    expect(main(['--check', '--check'], root, ONE)).toBe(2);
+  });
+});
+
+describe('CHARACTER_ART', () => {
+  it('compiles Juni and Fenn, each from its own SVG into its own module', () => {
+    expect(CHARACTER_ART).toEqual([
+      { id: 'juni', svg: 'art/bear.svg', out: 'src/art/bear-parts.gen.ts' },
+      { id: 'fenn', svg: 'art/duck.svg', out: 'src/art/duck-parts.gen.ts' },
+    ]);
   });
 });
 

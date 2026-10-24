@@ -3,7 +3,8 @@
  * checks that `render` allocates nothing per frame.
  *
  * The screenshots are rendered once each, with no rAF loop: `render` is a pure function of the pose, so a fixed
- * pose is a fixed seed and time. Baselines live in `__screenshots__/renderer.browser.test.ts/`; regenerate them
+ * pose is a fixed seed and time. Every key pose is drawn with Juni's rig (`<pose>`) and with Fenn's (`fenn-<pose>`, duck
+ * plan T123). Baselines live in `__screenshots__/renderer.browser.test.ts/`; regenerate them
  * with `pnpm test:browser --update` on Linux after a Playwright or Chromium bump. Never loosen the comparison.
  */
 import { beforeAll, describe, expect, test } from 'vitest';
@@ -16,6 +17,7 @@ import type { Pose } from './pose.ts';
 import { createContext, fitView, render, resizeCanvas } from './renderer.ts';
 import type { View } from './renderer.ts';
 import { boneMatrices, createRig, MAT, partIndex, partMatrix } from './rig.ts';
+import { FENN } from '../characters/fenn.ts';
 import { JUNI } from '../characters/juni.ts';
 
 /** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
@@ -82,6 +84,18 @@ describe('key poses match their baselines', () => {
       expect(view).toEqual({ scale: 0.5, ox: 0, oy: 0 });
       render(g, createRig(JUNI), POSES[name], view);
       await expect.element(canvas).toMatchScreenshot(name);
+    });
+  }
+});
+
+describe("key poses match their baselines with Fenn's rig", () => {
+  for (const name of NAMES) {
+    test(`fenn ${name}`, async () => {
+      expect(window.devicePixelRatio).toBe(1);
+      const { canvas, g, view } = mount(CSS_WIDTH, CSS_HEIGHT);
+      expect(view).toEqual({ scale: 0.5, ox: 0, oy: 0 });
+      render(g, createRig(FENN), POSES[name], view);
+      await expect.element(canvas).toMatchScreenshot(`fenn-${name}`);
     });
   }
 });

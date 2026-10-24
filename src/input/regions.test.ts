@@ -156,12 +156,17 @@ describe('REGIONS', () => {
     ]);
   });
 
-  it('holds every RegionId except background once (headTop twice: head, then tuft), each on a rig bone, frozen', () => {
+  it("holds each of Juni's region ids once (headTop twice: head, then tuft), each on a rig bone, frozen", () => {
+    // Per character (duck plan T123): Juni's ids are REGION_IDS minus background and Fenn's beak, wings and tail.
+    const juniIds = new Set(REGIONS.map((r) => r.id));
+    expect([...juniIds].toSorted()).toEqual(
+      REGION_IDS.filter((id) => !['background', 'beak', 'wingL', 'wingR', 'tail'].includes(id)).toSorted(),
+    );
     expect(
       REGIONS.filter((r) => r.id !== 'headTop')
         .map((r) => r.id)
         .toSorted(),
-    ).toEqual(REGION_IDS.filter((id) => id !== 'background' && id !== 'headTop').toSorted());
+    ).toEqual([...juniIds].filter((id) => id !== 'headTop').toSorted());
     const heads = REGIONS.flatMap((r, i) => (r.id === 'headTop' ? [[i, r.bone]] : []));
     expect(heads).toEqual([
       [13, 'head'],

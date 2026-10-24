@@ -25,9 +25,10 @@ export interface CharacterArt {
   out: string;
 }
 
-/** Every character the generator compiles. T123 adds `fenn` (art/duck.svg → src/art/duck-parts.gen.ts). */
+/** Every character the generator compiles. */
 export const CHARACTER_ART: readonly CharacterArt[] = [
   { id: 'juni', svg: 'art/bear.svg', out: 'src/art/bear-parts.gen.ts' },
+  { id: 'fenn', svg: 'art/duck.svg', out: 'src/art/duck-parts.gen.ts' },
 ];
 
 /** The repository root: the parent of scripts/. */
