@@ -29,6 +29,7 @@ talking-bear/
 ├── index.html
 ├── art/
 │   ├── bear.svg                    # source art: one id per part, data-pivot, data-parent
+│   ├── duck.svg                    # source art for Fenn, same rules
 │   └── icon.svg                    # icon source → generated PNGs committed in public/icons
 ├── public/
 │   ├── icons/                      # generated once by @vite-pwa/assets-generator
@@ -39,17 +40,18 @@ talking-bear/
 │   ├── audio/   engine.ts capture.worklet.ts player.ts output-clock.ts sfx.ts messages.ts
 │   ├── workers/ dsp.worker.ts
 │   ├── dsp/     biquad.ts ring-buffer.ts resample.ts energy-gate.ts voicing.ts segmenter.ts
-│   │            envelope.ts fft.ts normalize.ts fades.ts yin.ts
+│   │            envelope.ts fft.ts normalize.ts fades.ts yin.ts duck.ts
 │   │            silero/{model.ts,weights.ts,weights.bin,weights.provenance.json}
 │   ├── anim/    rig.ts pose.ts springs.ts director.ts renderer.ts loop.ts layers/*.ts clips/*.ts
-│   ├── art/     bear-parts.gen.ts      # generated from art/bear.svg (committed)
+│   ├── art/     bear-parts.gen.ts duck-parts.gen.ts   # generated from art/bear.svg, art/duck.svg (committed)
+│   ├── characters/ types.ts index.ts juni.ts fenn.ts   # one CharacterSpec per character
 │   ├── input/   recognizer.ts pointer-adapter.ts regions.ts
 │   ├── reactions/ table.ts
 │   ├── platform/ wake-lock.ts visibility.ts permissions.ts storage.ts
 │   ├── pwa/     register.ts
 │   ├── ui/      overlay.ts debug-overlay.ts styles.css
 │   └── test-hooks.ts               # only reachable when VITE_BEAR_TEST_HOOKS==='1'
-├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures
+├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures, duck
 │                                   #   (no page ever stores or downloads captured audio: Q2)
 ├── scripts/
 │   ├── gen-bear-parts.ts   extract-silero-weights.ts   gen-fixtures.ts   gen-corpus.ts
@@ -67,7 +69,7 @@ talking-bear/
 ├── tsconfig.json                   # references: app, worklet, worker, node, test
 ├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json  tsconfig.test.json
 ├── vite.config.ts  vitest.config.ts  playwright.config.ts
-├── .oxlintrc.json  .prettierrc  .size-limit.json
+├── .oxlintrc.json  .prettierrc  .size-limit.cjs
 └── LICENSE  README.md  THIRD_PARTY_NOTICES.md   # Silero (MIT) weights notice, etc.
 ```
 
