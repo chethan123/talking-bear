@@ -62,6 +62,7 @@ import { afterEach, expect, test } from 'vitest';
 import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import { mountBearView } from './bear-view.ts';
+import { JUNI } from '../characters/juni.ts';
 import type { Gesture } from '../input/recognizer.ts';
 import type { BearView } from './bear-view.ts';
 import { Ch } from './pose.ts';
@@ -247,6 +248,7 @@ test(
       requestFrame: viewFrames.request,
       cancelFrame: viewFrames.cancel,
       perfNow: () => 0,
+      character: JUNI,
     });
     views.push(view);
     view.onAnim({ e: 'idle' });

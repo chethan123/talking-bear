@@ -229,6 +229,7 @@ function harness(over: Partial<BearViewDeps> = {}, start = 1000): Harness {
     requestFrame: frames.request,
     cancelFrame: frames.cancel,
     perfNow: () => 0,
+    character: JUNI,
     ...over,
   });
   mounted.push(view);
@@ -1071,7 +1072,7 @@ describe('reaction clips in the frame (#221)', () => {
       h.run(1, P120);
       const t = h.clock.t / 1000;
       const p = h.view.pose();
-      evaluate(h.view.director(), t, expected, true);
+      evaluate(h.view.director(), t, expected, true, JUNI.cast);
       for (const ch of MOUTH) {
         expect(
           Math.abs(p[ch]! - expected[ch]!),

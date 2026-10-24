@@ -202,6 +202,7 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     haptics,
     seed: Math.floor(Math.random() * 2 ** 32),
     latencyMs: latencyFromQuery(location.search),
+    character: CHARACTERS.juni,
   });
   bear = view;
   // Reduced motion (plan §4.6.6): the OS setting or the parent's Gentle mode; it also sets the director's gentle

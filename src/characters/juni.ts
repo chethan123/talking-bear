@@ -1,12 +1,16 @@
 /**
- * Juni the bear (plan §4.6): the spec the rig, the renderer, the hit regions, the gaze and the texts read (duck plan
- * §4.1). Its art is `art/bear.svg`, generated into `src/art/bear-parts.gen.ts`.
+ * Juni the bear (plan §4.6): the spec the rig, the renderer, the hit regions, the gaze, the director, the reactions and
+ * the texts read (duck plan §4.1). Its art is `art/bear.svg`, generated into `src/art/bear-parts.gen.ts`.
  *
  * Node scripts import this module (scripts/gesture-eval.ts), so its relative imports end in `.ts`.
  */
+import { MIME_CLIPS, REACTION_CLIPS } from '../anim/clips/reactions.ts';
+import { SESSION_CLIPS } from '../anim/clips/session.ts';
+import { createDirectorCast } from '../anim/director.ts';
 import { BONE, BONES, PART, PARTS } from '../art/bear-parts.gen.ts';
 import { Ch } from '../anim/pose.ts';
 import type { RegionDef } from '../input/regions.ts';
+import { REACTIONS, reactionFor } from '../reactions/table.ts';
 import type { CharacterSpec, Drive, MouthSpec, StarsSpec } from './types.ts';
 
 /**
@@ -115,4 +119,7 @@ export const JUNI: CharacterSpec = {
   /** Frozen, array and entries: `compileRegions` reads them once into typed tables. */
   regions: Object.freeze(REGIONS.map((r) => Object.freeze(r))),
   names: { name: 'Juni', stage: 'Juni the bear', switchTo: 'Switch to Juni the bear' },
+  /** The session, reaction and mime clips (#115), the flinch and the mirrored pet; plan §4.6.4's reactions. */
+  cast: createDirectorCast([SESSION_CLIPS, REACTION_CLIPS, MIME_CLIPS], REACTIONS),
+  reactionFor,
 };

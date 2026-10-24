@@ -1,13 +1,16 @@
 /**
- * A character's data (duck plan §4.1): everything the rig, the renderer, the hit regions, the gaze and the texts read
- * about one character. The engine code is character-agnostic; each character is a `CharacterSpec` value
+ * A character's data (duck plan §4.1): everything the rig, the renderer, the hit regions, the gaze, the director, the
+ * reactions and the texts read about one character. The engine code is character-agnostic; each character is a `CharacterSpec` value
  * (`src/characters/juni.ts`), listed in `CHARACTERS` (`src/characters/index.ts`).
  *
  * Node scripts import this module (scripts/gesture-eval.ts), so its relative imports end in `.ts` and it uses
  * erasable syntax only.
  */
+import type { DirectorCast } from '../anim/director.ts';
 import type { Bone, Part } from '../art/bear-parts.gen.ts';
+import type { Gesture } from '../input/recognizer.ts';
 import type { RegionDef } from '../input/regions.ts';
+import type { Reaction } from '../reactions/table.ts';
 
 /** The characters there are. */
 export type CharacterId = 'juni';
@@ -102,4 +105,8 @@ export interface CharacterSpec {
   /** The hit regions, in priority order (first match wins). */
   readonly regions: readonly RegionDef[];
   readonly names: CharacterNames;
+  /** The clips and escalation targets the director plays for this character (`createDirectorCast`). */
+  readonly cast: DirectorCast;
+  /** The character's reactions table: a recognised gesture's reaction, or null (pure, allocates nothing). */
+  readonly reactionFor: (g: Gesture) => Reaction | null;
 }
