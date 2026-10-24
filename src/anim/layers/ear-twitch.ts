@@ -12,7 +12,7 @@
  *
  * **Orientation toward a background touch** (plan §4.6.4 "Background: gaze to the point; ears orient", #255): the
  * ear layer also reads `ctx.lookAt`, as the gaze does. While it is set (and finite), both ears turn toward the point's
- * side by the same angle, `EAR_ORIENT_MAX · clamp((lookAt.x − EYES_CENTER.x) / LOOK_SATURATE, −1, 1)`: the horizontal
+ * side by the same angle, `EAR_ORIENT_MAX · clamp((lookAt.x − eyesCenter.x) / LOOK_SATURATE, −1, 1)`: the horizontal
  * offset from the head's centre line, saturating at the gaze's distance, so a point left of the head turns both ears
  * counter-clockwise (tips left, −) and a point right of it clockwise (+); the vertical offset is ignored. A point
  * with a non-finite coordinate counts as unset. The orientation eases toward that target, and back to 0 once
@@ -30,8 +30,8 @@
 import { uniform } from '../rng.ts';
 import { Ch } from '../pose.ts';
 import type { Pose } from '../pose.ts';
-import { EYES_CENTER, LOOK_SATURATE } from './gaze.ts';
-import type { AnimContext, Layer } from './index.ts';
+import { checkCenter, LOOK_SATURATE } from './gaze.ts';
+import type { AnimContext, Layer, LookAt } from './index.ts';
 
 /** Spring constants of the ear springs; the bank's owner configures both indices with them. */
 export const EAR_SPRING = { freqHz: 6, zeta: 0.35 } as const;
@@ -80,22 +80,26 @@ const SINCE = 1;
 const ORIENT = 2;
 /** The orientation's target this update, in radians. */
 const TARGET = 3;
+/** The x of the midpoint between the eyes, design units (`createEarTwitch`'s `eyesCenter`). */
+const CX = 4;
 
 class EarTwitch implements EarTwitchLayer {
   readonly #earL: number;
   readonly #earR: number;
   #primed = false;
   /** The doubles kept between updates, by slot. */
-  readonly #s = new Float64Array(4);
+  readonly #s = new Float64Array(5);
   #count = 0;
   #right = 0;
 
-  constructor(springs: EarTwitchSprings) {
+  constructor(springs: EarTwitchSprings, eyesCenter: Readonly<LookAt>) {
     checkIndex(springs.earL, 'earL');
     checkIndex(springs.earR, 'earR');
+    checkCenter(eyesCenter);
     this.#earL = springs.earL;
     this.#earR = springs.earR;
     this.#s[SINCE] = Number.POSITIVE_INFINITY;
+    this.#s[CX] = eyesCenter.x;
   }
 
   get count(): number {
@@ -142,7 +146,7 @@ class EarTwitch implements EarTwitchLayer {
       const lx = look.x;
       const ly = look.y;
       if (lx - lx === 0 && ly - ly === 0) {
-        let u = (lx - EYES_CENTER.x) / LOOK_SATURATE;
+        let u = (lx - s[CX]!) / LOOK_SATURATE;
         if (u > 1) u = 1;
         else if (u < -1) u = -1;
         s[TARGET] = EAR_ORIENT_MAX * u;
@@ -158,9 +162,11 @@ class EarTwitch implements EarTwitchLayer {
 
 /**
  * A new ear-twitch layer kicking the springs at the given `ctx.springs` indices (configure them with
- * `EAR_SPRING`). Its first twitch is U(6, 15) s after its first update.
- * @throws RangeError unless both indices are integers ≥ 0; `update` throws if one is outside the bank.
+ * `EAR_SPRING`), orienting toward `ctx.lookAt` relative to `eyesCenter` (design units: the character's
+ * `spec.eyesCenter`, as the gaze's). Its first twitch is U(6, 15) s after its first update.
+ * @throws RangeError unless both indices are integers ≥ 0 and `eyesCenter` is finite; `update` throws if an index is
+ * outside the bank.
  */
-export function createEarTwitch(springs: EarTwitchSprings): EarTwitchLayer {
-  return new EarTwitch(springs);
+export function createEarTwitch(springs: EarTwitchSprings, eyesCenter: Readonly<LookAt>): EarTwitchLayer {
+  return new EarTwitch(springs, eyesCenter);
 }

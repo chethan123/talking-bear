@@ -12,6 +12,7 @@ import { realClock } from './app/clock.ts';
 import { initialSessionState, overlayFor } from './app/machine.ts';
 import { createSession, type Session } from './app/session.ts';
 import { createSettingsStore, presetFor } from './app/settings.ts';
+import { CHARACTERS, type CharacterNames } from './characters/index.ts';
 import { createEngine } from './audio/engine.ts';
 import { createPlayer } from './audio/player.ts';
 import { createSfx } from './audio/sfx.ts';
@@ -31,6 +32,8 @@ import { markBootStart, readPerfMeasures } from './perf.ts';
 markBootStart();
 
 const noop = (): void => {};
+/** The character the texts name (the paw's label, the parent sheet, the announcements, the privacy note). */
+const names = (): CharacterNames => CHARACTERS.juni.names;
 
 /** A developer flag: the `localStorage` value `'1'`. Storage can throw (blocked site data); default false. */
 function readFlag(key: string): boolean {
@@ -228,6 +231,7 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
       const ctx = engine.context();
       return ctx === null ? null : Math.round(ctx.currentTime * ctx.sampleRate);
     },
+    names,
   );
   sheet = mountSettingsSheet(app, {
     store: settings,
@@ -236,6 +240,7 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     // #114: "Try the microphone again" (For parents) dispatches `settingsRetry`; the sheet mounts the licences view.
     dispatch: (e) => s.dispatch(e),
     now: () => clock.now(),
+    names,
     pwa: {
       installAvailable: () => installAvailable,
       promptInstall: () => pwa.promptInstall(),

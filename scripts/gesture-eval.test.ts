@@ -4,12 +4,17 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fitView } from '../src/anim/renderer.ts';
 import { POSES } from '../src/anim/poses.ts';
-import { BONE_COUNT, boneMatrices, createRig, MAT } from '../src/anim/rig.ts';
+import { boneMatrices, createRig, MAT } from '../src/anim/rig.ts';
 import { STROKE_MIN_PATH } from '../src/input/recognizer.ts';
 import type { Gesture, PointerSample } from '../src/input/recognizer.ts';
-import { hitTest } from '../src/input/regions.ts';
+import { compileRegions, hitTest } from '../src/input/regions.ts';
 import { evaluate, FORMAT, main, neutralHit, predict, PRIORITY, replay, VERSION } from './gesture-eval.ts';
 import type { Age, GestureFile, GestureTrial, Intended } from './gesture-eval.ts';
+import { JUNI } from '../src/characters/juni.ts';
+
+/** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
+const JUNI_RIG = createRig(JUNI, { paths: false });
+const JUNI_REGIONS = compileRegions(JUNI_RIG);
 
 // ---- synthetic traces -------------------------------------------------------------------------------------------
 
@@ -275,13 +280,13 @@ describe('replay', () => {
 
   it('uses the page’s geometry: the neutral pose of the real rig, fitted to the canvas', () => {
     vi.stubGlobal('Path2D', FakePath2D);
-    const bones = boneMatrices(createRig(), POSES.neutral, new Float32Array(BONE_COUNT * MAT));
+    const bones = boneMatrices(createRig(JUNI), POSES.neutral, new Float32Array(JUNI_RIG.boneCount * MAT));
     const view = fitView(PHONE.cssWidth, PHONE.cssHeight, { scale: 0, ox: 0, oy: 0 });
     const hit = neutralHit(PHONE);
     const seen = new Set<string>();
     for (let y = 0; y <= PHONE.cssHeight; y += 4) {
       for (let x = 0; x <= PHONE.cssWidth; x += 4) {
-        const want = hitTest(x, y, bones, view);
+        const want = hitTest(x, y, bones, view, JUNI_REGIONS);
         expect(hit(x, y)).toBe(want);
         seen.add(want);
       }

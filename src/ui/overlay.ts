@@ -14,7 +14,7 @@
 //
 // Accessibility (#118, a11y.ts): every icon variant is `role="status"` with an `aria-label` and `aria-live="off"`;
 // the labels are attributes, so the variants keep an empty `textContent`. The app's one aria-live region sits outside
-// `root` (a11y.ts `liveRegion`), and `show(o)` sets it to `announcementFor(o)`: the Asleep, MicDenied or Error text
+// `root` (a11y.ts `liveRegion`), and `show(o)` sets it to `announcementFor(o, names())`: the Asleep, MicDenied or Error text
 // while `tapToWake`, `micHelp` or `error` is up, '' otherwise. So it speaks only on entering those three mic-closed
 // states and is cleared, in the same dispatch, on leaving them; nothing shown while the mic is armed ever changes
 // it, since a same-text `say` writes nothing: not the mic-muted badge (Listening), not the too-noisy badge
@@ -29,14 +29,20 @@
 // toggled with the `hidden` attribute.
 
 import type { Overlay, SessionEvent } from '../app/events.ts';
+import { JUNI } from '../characters/juni.ts';
+import type { CharacterNames } from '../characters/types.ts';
 import { A11Y_TEXT, announcementFor, labelStatus, liveRegion } from './a11y.ts';
 import { icon, type IconName } from './icons.ts';
 
-/** The parent-permission sheet's text: the only text among the overlays (plan §4.5). */
+/**
+ * The parent-permission sheet's text: the only text among the overlays (plan §4.5). The lines that name the character
+ * are functions of its `CharacterNames` (Juni: "Before Juni can listen").
+ */
 export const OVERLAY_TEXT = {
-  parentTitle: 'Before Juni can listen',
-  parentLocal: 'Juni only listens on this device. Nothing you say is sent anywhere.',
-  parentMicOff: 'The microphone switches off when Juni falls asleep.',
+  parentTitle: (n: CharacterNames): string => `Before ${n.name} can listen`,
+  parentLocal: (n: CharacterNames): string =>
+    `${n.name} only listens on this device. Nothing you say is sent anywhere.`,
+  parentMicOff: (n: CharacterNames): string => `The microphone switches off when ${n.name} falls asleep.`,
   parentContinue: 'Continue',
 } as const;
 
@@ -91,25 +97,35 @@ function holdButton(): HTMLButtonElement {
  * on the paw or the retry arrow reaches the bear. The paw, mic-help and retry icons sit at the bottom centre, over
  * the bear's body; the mic-muted and too-noisy badges at the top centre. The mic help stays a `section`. The hold
  * button (#116) takes pointer events and sits at the bottom centre too. Every `show(o)` also sets the document's live
- * region to `announcementFor(o)` (#118): the announcement of Asleep, MicDenied or Error, or '' (no write if unchanged).
+ * region to `announcementFor(o, names())` (#118): the announcement of Asleep, MicDenied or Error, or '' (no write if
+ * unchanged).
+ *
+ * `names` is the current character's names (duck plan §4.1; Juni's by default): the texts that name the character
+ * (the paw's label, the parent sheet, the Asleep announcement) are built from it at mount, and rebuilt by a `show`
+ * that finds it has changed.
  */
 export function mountOverlay(
   root: HTMLElement,
   dispatch: (e: SessionEvent) => void,
   nowFrame: () => number | null = () => null,
+  names: () => CharacterNames = () => JUNI.names,
 ): (o: Overlay) => void {
   const layer = element('div', 'overlay');
 
+  let named = names();
+  const parentTitle = element('h2', null, OVERLAY_TEXT.parentTitle(named));
+  const parentLocal = element('p', null, OVERLAY_TEXT.parentLocal(named));
+  const parentMicOff = element('p', null, OVERLAY_TEXT.parentMicOff(named));
   const parent = element('section', 'sheet');
   parent.append(
-    element('h2', null, OVERLAY_TEXT.parentTitle),
-    element('p', null, OVERLAY_TEXT.parentLocal),
-    element('p', null, OVERLAY_TEXT.parentMicOff),
+    parentTitle,
+    parentLocal,
+    parentMicOff,
     button(OVERLAY_TEXT.parentContinue, () => dispatch({ t: 'parentContinue' })),
   );
 
   const views: Record<View, HTMLElement> = {
-    tapToWake: iconView('div', 'overlay-icon overlay-paw', 'paw', A11Y_TEXT.tapToWake),
+    tapToWake: iconView('div', 'overlay-icon overlay-paw', 'paw', A11Y_TEXT.tapToWake(named)),
     parentPermission: parent,
     micHelp: iconView('section', 'overlay-icon', 'micBlocked', A11Y_TEXT.micHelp),
     micMuted: iconView('div', 'overlay-badge', 'micMuted', A11Y_TEXT.micMuted),
@@ -167,8 +183,16 @@ export function mountOverlay(
   return (o) => {
     // Hiding the button mid-hold (Recording ended, the page hid) ends the hold: its release would never arrive.
     if (o !== 'holdToTalk') endHold();
+    const n = names();
+    if (n !== named) {
+      named = n;
+      views.tapToWake.setAttribute('aria-label', A11Y_TEXT.tapToWake(n));
+      parentTitle.textContent = OVERLAY_TEXT.parentTitle(n);
+      parentLocal.textContent = OVERLAY_TEXT.parentLocal(n);
+      parentMicOff.textContent = OVERLAY_TEXT.parentMicOff(n);
+    }
     const shown = o === null ? null : views[o];
     for (const view of all) view.hidden = view !== shown;
-    live.say(announcementFor(o));
+    live.say(announcementFor(o, n));
   };
 }

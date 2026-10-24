@@ -22,6 +22,7 @@ import { commands, page, userEvent } from 'vitest/browser';
 import { realClock } from '../app/clock.ts';
 import type { Overlay, SessionEvent, StateName } from '../app/events.ts';
 import { createSettingsStore, DEFAULT_SETTINGS, type SettingsStore } from '../app/settings.ts';
+import { JUNI } from '../characters/juni.ts';
 import { mountDebugOverlay } from './debug-overlay.ts';
 import { mountOverlay } from './overlay.ts';
 import {
@@ -827,11 +828,12 @@ describe('For parents (#114)', () => {
       forParents: 'For parents',
       micRetry: 'Try the microphone again',
       micHelp: MIC_HELP_114,
-      privacy: PRIVACY_114,
       licences: 'Open-source licences',
       install: 'Install',
       restart: 'New version – restart',
     });
+    // The privacy note names the active character (T121): Juni's is #114's text.
+    expect(SETTINGS_TEXT.privacy(JUNI.names)).toBe(PRIVACY_114);
   });
 
   test('the section sits between Sleep after and Close: heading, retry, help, Install, restart, privacy, licences', () => {

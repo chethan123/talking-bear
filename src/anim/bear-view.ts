@@ -1,7 +1,8 @@
 /**
  * Juni on screen (plan §4.6, §7 M4; issue #81): the full-viewport canvas stage that replaced the M1 circle. It
  * owns the canvas, the rig, the pose buffers, the director, the layers, the springs and the frame loop. The canvas
- * is `role="img"` named "Juni the bear" (`A11Y_TEXT.stage`, plan §7 M8, #118).
+ * is `role="img"` named after the character, "Juni the bear" (`A11Y_TEXT.stage`, plan §7 M8, #118). The character
+ * is `CHARACTERS.juni` (duck plan §4.1; T122 makes it a dependency): its rig, hit regions and eyes' centre.
  *
  * **Per frame** (loop.ts drives it):
  * - `substep(dt)`, at 120 Hz: director tick, the playing clip's spring kicks that are due (#221), `springs.step(dt)`,
@@ -115,11 +116,12 @@ import type { Envelope } from '../dsp/types.ts';
 import { attachPointerAdapter } from '../input/pointer-adapter.ts';
 import type { Gesture, PointerSample } from '../input/recognizer.ts';
 import type { RegionId } from '../input/region-ids.ts';
-import { hitTest, REGIONS } from '../input/regions.ts';
+import { compileRegions, hitTest } from '../input/regions.ts';
 import type { Haptics } from '../platform/haptics.ts';
 import type { Visibility } from '../platform/visibility.ts';
 import { cancelTap, markFirstBearFrame, markTap } from '../perf.ts';
 import { reactionFor } from '../reactions/table.ts';
+import { CHARACTERS } from '../characters/index.ts';
 import { A11Y_TEXT } from '../ui/a11y.ts';
 import type { Clip } from './clip.ts';
 import type { MimeClipName } from './clips/reactions.ts';
@@ -142,7 +144,7 @@ import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
 import { createContext, fitView, render, resizeCanvas } from './renderer.ts';
 import type { View } from './renderer.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { mulberry32 } from './rng.ts';
 import { SpringBank } from './springs.ts';
 import { configureSprings, SECONDARY_SPRINGS, SPRING, SPRING_CHANNEL, SPRING_COUNT } from './springs-map.ts';
@@ -286,7 +288,7 @@ export interface BearView {
    */
   gesture(g: Gesture): void;
   /**
-   * The centre of region `id`'s first `REGIONS` entry in viewport CSS px, from the bone matrices of the last drawn
+   * The centre of region `id`'s first entry in the character's regions in viewport CSS px, from the bone matrices of the last drawn
    * pose (e2e: `__bearTest.regionCenter`). Throws a RangeError for an id without a region (`background`).
    */
   regionCenter(id: RegionId): { x: number; y: number };
@@ -333,10 +335,12 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const canvas = document.createElement('canvas');
   canvas.className = 'stage';
   canvas.setAttribute('role', 'img');
-  canvas.setAttribute('aria-label', A11Y_TEXT.stage);
+  const spec = CHARACTERS.juni;
+  canvas.setAttribute('aria-label', A11Y_TEXT.stage(spec.names));
   root.append(canvas);
   const g = createContext(canvas);
-  const rig = createRig();
+  const rig = createRig(spec);
+  const regions = compileRegions(rig);
   const view: View = { scale: 0, ox: 0, oy: 0 };
   /** `view` in CSS px of the canvas: hit tests, `regionCenter` and the gaze map pointer points through it. */
   const cssView: View = { scale: 1, ox: 0, oy: 0 };
@@ -358,8 +362,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const ctx: AnimContext = { rng: mulberry32(deps.seed ?? DEFAULT_SEED), weights, lookAt: null, springs };
   const blink = createBlink();
   const breathing = createBreathing();
-  const gaze = createGaze({ headRot: SPRING.headRot, headTilt: SPRING.headTilt });
-  const ears = createEarTwitch({ earL: SPRING.earL, earR: SPRING.earR });
+  const gaze = createGaze({ headRot: SPRING.headRot, headTilt: SPRING.headTilt }, spec.eyesCenter);
+  const ears = createEarTwitch({ earL: SPRING.earL, earR: SPRING.earR }, spec.eyesCenter);
   const mood = createMood();
   const mouth = new MouthLayer(deps.latencyMs ?? DISPLAY_LATENCY_MS);
   const mouthNow = (): number => T[FRAME_T]!;
@@ -664,7 +668,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   // ---- input (#93): pointer adapter → recogniser → reactions table → director → session ------------------------
   /** The bone matrices of the last drawn pose for hit tests; stale once a frame is drawn, recomputed on demand. */
-  const hitBones = new Float32Array(BONE_COUNT * MAT);
+  const hitBones = new Float32Array(rig.boneCount * MAT);
   let bonesStale = true;
   /** The gaze target of a background touch (design units), `ctx.lookAt` while held. */
   const look: LookAt = { x: 0, y: 0 };
@@ -682,7 +686,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   /** The region under a point in CSS px relative to the canvas, as the adapter's samples are. */
   function hit(x: number, y: number): RegionId {
-    return hitTest(x, y, bones(), cssView);
+    return hitTest(x, y, bones(), cssView, regions);
   }
 
   /** The director clock for a pointer input (s): the app clock, never stepping back. */
@@ -779,10 +783,10 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   });
 
   function regionCenter(id: RegionId): { x: number; y: number } {
-    const r = REGIONS.find((d) => d.id === id);
+    const r = spec.regions.find((d) => d.id === id);
     if (r === undefined) throw new RangeError(`regionCenter: no hit region ${id}`);
     const m = bones();
-    const o = boneIndex(r.bone) * MAT;
+    const o = boneIndex(rig, r.bone) * MAT;
     const x = m[o]! * r.cx + m[o + 2]! * r.cy + m[o + 4]!;
     const y = m[o + 1]! * r.cx + m[o + 3]! * r.cy + m[o + 5]!;
     const rect = canvas.getBoundingClientRect();

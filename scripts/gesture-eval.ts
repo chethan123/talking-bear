@@ -21,12 +21,13 @@
 import { readFileSync } from 'node:fs';
 import { fitView } from '../src/anim/renderer.ts';
 import { POSES } from '../src/anim/poses.ts';
-import { BONE_COUNT, boneMatrices, MAT } from '../src/anim/rig.ts';
-import type { Rig } from '../src/anim/rig.ts';
+import { boneMatrices, createRig, MAT } from '../src/anim/rig.ts';
+import { CHARACTERS } from '../src/characters/index.ts';
 import { initialRecState, recognize, STROKE_MIN_PATH } from '../src/input/recognizer.ts';
 import type { Gesture, PointerSample } from '../src/input/recognizer.ts';
 import type { RegionId } from '../src/input/region-ids.ts';
-import { hitTest } from '../src/input/regions.ts';
+import { compileRegions, hitTest } from '../src/input/regions.ts';
+import type { RegionTable } from '../src/input/regions.ts';
 
 /** The `format` and `version` of a trace file (written by `lab/gestures.ts`). */
 export const FORMAT = 'talking-bear-gestures';
@@ -141,17 +142,13 @@ export function parseGestureFile(v: unknown): GestureFile {
 // ---- replay and classes -------------------------------------------------------------------------------------
 
 /**
- * The neutral pose's bone matrices, as `lab/gestures` computes them. `boneMatrices` uses a `Rig` only for its
- * matrix stack; `createRig` also builds every part's `Path2D`, which Node lacks, so this rig has no paths.
+ * Juni's neutral-pose bone matrices and compiled hit regions, as `lab/gestures` computes them. The rig is built
+ * without paths: `createRig` would otherwise build every part's `Path2D`, which Node lacks.
  */
-function neutralBones(): Float32Array {
-  const rig: Rig = {
-    paths: [],
-    kind: new Uint8Array(0),
-    mouthSlot: 0,
-    stack: new Float64Array(BONE_COUNT * MAT),
-  };
-  return boneMatrices(rig, POSES.neutral, new Float32Array(BONE_COUNT * MAT));
+function neutralBones(): { bones: Float32Array; regions: RegionTable } {
+  const rig = createRig(CHARACTERS.juni, { paths: false });
+  const bones = boneMatrices(rig, POSES.neutral, new Float32Array(rig.boneCount * MAT));
+  return { bones, regions: compileRegions(rig) };
 }
 
 /** The page's hit test on a `cssWidth × cssHeight` canvas: the neutral pose, fitted with `fitView`, 12 px padding. */
@@ -159,9 +156,9 @@ export function neutralHit(canvas: {
   cssWidth: number;
   cssHeight: number;
 }): (x: number, y: number) => RegionId {
-  const bones = neutralBones();
+  const { bones, regions } = neutralBones();
   const view = fitView(canvas.cssWidth, canvas.cssHeight, { scale: 0, ox: 0, oy: 0 });
-  return (x, y) => hitTest(x, y, bones, view);
+  return (x, y) => hitTest(x, y, bones, view, regions);
 }
 
 /** Every gesture the recogniser emits for `samples`, fed in order from a fresh state. */

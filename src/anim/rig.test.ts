@@ -4,16 +4,11 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { BONES, PART, PARTS } from '../art/bear-parts.gen.ts';
 import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
-import {
-  BONE_COUNT,
-  boneIndex,
-  boneMatrices,
-  createRig,
-  MAT,
-  PartKind,
-  partIndex,
-  partMatrix,
-} from './rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT, PartKind, partIndex, partMatrix } from './rig.ts';
+import { JUNI } from '../characters/juni.ts';
+
+/** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
+const JUNI_RIG = createRig(JUNI, { paths: false });
 
 /** Stands in for the DOM's `Path2D` in Node: records the path data it was built from. */
 class FakePath2D {
@@ -52,7 +47,7 @@ const MIRROR: Mat = [-1, 0, 0, 1, 1000, 0];
 
 /** The spec's local matrix: translate(pivot + offset) × rotate × scale × translate(−pivot). */
 function local(bone: string, rot = 0, sx = 1, sy = 1, ox = 0, oy = 0): Mat {
-  const [px, py] = BONES[boneIndex(bone)]!.pivot;
+  const [px, py] = BONES[boneIndex(JUNI_RIG, bone)]!.pivot;
   return mul(mul(mul(T(px + ox, py + oy), R(rot)), S(sx, sy)), T(-px, -py));
 }
 
@@ -88,20 +83,26 @@ function inSubtree(b: number, ancestor: number): boolean {
 }
 
 function bonesOf(pose: Pose): Float32Array {
-  return boneMatrices(createRig(), pose, new Float32Array(BONE_COUNT * MAT));
+  return boneMatrices(createRig(JUNI), pose, new Float32Array(JUNI_RIG.boneCount * MAT));
 }
 
 function partOf(pose: Pose, part: string): Float64Array {
-  const rig = createRig();
+  const rig = createRig(JUNI);
   const m = new Float64Array(MAT);
-  partMatrix(rig, pose, boneMatrices(rig, pose, new Float32Array(BONE_COUNT * MAT)), partIndex(part), m);
+  partMatrix(
+    rig,
+    pose,
+    boneMatrices(rig, pose, new Float32Array(JUNI_RIG.boneCount * MAT)),
+    partIndex(JUNI_RIG, part),
+    m,
+  );
   return m;
 }
 
 describe('createRig', () => {
   it('builds one Path2D per distinct PARTS[i].d, once; a mirrored copy shares its source path', () => {
     const before = FakePath2D.built;
-    const rig = createRig();
+    const rig = createRig(JUNI);
     expect(FakePath2D.built - before).toBe(new Set(PARTS.map((p) => p.d)).size);
     expect(rig.paths).toHaveLength(PARTS.length);
     for (let i = 0; i < PARTS.length; i++) {
@@ -111,7 +112,7 @@ describe('createRig', () => {
       if (PARTS[i]!.mirror) expect(rig.paths[i]).toBe(rig.paths[i - 1]);
     }
     const built = FakePath2D.built;
-    const out = new Float32Array(BONE_COUNT * MAT);
+    const out = new Float32Array(JUNI_RIG.boneCount * MAT);
     const m = new Float64Array(MAT);
     boneMatrices(rig, createPose(), out);
     for (let i = 0; i < PARTS.length; i++) partMatrix(rig, createPose(), out, i, m);
@@ -119,7 +120,7 @@ describe('createRig', () => {
   });
 
   it('classifies the gaze, lid and blush parts, and puts the mouth after the muzzle subtree', () => {
-    const rig = createRig();
+    const rig = createRig(JUNI);
     const expected = new Map<string, number>([
       ['irisL', PartKind.gaze],
       ['pupilL', PartKind.gaze],
@@ -143,19 +144,19 @@ describe('createRig', () => {
 describe('boneMatrices', () => {
   it('neutral pose → every bone matrix is the identity', () => {
     const out = bonesOf(createPose());
-    for (let b = 0; b < BONE_COUNT; b++) expect(boneMat(out, b), BONES[b]!.id).toEqual([...I]);
+    for (let b = 0; b < JUNI_RIG.boneCount; b++) expect(boneMat(out, b), BONES[b]!.id).toEqual([...I]);
   });
 
   it('HeadRot = π/2 turns the head (and its children) clockwise about the head pivot (500, 600)', () => {
     const out = bonesOf(withChannels([[Ch.HeadRot, Math.PI / 2]]));
-    const head = boneIndex('head') * MAT;
-    const eyeL = boneIndex('eyeL') * MAT;
+    const head = boneIndex(JUNI_RIG, 'head') * MAT;
+    const eyeL = boneIndex(JUNI_RIG, 'eyeL') * MAT;
     expectPoint(apply(out, head, 500, 600), 500, 600); // the pivot stays put
     expectPoint(apply(out, head, 500, 165), 935, 600); // the head top (435 above the pivot) goes to 435 right of it
     expectPoint(apply(out, head, 790, 400), 700, 890); // the right cheek edge swings down
     expectPoint(apply(out, eyeL, 405, 385), 715, 505); // eyeL's pivot follows its parent
-    expect(boneMat(out, boneIndex('armL'))).toEqual([...I]);
-    expect(boneMat(out, boneIndex('neck'))).toEqual([...I]);
+    expect(boneMat(out, boneIndex(JUNI_RIG, 'armL'))).toEqual([...I]);
+    expect(boneMat(out, boneIndex(JUNI_RIG, 'neck'))).toEqual([...I]);
   });
 
   it('composes parent × translate(pivot + offset) × rotate × scale × translate(−pivot) down the chain', () => {
@@ -176,13 +177,13 @@ describe('boneMatrices', () => {
     const neck = mul(body, local('neck', 0.2));
     const head = mul(neck, local('head', -0.3, 1.1, 0.95, 12, -7));
     const earL = mul(head, local('earL', 0.4, 1, 1 - 0.5 * 0.5));
-    expectClose(boneMat(out, boneIndex('body')), body);
-    expectClose(boneMat(out, boneIndex('neck')), neck);
-    expectClose(boneMat(out, boneIndex('head')), head);
-    expectClose(boneMat(out, boneIndex('eyeL')), head);
-    expectClose(boneMat(out, boneIndex('earL')), earL);
-    expectClose(boneMat(out, boneIndex('innerEarL')), earL);
-    expectClose(boneMat(out, boneIndex('armL')), body);
+    expectClose(boneMat(out, boneIndex(JUNI_RIG, 'body')), body);
+    expectClose(boneMat(out, boneIndex(JUNI_RIG, 'neck')), neck);
+    expectClose(boneMat(out, boneIndex(JUNI_RIG, 'head')), head);
+    expectClose(boneMat(out, boneIndex(JUNI_RIG, 'eyeL')), head);
+    expectClose(boneMat(out, boneIndex(JUNI_RIG, 'earL')), earL);
+    expectClose(boneMat(out, boneIndex(JUNI_RIG, 'innerEarL')), earL);
+    expectClose(boneMat(out, boneIndex(JUNI_RIG, 'armL')), body);
   });
 
   // Issue #75's channel → bone table, one channel at a time: the bone gets `local`, its subtree follows, and
@@ -223,8 +224,8 @@ describe('boneMatrices', () => {
   for (const [name, ch, v, driven, m] of rows) {
     it(`${name} = ${v} drives ${driven.join(' and ')} only`, () => {
       const out = bonesOf(withChannels([[ch, v]]));
-      for (let b = 0; b < BONE_COUNT; b++) {
-        const owner = driven.find((d) => inSubtree(b, boneIndex(d)));
+      for (let b = 0; b < JUNI_RIG.boneCount; b++) {
+        const owner = driven.find((d) => inSubtree(b, boneIndex(JUNI_RIG, d)));
         expectClose(boneMat(out, b), owner === undefined ? I : m(owner), 4);
       }
     });
@@ -247,14 +248,16 @@ describe('boneMatrices', () => {
       ].map((ch) => [ch, 0.7] as const),
     );
     const out = bonesOf(pose);
-    for (let b = 0; b < BONE_COUNT; b++) expect(boneMat(out, b)).toEqual([...I]);
+    for (let b = 0; b < JUNI_RIG.boneCount; b++) expect(boneMat(out, b)).toEqual([...I]);
   });
 
   it('returns out, and throws a RangeError when out has fewer than 6 floats per bone', () => {
-    const rig = createRig();
-    const out = new Float32Array(BONE_COUNT * MAT);
+    const rig = createRig(JUNI);
+    const out = new Float32Array(JUNI_RIG.boneCount * MAT);
     expect(boneMatrices(rig, createPose(), out)).toBe(out);
-    expect(() => boneMatrices(rig, createPose(), new Float32Array(BONE_COUNT * MAT - 1))).toThrow(RangeError);
+    expect(() => boneMatrices(rig, createPose(), new Float32Array(JUNI_RIG.boneCount * MAT - 1))).toThrow(
+      RangeError,
+    );
   });
 });
 
@@ -305,14 +308,14 @@ describe('partMatrix', () => {
   });
 
   it('LidL / LidR scale the upper lids in y about their bbox top, clamped to [0, 1]', () => {
-    const top = PARTS[partIndex('lidUpperL')]!.bbox[1];
+    const top = PARTS[partIndex(JUNI_RIG, 'lidUpperL')]!.bbox[1];
     expect(top).toBe(335);
     const quarter = partOf(withChannels([[Ch.LidL, 0.25]]), 'lidUpperL');
     expectClose(quarter, [1, 0, 0, 0.25, 0, top * 0.75]);
     expect(apply(quarter, 0, 400, top)[1]).toBeCloseTo(top, 6); // the top edge stays put
     expect(apply(quarter, 0, 400, 433)[1]).toBeCloseTo(top + 0.25 * (433 - top), 6);
     // LidR stays 0 (hidden): lidUpperR collapses onto its top edge (the renderer skips drawing it).
-    expect(PARTS[partIndex('lidUpperR')]!.bbox[1]).toBe(top);
+    expect(PARTS[partIndex(JUNI_RIG, 'lidUpperR')]!.bbox[1]).toBe(top);
     expectClose(partOf(withChannels([[Ch.LidL, 0.25]]), 'lidUpperR'), [1, 0, 0, 0, 0, top]);
     expectClose(partOf(withChannels([[Ch.LidR, 0.6]]), 'lidUpperR'), [1, 0, 0, 0.6, 0, top * 0.4]);
     expectClose(partOf(withChannels([[Ch.LidL, 1]]), 'lidUpperL'), I);
@@ -327,7 +330,7 @@ describe('mirror handling (rotation channels are clockwise-positive with the sam
     const mirrored = PARTS.filter((p) => p.mirror).map((p) => p.id);
     expect(mirrored).toHaveLength(11);
     for (const id of mirrored) expectClose(partOf(createPose(), id), MIRROR);
-    const [minX, minY] = PARTS[partIndex('armFurR')]!.bbox;
+    const [minX, minY] = PARTS[partIndex(JUNI_RIG, 'armFurR')]!.bbox;
     const p = apply(partOf(createPose(), 'armFurR'), 0, minX, minY);
     expect(p[0]).toBeCloseTo(1000 - minX, 6);
     expect(p[1]).toBeCloseTo(minY, 6);
@@ -336,17 +339,17 @@ describe('mirror handling (rotation channels are clockwise-positive with the sam
   it('ArmRotL = +π/2 moves pawL toward −x; ArmRotR = −π/2 moves pawR toward +x (arms up)', () => {
     // armL pivot (300, 700), pawL pivot (326.6, 867.9): the offset (26.6, 167.9) turns to (−167.9, 26.6).
     const left = bonesOf(withChannels([[Ch.ArmRotL, Math.PI / 2]]));
-    const pawL = apply(left, boneIndex('pawL') * MAT, 326.6, 867.9);
+    const pawL = apply(left, boneIndex(JUNI_RIG, 'pawL') * MAT, 326.6, 867.9);
     expect(pawL[0]).toBeCloseTo(132.1, 3);
     expect(pawL[1]).toBeCloseTo(726.6, 3);
     // armR pivot (700, 700), pawR pivot (673.4, 867.9): the offset (−26.6, 167.9) turns to (167.9, 26.6).
     const right = bonesOf(withChannels([[Ch.ArmRotR, -Math.PI / 2]]));
-    const pawR = apply(right, boneIndex('pawR') * MAT, 673.4, 867.9);
+    const pawR = apply(right, boneIndex(JUNI_RIG, 'pawR') * MAT, 673.4, 867.9);
     expect(pawR[0]).toBeCloseTo(867.9, 3);
     expect(pawR[1]).toBeCloseTo(726.6, 3);
     // The same sign turns both arms the same way on screen: +π/2 swings pawR toward −x too.
     const same = bonesOf(withChannels([[Ch.ArmRotR, Math.PI / 2]]));
-    expect(apply(same, boneIndex('pawR') * MAT, 673.4, 867.9)[0]).toBeCloseTo(700 - 167.9, 3);
+    expect(apply(same, boneIndex(JUNI_RIG, 'pawR') * MAT, 673.4, 867.9)[0]).toBeCloseTo(700 - 167.9, 3);
   });
 
   it('under a left/right-symmetric pose (ArmRotR = −ArmRotL, …) every mirrored copy is the mirror image of its source', () => {
@@ -476,11 +479,11 @@ function heapGrowth(fn: () => void): number {
 }
 
 describe('boneMatrices and partMatrix: no allocation', () => {
-  const rig = createRig();
+  const rig = createRig(JUNI);
   // Every channel non-zero, so every code path runs (and gets optimised) before the measurement.
   const pose = createPose();
   for (let i = 0; i < CH_COUNT; i++) pose[i] = 0.1 + 0.01 * i;
-  const out = new Float32Array(BONE_COUNT * MAT);
+  const out = new Float32Array(JUNI_RIG.boneCount * MAT);
   const m = new Float64Array(MAT);
 
   it('the counter sees typed-array allocations (positive control)', () => {

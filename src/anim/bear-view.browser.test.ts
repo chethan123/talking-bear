@@ -17,7 +17,7 @@ import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import type { Gesture } from '../input/recognizer.ts';
 import { REGION_IDS, type RegionId } from '../input/region-ids.ts';
-import { hitTest, REGIONS } from '../input/regions.ts';
+import { compileRegions, hitTest } from '../input/regions.ts';
 import type { VisEvent } from '../platform/visibility.ts';
 import { DEBUG_REFRESH_MS, formatFrameStats, mountDebugOverlay } from '../ui/debug-overlay.ts';
 import {
@@ -45,10 +45,17 @@ import { ASLEEP_FPS, IDLE_FPS, STATS_FRAMES, type FrameStats } from './loop.ts';
 import { Ch, createPose } from './pose.ts';
 import { POSES } from './poses.ts';
 import { createContext, fitView, MAX_DPR, render } from './renderer.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { SpringBank } from './springs.ts';
 import { MAX_FRAME_DT, Stepper } from './stepper.ts';
 import { configureSprings, SPRING, SPRING_COUNT, SPRING_PARAMS } from './springs-map.ts';
+import { JUNI } from '../characters/juni.ts';
+
+/** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
+const JUNI_RIG = createRig(JUNI, { paths: false });
+const JUNI_REGIONS = compileRegions(JUNI_RIG);
+/** Juni's hit regions, priority order (they moved from `regions.ts` to `JUNI.regions`). */
+const REGIONS = JUNI.regions;
 
 const DEG = Math.PI / 180;
 /** One 60 Hz vsync, in ms. */
@@ -1302,7 +1309,7 @@ describe('showPose (e2e screenshots)', () => {
     const g = createContext(ref);
     const view = fitView(500, 700, { scale: 0, ox: 0, oy: 0 });
     expect(view).toEqual({ scale: 0.5, ox: 0, oy: 0 });
-    render(g, createRig(), POSES.talkOpen, view);
+    render(g, createRig(JUNI), POSES.talkOpen, view);
     const want = g.getImageData(0, 0, 500, 700).data;
     const differing = (): number => {
       const got = h.view.canvas.getContext('2d')!.getImageData(0, 0, 500, 700).data;
@@ -1358,8 +1365,14 @@ function background(h: Harness, dy = 400): { x: number; y: number } {
 /** The region under viewport point `p`, by an independent hit test over the drawn pose at the stage's CSS view. */
 function hitAt(h: Harness, p: { x: number; y: number }): RegionId {
   const r = h.view.canvas.getBoundingClientRect();
-  const bones = boneMatrices(createRig(), h.view.pose(), new Float32Array(BONE_COUNT * MAT));
-  return hitTest(p.x - r.left, p.y - r.top, bones, fitView(STAGE_W, STAGE_H, { scale: 0, ox: 0, oy: 0 }));
+  const bones = boneMatrices(createRig(JUNI), h.view.pose(), new Float32Array(JUNI_RIG.boneCount * MAT));
+  return hitTest(
+    p.x - r.left,
+    p.y - r.top,
+    bones,
+    fitView(STAGE_W, STAGE_H, { scale: 0, ox: 0, oy: 0 }),
+    JUNI_REGIONS,
+  );
 }
 
 function fakeHaptics(): {
@@ -1715,12 +1728,12 @@ describe('pointer input and reactions (#93)', () => {
       h.run(30);
       const rect = h.view.canvas.getBoundingClientRect();
       expect(rect.left).toBeGreaterThanOrEqual(200);
-      const bones = boneMatrices(createRig(), h.view.pose(), new Float32Array(BONE_COUNT * MAT));
+      const bones = boneMatrices(createRig(JUNI), h.view.pose(), new Float32Array(JUNI_RIG.boneCount * MAT));
       const view = fitView(STAGE_W, STAGE_H, { scale: 0, ox: 0, oy: 0 });
       for (const id of ['nose', 'headTop'] as const) {
         // headTop has a second entry on the tuft bone, after the head's: the first one is the centre.
         const r = REGIONS.find((d) => d.id === id)!;
-        const o = boneIndex(r.bone) * MAT;
+        const o = boneIndex(JUNI_RIG, r.bone) * MAT;
         const x = bones[o]! * r.cx + bones[o + 2]! * r.cy + bones[o + 4]!;
         const y = bones[o + 1]! * r.cx + bones[o + 3]! * r.cy + bones[o + 5]!;
         const c = h.view.regionCenter(id);

@@ -25,12 +25,16 @@
 // is added to any overlay.
 
 import type { Overlay, StateName } from '../app/events.ts';
+import type { CharacterNames } from '../characters/types.ts';
 
-/** The accessible names: the canvas and the child-facing overlays (their icons are `aria-hidden`). */
+/**
+ * The accessible names: the canvas and the child-facing overlays (their icons are `aria-hidden`). The ones that name
+ * the character are functions of its `CharacterNames` (Juni: "Juni the bear", "Tap to wake Juni").
+ */
 export const A11Y_TEXT = {
   /** The canvas stage, `role="img"`. */
-  stage: 'Juni the bear',
-  tapToWake: 'Tap to wake Juni',
+  stage: (n: CharacterNames): string => n.stage,
+  tapToWake: (n: CharacterNames): string => `Tap to wake ${n.name}`,
   micHelp: 'Microphone blocked',
   micMuted: 'Microphone muted',
   tooNoisy: 'Too noisy',
@@ -39,23 +43,23 @@ export const A11Y_TEXT = {
   holdToTalk: 'Hold to talk',
 } as const;
 
-/** What the live region says on entering each announcing state (issue #118). No other state announces. */
+/**
+ * What the live region says on entering each announcing state (issue #118). No other state announces. Asleep's names
+ * the character (Juni: "Juni is asleep. Tap to wake.").
+ */
 export const ANNOUNCEMENTS = {
-  Asleep: 'Juni is asleep. Tap to wake.',
+  Asleep: (n: CharacterNames): string => `${n.name} is asleep. Tap to wake.`,
   MicDenied: 'Microphone blocked. A parent can fix this in settings.',
   Error: 'Something went wrong. Tap to try again.',
-} as const satisfies Partial<Record<StateName, string>>;
+} as const satisfies Partial<Record<StateName, string | ((n: CharacterNames) => string)>>;
 
-/** The overlay each announcing state shows (`overlayFor`): the region speaks only while one of these is up. */
-const ANNOUNCED: Readonly<Partial<Record<Exclude<Overlay, null>, string>>> = {
-  tapToWake: ANNOUNCEMENTS.Asleep,
-  micHelp: ANNOUNCEMENTS.MicDenied,
-  error: ANNOUNCEMENTS.Error,
-};
-
-/** The live region's text while overlay `o` is shown: its state's announcement, or '' (cleared). */
-export function announcementFor(o: Overlay): string {
-  return o === null ? '' : (ANNOUNCED[o] ?? '');
+/** The live region's text while overlay `o` is shown, for character `names`: its state's announcement, or '' (cleared). */
+export function announcementFor(o: Overlay, names: CharacterNames): string {
+  // The overlay each announcing state shows (`overlayFor`): the region speaks only while one of these is up.
+  if (o === 'tapToWake') return ANNOUNCEMENTS.Asleep(names);
+  if (o === 'micHelp') return ANNOUNCEMENTS.MicDenied;
+  if (o === 'error') return ANNOUNCEMENTS.Error;
+  return '';
 }
 
 /** The live region's class: styles.css hides it visually, never from assistive tech. */

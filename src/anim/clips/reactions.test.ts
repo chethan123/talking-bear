@@ -7,7 +7,7 @@ import type { Clip } from '../clip.ts';
 import { EAR_SPRING, GAZE_SPRING } from '../layers/index.ts';
 import { addPose, Ch, CH_COUNT, createPose } from '../pose.ts';
 import type { Pose } from '../pose.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT, partIndex, partMatrix } from '../rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT, partIndex, partMatrix } from '../rig.ts';
 import { SpringBank } from '../springs.ts';
 import {
   BELLY_SPRING,
@@ -26,6 +26,10 @@ import {
 import { SUBSTEP } from '../stepper.ts';
 import { GENTLE_BASES, GENTLE_SCALE, MIME_CLIPS, REACTION_CLIPS } from './reactions.ts';
 import type { ReactionClipName } from './reactions.ts';
+import { JUNI } from '../../characters/juni.ts';
+
+/** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
+const JUNI_RIG = createRig(JUNI, { paths: false });
 
 const DEG = Math.PI / 180;
 /** "Within 0.02 of neutral" (validation 2). */
@@ -124,13 +128,13 @@ vi.stubGlobal(
     }
   },
 );
-const RIG = createRig();
-const BONE_BUF = new Float32Array(BONE_COUNT * MAT);
+const RIG = createRig(JUNI);
+const BONE_BUF = new Float32Array(JUNI_RIG.boneCount * MAT);
 
 /** Where bone `id`'s pivot is drawn (design units) in `pose`: its rest pivot through its bone matrix. */
 function posedPivot(pose: Pose, id: string): [number, number] {
   boneMatrices(RIG, pose, BONE_BUF);
-  const b = boneIndex(id);
+  const b = boneIndex(JUNI_RIG, id);
   const [x, y] = BONES[b]!.pivot;
   const o = b * MAT;
   const m = BONE_BUF;
@@ -437,7 +441,7 @@ describe('REACTION_CLIPS: content (issue #89 "Clips")', () => {
       ['irisL', 6],
       ['irisR', -6],
     ] as const) {
-      partMatrix(RIG, peak, BONE_BUF, partIndex(id), m);
+      partMatrix(RIG, peak, BONE_BUF, partIndex(JUNI_RIG, id), m);
       const want = [1, 0, 0, 1, dx, 0];
       for (let i = 0; i < MAT; i++) expect(m[i], `${id}[${i}]`).toBeCloseTo(want[i]!, 9);
     }
@@ -703,8 +707,8 @@ function pawToEarL(pose: Pose): number {
 function pawVisibleL(pose: Pose): number {
   boneMatrices(RIG, pose, BONE_BUF);
   const m = BONE_BUF;
-  const p = boneIndex('pawL') * MAT;
-  const h = boneIndex('head') * MAT;
+  const p = boneIndex(JUNI_RIG, 'pawL') * MAT;
+  const h = boneIndex(JUNI_RIG, 'head') * MAT;
   const [a, b, c, d, e, f] = [m[h]!, m[h + 1]!, m[h + 2]!, m[h + 3]!, m[h + 4]!, m[h + 5]!];
   const det = a * d - b * c;
   let total = 0;

@@ -32,6 +32,8 @@
 
 import type { SessionEvent, StateName } from '../app/events.ts';
 import { CUSTOM_PITCH_MAX, CUSTOM_PITCH_MIN, type Settings, type SettingsStore } from '../app/settings.ts';
+import { JUNI } from '../characters/juni.ts';
+import type { CharacterNames } from '../characters/types.ts';
 import { mountLicencesScreen, type LicencesScreen } from './licences-screen.ts';
 
 export const SETTINGS_TEXT = {
@@ -57,9 +59,9 @@ export const SETTINGS_TEXT = {
     "If the microphone is blocked: open Chrome's menu → Settings → Site settings → Microphone, and allow this site.",
   install: 'Install',
   restart: 'New version – restart',
-  /** The parent privacy note, adapted from plan §2 "Privacy posture". */
-  privacy:
-    'Talking Bear works entirely on this device. It has no accounts, analytics or tracking, and never sends audio anywhere. What Juni hears stays in memory only until the replay finishes. Settings are stored on this device.',
+  /** The parent privacy note, adapted from plan §2 "Privacy posture"; it names the active character. */
+  privacy: (n: CharacterNames): string =>
+    `Talking Bear works entirely on this device. It has no accounts, analytics or tracking, and never sends audio anywhere. What ${n.name} hears stays in memory only until the replay finishes. Settings are stored on this device.`,
   licences: 'Open-source licences',
   close: 'Close',
 } as const;
@@ -110,6 +112,8 @@ export interface SettingsSheetDeps {
   fetch?: (url: string) => Promise<Response>;
   /** Milliseconds on a monotonic clock, for the gear's press time; defaults to `performance.now()`. */
   now?: () => number;
+  /** The active character's names, for the privacy note (read on every `open`); defaults to Juni's. */
+  names?: () => CharacterNames;
 }
 
 export interface SettingsSheet {
@@ -302,7 +306,9 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
   licencesButton.addEventListener('click', () => {
     void licences?.open();
   });
-  parents.append(element('p', null, SETTINGS_TEXT.privacy), licencesButton);
+  const names = deps.names ?? ((): CharacterNames => JUNI.names);
+  const privacy = element('p', null, SETTINGS_TEXT.privacy(names()));
+  parents.append(privacy, licencesButton);
   dialog.append(parents, close);
 
   /**
@@ -315,6 +321,8 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
     pitch.disabled = s.voice !== 'custom';
     for (const [key, input] of toggles) input.checked = s[key];
     sleep.value = String(s.sleepTimeoutSec);
+    const text = SETTINGS_TEXT.privacy(names());
+    if (privacy.textContent !== text) privacy.textContent = text;
     refreshPwa();
   }
 

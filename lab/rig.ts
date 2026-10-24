@@ -31,8 +31,6 @@ import type { Pose } from '../src/anim/pose.ts';
 import { POSES } from '../src/anim/poses.ts';
 import type { PoseName } from '../src/anim/poses.ts';
 import {
-  BG_BOTTOM,
-  BG_TOP,
   BLUSH_ALPHA,
   createContext,
   DESIGN_HEIGHT,
@@ -43,7 +41,8 @@ import {
   resizeCanvas,
 } from '../src/anim/renderer.ts';
 import type { View } from '../src/anim/renderer.ts';
-import { BONE_COUNT, boneMatrices, createRig, MAT, PartKind, partMatrix } from '../src/anim/rig.ts';
+import { boneMatrices, createRig, MAT, PartKind, partMatrix } from '../src/anim/rig.ts';
+import { CHARACTERS } from '../src/characters/index.ts';
 import { mulberry32 } from '../src/anim/rng.ts';
 import { SpringBank } from '../src/anim/springs.ts';
 import {
@@ -338,7 +337,7 @@ function summarize(): Summary | null {
 
 // ---- rig, views and page ------------------------------------------------------------------------------------
 
-const rig = createRig();
+const rig = createRig(CHARACTERS.juni);
 /** The sliders' pose: what both views show, and the stress run's base pose. */
 const base = createPose();
 /** Bumped by every change of `base`. */
@@ -378,8 +377,8 @@ const svgClips = new Map<number, SVGPathElement>();
     svgEl(
       'linearGradient',
       { id: 'rig-bg', x1: '0', y1: '0', x2: '0', y2: '1' },
-      svgEl('stop', { offset: '0', 'stop-color': BG_TOP }),
-      svgEl('stop', { offset: '1', 'stop-color': BG_BOTTOM }),
+      svgEl('stop', { offset: '0', 'stop-color': rig.spec.background.top }),
+      svgEl('stop', { offset: '1', 'stop-color': rig.spec.background.bottom }),
     ),
   );
   svg.append(
@@ -573,7 +572,7 @@ const log = logPanel(root);
 
 // ---- static views -------------------------------------------------------------------------------------------
 
-const BONE_BUF = new Float32Array(BONE_COUNT * MAT);
+const BONE_BUF = new Float32Array(rig.boneCount * MAT);
 const PART_M = new Float64Array(MAT);
 /** The pose the SVG view shows, and its `version`: the pixel difference renders exactly this pose. */
 const svgPose = createPose();
@@ -742,8 +741,8 @@ function createStress(): Stress {
   const layers: readonly Layer[] = [
     createBlink(),
     createBreathing(),
-    createGaze({ headRot: springIndex('headRot'), headTilt: springIndex('headTilt') }),
-    createEarTwitch({ earL: springIndex('earL'), earR: springIndex('earR') }),
+    createGaze({ headRot: springIndex('headRot'), headTilt: springIndex('headTilt') }, rig.spec.eyesCenter),
+    createEarTwitch({ earL: springIndex('earL'), earR: springIndex('earR') }, rig.spec.eyesCenter),
     createMood(),
   ];
   const prev = createPose();
