@@ -1,11 +1,13 @@
 // The installer screenshots that the web app manifest lists (plan §4.7, issue #97):
-// public/screenshots/phone-1.webp, phone-2.webp (form_factor narrow) and desktop-1.webp (wide). Each one is the
+// public/screenshots/phone-1.webp, phone-2.webp, phone-3.webp (form_factor narrow) and desktop-1.webp (wide).
+// phone-3 shows Fenn: while the app is Asleep (the only state with the swap button) the script clicks
+// `.character-switch` and waits for the canvas's aria-label "Fenn the duckling". Each one is the
 // app's own BearView drawing one pose through the e2e hook `__bearTest.showPose(name, { cssWidth, cssHeight })`
 // (#81) at the screenshot's real size and DPR 1, encoded in the page with `canvas.toBlob(…, 'image/webp', 0.9)`.
 // No image tooling runs in Node. The screenshots are not precached.
 //
 // The script builds the e2e bundle (`pnpm build:e2e`), serves it with `pnpm preview:e2e` on port 4173, which must
-// be free, captures the three poses and stops the server. Then it checks every file: a RIFF/WEBP header, and the
+// be free, captures the poses and stops the server. Then it checks every file: a RIFF/WEBP header, and the
 // size Chromium decodes with createImageBitmap must be exactly the target size. `--check` runs only that check,
 // on the files already in public/screenshots/. It needs a Playwright Chromium (PLAYWRIGHT_BROWSERS_PATH, or
 // `pnpm exec playwright install --no-shell chromium`) and is never part of CI. See docs/icons.md.
@@ -19,6 +21,7 @@ import { join } from 'node:path';
 import { chromium, type Browser } from '@playwright/test';
 
 import type { PoseName } from '../src/anim/poses.ts';
+import type { CharacterId } from '../src/characters/types.ts';
 
 const ORIGIN = 'http://localhost:4173';
 const REPO_ROOT = join(import.meta.dirname, '..');
@@ -31,10 +34,14 @@ const SERVER_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 5_000;
 const KILL_TIMEOUT_MS = 1_000;
 const POLL_MS = 200;
+/** The stage canvas's accessible name per character (the `names.stage` of src/characters/*.ts). */
+const STAGE_NAME: Record<CharacterId, string> = { juni: 'Juni the bear', fenn: 'Fenn the duckling' };
 
 export interface Shot {
   file: string;
   pose: PoseName;
+  /** Who is on stage; Juni when absent. */
+  character?: CharacterId;
   width: number;
   height: number;
 }
@@ -43,6 +50,7 @@ export interface Shot {
 export const SHOTS: readonly Shot[] = [
   { file: 'phone-1.webp', pose: 'listening', width: 1080, height: 1920 },
   { file: 'phone-2.webp', pose: 'talkOpen', width: 1080, height: 1920 },
+  { file: 'phone-3.webp', pose: 'talkOpen', character: 'fenn', width: 1080, height: 1920 },
   { file: 'desktop-1.webp', pose: 'neutral', width: 1920, height: 1080 },
 ];
 
@@ -125,6 +133,14 @@ async function capture(browser: Browser, shot: Shot): Promise<Buffer> {
         typeof Reflect.get(Object(Reflect.get(window, '__bearTest')), 'showPose') === 'function' &&
         document.querySelector('canvas.stage') !== null,
     );
+    if (shot.character !== undefined && shot.character !== 'juni') {
+      // The swap button exists only in Asleep, which is where the app boots. The remounted canvas fades in over
+      // 200 ms: wait for it, so the pose is drawn on the settled stage.
+      await page.locator('button.character-switch').click();
+      const stage = page.locator('canvas.stage');
+      await stage.and(page.locator(`[aria-label="${STAGE_NAME[shot.character]}"]`)).waitFor();
+      await stage.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+    }
     // showPose stops the frame loop and draws the pose once; toBlob encodes the bitmap as it is when called. Both
     // run in this one task, so nothing can draw in between and no page clock is needed.
     const bytes = await page.evaluate(

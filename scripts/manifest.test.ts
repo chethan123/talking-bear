@@ -13,7 +13,7 @@ const PLAN_MANIFEST = {
   short_name: 'Talking Bear',
   lang: 'en',
   description:
-    'Talk to Juni the bear and hear yourself back in a funny bear voice. Works offline; audio never leaves your device.',
+    'Talk to Juni the bear or Fenn the duckling and hear yourself back in a funny voice. Works offline; audio never leaves your device.',
   display: 'standalone',
   orientation: 'portrait',
   theme_color: '#2F7A6D',
@@ -38,6 +38,13 @@ const PLAN_MANIFEST = {
       type: 'image/webp',
       form_factor: 'narrow',
       label: 'The bear talking back',
+    },
+    {
+      src: '/screenshots/phone-3.webp',
+      sizes: '1080x1920',
+      type: 'image/webp',
+      form_factor: 'narrow',
+      label: 'The duckling talking back',
     },
     {
       src: '/screenshots/desktop-1.webp',
