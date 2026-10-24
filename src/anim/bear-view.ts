@@ -341,7 +341,9 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const cast = spec.cast;
   const reactionFor = spec.reactionFor;
   canvas.setAttribute('aria-label', A11Y_TEXT.stage(spec.names));
-  root.append(canvas);
+  // First child of `root`: a remount (T126) puts the new canvas back below the overlays, the gear and the sheets,
+  // and before the swap button, which styles.css hides after a fixed (`showPose`) stage.
+  root.prepend(canvas);
   const g = createContext(canvas);
   const rig = createRig(spec);
   const regions = compileRegions(rig);

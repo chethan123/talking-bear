@@ -49,6 +49,7 @@ import { boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { SpringBank } from './springs.ts';
 import { MAX_FRAME_DT, Stepper } from './stepper.ts';
 import { configureSprings, SPRING, SPRING_COUNT, SPRING_PARAMS } from './springs-map.ts';
+import { FENN } from '../characters/fenn.ts';
 import { JUNI } from '../characters/juni.ts';
 
 /** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
@@ -1909,6 +1910,109 @@ describe('allocation smoke', () => {
     });
     expect(kept).toHaveLength(FRAMES);
     expect(leak).toBeGreaterThanOrEqual(BOUND);
+  });
+});
+
+// ---- T126: remounting on a character swap ---------------------------------------------------------------------
+
+describe('remount on a character swap (T126)', () => {
+  test('the new canvas takes the old one’s place: root’s first child, before what was mounted after it', () => {
+    const first = harness();
+    const later = document.createElement('div');
+    root.append(later);
+    expect(root.firstElementChild).toBe(first.view.canvas);
+    first.view.dispose();
+    mounted.splice(0);
+    const second = harness({ character: FENN });
+    expect(root.firstElementChild).toBe(second.view.canvas);
+    expect(second.view.canvas.nextElementSibling).toBe(later);
+    expect(root.querySelectorAll('canvas')).toHaveLength(1);
+    expect(second.view.canvas.getAttribute('aria-label')).toBe('Fenn the duckling');
+  });
+
+  /**
+   * R3 of the duck plan: a remount must not leak the old view (its rig, director, listeners, rAF callback). V8's
+   * warm-up retains heap of its own over the first mounts of a session (feedback and optimised code for the mount
+   * path): rounds of 20 mount/dispose pairs from a cold start retained 232 924, 0, 41 156, 3 612, then 10 256, 0, 0, 0
+   * B, then 0 in every round. So `WARMUP_SWAPS` uncounted swaps come first; then the baseline after 1 swap, and 20
+   * swaps after it. A positive control keeps the disposed views reachable.
+   */
+  test('20 swaps, then a forced GC, retain no more heap than 1 swap + 64 KB', () => {
+    const gc: unknown = Reflect.get(globalThis, 'gc');
+    if (typeof gc !== 'function')
+      throw new Error('needs Chromium with --js-flags=--expose-gc (vitest.config.ts)');
+    const SWAPS = 20;
+    const BOUND = 64 * 1024;
+    const WARMUP_SWAPS = 60;
+    /** Frames each mounted view draws before the next swap: wake, a reaction, the loop running, sleep. */
+    const FRAMES = 60;
+    // One scheduler, clock and visibility for every view, as in main.ts: a view that kept its visibility listener,
+    // its rAF callback or its resize listener after dispose() would stay reachable through them.
+    const frames = fakeFrames();
+    const visibility = fakeVisibility();
+    const clock = { t: 1000 };
+    const deps = (character: BearViewDeps['character']): BearViewDeps => ({
+      visibility: visibility.vis,
+      now: () => clock.t,
+      state: () => 'Asleep',
+      dispatch: () => undefined,
+      engine: { getProcessed: () => undefined, context: () => null },
+      seed: 1234,
+      requestFrame: frames.request,
+      cancelFrame: frames.cancel,
+      perfNow: () => 0,
+      character,
+    });
+    const exercise = (v: BearView): void => {
+      v.onAnim({ e: 'wake' });
+      v.onAnim({ e: 'idle' });
+      v.gesture({ g: 'tap', phase: 'down', region: 'eyeL', x: 0, y: 0, count: 1 });
+      for (let k = 0; k < FRAMES; k++) {
+        clock.t += VSYNC;
+        frames.step(clock.t);
+      }
+      v.onAnim({ e: 'sleep' });
+      window.dispatchEvent(new Event('resize'));
+    };
+    let view = mountBearView(root, deps(JUNI));
+    exercise(view);
+    let swaps = 0;
+    /** The next swap: Fenn after an odd number of swaps, Juni after an even one. */
+    const swap = (keep?: BearView[]): void => {
+      view.dispose();
+      keep?.push(view);
+      swaps++;
+      view = mountBearView(root, deps(swaps % 2 === 1 ? FENN : JUNI));
+      exercise(view);
+    };
+    const retained = (): number => {
+      gc();
+      gc();
+      return usedJSHeapSize();
+    };
+    // The views mounted here are disposed by `swap` and, last, by `finally`; the harness's `mounted` holds none.
+    try {
+      for (let i = 0; i < WARMUP_SWAPS; i++) swap();
+      swap(); // the 1 swap: Fenn
+      const baseline = retained();
+      for (let i = 0; i < SWAPS; i++) swap(); // back on Fenn
+      const after = retained();
+      expect(root.querySelectorAll('canvas')).toHaveLength(1);
+      expect(view.canvas.getAttribute('aria-label')).toBe('Fenn the duckling');
+      expect(frames.pending.size).toBe(1); // only the current view's frame is scheduled
+      // Positive control: the same swaps keeping every disposed view reachable.
+      const kept: BearView[] = [];
+      const before = retained();
+      for (let i = 0; i < SWAPS; i++) swap(kept);
+      const leaked = retained() - before;
+      expect(kept).toHaveLength(SWAPS);
+      const report = `retained after 1 swap ${baseline} B, after ${SWAPS} more ${after} B (Δ ${after - baseline} B, bound ${BOUND}); positive control (disposed views kept) Δ ${leaked} B`;
+      console.log(`[T126 remount] ${report}`);
+      expect(after - baseline, report).toBeLessThanOrEqual(BOUND);
+      expect(leaked, report).toBeGreaterThan(BOUND);
+    } finally {
+      view.dispose();
+    }
   });
 });
 
