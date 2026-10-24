@@ -5,12 +5,16 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import type { AnimEvent } from '../app/events.ts';
+import { FENN } from '../characters/fenn.ts';
+import type { Gesture } from '../input/recognizer.ts';
 import type { RegionId } from '../input/region-ids.ts';
+import { FENN_REACTIONS } from '../reactions/fenn-table.ts';
 import { REACTIONS } from '../reactions/table.ts';
 import type { Reaction } from '../reactions/table.ts';
 import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
+import { FENN_CLIPS } from './clips/fenn.ts';
 import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
 import { SESSION_CLIPS } from './clips/session.ts';
 import {
@@ -1461,6 +1465,126 @@ describe('#91 Validation 3: escalation', () => {
     expect(r.s).toMatchObject({ name: 'Reacting', clip: { name: 'bigSneeze', start: 11.4 } });
     // The cooldown is now the big sneeze's: a fourth quick tap (count 4) is ignored.
     expect(directorStep(r.s, noseTap(11.6, 4), CAST).out).toStrictEqual([]);
+  });
+});
+
+// ==== T125: Fenn's cast (duck plan §4.6, T125 acceptance 3) ===================================================
+/**
+ * The director input for Fenn's reaction to `g` (one with a region) at `now`, with a stroke's `dirX`; fails if there
+ * is none.
+ */
+function fennGest(g: Gesture & { region: RegionId }, now: number, dirX?: -1 | 1): DirInput {
+  const r = FENN.reactionFor(g);
+  if (r === null) throw new Error(`Fenn has no reaction to ${g.g} on ${g.region}`);
+  const i: DirInput = { k: 'gesture', r, region: g.region, gesture: g.g, now };
+  return dirX === undefined ? i : { ...i, dirX };
+}
+const beakTap = (now: number, count: number): DirInput =>
+  fennGest({ g: 'tap', phase: 'down', region: 'beak', x: 500, y: 528, count }, now);
+const bellyTickle = (now: number): DirInput => fennGest({ g: 'tickle', region: 'belly' }, now);
+const headFlick = (now: number): DirInput =>
+  fennGest({ g: 'flick', region: 'headTop', vx: 0, vy: -1500 }, now);
+/** The session event of Fenn's reaction `name`. */
+const fennSess = (name: string, priority: Reaction['priority'], sfx: Reaction['sfx']): DirOut => ({
+  k: 'toSession',
+  ev: { t: 'reaction', name, priority, sfx },
+});
+
+describe("T125: the director with Fenn's cast", () => {
+  const FCAST = FENN.cast;
+
+  /** Folds `directorStep` over `inputs` with Fenn's cast (checking `directorReduce` agrees), with every output. */
+  function stepFenn(s0: DirectorState, ...inputs: DirInput[]): { s: DirectorState; out: DirOut[] } {
+    let s = s0;
+    const out: DirOut[] = [];
+    for (const i of inputs) {
+      const r = directorStep(s, i, FCAST);
+      expect(r.state, `directorReduce agrees on ${i.k}`).toStrictEqual(directorReduce(s, i, FCAST));
+      s = r.state;
+      out.push(...r.out);
+    }
+    return { s, out };
+  }
+
+  it('a beak tap with count 3 is bigQuack by a count rule (no escalation), and plays bigQuack', () => {
+    const r = FENN.reactionFor({ g: 'tap', phase: 'down', region: 'beak', x: 500, y: 528, count: 3 });
+    expect(r).toBe(FENN_REACTIONS.bigQuack);
+    expect(r?.priority).toBe(4);
+    expect(
+      FENN.reactionFor({ g: 'tap', phase: 'down', region: 'beak', x: 500, y: 528, count: 1 })?.escalation,
+    ).toBe(undefined);
+    const step = stepFenn(stateIn('Idle'), beakTap(11, 3));
+    expect(step.out).toStrictEqual([fennSess('bigQuack', 4, 'bigQuack'), TAP_HAPTIC]);
+    expect(step.s).toMatchObject({ name: 'Reacting', clip: { name: 'bigQuack', start: 11 } });
+    expect(step.s.reaction?.r).toBe(FENN_REACTIONS.bigQuack);
+    expect(clipByName('bigQuack', FCAST)).toBe(FENN_CLIPS.bigQuack);
+    // The clip plays: the jaw is open at the first quack's peak, and the reaction ends at the clip's end.
+    const pose = evaluate(step.s, 11.06, createPose(), true, FCAST);
+    expect(pose[Ch.Jaw]).toBeGreaterThan(0.5);
+    const end = 11 + FENN_CLIPS.bigQuack.duration;
+    expect(stepFenn(step.s, tick(end)).s).toMatchObject({ name: 'Idle', clip: null, reaction: null });
+  });
+
+  it('three quick beak pokes (count 1, 2, 3) inside the cooldown: quack, then bigQuack (P4)', () => {
+    const r = stepFenn(stateIn('Idle'), beakTap(11, 1), beakTap(11.2, 2), beakTap(11.4, 3));
+    expect(r.out).toStrictEqual([
+      fennSess('quack', 2, 'quack'),
+      TAP_HAPTIC,
+      fennSess('bigQuack', 4, 'bigQuack'),
+      TAP_HAPTIC,
+    ]);
+    expect(r.s).toMatchObject({ name: 'Reacting', clip: { name: 'bigQuack', start: 11.4 } });
+  });
+
+  it('Gentle: the beak tap with count 3 plays bigQuackGentle, a single quack its own clip', () => {
+    const g = stepFenn(stateIn('Idle'), gentle(true)).s;
+    const big = stepFenn(g, beakTap(11, 3));
+    expect(big.s.clip).toStrictEqual({ name: 'bigQuackGentle', start: 11 });
+    expect(big.s.reaction?.clip).toBe('bigQuackGentle');
+    expect(big.out[0]).toStrictEqual(fennSess('bigQuack', 4, 'bigQuack'));
+    expect(clipByName('bigQuackGentle', FCAST)).toBe(FENN_CLIPS.bigQuackGentle);
+    expect(stepFenn(g, beakTap(11, 1)).s.clip?.name).toBe('quack');
+  });
+
+  it('a 3 s belly tickle escalates to laughFit (Juni’s giggle and its target)', () => {
+    const six = stepFenn(stateIn('Idle'), ...[0, 1, 2, 3, 4, 5].map((k) => bellyTickle(11 + k * 0.6)));
+    expect(sessionNames(six.out)).toStrictEqual(['giggle']);
+    expect(six.s).toMatchObject({ name: 'Sustained' });
+    const seven = stepFenn(six.s, bellyTickle(11 + 3.6));
+    expect(seven.out).toStrictEqual([
+      fennSess('laughFit', 4, 'giggle'),
+      { k: 'haptic', pattern: [8, 40, 8, 40, 8] },
+    ]);
+    expect(seven.s).toMatchObject({ name: 'Reacting', clip: { name: 'laughFit', start: 14.6 } });
+    expect(seven.s.reaction?.r).toBe(REACTIONS['laughFit']);
+  });
+
+  it('three head flicks within 3 s → dizzy (P4)', () => {
+    const r = stepFenn(stateIn('Idle'), headFlick(11), headFlick(12), headFlick(13));
+    expect(sessionNames(r.out)).toStrictEqual(['wobble', 'wobble', 'dizzy']);
+    expect(r.out.at(-1)).toStrictEqual(fennSess('dizzy', 4, 'whoa'));
+    expect(r.s).toMatchObject({ name: 'Reacting', clip: { name: 'dizzy', start: 13 } });
+    expect(r.s.reaction?.r).toBe(REACTIONS['dizzy']);
+  });
+
+  it("Fenn's cast is Juni's session, reaction and mime clips plus FENN_CLIPS, the flinch and the mirrored pet", () => {
+    expect([...FCAST.clips.keys()]).toStrictEqual([
+      ...Object.keys(SESSION_CLIPS),
+      ...Object.keys(REACTION_CLIPS),
+      ...Object.keys(MIME_CLIPS),
+      ...Object.keys(FENN_CLIPS),
+      'flinch',
+      'petMirrored',
+    ]);
+    // petTrill plays the pet, so a leftward stroke plays the mirrored pet on Fenn too.
+    const pet = fennGest(
+      { g: 'stroke', region: 'headTop', phase: 'update', pathPx: 200, dir: Math.PI, against: false },
+      11,
+      -1,
+    );
+    const left = stepFenn(stateIn('Idle'), pet);
+    expect(left.s.clip?.name).toBe('petMirrored');
+    for (const name of Object.keys(FENN_CLIPS)) expect(clipByName(name, CAST), name).toBeUndefined();
   });
 });
 

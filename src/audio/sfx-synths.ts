@@ -116,23 +116,29 @@ function lfo(
 const NOISE_SEC = 2;
 const NOISE_SEED = 0x5eed_0b3a;
 const noiseBuffers = new WeakMap<BaseAudioContext, AudioBuffer>();
+/**
+ * The sample rate of `noise(ctx, true)`'s buffer, whatever the context's. A few-millisecond burst of filtered noise
+ * has only a handful of independent peaks, so a buffer at the context's rate (a different waveform at 44.1 kHz) can
+ * peak 2.5 dB higher there; one fixed waveform, resampled by the source, peaks the same at every rate.
+ */
+const FIXED_NOISE_RATE = 48000;
+const fixedNoiseBuffers = new WeakMap<BaseAudioContext, AudioBuffer>();
 
 /**
  * A looping white-noise source, uniform on [−1, 1). The buffer is made once per context from a fixed seed, so
- * a recipe sounds (and measures) the same every time.
+ * a recipe sounds (and measures) the same every time. With `fixedRate` the buffer is at `FIXED_NOISE_RATE`
+ * (Fenn's bursts, whose level must not depend on the context's rate); otherwise at the context's rate.
  */
-function noise(ctx: BaseAudioContext): AudioBufferSourceNode {
-  let buffer = noiseBuffers.get(ctx);
+function noise(ctx: BaseAudioContext, fixedRate = false): AudioBufferSourceNode {
+  const cache = fixedRate ? fixedNoiseBuffers : noiseBuffers;
+  let buffer = cache.get(ctx);
   if (buffer === undefined) {
-    buffer = new AudioBuffer({
-      numberOfChannels: 1,
-      length: Math.round(NOISE_SEC * ctx.sampleRate),
-      sampleRate: ctx.sampleRate,
-    });
+    const sampleRate = fixedRate ? FIXED_NOISE_RATE : ctx.sampleRate;
+    buffer = new AudioBuffer({ numberOfChannels: 1, length: Math.round(NOISE_SEC * sampleRate), sampleRate });
     const data = buffer.getChannelData(0);
     const rng = mulberry32(NOISE_SEED);
     for (let i = 0; i < data.length; i++) data[i] = 2 * rng() - 1;
-    noiseBuffers.set(ctx, buffer);
+    cache.set(ctx, buffer);
   }
   return new AudioBufferSourceNode(ctx, { buffer, loop: true });
 }
@@ -777,6 +783,246 @@ const rustle: SfxSynth = (ctx, out, when) => {
   return run([src], [env], [end], when, RUSTLE.dur);
 };
 
+// -----------------------------------------------------------------------------------------------------------
+// Fenn the duckling (duck plan §4.6): quack, bigQuack, nibble, trill, peep, flap, pat
+//
+// Each recipe's envelope is relative (1 is its peak) and has one gain constant (`*_GAIN`) that sets its level: the
+// sample peak, rendered alone at 48 kHz, is −10 ± 1 dBFS (the duck plan's level rule). Every noise burst or click
+// rises linearly over 5 ms and falls linearly to 0 over the rest of its length.
+
+/** `points` with every gain × `gain` (module setup only). */
+function scaled(points: readonly EnvPoint[], gain: number): EnvPoint[] {
+  return points.map(([t, g]): EnvPoint => [t, g * gain]);
+}
+
+/** One quack: its onset (s after the sfx's start), its pitch glide, and its envelope from that onset. */
+interface QuackNote {
+  at: number;
+  fromHz: number;
+  toHz: number;
+  env: readonly EnvPoint[];
+}
+
+/** Quacks on one sawtooth through a nasal band-pass, amplitude-modulated, under one envelope. */
+interface Quacks {
+  dur: number;
+  notes: readonly QuackNote[];
+}
+
+/** The quack's tone: the band-pass that makes it nasal, and its AM (the gain swings between 1 − amDepth and 1). */
+const QUACK_TONE = { bandHz: 1600, q: 3, amHz: 70, amDepth: 0.35 } as const;
+/** One quack's relative envelope: 0 → 1 at 6 ms → 0.8 at 160 ms → 0 at 220 ms. */
+const QUACK_ENV: readonly EnvPoint[] = [
+  [0.006, 1],
+  [0.16, 0.8],
+  [0.22, 0],
+];
+
+/** The level of `quack` (measured peak −10.0 dBFS). */
+const QUACK_GAIN = 0.825;
+/** The level of `bigQuack` (measured peak −10.0 dBFS). */
+const BIG_QUACK_GAIN = 0.752;
+
+/** "quack!": a short, bright sawtooth glide 620 → 440 Hz through a nasal band-pass with a 70 Hz flutter. */
+const QUACK: Quacks = {
+  dur: 0.22,
+  notes: [{ at: 0, fromHz: 620, toHz: 440, env: scaled(QUACK_ENV, QUACK_GAIN) }],
+};
+
+/** "quack-quack-quaaack!": three quacks, the last lower and a little longer. */
+const BIG_QUACK: Quacks = {
+  dur: 0.85,
+  notes: [
+    { at: 0, fromHz: 620, toHz: 440, env: scaled(QUACK_ENV, BIG_QUACK_GAIN) },
+    { at: 0.28, fromHz: 620, toHz: 440, env: scaled(QUACK_ENV, BIG_QUACK_GAIN) },
+    {
+      at: 0.56,
+      fromHz: 560,
+      toHz: 380,
+      env: scaled(
+        [
+          [0.006, 1],
+          [0.23, 0.8],
+          [0.29, 0],
+        ],
+        BIG_QUACK_GAIN,
+      ),
+    },
+  ],
+};
+
+function quackSynth(q: Quacks): SfxSynth {
+  return (ctx, out, when) => {
+    const saw = new OscillatorNode(ctx, { type: 'sawtooth' });
+    const band = new BiquadFilterNode(ctx, {
+      type: 'bandpass',
+      frequency: QUACK_TONE.bandHz,
+      Q: QUACK_TONE.q,
+    });
+    const am = new GainNode(ctx, { gain: 1 - QUACK_TONE.amDepth / 2 });
+    const mod = lfo(ctx, QUACK_TONE.amHz, QUACK_TONE.amDepth / 2, am.gain);
+    const env = new GainNode(ctx, { gain: 0 });
+    const ends: number[] = [];
+    for (const n of q.notes) {
+      const len = n.env.at(-1)?.[0] ?? 0;
+      saw.frequency.setValueAtTime(n.fromHz, when + n.at);
+      saw.frequency.exponentialRampToValueAtTime(n.toHz, when + n.at + len);
+      ends.push(envelope(env.gain, when + n.at, n.env));
+    }
+    saw.connect(band).connect(am).connect(env).connect(out);
+    return run([saw, mod.osc], [env], ends, when, q.dur);
+  };
+}
+
+/** Filtered-noise bursts under one envelope: each `len` s long from its onset, 5 ms up, then linearly down to 0. */
+interface Bursts {
+  dur: number;
+  at: readonly number[];
+  len: number;
+  filter: BiquadFilterType;
+  hz: number;
+  q: number;
+  /** The level: a burst's envelope peak. */
+  gain: number;
+}
+
+function burstSynth(b: Bursts): SfxSynth {
+  const burst: readonly EnvPoint[] = [
+    [MIN_ATTACK_SEC, b.gain],
+    [b.len, 0],
+  ];
+  return (ctx, out, when) => {
+    const src = noise(ctx, true);
+    const filter = new BiquadFilterNode(ctx, { type: b.filter, frequency: b.hz, Q: b.q });
+    const env = new GainNode(ctx, { gain: 0 });
+    const ends = b.at.map((t) => envelope(env.gain, when + t, burst));
+    src.connect(filter).connect(env).connect(out);
+    return run([src], [env], ends, when, b.dur);
+  };
+}
+
+/** The level of `nibble` (measured peak −10.0 dBFS). */
+const NIBBLE_GAIN = 0.952;
+
+/** A beak nibbling the finger: four tiny clicks of band-passed noise, 90 ms apart. */
+const NIBBLE: Bursts = {
+  dur: 0.29,
+  at: [0, 0.09, 0.18, 0.27],
+  len: 0.012,
+  filter: 'bandpass',
+  hz: 2500,
+  q: 2,
+  gain: NIBBLE_GAIN,
+};
+
+/** The level of `flap` (measured peak −10.0 dBFS). */
+const FLAP_GAIN = 0.721;
+
+/** Little wings flapping: three soft whooshes of low-passed noise. */
+const FLAP: Bursts = {
+  dur: 0.28,
+  at: [0, 0.11, 0.22],
+  len: 0.04,
+  filter: 'lowpass',
+  hz: 1200,
+  q: Math.SQRT1_2,
+  gain: FLAP_GAIN,
+};
+
+/** The level of `trill` (measured peak −10.0 dBFS). */
+const TRILL_GAIN = 0.281;
+
+/** A happy little trill: a 1.4 kHz sine warbling ±80 Hz at 18 Hz, low-passed at 3 kHz. */
+const TRILL = {
+  dur: 0.5,
+  hz: 1400,
+  fmHz: 18,
+  fmDepthHz: 80,
+  lowpassHz: 3000,
+  env: scaled(
+    [
+      [0.02, 1],
+      [0.4, 0.7],
+      [0.5, 0],
+    ],
+    TRILL_GAIN,
+  ),
+} as const;
+
+const trill: SfxSynth = (ctx, out, when) => {
+  const osc = new OscillatorNode(ctx, { type: 'sine', frequency: TRILL.hz });
+  const fm = lfo(ctx, TRILL.fmHz, TRILL.fmDepthHz, osc.frequency);
+  const lowpass = new BiquadFilterNode(ctx, { type: 'lowpass', frequency: TRILL.lowpassHz, Q: Math.SQRT1_2 });
+  const env = new GainNode(ctx, { gain: 0 });
+  const end = envelope(env.gain, when, TRILL.env);
+  osc.connect(lowpass).connect(env).connect(out);
+  return run([osc, fm.osc], [env], [end], when, TRILL.dur);
+};
+
+/** The level of `peep` (measured peak −10.0 dBFS). */
+const PEEP_GAIN = 0.317;
+
+/** "peep!": a tiny rising sine, 1.8 → 2.3 kHz. */
+const PEEP = {
+  dur: 0.12,
+  pitch: [
+    [0, 1800],
+    [0.12, 2300],
+  ],
+  env: scaled(
+    [
+      [0.008, 1],
+      [0.12, 0],
+    ],
+    PEEP_GAIN,
+  ),
+} as const;
+
+const peep: SfxSynth = (ctx, out, when) => {
+  const osc = new OscillatorNode(ctx, { type: 'sine' });
+  contour(osc.frequency, when, PEEP.pitch);
+  const env = new GainNode(ctx, { gain: 0 });
+  const end = envelope(env.gain, when, PEEP.env);
+  osc.connect(env).connect(out);
+  return run([osc], [env], [end], when, PEEP.dur);
+};
+
+/** The level of `pat` (measured peak −10.0 dBFS). */
+const PAT_GAIN = 0.271;
+
+/** A soft webbed-foot pat: a sine thump falling 180 → 90 Hz with a little low-passed noise for the slap. */
+const PAT = {
+  dur: 0.12,
+  pitch: [
+    [0, 180],
+    [0.12, 90],
+  ],
+  lowpassHz: 400,
+  /** The noise's level relative to the sine's. */
+  noiseMix: 1.5,
+  env: scaled(
+    [
+      [0.006, 1],
+      [0.12, 0],
+    ],
+    PAT_GAIN,
+  ),
+} as const;
+
+const pat: SfxSynth = (ctx, out, when) => {
+  const osc = new OscillatorNode(ctx, { type: 'sine' });
+  contour(osc.frequency, when, PAT.pitch);
+  const src = noise(ctx, true);
+  const lowpass = new BiquadFilterNode(ctx, { type: 'lowpass', frequency: PAT.lowpassHz, Q: Math.SQRT1_2 });
+  const noiseMix = new GainNode(ctx, { gain: PAT.noiseMix });
+  const env = new GainNode(ctx, { gain: 0 });
+  const end = envelope(env.gain, when, PAT.env);
+  osc.connect(env);
+  src.connect(lowpass).connect(noiseMix).connect(env);
+  env.connect(out);
+  return run([osc, src], [env], [end], when, PAT.dur);
+};
+
 /** Every sound effect, by id (plan §4.6.4). */
 export const SYNTHS: Record<SfxId, SfxSynth> = {
   testBeep,
@@ -795,4 +1041,11 @@ export const SYNTHS: Record<SfxId, SfxSynth> = {
   hey: blip(HEY),
   whoa: blip(WHOA),
   rustle,
+  quack: quackSynth(QUACK),
+  bigQuack: quackSynth(BIG_QUACK),
+  nibble: burstSynth(NIBBLE),
+  trill,
+  peep,
+  flap: burstSynth(FLAP),
+  pat,
 };

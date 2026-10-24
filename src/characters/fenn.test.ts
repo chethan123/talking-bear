@@ -4,11 +4,14 @@
  * are at least Juni's size.
  */
 import { describe, expect, it } from 'vitest';
+import { FENN_CLIPS } from '../anim/clips/fenn.ts';
 import { Ch, CH_COUNT, createPose } from '../anim/pose.ts';
 import { boneIndex, boneMatrices, createRig, MAT } from '../anim/rig.ts';
 import { BONE, BONES } from '../art/duck-parts.gen.ts';
 import { REGION_IDS } from '../input/region-ids.ts';
 import { compileRegions, hitTest } from '../input/regions.ts';
+import { FENN_REACTIONS, fennReactionFor } from '../reactions/fenn-table.ts';
+import { REACTIONS } from '../reactions/table.ts';
 import { FENN } from './fenn.ts';
 import { CHARACTERS } from './index.ts';
 import { JUNI } from './juni.ts';
@@ -153,9 +156,11 @@ describe('FENN', () => {
     }
   });
 
-  it('is a placeholder cast until T125: no gesture reacts', () => {
+  it("has Fenn's reaction table and cast (T125; covered in reactions/fenn-table.test.ts)", () => {
+    expect(FENN.reactionFor).toBe(fennReactionFor);
     expect(FENN.reactionFor({ g: 'cancel' })).toBeNull();
-    expect(FENN.reactionFor({ g: 'hug' })).toBeNull();
-    expect(FENN.cast.clips.size).toBeGreaterThan(0);
+    expect(FENN.reactionFor({ g: 'hug' })).toBe(REACTIONS['hug']);
+    for (const [name, c] of Object.entries(FENN_CLIPS)) expect(FENN.cast.clips.get(name), name).toBe(c);
+    expect(FENN.cast.reactions).toStrictEqual({ ...REACTIONS, ...FENN_REACTIONS });
   });
 });

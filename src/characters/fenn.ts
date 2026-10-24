@@ -9,12 +9,14 @@
  *
  * Node scripts may import this module, so its relative imports end in `.ts`.
  */
+import { FENN_CLIPS } from '../anim/clips/fenn.ts';
 import { MIME_CLIPS, REACTION_CLIPS } from '../anim/clips/reactions.ts';
 import { SESSION_CLIPS } from '../anim/clips/session.ts';
 import { createDirectorCast } from '../anim/director.ts';
 import { Ch } from '../anim/pose.ts';
 import { BONE, BONES, PART, PARTS } from '../art/duck-parts.gen.ts';
 import type { RegionDef } from '../input/regions.ts';
+import { FENN_REACTIONS, fennReactionFor } from '../reactions/fenn-table.ts';
 import { REACTIONS } from '../reactions/table.ts';
 import type { CharacterSpec, Drive, StarsSpec } from './types.ts';
 
@@ -95,8 +97,14 @@ export const FENN: CharacterSpec = {
   /** Frozen, array and entries: `compileRegions` reads them once into typed tables. */
   regions: Object.freeze(REGIONS.map((r) => Object.freeze(r))),
   names: { name: 'Fenn', stage: 'Fenn the duckling', switchTo: 'Switch to Fenn the duckling' },
-  /** Placeholder until T125: Juni's session, reaction and mime clips and escalation targets. */
-  cast: createDirectorCast([SESSION_CLIPS, REACTION_CLIPS, MIME_CLIPS], REACTIONS),
-  /** Placeholder until T125 (Fenn's reaction table): no gesture reacts. */
-  reactionFor: () => null,
+  /**
+   * Juni's session, reaction and mime clips plus Fenn's own (duck plan §4.6), and Juni's reactions plus Fenn's: the
+   * escalation targets (`dizzy`, `laughFit`) are Juni's.
+   */
+  cast: createDirectorCast([SESSION_CLIPS, REACTION_CLIPS, MIME_CLIPS, FENN_CLIPS], {
+    ...REACTIONS,
+    ...FENN_REACTIONS,
+  }),
+  /** Fenn's reaction table (duck plan §4.6). */
+  reactionFor: fennReactionFor,
 };
