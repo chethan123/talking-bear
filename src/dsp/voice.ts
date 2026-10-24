@@ -1,15 +1,18 @@
-// The voice effect chain (plan §4.3.4, §7 M3), run in the DSP worker on each take:
-//   clip → clipping flag → HPF 80 Hz → trim → sinc resample (ratio 1/p) → voiced? → loudness gain and
-//   true-peak ceiling → 8 ms fades → envelope analysis.
-// Each step is an exported stage, collected in `voiceStages`, and processVoice is exactly their composition,
-// so lab/bench (X-F3, #69) can time the stages one by one.
+// The voice effect chain (plan §4.3.4, §4.3.5, §7 M3), run in the DSP worker on each take:
+//   clip → clipping flag → HPF 80 Hz → trim → sinc resample (ratio 1/p) → voiced? → [duck stage, the duck
+//   preset only] → loudness gain and true-peak ceiling → 8 ms fades → envelope analysis.
+// The voiced decision is made on the pitch-shifted clip before the duck stage, so the duck's AM never changes
+// the make-up-gain decision; the gain, ceiling, fades and envelope then run on the duck output, the buffer
+// that plays. Each step is an exported stage, collected in `voiceStages`, and processVoice is exactly their
+// composition, so lab/bench (X-F3, #69) can time the stages one by one.
 // Pure: no DOM, no globals, no timers. processVoice never modifies its input.
 
 import { butterworthHighpass } from './biquad.ts';
 import { analyzeEnvelope } from './envelope.ts';
+import { DUCK, duckStage } from './duck.ts';
 import { applyFades } from './fades.ts';
 import { voiceGainDb } from './normalize.ts';
-import { resampleOffline } from './resample.ts';
+import { createResampler, resampleOffline } from './resample.ts';
 import type { Envelope, VoicePreset, VoiceResult } from './types.ts';
 import { createVoicing, VOICED_THRESHOLD } from './voicing.ts';
 
@@ -35,6 +38,8 @@ export const VOICING_FS = 8000;
 export const VOICING_WINDOW = 256;
 export const VOICING_HOP = 160;
 export const VOICED_MIN_WINDOWS = 3;
+/** isVoiced feeds its streaming 8 kHz resampler input chunks of round(0.25·fs) samples. */
+export const VOICING_CHUNK_SEC = 0.25;
 /** Raised-cosine fade length in ms at each end. */
 export const FADE_MS = 8;
 
@@ -135,18 +140,41 @@ export function resample(x: Float32Array, pitchRatio: number): Float32Array {
  * createVoicing(8000) on 256-sample windows starting every 160 samples (20 ms) at 0, 160, 320, … that lie
  * wholly inside the copy, and returns true as soon as 3 windows score above VOICED_THRESHOLD. A copy shorter
  * than 256 samples has no window and is unvoiced.
+ *
+ * The copy is made by the streaming resampler createResampler(fs, 8000), fed input chunks of round(0.25·fs)
+ * samples and flushed at the end, which gives the offline copy bit for bit; each window is scored as soon as
+ * its last sample has arrived, so a voiced clip stops resampling at its third voiced window (duck plan T114).
  */
 export function isVoiced(y: Float32Array, fs: number): boolean {
-  const z = resampleOffline(y, VOICING_FS / fs);
+  const resampler = createResampler(fs, VOICING_FS);
   const voicing = createVoicing(VOICING_FS);
+  const n = y.length;
+  const chunk = Math.max(1, Math.round(VOICING_CHUNK_SEC * fs));
+  const z = new Float32Array(Math.round(n * resampler.ratio));
+  const out = new Float32Array(Math.ceil(chunk * resampler.ratio) + 2);
+  let filled = 0;
+  let start = 0;
   let count = 0;
-  for (let s = 0; s + VOICING_WINDOW <= z.length; s += VOICING_HOP) {
-    if (voicing.score(z.subarray(s, s + VOICING_WINDOW)) > VOICED_THRESHOLD) {
-      count++;
-      if (count >= VOICED_MIN_WINDOWS) return true;
+  /** Scores every complete window not yet scored; true once VOICED_MIN_WINDOWS have scored above threshold. */
+  const scoreReady = (): boolean => {
+    for (; start + VOICING_WINDOW <= filled; start += VOICING_HOP) {
+      if (voicing.score(z.subarray(start, start + VOICING_WINDOW)) > VOICED_THRESHOLD) {
+        count++;
+        if (count >= VOICED_MIN_WINDOWS) return true;
+      }
     }
+    return false;
+  };
+  for (let off = 0; off < n; off += chunk) {
+    const k = resampler.processInto(y.subarray(off, Math.min(off + chunk, n)), out);
+    z.set(out.subarray(0, k), filled);
+    filled += k;
+    if (scoreReady()) return true;
   }
-  return false;
+  const tail = resampler.flush();
+  z.set(tail, filled);
+  filled += tail.length;
+  return scoreReady();
 }
 
 /**
@@ -170,25 +198,39 @@ export function envelope(y: Float32Array, fs: number, pitchRatio: number): Envel
   return analyzeEnvelope(y, fs, pitchRatio);
 }
 
-/** The stages of processVoice, in order, for benchmarks (#69). */
-export const voiceStages = { clipDetect, hpfTrim, resample, isVoiced, applyGain, fades, envelope } as const;
+/**
+ * The stages of processVoice, in order, for benchmarks (#69). `duck` (src/dsp/duck.ts, plan §4.3.5) runs only
+ * for the duck preset, as duckStage(y, fs, DUCK).
+ */
+export const voiceStages = {
+  clipDetect,
+  hpfTrim,
+  resample,
+  isVoiced,
+  duck: duckStage,
+  applyGain,
+  fades,
+  envelope,
+} as const;
 
 /**
  * The voice effect (plan §4.3.4) on a take `pcm` at sample rate `fs`, exactly the composition of voiceStages:
  *   clipped = clipDetect(pcm); x = hpfTrim(pcm, fs, !opts?.noTrim); y = resample(x, p);
- *   voiced = isVoiced(y, fs); applyGain(y, fs, voiced); fades(y, fs); env = envelope(y, fs, p)
- * with p = preset.pitchRatio. Returns { pcm: y, envelope: env, durationSec: y.length / fs, clipped }: y plays
- * at rate 1, and its envelope is computed from exactly that buffer.
+ *   voiced = isVoiced(y, fs); z = preset.id === 'duck' ? duckStage(y, fs, DUCK) : y;
+ *   applyGain(z, fs, voiced); fades(z, fs); env = envelope(z, fs, p)
+ * with p = preset.pitchRatio. Returns { pcm: z, envelope: env, durationSec: z.length / fs, clipped }: z plays
+ * at rate 1, and its envelope is computed from exactly that buffer. The duck stage keeps the length, so z has
+ * y's length for every preset.
  *
  * Non-finite input samples (NaN, ±Infinity) are replaced by 0 and finite samples are clamped to ±1e30
  * (SAMPLE_LIMIT) before the high-pass (clipDetect still sees the raw input, so ±Infinity counts as clipped).
  * Every stage after clipDetect therefore sees finite, bounded samples, and the output and its envelope are
  * finite for every input.
- * `pcm` is never modified, and y is a new buffer. `opts.noTrim` is test-only.
+ * `pcm` is never modified, and z is a new buffer. `opts.noTrim` is test-only.
  *
  * Throws RangeError (from the stages) unless fs is finite and above 2·1681.97 ≈ 3364 Hz (the BS.1770
  * K-weighting in applyGain is the binding bound; hpfTrim alone needs fs > 160) and preset.pitchRatio is finite
- * and > 0.
+ * and > 0; for the duck preset, also unless fs ≥ 16000 (duckStage's bound).
  */
 export function processVoice(
   pcm: Float32Array,
@@ -201,8 +243,9 @@ export function processVoice(
   const x = hpfTrim(pcm, fs, opts?.noTrim !== true);
   const y = resample(x, p);
   const voiced = isVoiced(y, fs);
-  applyGain(y, fs, voiced);
-  fades(y, fs);
-  const env = envelope(y, fs, p);
-  return { pcm: y, envelope: env, durationSec: y.length / fs, clipped };
+  const z = preset.id === 'duck' ? duckStage(y, fs, DUCK) : y;
+  applyGain(z, fs, voiced);
+  fades(z, fs);
+  const env = envelope(z, fs, p);
+  return { pcm: z, envelope: env, durationSec: z.length / fs, clipped };
 }

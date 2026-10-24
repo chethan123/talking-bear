@@ -12,16 +12,31 @@ import {
   SETTINGS_KEY,
   SLEEP_TIMEOUT_MAX_SEC,
   SLEEP_TIMEOUT_MIN_SEC,
+  voiceKey,
+  type CharacterId,
   type Settings,
 } from './settings.ts';
 
-const VOICES = ['cub', 'chipmunk', 'bigbear', 'custom'] as const;
-const KEYS = ['voice', 'customPitch', 'quietMode', 'gentleMode', 'haptics', 'noisyRoomNs', 'sleepTimeoutSec'];
+const VOICES = ['cub', 'chipmunk', 'bigbear', 'duck', 'custom'] as const;
+const CHARACTERS = ['juni', 'fenn'] as const;
+const KEYS = [
+  'voice',
+  'fennVoice',
+  'character',
+  'customPitch',
+  'quietMode',
+  'gentleMode',
+  'haptics',
+  'noisyRoomNs',
+  'sleepTimeoutSec',
+];
 
 /** A complete, valid `Settings` (the invariant `parseSettings` guarantees). */
 function expectValid(s: Settings): void {
   expect(Object.keys(s).toSorted()).toEqual([...KEYS].toSorted());
   expect(VOICES).toContain(s.voice);
+  expect(VOICES).toContain(s.fennVoice);
+  expect(CHARACTERS).toContain(s.character);
   expect(Number.isFinite(s.customPitch)).toBe(true);
   expect(s.customPitch).toBeGreaterThanOrEqual(CUSTOM_PITCH_MIN);
   expect(s.customPitch).toBeLessThanOrEqual(CUSTOM_PITCH_MAX);
@@ -66,6 +81,8 @@ describe('DEFAULT_SETTINGS', () => {
   it('are exactly the specified defaults (issue #65, plan §4.3.4, §7 M8, Q1)', () => {
     expect(DEFAULT_SETTINGS).toStrictEqual({
       voice: 'cub',
+      fennVoice: 'duck',
+      character: 'juni',
       customPitch: PRESETS.cub.pitchRatio,
       quietMode: true,
       gentleMode: false,
@@ -81,16 +98,40 @@ describe('DEFAULT_SETTINGS', () => {
     expectValid(DEFAULT_SETTINGS);
   });
 
-  it('types: voice is exactly the VoicePreset ids', () => {
+  it('types: voice and fennVoice are exactly the VoicePreset ids, character the CharacterIds', () => {
     expectTypeOf<Settings['voice']>().toEqualTypeOf<VoicePreset['id']>();
+    expectTypeOf<Settings['fennVoice']>().toEqualTypeOf<VoicePreset['id']>();
+    expectTypeOf<Settings['character']>().toEqualTypeOf<CharacterId>();
+    expectTypeOf<CharacterId>().toEqualTypeOf<'juni' | 'fenn'>();
     expectTypeOf(createSettingsStore).parameter(1).toEqualTypeOf<string | undefined>();
   });
 });
 
 describe('presetFor', () => {
-  it.each(['cub', 'chipmunk', 'bigbear'] as const)('returns the shared PRESETS entry for %s', (voice) => {
-    const s: Settings = { ...DEFAULT_SETTINGS, voice, customPitch: 2.1 };
-    expect(presetFor(s)).toBe(PRESETS[voice]);
+  it.each(['cub', 'chipmunk', 'bigbear', 'duck'] as const)(
+    'returns the shared PRESETS entry for %s',
+    (voice) => {
+      const s: Settings = { ...DEFAULT_SETTINGS, voice, customPitch: 2.1 };
+      expect(presetFor(s)).toBe(PRESETS[voice]);
+    },
+  );
+
+  it("picks the active character's voice: voice for Juni, fennVoice for Fenn", () => {
+    const s: Settings = { ...DEFAULT_SETTINGS, voice: 'chipmunk', fennVoice: 'bigbear' };
+    expect(presetFor({ ...s, character: 'juni' })).toBe(PRESETS.chipmunk);
+    expect(presetFor({ ...s, character: 'fenn' })).toBe(PRESETS.bigbear);
+    expect(presetFor({ ...s, character: 'fenn', fennVoice: 'custom', customPitch: 1.3 })).toStrictEqual({
+      id: 'custom',
+      pitchRatio: 1.3,
+    });
+    expect(voiceKey('juni')).toBe('voice');
+    expect(voiceKey('fenn')).toBe('fennVoice');
+  });
+
+  it('T116 acceptance 5: Fenn with the Duckling voice is PRESETS.duck', () => {
+    expect(presetFor({ ...DEFAULT_SETTINGS, character: 'fenn', fennVoice: 'duck' })).toBe(PRESETS.duck);
+    // Fenn's default voice is the Duckling.
+    expect(presetFor({ ...DEFAULT_SETTINGS, character: 'fenn' })).toBe(PRESETS.duck);
   });
 
   it('returns { id: custom, pitchRatio: customPitch } for custom, as a new object', () => {
@@ -166,9 +207,15 @@ describe('parseSettings', () => {
   });
 
   it('accepts every valid value', () => {
-    for (const voice of VOICES) expect(parseSettings({ voice }).voice).toBe(voice);
+    for (const voice of VOICES) {
+      expect(parseSettings({ voice }).voice).toBe(voice);
+      expect(parseSettings({ fennVoice: voice }).fennVoice).toBe(voice);
+    }
+    for (const character of CHARACTERS) expect(parseSettings({ character }).character).toBe(character);
     const all: Settings = {
       voice: 'bigbear',
+      fennVoice: 'chipmunk',
+      character: 'fenn',
       customPitch: 0.95,
       quietMode: false,
       gentleMode: true,
@@ -183,6 +230,8 @@ describe('parseSettings', () => {
     expect(
       parseSettings({
         voice: ['cub'],
+        fennVoice: ['duck'],
+        character: ['fenn'],
         customPitch: '1.8',
         quietMode: 'false',
         gentleMode: 1,
@@ -196,7 +245,41 @@ describe('parseSettings', () => {
   it('rejects inherited names as voices', () => {
     for (const voice of ['toString', '__proto__', 'constructor', 'hasOwnProperty', 'CUB', ' cub']) {
       expect(parseSettings({ voice }).voice).toBe('cub');
+      expect(parseSettings({ fennVoice: voice }).fennVoice).toBe('duck');
     }
+  });
+
+  it('T116 acceptance 5: a stored v1 object without the new keys parses to their defaults', () => {
+    expect(parseSettings({ voice: 'chipmunk' })).toStrictEqual({
+      ...DEFAULT_SETTINGS,
+      voice: 'chipmunk',
+      character: 'juni',
+      fennVoice: 'duck',
+    });
+  });
+
+  it('T116 acceptance 5: an invalid character or fennVoice takes the default', () => {
+    for (const character of [
+      'bear',
+      'Juni',
+      'FENN',
+      '',
+      'toString',
+      1,
+      true,
+      null,
+      ['fenn'],
+      { id: 'fenn' },
+    ]) {
+      expect(parseSettings({ character }).character).toBe('juni');
+    }
+    for (const fennVoice of ['quack', 'Duck', 'juni', 1, null, ['duck']]) {
+      expect(parseSettings({ fennVoice }).fennVoice).toBe('duck');
+    }
+    expect(parseSettings({ character: 'robot', fennVoice: 'chipmunk' })).toStrictEqual({
+      ...DEFAULT_SETTINGS,
+      fennVoice: 'chipmunk',
+    });
   });
 
   it('drops unknown keys', () => {
@@ -252,10 +335,13 @@ describe('parseSettings', () => {
       fc.integer({ min: -1000, max: 1000 }),
       fc.boolean(),
       fc.constantFrom(...VOICES),
+      fc.constantFrom(...CHARACTERS),
     );
     const record = fc.record(
       {
         voice: field,
+        fennVoice: field,
+        character: field,
         customPitch: field,
         quietMode: field,
         gentleMode: field,
@@ -279,6 +365,8 @@ describe('parseSettings', () => {
   it('property: valid settings pass through unchanged', () => {
     const valid = fc.record({
       voice: fc.constantFrom(...VOICES),
+      fennVoice: fc.constantFrom(...VOICES),
+      character: fc.constantFrom(...CHARACTERS),
       customPitch: fc.double({ min: CUSTOM_PITCH_MIN, max: CUSTOM_PITCH_MAX, noNaN: true }),
       quietMode: fc.boolean(),
       gentleMode: fc.boolean(),
@@ -455,6 +543,7 @@ describe('createSettingsStore: set', () => {
       fc.double(),
       fc.boolean(),
       fc.constantFrom(...VOICES),
+      fc.constantFrom(...CHARACTERS),
     );
     const patch = fc.dictionary(fc.constantFrom(...KEYS, 'junk'), value, { noNullPrototype: true });
     fc.assert(
@@ -503,6 +592,8 @@ describe('createSettingsStore: round trip', () => {
     const a = createSettingsStore(st);
     const want: Settings = {
       voice: 'custom',
+      fennVoice: 'bigbear',
+      character: 'juni',
       customPitch: 0.85,
       quietMode: false,
       gentleMode: true,
@@ -521,6 +612,8 @@ describe('createSettingsStore: round trip', () => {
     const patch = fc.record(
       {
         voice: fc.constantFrom(...VOICES),
+        fennVoice: fc.constantFrom(...VOICES),
+        character: fc.constantFrom(...CHARACTERS),
         customPitch: fc.double({ min: 0, max: 3, noNaN: true }),
         quietMode: fc.boolean(),
         gentleMode: fc.boolean(),

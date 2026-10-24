@@ -477,29 +477,28 @@ describe('main: the gen:bear CLI', () => {
   });
 
   describe('with a table of two characters', () => {
-    const TWO: readonly CharacterArt[] = [
-      JUNI,
-      { id: 'fenn', svg: 'art/duck.svg', out: 'src/art/duck-parts.gen.ts' },
-    ];
-    const duckOut = () => join(root, 'src/art/duck-parts.gen.ts');
+    const FENN_ART: CharacterArt = { id: 'fenn', svg: 'art/duck.svg', out: 'src/art/duck-parts.gen.ts' };
+    const TWO: readonly CharacterArt[] = [JUNI, FENN_ART];
+    let duckOut = '';
     beforeEach(() => {
+      duckOut = join(root, FENN_ART.out);
       writeFileSync(join(root, 'art/duck.svg'), FIXTURE);
     });
 
     it('regenerates every entry, and --character limits it to one', () => {
       expect(main(['--character', 'fenn'], root, TWO)).toBe(0);
-      expect(existsSync(duckOut())).toBe(true);
+      expect(existsSync(duckOut)).toBe(true);
       expect(existsSync(join(root, OUT_FILE))).toBe(false);
       expect(main([], root, TWO)).toBe(0);
       expect(readFileSync(join(root, OUT_FILE), 'utf8')).toBe(generate(FIXTURE, JUNI));
-      expect(readFileSync(duckOut(), 'utf8')).toBe(generate(FIXTURE, TWO[1] as CharacterArt));
-      expect(readFileSync(duckOut(), 'utf8')).toContain('from art/duck.svg — do not edit.');
+      expect(readFileSync(duckOut, 'utf8')).toBe(generate(FIXTURE, FENN_ART));
+      expect(readFileSync(duckOut, 'utf8')).toContain('from art/duck.svg — do not edit.');
       expect(main(['--check'], root, TWO)).toBe(0);
     });
 
     it('--check names the stale entry and its file, and --character checks only that entry', () => {
       expect(main([], root, TWO)).toBe(0);
-      writeFileSync(duckOut(), readFileSync(duckOut(), 'utf8').replace('#2F7A6D', '#3F9282'));
+      writeFileSync(duckOut, readFileSync(duckOut, 'utf8').replace('#2F7A6D', '#3F9282'));
       errors = [];
       expect(main(['--check'], root, TWO)).toBe(1);
       const message = errors.join('\n');

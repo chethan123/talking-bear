@@ -1,9 +1,14 @@
 // The settings sheet (plan §7 M3, M8; issues #66, #113, #114). A gear button in the top-right corner opens a modal
-// sheet with the voice preset (Bear cub, Chipmunk, Big bear, Custom), the custom pitch slider (0.7–2.2, enabled only
-// for Custom), Quiet mode, Gentle mode, Haptics, Noisy room (noise suppression), Sleep after (1–10 min) and the
+// sheet with the voice preset (Bear cub, Chipmunk, Big bear, Duckling, Custom), the custom pitch slider (0.7–2.2,
+// enabled only for Custom), Quiet mode, Gentle mode, Haptics, Noisy room (noise suppression), Sleep after (1–10 min) and the
 // "For parents" section. Every control writes the settings store at once; main.ts and the session apply each setting
 // (Quiet: the engine's bus; Gentle: the bear's reduced motion; Haptics: `createHaptics`'s `getEnabled`; Noisy room:
 // the next mic open; Sleep after: the next sleep-timer start).
+//
+// The voice group edits the active character's voice (duck plan Q11): `voice` while the character is Juni,
+// `fennVoice` while it is Fenn; Custom's slider is the shared `customPitch`. It needs no store subscription: the
+// character only changes from the swap button, which can't be reached while the modal sheet is open, and render()
+// re-reads the store at every open().
 //
 // Guard (M8, plan Q3): the gear opens the sheet only after a continuous press of at least `GEAR_HOLD_MS` (1 s):
 // `pointerdown` … `pointerup` on the gear, or a held Enter / Space key. A ring fills during the press (styles.css);
@@ -31,9 +36,16 @@
 // never HTML strings, and nothing sets a `style` attribute; styles.css styles it, including the ring's fill.
 
 import type { SessionEvent, StateName } from '../app/events.ts';
-import { CUSTOM_PITCH_MAX, CUSTOM_PITCH_MIN, type Settings, type SettingsStore } from '../app/settings.ts';
+import {
+  CUSTOM_PITCH_MAX,
+  CUSTOM_PITCH_MIN,
+  voiceKey,
+  type Settings,
+  type SettingsStore,
+} from '../app/settings.ts';
 import { JUNI } from '../characters/juni.ts';
 import type { CharacterNames } from '../characters/types.ts';
+import type { VoiceId } from '../dsp/types.ts';
 import { mountLicencesScreen, type LicencesScreen } from './licences-screen.ts';
 
 export const SETTINGS_TEXT = {
@@ -43,6 +55,7 @@ export const SETTINGS_TEXT = {
   cub: 'Bear cub',
   chipmunk: 'Chipmunk',
   bigbear: 'Big bear',
+  duck: 'Duckling',
   custom: 'Custom',
   customPitch: 'Custom pitch',
   quietMode: 'Quiet mode',
@@ -83,7 +96,7 @@ export const SHEET_BLOCKED: ReadonlySet<StateName> = new Set<StateName>([
   'Playing',
 ]);
 
-const VOICES: readonly Settings['voice'][] = ['cub', 'chipmunk', 'bigbear', 'custom'];
+const VOICES: readonly VoiceId[] = ['cub', 'chipmunk', 'bigbear', 'duck', 'custom'];
 
 /** The PWA side of the sheet (src/pwa/register.ts, plus the install availability main.ts tracks). */
 export interface SheetPwa {
@@ -198,7 +211,7 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
   const pitchLabel = element('label', 'settings-option settings-pitch');
   pitchLabel.append(element('span', null, SETTINGS_TEXT.customPitch), pitch);
 
-  const radios = new Map<Settings['voice'], HTMLInputElement>();
+  const radios = new Map<VoiceId, HTMLInputElement>();
   const voices = element('fieldset', 'settings-group');
   voices.append(element('legend', null, SETTINGS_TEXT.voice));
   for (const voice of VOICES) {
@@ -209,7 +222,9 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
     radio.addEventListener('change', () => {
       if (!radio.checked) return;
       pitch.disabled = voice !== 'custom';
-      store.set({ voice });
+      const patch: Partial<Settings> = {};
+      patch[voiceKey(store.get().character)] = voice; // the active character's voice
+      store.set(patch);
     });
     radios.set(voice, radio);
     voices.append(labelled(radio, SETTINGS_TEXT[voice]));
@@ -312,13 +327,14 @@ export function mountSettingsSheet(root: HTMLElement, deps: SettingsSheetDeps): 
   dialog.append(parents, close);
 
   /**
-   * Shows the store's current values. A stored sleep timeout that is not one of the choices (only a hand-edited
+   * Shows the store's current values, with the radio of the active character's voice checked. A stored sleep timeout that is not one of the choices (only a hand-edited
    * store has one) selects nothing rather than show a value that isn't in effect.
    */
   function render(s: Settings): void {
-    for (const [voice, radio] of radios) radio.checked = voice === s.voice;
+    const active = s[voiceKey(s.character)];
+    for (const [voice, radio] of radios) radio.checked = voice === active;
     pitch.value = String(s.customPitch);
-    pitch.disabled = s.voice !== 'custom';
+    pitch.disabled = active !== 'custom';
     for (const [key, input] of toggles) input.checked = s[key];
     sleep.value = String(s.sleepTimeoutSec);
     const text = SETTINGS_TEXT.privacy(names());
