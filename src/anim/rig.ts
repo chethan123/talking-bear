@@ -1,12 +1,15 @@
 /**
  * The rig: pose channels → one 2D affine matrix per bone (plan §4.6.5, §4.6.6; issue #75).
  *
- * A bone's matrix maps **rest-pose design coordinates** (the 1000 × 1400 design box of `art/bear.svg`,
- * y down) to posed design coordinates. It is `parent × translate(pivot + offset) × rotate(θ) × scale(sx, sy)
+ * The rig is built per character (duck plan §4.1): `createRig(spec)` compiles a `CharacterSpec`'s art and drives into
+ * typed tables on the `Rig`, so this module holds no character data.
+ *
+ * A bone's matrix maps **rest-pose design coordinates** (the 1000 × 1400 design box of the character's art, e.g.
+ * `art/bear.svg`, y down) to posed design coordinates. It is `parent × translate(pivot + offset) × rotate(θ) × scale(sx, sy)
  * × translate(−pivot)`, so the neutral pose (every channel 0) gives the identity for every bone. The view
  * transform (design units → canvas pixels) is not part of it: the renderer multiplies it in front.
  *
- * **Output layout** (`boneMatrices`): 6 floats per bone, in `BONES` order. Bone `i` is
+ * **Output layout** (`boneMatrices`): 6 floats per bone, in the art's `BONES` order. Bone `i` is
  * `out[6i … 6i + 5] = [a, b, c, d, e, f]`, in `CanvasRenderingContext2D.setTransform(a, b, c, d, e, f)` order:
  * `x' = a·x + c·y + e`, `y' = b·x + d·y + f`.
  *
@@ -15,9 +18,9 @@
  * under `translate(1000, 0) scale(−1, 1)`, right-multiplied, so the mirror applies to the part only: `partMatrix`
  * gives `bone × part-level × mirror`. So "both arms up" is `ArmRotL = +θ`, `ArmRotR = −θ`.
  */
-import { BONE, BONES, PART, PARTS } from '../art/bear-parts.gen.ts';
 import { Ch } from './pose.ts';
 import type { Pose } from './pose.ts';
+import type { CharacterSpec } from '../characters/types.ts';
 
 /** Floats per matrix: `[a, b, c, d, e, f]`. */
 export const MAT = 6;
@@ -25,167 +28,187 @@ export const MAT = 6;
 /** A `mirror: true` part is drawn under `translate(MIRROR_X, 0) scale(−1, 1)`: mirrored about x = 500. */
 export const MIRROR_X = 1000;
 
-/** Number of bones: `boneMatrices` needs `out.length ≥ BONE_COUNT · MAT`. */
-export const BONE_COUNT = BONES.length;
-
 /** Part kinds (`Rig.kind`): how the renderer treats a part beyond `bone × fill`. */
 export const PartKind = {
   /** Drawn under its bone matrix [× mirror], with its own fill and opacity. */
   plain: 0,
   /**
-   * `iris*`, `pupil*`, `highlight*`: translated by (`IrisX` ± `IrisConverge`, `IrisY`) in eye-bone space (+ for the
-   * left eye, − for the right); clipped to the sclera.
+   * `spec.gazeParts` (Juni: `iris*`, `pupil*`, `highlight*`): translated by (`IrisX` ± `IrisConverge`, `IrisY`) in
+   * eye-bone space (+ for the left eye, − for the right); clipped to the sclera.
    */
   gaze: 1,
-  /** `lidUpperL`: scaled in y about its bbox top by `LidL`. */
+  /** `spec.lidParts.L` (Juni: `lidUpperL`): scaled in y about its bbox top by `LidL`. */
   lidL: 2,
-  /** `lidUpperR`: scaled in y about its bbox top by `LidR`. */
+  /** `spec.lidParts.R` (Juni: `lidUpperR`): scaled in y about its bbox top by `LidR`. */
   lidR: 3,
-  /** `blushL`, `blushR`: alpha `0.35·Blush` instead of the file's opacity 0. */
+  /** `spec.blushParts` (Juni: `blushL`, `blushR`): alpha `0.35·Blush` instead of the file's opacity 0. */
   blush: 4,
 } as const;
 
+/**
+ * A character's rig: the tables `boneMatrices`, `partMatrix` and the renderer read, built once from its spec by
+ * `createRig`. Every rig is built by that one factory, so every rig has the same object shape (one hidden class).
+ */
 export interface Rig {
-  /** One `Path2D` per part, in `PARTS` order, built once from `PARTS[i].d`. Parts with the same `d` (a mirrored copy and its source) share one. */
+  /** The character. */
+  readonly spec: CharacterSpec;
+  /** Number of bones: `boneMatrices` needs `out.length ≥ boneCount · MAT`. */
+  readonly boneCount: number;
+  /**
+   * One `Path2D` per part, in `PARTS` order, built once from `PARTS[i].d`. Parts with the same `d` (a mirrored copy
+   * and its source) share one. Empty for a rig built with `paths: false`.
+   */
   readonly paths: readonly Path2D[];
   /** `PartKind` per part, in `PARTS` order. */
   readonly kind: Uint8Array;
-  /** The mouth draws right before `PARTS[mouthSlot]` (after the last part of the `muzzle` subtree; `PARTS.length` = after every part). */
+  /**
+   * The mouth draws right before `PARTS[mouthSlot]` (after the last part of the `mouth.afterSubtree` subtree;
+   * `PARTS.length` = after every part); −1 for mouth kind `'parts'`, so the renderer's slot test is never true.
+   */
   readonly mouthSlot: number;
+  /** The mouth's bone (`mouth.bone`), −1 for mouth kind `'parts'`. */
+  readonly jaw: number;
+  /** The stars' bone (`stars.bone`). */
+  readonly head: number;
+  /** Parent bone index per bone, `BONES` order; −1 for the root. */
+  readonly parent: Int32Array;
+  /** Pivot per bone, design units. */
+  readonly pivotX: Float64Array;
+  readonly pivotY: Float64Array;
+  /** Channel of each term, `BONES` order × `TERMS` (rot, tx, ty, sx, sy); −1 = none. */
+  readonly driveCh: Int8Array;
+  /** Gain of each term. */
+  readonly driveK: Float64Array;
+  /**
+   * Per part, `PARTS` order: the sign `IrisConverge` moves a gaze part with in eye-bone x. +1 for the eye whose
+   * bone pivot is left of the mirror axis at rest (`eyeL`), −1 for the one right of it (`eyeR`), 0 for every
+   * other part. So + moves both irises toward the face's centre line (#222).
+   */
+  readonly irisSide: Int8Array;
   /** The preallocated matrix stack: each bone's world matrix in double precision, 6 per bone, `BONES` order. */
   readonly stack: Float64Array;
+  /** The renderer's per-frame scratch: `boneMatrices` output for the frame being drawn. */
+  readonly boneBuf: Float32Array;
 }
-
-/** One term `k · pose[ch]`. */
-type Term = readonly [ch: number, k: number];
-
-/** What drives a bone. Rotation `k·v` rad; translation `k·v` design units in the parent's space; scale `1 + k·v`. */
-interface Drive {
-  readonly rot?: Term;
-  readonly tx?: Term;
-  readonly ty?: Term;
-  readonly sx?: Term;
-  readonly sy?: Term;
-}
-
-/**
- * Issue #75's channel → bone table. `IrisX/Y`, `IrisConverge` and `LidL/R` are part-level (`partMatrix`); `Blush` is
- * the renderer's alpha.
- */
-const DRIVES: Readonly<Record<string, Drive>> = {
-  head: {
-    rot: [Ch.HeadRot, 1],
-    tx: [Ch.HeadX, 1],
-    ty: [Ch.HeadY, 1],
-    sx: [Ch.HeadSquishX, 1],
-    sy: [Ch.HeadSquishY, 1],
-  },
-  neck: { rot: [Ch.HeadTilt, 1] },
-  earL: { rot: [Ch.EarRotL, 1], sy: [Ch.EarFoldL, -0.5] },
-  earR: { rot: [Ch.EarRotR, 1], sy: [Ch.EarFoldR, -0.5] },
-  tuft: { rot: [Ch.TuftRot, 1] },
-  body: { rot: [Ch.BodyLean, 1], sx: [Ch.BodySquash, -0.5], sy: [Ch.BodySquash, 1] },
-  belly: { sx: [Ch.BellyJiggle, 1], sy: [Ch.BellyJiggle, 1] },
-  armL: { rot: [Ch.ArmRotL, 1] },
-  armR: { rot: [Ch.ArmRotR, 1] },
-  footL: { tx: [Ch.FootL, -30] },
-  footR: { tx: [Ch.FootR, 30] },
-  tailA: { rot: [Ch.KerchiefA, 1] },
-  tailB: { rot: [Ch.KerchiefB, 1] },
-  nose: { ty: [Ch.NoseY, 1], sy: [Ch.NoseWrinkle, -0.15] },
-  cheekBlushL: { sx: [Ch.CheekPuff, 1], sy: [Ch.CheekPuff, 1] },
-  cheekBlushR: { sx: [Ch.CheekPuff, 1], sy: [Ch.CheekPuff, 1] },
-  browL: { ty: [Ch.BrowL, -1] },
-  browR: { ty: [Ch.BrowR, -1] },
-};
 
 /** Terms per bone in the compiled tables: rot, tx, ty, sx, sy. */
 const TERMS = 5;
-/** Channel of each term, `BONES` order × TERMS; −1 = none. */
-const DRIVE_CH = new Int8Array(BONE_COUNT * TERMS).fill(-1);
-/** Gain of each term. */
-const DRIVE_K = new Float64Array(BONE_COUNT * TERMS);
-const PARENT = new Int32Array(BONE_COUNT);
-const PIVOT_X = new Float64Array(BONE_COUNT);
-const PIVOT_Y = new Float64Array(BONE_COUNT);
 
-for (let i = 0; i < BONE_COUNT; i++) {
-  const bone = BONES[i]!;
-  if (bone.parent >= i) throw new Error(`BONES must list parents before children: ${bone.id}`);
-  PARENT[i] = bone.parent;
-  PIVOT_X[i] = bone.pivot[0];
-  PIVOT_Y[i] = bone.pivot[1];
-}
-for (const [id, drive] of Object.entries(DRIVES)) {
-  const i = boneIndex(id);
-  const terms = [drive.rot, drive.tx, drive.ty, drive.sx, drive.sy];
-  for (let t = 0; t < TERMS; t++) {
-    const entry = terms[t];
-    if (entry === undefined) continue;
-    DRIVE_CH[i * TERMS + t] = entry[0];
-    DRIVE_K[i * TERMS + t] = entry[1];
-  }
-}
-
-const GAZE_PARTS = ['irisL', 'pupilL', 'highlightL', 'irisR', 'pupilR', 'highlightR'] as const;
-/**
- * Per part, `PARTS` order: the sign `IrisConverge` moves a gaze part with in eye-bone x. +1 for the eye whose
- * bone pivot is left of the mirror axis at rest (`eyeL`), −1 for the one right of it (`eyeR`), 0 for every
- * other part. So + moves both irises toward the face's centre line (#222).
- */
-const IRIS_SIDE = new Int8Array(PARTS.length);
-for (const id of GAZE_PARTS) {
-  const i = partIndex(id);
-  const x = BONES[PARTS[i]!.bone]!.pivot[0];
-  if (x === MIRROR_X / 2) throw new Error(`gaze part ${id}: its eye bone sits on the centre line`);
-  IRIS_SIDE[i] = x < MIRROR_X / 2 ? 1 : -1;
-}
-const BLUSH_PARTS = ['blushL', 'blushR'] as const;
-const LID_L = partIndex('lidUpperL');
-const LID_R = partIndex('lidUpperR');
-const MUZZLE = boneIndex('muzzle');
-
-/** `BONE[id]`, or throws: a missing bone means the art and the rig disagree. */
-export function boneIndex(id: string): number {
-  const i = BONE[id];
-  if (i === undefined) throw new Error(`no bone ${id} in bear-parts.gen.ts`);
+/** `spec.art.BONE[id]`, or throws: a missing bone means the art and the spec disagree. */
+function boneOf(spec: CharacterSpec, id: string): number {
+  const i = spec.art.BONE[id];
+  if (i === undefined) throw new Error(`no bone ${id} in ${spec.id}'s art`);
   return i;
 }
 
-/** `PART[id]`, or throws. */
-export function partIndex(id: string): number {
-  const i = PART[id];
-  if (i === undefined) throw new Error(`no part ${id} in bear-parts.gen.ts`);
+/** `spec.art.PART[id]`, or throws. */
+function partOf(spec: CharacterSpec, id: string): number {
+  const i = spec.art.PART[id];
+  if (i === undefined) throw new Error(`no part ${id} in ${spec.id}'s art`);
   return i;
+}
+
+/** The index of bone `id` in the rig's `BONES`, or throws: a missing bone means the art and the rig disagree. */
+export function boneIndex(rig: Rig, id: string): number {
+  return boneOf(rig.spec, id);
+}
+
+/** The index of part `id` in the rig's `PARTS`, or throws. */
+export function partIndex(rig: Rig, id: string): number {
+  return partOf(rig.spec, id);
 }
 
 /** True if bone `b` is `ancestor` or one of its descendants. */
-function inSubtree(b: number, ancestor: number): boolean {
-  for (let i = b; i >= 0; i = PARENT[i]!) if (i === ancestor) return true;
+function inSubtree(parent: Int32Array, b: number, ancestor: number): boolean {
+  for (let i = b; i >= 0; i = parent[i]!) if (i === ancestor) return true;
   return false;
 }
 
-/** Builds the rig: the `Path2D` objects (once), the part kinds and the matrix stack. Allocates: call it at setup. */
-export function createRig(): Rig {
+/**
+ * Builds `spec`'s rig: the bone and drive tables, the `Path2D` objects (once), the part kinds, the matrix stack and
+ * the renderer's bone buffer. `paths: false` leaves `paths` empty (no `Path2D`, for Node: scripts/gesture-eval.ts);
+ * every other field is built. Allocates: call it at setup.
+ * @throws Error if the spec names a bone or part its art lacks, or the art lists a child before its parent.
+ */
+export function createRig(spec: CharacterSpec, opts?: { paths?: boolean }): Rig {
+  const { BONES, PARTS } = spec.art;
+  const boneCount = BONES.length;
+  const parent = new Int32Array(boneCount);
+  const pivotX = new Float64Array(boneCount);
+  const pivotY = new Float64Array(boneCount);
+  for (let i = 0; i < boneCount; i++) {
+    const bone = BONES[i]!;
+    if (bone.parent >= i) throw new Error(`BONES must list parents before children: ${bone.id}`);
+    parent[i] = bone.parent;
+    pivotX[i] = bone.pivot[0];
+    pivotY[i] = bone.pivot[1];
+  }
+  const driveCh = new Int8Array(boneCount * TERMS).fill(-1);
+  const driveK = new Float64Array(boneCount * TERMS);
+  for (const [id, drive] of Object.entries(spec.drives)) {
+    const i = boneOf(spec, id);
+    const terms = [drive.rot, drive.tx, drive.ty, drive.sx, drive.sy];
+    for (let t = 0; t < TERMS; t++) {
+      const entry = terms[t];
+      if (entry === undefined) continue;
+      driveCh[i * TERMS + t] = entry[0];
+      driveK[i * TERMS + t] = entry[1];
+    }
+  }
+
+  const irisSide = new Int8Array(PARTS.length);
+  for (const id of spec.gazeParts) {
+    const i = partOf(spec, id);
+    const x = BONES[PARTS[i]!.bone]!.pivot[0];
+    if (x === MIRROR_X / 2) throw new Error(`gaze part ${id}: its eye bone sits on the centre line`);
+    irisSide[i] = x < MIRROR_X / 2 ? 1 : -1;
+  }
+
+  const kind = new Uint8Array(PARTS.length);
+  for (const id of spec.gazeParts) kind[partOf(spec, id)] = PartKind.gaze;
+  for (const id of spec.blushParts) kind[partOf(spec, id)] = PartKind.blush;
+  kind[partOf(spec, spec.lidParts.L)] = PartKind.lidL;
+  kind[partOf(spec, spec.lidParts.R)] = PartKind.lidR;
+
+  const mouth = spec.mouth;
+  const after = mouth.kind === 'lips' ? boneOf(spec, mouth.afterSubtree) : -1;
+  const jaw = mouth.kind === 'lips' ? boneOf(spec, mouth.bone) : -1;
+  const head = boneOf(spec, spec.stars.bone);
+
+  const build = opts?.paths ?? true;
   const byD = new Map<string, Path2D>();
   const paths: Path2D[] = [];
-  let mouthSlot = 0;
+  let mouthSlot = mouth.kind === 'lips' ? 0 : -1;
   for (let i = 0; i < PARTS.length; i++) {
     const part = PARTS[i]!;
-    let path = byD.get(part.d);
-    if (path === undefined) {
-      path = new Path2D(part.d);
-      byD.set(part.d, path);
+    if (build) {
+      let path = byD.get(part.d);
+      if (path === undefined) {
+        path = new Path2D(part.d);
+        byD.set(part.d, path);
+      }
+      paths.push(path);
     }
-    paths.push(path);
-    if (inSubtree(part.bone, MUZZLE)) mouthSlot = i + 1;
+    if (after >= 0 && inSubtree(parent, part.bone, after)) mouthSlot = i + 1;
   }
-  const kind = new Uint8Array(PARTS.length);
-  for (const id of GAZE_PARTS) kind[partIndex(id)] = PartKind.gaze;
-  for (const id of BLUSH_PARTS) kind[partIndex(id)] = PartKind.blush;
-  kind[LID_L] = PartKind.lidL;
-  kind[LID_R] = PartKind.lidR;
-  return { paths, kind, mouthSlot, stack: new Float64Array(BONE_COUNT * MAT) };
+
+  return {
+    spec,
+    boneCount,
+    paths,
+    kind,
+    mouthSlot,
+    jaw,
+    head,
+    parent,
+    pivotX,
+    pivotY,
+    driveCh,
+    driveK,
+    irisSide,
+    stack: new Float64Array(boneCount * MAT),
+    boneBuf: new Float32Array(boneCount * MAT),
+  };
 }
 
 /**
@@ -193,24 +216,30 @@ export function createRig(): Rig {
  * in the rig's preallocated matrix stack (`rig.stack`) and copies each result to `out`.
  */
 export function boneMatrices(rig: Rig, pose: Pose, out: Float32Array): Float32Array {
-  if (out.length < BONE_COUNT * MAT) throw new RangeError('boneMatrices: out needs 6 floats per bone');
+  const count = rig.boneCount;
+  if (out.length < count * MAT) throw new RangeError('boneMatrices: out needs 6 floats per bone');
   const w = rig.stack;
-  for (let i = 0; i < BONE_COUNT; i++) {
+  const driveCh = rig.driveCh;
+  const driveK = rig.driveK;
+  const pivotX = rig.pivotX;
+  const pivotY = rig.pivotY;
+  const parent = rig.parent;
+  for (let i = 0; i < count; i++) {
     // Each term is k·pose[ch], or 0 without a channel. Written out, not a helper: a call that TurboFan
     // doesn't inline boxes its double result, which would allocate.
     const t = i * TERMS;
-    let ch = DRIVE_CH[t]!;
-    const rot = ch < 0 ? 0 : DRIVE_K[t]! * pose[ch]!;
-    ch = DRIVE_CH[t + 1]!;
-    const tx = ch < 0 ? 0 : DRIVE_K[t + 1]! * pose[ch]!;
-    ch = DRIVE_CH[t + 2]!;
-    const ty = ch < 0 ? 0 : DRIVE_K[t + 2]! * pose[ch]!;
-    ch = DRIVE_CH[t + 3]!;
-    const sx = ch < 0 ? 1 : 1 + DRIVE_K[t + 3]! * pose[ch]!;
-    ch = DRIVE_CH[t + 4]!;
-    const sy = ch < 0 ? 1 : 1 + DRIVE_K[t + 4]! * pose[ch]!;
-    const px = PIVOT_X[i]!;
-    const py = PIVOT_Y[i]!;
+    let ch = driveCh[t]!;
+    const rot = ch < 0 ? 0 : driveK[t]! * pose[ch]!;
+    ch = driveCh[t + 1]!;
+    const tx = ch < 0 ? 0 : driveK[t + 1]! * pose[ch]!;
+    ch = driveCh[t + 2]!;
+    const ty = ch < 0 ? 0 : driveK[t + 2]! * pose[ch]!;
+    ch = driveCh[t + 3]!;
+    const sx = ch < 0 ? 1 : 1 + driveK[t + 3]! * pose[ch]!;
+    ch = driveCh[t + 4]!;
+    const sy = ch < 0 ? 1 : 1 + driveK[t + 4]! * pose[ch]!;
+    const px = pivotX[i]!;
+    const py = pivotY[i]!;
     const cs = Math.cos(rot);
     const sn = Math.sin(rot);
     // Local = translate(pivot + offset) × rotate × scale × translate(−pivot). `0 − …` keeps zeros positive.
@@ -221,7 +250,7 @@ export function boneMatrices(rig: Rig, pose: Pose, out: Float32Array): Float32Ar
     const e = px + tx - (a * px + c * py);
     const f = py + ty - (b * px + d * py);
     const o = i * MAT;
-    const p = PARENT[i]!;
+    const p = parent[i]!;
     if (p < 0) {
       w[o] = a;
       w[o + 1] = b;
@@ -264,7 +293,7 @@ export function partMatrix(
   out: Float32Array | Float64Array,
   o = 0,
 ): void {
-  const p = PARTS[part]!;
+  const p = rig.spec.art.PARTS[part]!;
   const q = p.bone * MAT;
   let a = bones[q]!;
   let b = bones[q + 1]!;
@@ -274,7 +303,7 @@ export function partMatrix(
   let f = bones[q + 5]!;
   const kind = rig.kind[part]!;
   if (kind === PartKind.gaze) {
-    const ix = pose[Ch.IrisX]! + IRIS_SIDE[part]! * pose[Ch.IrisConverge]!;
+    const ix = pose[Ch.IrisX]! + rig.irisSide[part]! * pose[Ch.IrisConverge]!;
     const iy = pose[Ch.IrisY]!;
     e += a * ix + c * iy;
     f += b * ix + d * iy;

@@ -15,4 +15,12 @@ export type SfxId =
   | 'hi'
   | 'hey'
   | 'whoa'
-  | 'rustle';
+  | 'rustle'
+  // Fenn the duckling (duck plan §4.6)
+  | 'quack'
+  | 'bigQuack'
+  | 'nibble'
+  | 'trill'
+  | 'peep'
+  | 'flap'
+  | 'pat';

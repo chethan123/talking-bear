@@ -32,6 +32,7 @@ const STAGE_KEYS: readonly VoiceStageName[] = [
   'hpfTrim',
   'resample',
   'isVoiced',
+  'duck',
   'applyGain',
   'fades',
   'envelope',
@@ -42,6 +43,7 @@ const STAGE_LABELS: Readonly<Record<VoiceStageName, string>> = {
   hpfTrim: 'hpfTrim',
   resample: 'resample',
   isVoiced: 'isVoiced',
+  duck: 'duck (duck preset only)',
   applyGain: 'applyGain (loudness + ceiling)',
   fades: 'fades',
   envelope: 'envelope',
@@ -102,9 +104,10 @@ root.append(
     {},
     'voice-chain (X-F3, plan §5): processVoice (src/dsp/voice.ts) on synthetic 1, 5 and 10 s clips (400 ms ' +
       'vowel bursts, each followed by 100 ms of pink noise: 20 % noise) at the context rate below, for the ' +
-      'cub, chipmunk and bigbear presets: after an untimed pre-warm, one warm-up call, then 30 timed calls ' +
-      'each, back to back (steady state; the pre-warm log line gives the cold first call). Each voiceStages ' +
-      'function is then timed on its own input, as batch means. Gate: p95 ≤ ' +
+      'cub, chipmunk, bigbear and duck presets: after an untimed pre-warm, one warm-up call, then 30 timed ' +
+      'calls each, back to back (steady state; the pre-warm log line gives the cold first call). Each ' +
+      'voiceStages function that processVoice runs for the preset is then timed on its own input, as batch ' +
+      'means (the duck stage only on the duck rows: — elsewhere). Gate: p95 ≤ ' +
       `${VOICE_BUDGET_MS_PER_S} ms per second of audio (plan §4.10) for every clip and preset. Not part of ` +
       'the 10-min thermal soak.',
   ),

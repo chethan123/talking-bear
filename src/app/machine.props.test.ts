@@ -416,6 +416,7 @@ describe('session reducer properties (plan §4.9.1)', () => {
     let keptByWalk = 0; // injected with a preset equal to the current one
     let changedByWalk = 0;
     let customByWalk = 0; // injected with a Custom preset from the slider's grid
+    let duckByWalk = 0; // injected with the Duckling preset (the named pool is every PRESETS entry)
     property((w) => {
       runWalk(
         w,
@@ -425,6 +426,7 @@ describe('session reducer properties (plan §4.9.1)', () => {
           if (t.next === t.prev) keptByWalk++;
           else changedByWalk++;
           if (t.event.preset.id === 'custom') customByWalk++;
+          if (t.event.preset === PRESETS.duck) duckByWalk++;
           const why = settingsChangedViolation(t.prev, t.event.preset, t.next, t.effects);
           if (why !== null) fail(sim, `P10: ${fmt(t.event)} in ${t.prev.name} ${why}`);
         },
@@ -445,6 +447,7 @@ describe('session reducer properties (plan §4.9.1)', () => {
     expect(keptByWalk).toBeGreaterThan(0);
     expect(changedByWalk).toBeGreaterThan(0);
     expect(customByWalk).toBeGreaterThan(0);
+    expect(duckByWalk).toBeGreaterThan(0);
     expect([...probedIn].toSorted()).toEqual(Object.keys(TABLE).toSorted());
   });
 

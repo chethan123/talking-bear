@@ -51,6 +51,11 @@
  * channels only when asked (`mouth`, #221): bear-view lets a reaction clip's mouth tracks through while not talking.
  * `clipByName` hands bear-view the clip behind `clip.name`, whose spring kicks (`impulses`) it applies (#221).
  *
+ * **Cast** (duck plan §4.1). The clips and the escalation targets are the character's, a `DirectorCast` that
+ * `directorStep`, `directorReduce`, `evaluate`, `evaluateFrom` and `clipByName` take as their last argument (bear-view
+ * passes its character's `cast`, built once by `createDirectorCast`). The director keeps no character state of its
+ * own: the same state machine plays every character. Passing the cast per call allocates nothing.
+ *
  * **Reactions** (plan §3.5, issue #91). A `gesture` input carries the reaction `reactionFor` (#90) found:
  * - **Gates:** ignored in Asleep and Waking; in Dozing it moves to Idle first.
  * - **Refresh:** the same reaction name as the held Sustained reaction refreshes it, bypassing the cooldown:
@@ -98,8 +103,6 @@ import { BASE } from './base-poses.ts';
 import type { BaseName } from './base-poses.ts';
 import { sampleClip } from './clip.ts';
 import type { Clip } from './clip.ts';
-import { MIME_CLIPS, REACTION_CLIPS } from './clips/reactions.ts';
-import { SESSION_CLIPS } from './clips/session.ts';
 import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
 
@@ -305,25 +308,49 @@ function mirrored(c: Clip): Clip {
   };
 }
 
-const PET_MIRRORED: Clip = mirrored(REACTION_CLIPS.pet);
-/** The clips with a mirrored variant, by name: played for a stroke with `dirX` −1. */
-const MIRRORED: ReadonlyMap<string, string> = new Map([[REACTION_CLIPS.pet.name, PET_MIRRORED.name]]);
-
-/** The clips the director plays, by name: session, reaction and mime (#115), the flinch and the mirrored pet. */
-const CLIPS: ReadonlyMap<string, Clip> = new Map<string, Clip>([
-  ...Object.entries(SESSION_CLIPS),
-  ...Object.entries(REACTION_CLIPS),
-  ...Object.entries(MIME_CLIPS),
-  [FLINCH.name, FLINCH],
-  [PET_MIRRORED.name, PET_MIRRORED],
-]);
+/** The clip with a mirrored variant (#89 hand-off): the pet, played mirrored for a leftward stroke. */
+const MIRRORED_CLIP = 'pet';
 
 /**
- * The clip the director plays under `name` (a `clip.name` or `prevClip.name`): a session, reaction or mime clip, the
- * flinch or the mirrored pet; undefined for a name it doesn't know. bear-view applies its `impulses` (#221).
+ * A character's clips and reactions as the director reads them (duck plan §4.1). Every exported function that plays
+ * a clip or escalates a reaction takes it as its last argument; a character builds it once (`createDirectorCast`).
  */
-export function clipByName(name: string): Clip | undefined {
-  return CLIPS.get(name);
+export interface DirectorCast {
+  /** The clips the director plays, by name: the character's clip sets, the flinch and the mirrored pet. */
+  readonly clips: ReadonlyMap<string, Clip>;
+  /** The clips with a mirrored variant, by name: played for a stroke with `dirX` −1 (today: pet → petMirrored). */
+  readonly mirrored: ReadonlyMap<string, string>;
+  /** The escalation targets, by name (`Escalation.to`). */
+  readonly reactions: Readonly<Record<string, Reaction>>;
+}
+
+/**
+ * The cast of `clipSets` (later sets override earlier names; Juni: session, reaction and mime clips, #115) and
+ * `reactions`, plus the flinch and, when a set has a `pet`, the mirrored pet. Allocates; setup only.
+ */
+export function createDirectorCast(
+  clipSets: readonly Readonly<Record<string, Clip>>[],
+  reactions: Readonly<Record<string, Reaction>>,
+): DirectorCast {
+  const clips = new Map<string, Clip>();
+  for (const set of clipSets) for (const [name, c] of Object.entries(set)) clips.set(name, c);
+  clips.set(FLINCH.name, FLINCH);
+  const mirroredNames = new Map<string, string>();
+  const pet = clips.get(MIRRORED_CLIP);
+  if (pet !== undefined) {
+    const m = mirrored(pet);
+    clips.set(m.name, m);
+    mirroredNames.set(pet.name, m.name);
+  }
+  return Object.freeze({ clips, mirrored: mirroredNames, reactions });
+}
+
+/**
+ * The clip the director plays under `name` (a `clip.name` or `prevClip.name`) in `cast`: one of its clip sets' clips,
+ * the flinch or the mirrored pet; undefined for a name it doesn't know. bear-view applies its `impulses` (#221).
+ */
+export function clipByName(name: string, cast: DirectorCast): Clip | undefined {
+  return cast.clips.get(name);
 }
 
 /** Scratch pose for the clip sample in `evaluate`, allocated once so `evaluate` never allocates. */
@@ -357,6 +384,7 @@ type Handler<K extends AnimKind = AnimKind> = (
   s: DirectorState,
   ev: EventOf<K>,
   now: number,
+  cast: DirectorCast,
 ) => DirectorState;
 type Row = { readonly [K in AnimKind]: Handler<K> | 'ignore' };
 /** Where a step's outputs go; null when the caller (`directorReduce`) drops them. */
@@ -377,8 +405,8 @@ const TICK_NOW = new Float64Array(1);
  * it every substep, so the end goes through a slot rather than a return value, which V8's mid tier boxes as a new
  * heap number at a call it doesn't inline (#229).
  */
-function writeClipEnd(s: DirectorState, clip: { name: string; start: number }): void {
-  const c = CLIPS.get(clip.name);
+function writeClipEnd(s: DirectorState, clip: { name: string; start: number }, cast: DirectorCast): void {
+  const c = cast.clips.get(clip.name);
   if (c === undefined) {
     END[0] = clip.start;
     return;
@@ -398,8 +426,8 @@ function writeClipEnd(s: DirectorState, clip: { name: string; start: number }): 
 }
 
 /** End of `clip` on the director clock (`writeClipEnd`), for the event paths. */
-function clipEnd(s: DirectorState, clip: { name: string; start: number }): number {
-  writeClipEnd(s, clip);
+function clipEnd(s: DirectorState, clip: { name: string; start: number }, cast: DirectorCast): number {
+  writeClipEnd(s, clip, cast);
   return END[0]!;
 }
 
@@ -434,7 +462,7 @@ function enter(s: DirectorState, to: DirState, now: number, clip = keptClip(s)):
 
 // ---- handlers ------------------------------------------------------------------------------------------
 /** A handler that ignores the event's fields. */
-type Transition = (s: DirectorState, _ev: unknown, now: number) => DirectorState;
+type Transition = (s: DirectorState, _ev: unknown, now: number, cast: DirectorCast) => DirectorState;
 
 /** `s` without its reaction and queue: `wake` and `sleep` end every reaction. */
 const calm = (s: DirectorState): DirectorState =>
@@ -446,10 +474,10 @@ const toAsleep: Transition = (s, _ev, now) => enter(calm(s), 'Asleep', now, clip
  * To Idle, or to the reaction going on there: a reaction handed to the session while Talking (queued,
  * announced) starts at `talkEnd`; an active reaction (additive until now) becomes Reacting or Sustained.
  */
-const toIdle: Transition = (s, _ev, now) => {
+const toIdle: Transition = (s, _ev, now, cast) => {
   const idle = enter(s, 'Idle', now);
   const q = idle.queued;
-  if (q !== null && q.announced && now <= q.at + QUEUE_S) return startQueued(idle, q, now, null);
+  if (q !== null && q.announced && now <= q.at + QUEUE_S) return startQueued(idle, q, now, null, cast);
   const a = idle.reaction;
   return a === null ? idle : { ...idle, name: a.r.sustained ? 'Sustained' : 'Reacting' };
 };
@@ -478,8 +506,9 @@ const additive = (
   s: DirectorState,
   ev: { e: 'confused' | 'earTwitch' | 'shrug' },
   now: number,
+  cast: DirectorCast,
 ): DirectorState =>
-  s.reaction !== null || (s.clip !== null && now < clipEnd(s, s.clip))
+  s.reaction !== null || (s.clip !== null && now < clipEnd(s, s.clip, cast))
     ? s
     : { ...s, clip: clipAt(ev.e, now) };
 
@@ -636,14 +665,14 @@ function toSession(out: Out, r: Reaction, sfx: SfxId): void {
 }
 
 /** The clip `r` plays: its gentle clip in Gentle mode, the mirrored variant for a leftward stroke. */
-function clipFor(r: Reaction, gentle: boolean, dirX: -1 | 1 | null): string {
+function clipFor(r: Reaction, gentle: boolean, dirX: -1 | 1 | null, cast: DirectorCast): string {
   const name = gentle && r.gentleClip !== undefined ? r.gentleClip : r.clip;
-  return dirX === -1 ? (MIRRORED.get(name) ?? name) : name;
+  return dirX === -1 ? (cast.mirrored.get(name) ?? name) : name;
 }
 
 /** The escalation target, or null: unknown, or in Gentle mode without a gentle clip (the base plays). */
-function escalationTarget(esc: Escalation, gentle: boolean): Reaction | null {
-  const to = REACTIONS[esc.to];
+function escalationTarget(esc: Escalation, gentle: boolean, cast: DirectorCast): Reaction | null {
+  const to = cast.reactions[esc.to];
   if (to === undefined || (gentle && to.gentleClip === undefined)) return null;
   return to;
 }
@@ -687,11 +716,11 @@ function withRepeat(repeats: readonly Repeat[], r: Reaction, now: number): reado
 }
 
 /** Whether a reaction is over at `now`: a one-shot at its clip end, a released one 400 ms after its release. */
-function isOver(s: DirectorState, a: ActiveReaction, now: number): boolean {
+function isOver(s: DirectorState, a: ActiveReaction, now: number, cast: DirectorCast): boolean {
   if (a.release !== null) return now >= a.release + RELEASE_S;
   if (a.r.sustained) return false;
   const c = s.clip;
-  return c === null || c.name !== a.clip || now >= clipEnd(s, c);
+  return c === null || c.name !== a.clip || now >= clipEnd(s, c, cast);
 }
 
 /**
@@ -709,10 +738,11 @@ function start(
   now: number,
   out: Out,
   announced: boolean,
+  cast: DirectorCast,
 ): DirectorState {
   const quiet = announced || region === null || gesture === null;
   if (!quiet) accept(out, r, r.sfx);
-  const clipName = clipFor(r, s.gentle, dirX);
+  const clipName = clipFor(r, s.gentle, dirX, cast);
   const clip = clipAt(clipName, now);
   const next: DirectorState = {
     ...s,
@@ -725,8 +755,14 @@ function start(
 }
 
 /** Starts the queued reaction `q` (and empties the queue). */
-function startQueued(s: DirectorState, q: QueuedReaction, now: number, out: Out): DirectorState {
-  return start({ ...s, queued: null }, q.r, q.region, q.gesture, q.dirX, now, out, q.announced);
+function startQueued(
+  s: DirectorState,
+  q: QueuedReaction,
+  now: number,
+  out: Out,
+  cast: DirectorCast,
+): DirectorState {
+  return start({ ...s, queued: null }, q.r, q.region, q.gesture, q.dirX, now, out, q.announced, cast);
 }
 
 /**
@@ -734,19 +770,31 @@ function startQueued(s: DirectorState, q: QueuedReaction, now: number, out: Out)
  * Reacting and Sustained go to Idle. While Talking nothing starts: an announced reaction waits for `talkEnd`, and
  * one queued behind the reaction that just ended (unannounced, the session never had it) is dropped.
  */
-function endReaction(s: DirectorState, a: ActiveReaction, now: number, out: Out): DirectorState {
+function endReaction(
+  s: DirectorState,
+  a: ActiveReaction,
+  now: number,
+  out: Out,
+  cast: DirectorCast,
+): DirectorState {
   const clip = s.clip !== null && s.clip.name === a.clip ? null : s.clip;
   const q = s.queued;
   const talking = s.name === 'Talking';
   if (q !== null && !talking && now <= q.at + QUEUE_S)
-    return startQueued({ ...s, reaction: null, clip }, q, now, out);
+    return startQueued({ ...s, reaction: null, clip }, q, now, out, cast);
   const kept = talking && q !== null && q.announced ? q : null;
   const cleared: DirectorState = { ...s, reaction: null, clip, queued: kept };
   return s.name === 'Reacting' || s.name === 'Sustained' ? enter(cleared, 'Idle', now, clip) : cleared;
 }
 
 /** A refresh of the held reaction `a` by the same reaction (see the module comment). */
-function refresh(s: DirectorState, a: ActiveReaction, i: GestureInput, out: Out): DirectorState {
+function refresh(
+  s: DirectorState,
+  a: ActiveReaction,
+  i: GestureInput,
+  out: Out,
+  cast: DirectorCast,
+): DirectorState {
   const now = i.now;
   const talking = s.name === 'Talking';
   const esc = a.r.escalation;
@@ -754,12 +802,12 @@ function refresh(s: DirectorState, a: ActiveReaction, i: GestureInput, out: Out)
   if (esc !== undefined && esc.continuousMs !== undefined) {
     if (esc.maxGapMs !== undefined && now > a.last + esc.maxGapMs / 1000) runStart = now;
     if (!talking && now > runStart + esc.continuousMs / 1000) {
-      const to = escalationTarget(esc, s.gentle);
-      if (to !== null) return start(s, to, i.region, i.gesture, i.dirX ?? null, now, out, false);
+      const to = escalationTarget(esc, s.gentle, cast);
+      if (to !== null) return start(s, to, i.region, i.gesture, i.dirX ?? null, now, out, false, cast);
     }
   }
   let clip = s.clip;
-  const def = CLIPS.get(a.clip);
+  const def = cast.clips.get(a.clip);
   if (
     def !== undefined &&
     (clip === null || clip.name !== a.clip || (def.sustained !== true && now >= clip.start + def.duration))
@@ -795,13 +843,13 @@ function withQueued(s: DirectorState, q: QueuedReaction): DirectorState {
 }
 
 /** A gesture's reaction (see the module comment for the rules, in this order). */
-function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState {
+function onGesture(s0: DirectorState, i: GestureInput, out: Out, cast: DirectorCast): DirectorState {
   if (s0.name === 'Asleep' || s0.name === 'Waking') return s0;
   const now = i.now;
   const s = s0.name === 'Dozing' ? enter(s0, 'Idle', now) : s0;
-  const live = s.reaction !== null && !isOver(s, s.reaction, now) ? s.reaction : null;
+  const live = s.reaction !== null && !isOver(s, s.reaction, now, cast) ? s.reaction : null;
   if (live !== null && live.release === null && live.r.sustained && live.r.name === i.r.name)
-    return refresh(s, live, i, out);
+    return refresh(s, live, i, out, cast);
   if (cooledDown(s, i)) return s;
   const dirX = i.dirX ?? null;
   let r = i.r;
@@ -810,7 +858,7 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
   if (isRepeat(esc)) {
     let n = 1;
     for (const e of repeats) if (e.name === r.name && now <= e.at + e.within) n++;
-    const to = n >= (esc.count ?? REPEAT_COUNT) ? escalationTarget(esc, s.gentle) : null;
+    const to = n >= (esc.count ?? REPEAT_COUNT) ? escalationTarget(esc, s.gentle, cast) : null;
     if (to !== null) {
       const from = r.name;
       repeats = repeats.filter((e) => e.name !== from);
@@ -825,7 +873,7 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
     const counted = withRepeat(st.repeats, r, now);
     if (r.priority < STOPS_PLAYBACK) {
       accept(out, r, null);
-      const free = st.clip === null || now >= clipEnd(st, st.clip);
+      const free = st.clip === null || now >= clipEnd(st, st.clip, cast);
       return { ...st, cooldowns, repeats: counted, clip: free ? clipAt(FLINCH.name, now) : st.clip };
     }
     accept(out, r, r.sfx);
@@ -834,14 +882,14 @@ function onGesture(s0: DirectorState, i: GestureInput, out: Out): DirectorState 
   }
   if (live !== null && r.priority < live.r.priority)
     return withQueued(st, { r, region: i.region, gesture: i.gesture, dirX, at: now, announced: false });
-  return start(st, r, i.region, i.gesture, dirX, now, out, false);
+  return start(st, r, i.region, i.gesture, dirX, now, out, false, cast);
 }
 
 /** The reaction a `clip` input plays (#115): P2, one-shot, silent; with its `<name>Gentle` clip when there is one. */
-function clipReaction(name: string): Reaction {
+function clipReaction(name: string, cast: DirectorCast): Reaction {
   const r: Reaction = { name, priority: CLIP_PRIORITY, sfx: null, clip: name, sustained: false };
   const gentle = `${name}Gentle`;
-  if (CLIPS.has(gentle)) r.gentleClip = gentle;
+  if (cast.clips.has(gentle)) r.gentleClip = gentle;
   return r;
 }
 
@@ -849,21 +897,21 @@ function clipReaction(name: string): Reaction {
  * A `clip` input (#115; the module comment has the rules): gated like a gesture, then a flinch while Talking, queued
  * behind a higher priority, otherwise started; `start` keeps it quiet (no gesture), so nothing reaches `out`.
  */
-function onClip(s0: DirectorState, i: ClipInput, out: Out): DirectorState {
-  if (s0.name === 'Asleep' || s0.name === 'Waking' || !CLIPS.has(i.name)) return s0;
+function onClip(s0: DirectorState, i: ClipInput, out: Out, cast: DirectorCast): DirectorState {
+  if (s0.name === 'Asleep' || s0.name === 'Waking' || !cast.clips.has(i.name)) return s0;
   const now = i.now;
   const s = s0.name === 'Dozing' ? enter(s0, 'Idle', now) : s0;
   if (s.name === 'Talking') {
-    const free = s.clip === null || now >= clipEnd(s, s.clip);
+    const free = s.clip === null || now >= clipEnd(s, s.clip, cast);
     return free ? { ...s, clip: clipAt(FLINCH.name, now) } : s;
   }
-  const r = clipReaction(i.name);
-  const live = s.reaction !== null && !isOver(s, s.reaction, now) ? s.reaction : null;
+  const r = clipReaction(i.name, cast);
+  const live = s.reaction !== null && !isOver(s, s.reaction, now, cast) ? s.reaction : null;
   if (live !== null && r.priority < live.r.priority)
     return withQueued(s, { r, region: null, gesture: null, dirX: null, at: now, announced: false });
-  return playsFrom(s, i.name, clipFor(r, s.gentle, null), now)
+  return playsFrom(s, i.name, clipFor(r, s.gentle, null, cast), now)
     ? s
-    : start(s, r, null, null, null, now, out, false);
+    : start(s, r, null, null, null, now, out, false, cast);
 }
 
 /**
@@ -919,7 +967,7 @@ function release(s: DirectorState, i: ReleaseInput, out: Out): DirectorState {
  * call either: the clip end comes back through `END`, `isOver` is written out, and the time reaches `crossfade`
  * through `TICK_NOW` (#229).
  */
-function tick(s: DirectorState, i: { readonly now: number }, out: Out): DirectorState {
+function tick(s: DirectorState, i: { readonly now: number }, out: Out, cast: DirectorCast): DirectorState {
   const now = i.now;
   TICK_NOW[0] = now;
   if (now - now !== 0) return s;
@@ -932,17 +980,17 @@ function tick(s: DirectorState, i: { readonly now: number }, out: Out): Director
       const c = s.clip;
       if (c === null || c.name !== a.clip) over = true;
       else {
-        writeClipEnd(s, c);
+        writeClipEnd(s, c, cast);
         over = now >= END[0]!;
       }
     }
-    if (over) return endReaction(s, a, now, out);
+    if (over) return endReaction(s, a, now, out, cast);
   }
   const q = s.queued;
   if (q !== null && now > q.at + QUEUE_S) return { ...s, queued: null };
   const c = s.clip;
   if (c !== null) {
-    writeClipEnd(s, c);
+    writeClipEnd(s, c, cast);
     if (now < END[0]!) return s;
   }
   if (s.name === 'Waking') return enter(s, 'Idle', now, null);
@@ -954,22 +1002,22 @@ function tick(s: DirectorState, i: { readonly now: number }, out: Out): Director
  * gesture, release or clip at a non-finite time changes nothing (a NaN release would otherwise never end; `tick`
  * checks its own).
  */
-function step(s: DirectorState, i: DirInput, out: Out): DirectorState {
+function step(s: DirectorState, i: DirInput, out: Out, cast: DirectorCast): DirectorState {
   if ((i.k === 'gesture' || i.k === 'release' || i.k === 'clip') && i.now - i.now !== 0) return s;
   switch (i.k) {
     case 'tick':
-      return tick(s, i, out);
+      return tick(s, i, out, cast);
     case 'anim': {
       if (!KINDS.has(i.ev.e)) return s;
       const handler = handlerFor(s.name, i.ev.e);
-      return handler === 'ignore' ? s : handler(s, i.ev, i.now);
+      return handler === 'ignore' ? s : handler(s, i.ev, i.now, cast);
     }
     case 'gesture':
-      return onGesture(s, i, out);
+      return onGesture(s, i, out, cast);
     case 'release':
       return release(s, i, out);
     case 'clip':
-      return onClip(s, i, out);
+      return onClip(s, i, out, cast);
     case 'setGentle':
       return s.gentle === i.on ? s : { ...s, gentle: i.on };
     default:
@@ -1074,22 +1122,22 @@ function poseJump(a: Pose, b: Pose): number {
  * Otherwise it returns `next` itself. A step that changes nothing, with no `prevClip`, returns at the first line
  * and reads no time (the frame's quiet tick, #229). The expiry reads a tick's time from `TICK_NOW`, not `i.now`.
  */
-function crossfade(s: DirectorState, next: DirectorState, i: DirInput): DirectorState {
+function crossfade(s: DirectorState, next: DirectorState, i: DirInput, cast: DirectorCast): DirectorState {
   if (next === s && s.prevClip === null) return s;
   if (i.k === 'setGentle') return next;
   if (next.clip === null) return next.prevClip === null ? next : { ...next, prevClip: null };
   const old = s.clip;
   const cur = next.clip;
-  if (old !== null && (cur.name !== old.name || cur.start !== old.start) && i.now < clipEnd(s, old)) {
+  if (old !== null && (cur.name !== old.name || cur.start !== old.start) && i.now < clipEnd(s, old, cast)) {
     const a = s.reaction;
     const releasedAt = a !== null && a.release !== null && a.clip === old.name ? a.release : null;
     const now = i.now;
     const cut = { ...next, prevClip: cutClip(old.name, old.start, now, releasedAt) };
     const q = s.prevClip;
     if (q === null || now >= q.cutAt + CUT_S) return cut;
-    evaluate(s, now, CUT_FROM);
-    const keepJump = poseJump(evaluate(next, now, CUT_KEEP), CUT_FROM);
-    return keepJump <= poseJump(evaluate(cut, now, CUT_NEW), CUT_FROM) ? next : cut;
+    evaluate(s, now, CUT_FROM, false, cast);
+    const keepJump = poseJump(evaluate(next, now, CUT_KEEP, false, cast), CUT_FROM);
+    return keepJump <= poseJump(evaluate(cut, now, CUT_NEW, false, cast), CUT_FROM) ? next : cut;
   }
   // A tick's time is `TICK_NOW[0]`: `tick` has just written it (directorStep and directorReduce run it first).
   const p = next.prevClip;
@@ -1107,9 +1155,9 @@ let quiet: DirStep = Object.freeze({ state: initialDirector(0), out: NO_OUT });
  * Pure: it never mutates `s` and returns `s` itself as the state when nothing changes. A step without
  * outputs returns a frozen result that is shared while its state is the same object.
  */
-export function directorStep(s: DirectorState, i: DirInput): DirStep {
+export function directorStep(s: DirectorState, i: DirInput, cast: DirectorCast): DirStep {
   SCRATCH.length = 0;
-  const state = crossfade(s, step(s, i, SCRATCH), i);
+  const state = crossfade(s, step(s, i, SCRATCH, cast), i, cast);
   if (SCRATCH.length === 0) {
     if (quiet.state !== state) quiet = Object.freeze({ state, out: NO_OUT });
     return quiet;
@@ -1118,8 +1166,8 @@ export function directorStep(s: DirectorState, i: DirInput): DirStep {
 }
 
 /** The director reducer: `directorStep(s, i).state`, without collecting the outputs. */
-export function directorReduce(s: DirectorState, i: DirInput): DirectorState {
-  return crossfade(s, i.k === 'tick' ? tick(s, i, null) : step(s, i, null), i);
+export function directorReduce(s: DirectorState, i: DirInput, cast: DirectorCast): DirectorState {
+  return crossfade(s, i.k === 'tick' ? tick(s, i, null, cast) : step(s, i, null, cast), i, cast);
 }
 
 /** `evaluate`'s time, for `evaluateFrom`. */
@@ -1139,9 +1187,9 @@ const EVAL_NOW = new Float64Array(1);
  * layer owns them while talking.
  * Never allocates.
  */
-export function evaluate(s: DirectorState, now: number, out: Pose, mouth = false): Pose {
+export function evaluate(s: DirectorState, now: number, out: Pose, mouth: boolean, cast: DirectorCast): Pose {
   EVAL_NOW[0] = now;
-  return evaluateFrom(s, EVAL_NOW, 0, out, mouth);
+  return evaluateFrom(s, EVAL_NOW, 0, out, mouth, cast);
 }
 
 /**
@@ -1154,7 +1202,8 @@ export function evaluateFrom(
   clock: Readonly<Float64Array>,
   at: number,
   out: Pose,
-  mouth = false,
+  mouth: boolean,
+  cast: DirectorCast,
 ): Pose {
   const now = clock[at]!;
   const a = BASE[s.prevBase];
@@ -1168,7 +1217,7 @@ export function evaluateFrom(
   let wp = 1;
   const playing = s.clip;
   if (playing !== null) {
-    const c = CLIPS.get(playing.name);
+    const c = cast.clips.get(playing.name);
     if (c !== undefined) {
       sampleClip(c, now - playing.start, CLIP_DELTA);
       withClip = true;
@@ -1180,7 +1229,7 @@ export function evaluateFrom(
       const p = s.prevClip;
       if (p !== null) {
         const u = (now - p.cutAt) / CUT_S;
-        const pc = u < 1 ? CLIPS.get(p.name) : undefined;
+        const pc = u < 1 ? cast.clips.get(p.name) : undefined;
         if (pc !== undefined) {
           sampleClip(pc, now - p.start, PREV_DELTA);
           k = u > 0 ? 1 - u * u * (3 - 2 * u) : 1;

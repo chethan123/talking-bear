@@ -20,7 +20,7 @@
     "typecheck": "tsc -b",
     "test": "vitest run --project node --project worklet",
     "test:coverage": "vitest run --project node --project worklet --coverage",
-    "test:browser": "vitest run --project browser src/anim/frame-alloc.browser.test.ts && vitest run --project browser --exclude src/anim/frame-alloc.browser.test.ts",
+    "test:browser": "vitest run --project browser src/anim/frame-alloc.browser.test.ts && vitest run --project browser src/anim/frame-alloc-fenn.browser.test.ts && vitest run --project browser --exclude src/anim/frame-alloc.browser.test.ts --exclude src/anim/frame-alloc-fenn.browser.test.ts",
     "e2e": "pnpm build:e2e && playwright test",
     "fixtures": "node scripts/gen-fixtures.ts",
     "corpus": "node scripts/gen-corpus.ts",

@@ -62,8 +62,11 @@ import { afterEach, expect, test } from 'vitest';
 import type { OutputClockCtx } from '../audio/output-clock.ts';
 import type { Envelope } from '../dsp/types.ts';
 import { mountBearView } from './bear-view.ts';
+import { JUNI } from '../characters/juni.ts';
 import type { Gesture } from '../input/recognizer.ts';
 import type { BearView } from './bear-view.ts';
+import { FENN } from '../characters/fenn.ts';
+import { characterThumbnail } from '../ui/character-switch.ts';
 import { Ch } from './pose.ts';
 
 /** One 60 Hz vsync, in ms. */
@@ -247,8 +250,13 @@ test(
       requestFrame: viewFrames.request,
       cancelFrame: viewFrames.cancel,
       perfNow: () => 0,
+      character: JUNI,
     });
     views.push(view);
+    // The app's mixed state (T126): its swap button draws the other character's head once, through the same rig and
+    // renderer code, right after the stage is mounted, so the frame below runs where both rigs have been rendered in
+    // this isolate.
+    characterThumbnail(FENN);
     view.onAnim({ e: 'idle' });
     // Phase 0 (#281): the session's first reaction, hardBlinkL (which also bumps `annoy`), over before talking starts.
     view.gesture(EYE_TAP);

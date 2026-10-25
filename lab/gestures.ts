@@ -11,12 +11,13 @@
 
 import { createContext, DESIGN_HEIGHT, DESIGN_WIDTH, fitView, render } from '../src/anim/renderer.ts';
 import { POSES } from '../src/anim/poses.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from '../src/anim/rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT } from '../src/anim/rig.ts';
+import { CHARACTERS } from '../src/characters/index.ts';
 import { attachPointerAdapter } from '../src/input/pointer-adapter.ts';
 import { initialRecState, recognize } from '../src/input/recognizer.ts';
 import type { Gesture, PointerSample, RecState } from '../src/input/recognizer.ts';
 import type { RegionId } from '../src/input/region-ids.ts';
-import { hitTest, REGIONS } from '../src/input/regions.ts';
+import { compileRegions, hitTest } from '../src/input/regions.ts';
 import { el, fmt, logPanel } from './common.ts';
 
 /** A trial lasts from its first down until this long after its last up or cancel (a down before then continues it). */
@@ -121,11 +122,12 @@ canvas.width = cssWidth;
 canvas.height = cssHeight;
 
 const g = createContext(canvas);
-const rig = createRig();
-const bones = boneMatrices(rig, POSES.neutral, new Float32Array(BONE_COUNT * MAT));
+const rig = createRig(CHARACTERS.juni);
+const table = compileRegions(rig);
+const bones = boneMatrices(rig, POSES.neutral, new Float32Array(rig.boneCount * MAT));
 /** Design units → canvas px, which are CSS px here: the renderer's view and the hit test's are the same. */
 const view = fitView(cssWidth, cssHeight, { scale: 0, ox: 0, oy: 0 });
-const hit = (x: number, y: number): RegionId => hitTest(x, y, bones, view);
+const hit = (x: number, y: number): RegionId => hitTest(x, y, bones, view, table);
 
 /** Draws the neutral bear and outlines `regions` (dashed, in their bones' space through the view). */
 function draw(regions: readonly RegionId[]): void {
@@ -135,9 +137,9 @@ function draw(regions: readonly RegionId[]): void {
   g.lineWidth = OUTLINE_PX;
   g.setLineDash(OUTLINE_DASH);
   g.strokeStyle = OUTLINE_COLOR;
-  for (const r of REGIONS) {
+  for (const r of rig.spec.regions) {
     if (!regions.includes(r.id)) continue;
-    const o = boneIndex(r.bone) * MAT;
+    const o = boneIndex(rig, r.bone) * MAT;
     // The path is built under view × bone, then stroked in canvas px so the line keeps its width.
     g.setTransform(
       s * bones[o]!,

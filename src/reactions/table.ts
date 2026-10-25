@@ -52,16 +52,16 @@ export interface Reaction {
 const BIG_SNEEZE_COUNT = 3;
 
 /** Haptic patterns (plan §4.6.3; issue #90): a poke, a tickle or giggle, a purr. Shared and frozen. */
-const HAPTIC_TAP: number[] = [12];
-const HAPTIC_TICKLE: number[] = [8, 40, 8, 40, 8];
-const HAPTIC_PURR: number[] = [15, 35, 15, 35, 15, 35];
+export const HAPTIC_TAP: number[] = [12];
+export const HAPTIC_TICKLE: number[] = [8, 40, 8, 40, 8];
+export const HAPTIC_PURR: number[] = [15, 35, 15, 35, 15, 35];
 Object.freeze(HAPTIC_TAP);
 Object.freeze(HAPTIC_TICKLE);
 Object.freeze(HAPTIC_PURR);
 
 /** Mood steps (issue #90): delight for pet, giggle and hug; mild grumpiness for againstFur and hardBlink. */
-const JOY: { joy: number } = { joy: 0.2 };
-const ANNOY: { annoy: number } = { annoy: 0.2 };
+export const JOY: { joy: number } = { joy: 0.2 };
+export const ANNOY: { annoy: number } = { annoy: 0.2 };
 Object.freeze(JOY);
 Object.freeze(ANNOY);
 

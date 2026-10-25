@@ -35,9 +35,10 @@ export const SACCADE_MIN = 1.5;
 export const SACCADE_MAX = 4;
 /** Time constant of the iris moving to a new target, in seconds. */
 export const IRIS_TAU = 0.015;
-/** Midpoint between the eyes (plan §4.6.5: eyes at (405/595, 385)), in design units. */
-export const EYES_CENTER: Readonly<LookAt> = { x: 500, y: 385 };
-/** Distance from `EYES_CENTER`, in design units, at which a `lookAt` point turns the iris fully. */
+/**
+ * Distance from the eyes' centre (the `eyesCenter` of `createGaze`, the character's `spec.eyesCenter`), in design
+ * units, at which a `lookAt` point turns the iris fully.
+ */
 export const LOOK_SATURATE = 200;
 
 /** SpringBank indices of the head-follow springs. */
@@ -60,6 +61,11 @@ function checkIndex(i: number, name: string): void {
   if (!Number.isInteger(i) || i < 0) throw new RangeError(`${name} must be an integer >= 0`);
 }
 
+/** Throws a RangeError unless both coordinates of the eyes' centre are finite. */
+export function checkCenter(c: Readonly<LookAt>): void {
+  if (!Number.isFinite(c.x) || !Number.isFinite(c.y)) throw new RangeError('eyesCenter must be finite');
+}
+
 // The doubles kept between updates live in a `Float64Array`, one slot each: V8's mid tier boxes a double written to
 // a class field as a new heap number on every write (#214).
 /** Seconds until the next saccade. */
@@ -72,21 +78,27 @@ const TY = 3;
 /** Current iris offset. */
 const IX = 4;
 const IY = 5;
+/** The midpoint between the eyes, design units (`createGaze`'s `eyesCenter`). */
+const CX = 6;
+const CY = 7;
 
 class Gaze implements GazeLayer {
   readonly #rot: number;
   readonly #tilt: number;
   #primed = false;
   /** The doubles kept between updates, by slot. */
-  readonly #s = new Float64Array(6);
+  readonly #s = new Float64Array(8);
   #count = 0;
 
-  constructor(springs: GazeSprings) {
+  constructor(springs: GazeSprings, eyesCenter: Readonly<LookAt>) {
     checkIndex(springs.headRot, 'headRot');
     checkIndex(springs.headTilt, 'headTilt');
+    checkCenter(eyesCenter);
     this.#rot = springs.headRot;
     this.#tilt = springs.headTilt;
     this.#s[SINCE] = Number.POSITIVE_INFINITY;
+    this.#s[CX] = eyesCenter.x;
+    this.#s[CY] = eyesCenter.y;
   }
 
   get count(): number {
@@ -139,8 +151,8 @@ class Gaze implements GazeLayer {
       const ly = look.y;
       if (lx - lx === 0 && ly - ly === 0) {
         // Toward the point: full offset at LOOK_SATURATE or farther, proportional closer in.
-        const dx = lx - EYES_CENTER.x;
-        const dy = ly - EYES_CENTER.y;
+        const dx = lx - st[CX]!;
+        const dy = ly - st[CY]!;
         const d = Math.sqrt(dx * dx + dy * dy);
         const near = d / LOOK_SATURATE;
         const s = d > 0 ? (GAZE_MAX * (near < 1 ? near : 1)) / d : 0;
@@ -166,9 +178,11 @@ class Gaze implements GazeLayer {
 
 /**
  * A new gaze layer driving the head-follow springs at the given `ctx.springs` indices (configure them with
- * `GAZE_SPRING`). Its first saccade is U(1.5, 4) s after its first update.
- * @throws RangeError unless both indices are integers ≥ 0; `update` throws if one is outside the bank.
+ * `GAZE_SPRING`), looking at `ctx.lookAt` from `eyesCenter` (design units: the character's `spec.eyesCenter`, Juni's
+ * (500, 385)). Its first saccade is U(1.5, 4) s after its first update.
+ * @throws RangeError unless both indices are integers ≥ 0 and `eyesCenter` is finite; `update` throws if an index is
+ * outside the bank.
  */
-export function createGaze(springs: GazeSprings): GazeLayer {
-  return new Gaze(springs);
+export function createGaze(springs: GazeSprings, eyesCenter: Readonly<LookAt>): GazeLayer {
+  return new Gaze(springs, eyesCenter);
 }

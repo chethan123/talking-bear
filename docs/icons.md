@@ -1,6 +1,6 @@
 # Icons and installer screenshots
 
-The web app manifest (plan §4.7, written by #98) lists three icons and three installer screenshots. They are generated **once**, by hand, and committed. CI never generates them: the build copies the committed files from `public/` into `dist/`.
+The web app manifest (plan §4.7, written by #98) lists three icons and four installer screenshots. They are generated **once**, by hand, and committed. CI never generates them: the build copies the committed files from `public/` into `dist/`.
 
 | File | Size | Purpose |
 |---|---|---|
@@ -9,6 +9,7 @@ The web app manifest (plan §4.7, written by #98) lists three icons and three in
 | `public/icons/maskable-512.png` | 512 × 512 | manifest icon, purpose `maskable` |
 | `public/screenshots/phone-1.webp` | 1080 × 1920 | `form_factor: narrow`: the bear listening |
 | `public/screenshots/phone-2.webp` | 1080 × 1920 | `form_factor: narrow`: the bear talking back |
+| `public/screenshots/phone-3.webp` | 1080 × 1920 | `form_factor: narrow`: the duckling (Fenn) talking back (T127) |
 | `public/screenshots/desktop-1.webp` | 1920 × 1080 | `form_factor: wide`: desktop |
 
 The service worker (plan §4.7, #98) precaches the icons but **not the screenshots**, which only the installer uses. The icons are also WebAPK update fields: changing an icon makes every installed WebAPK update (plan §4.7). So regenerate the icons only when the art really changes.
@@ -92,7 +93,10 @@ node scripts/gen-screenshots.ts
    |---|---|---|
    | `phone-1` | `listening` | 1080 × 1920 |
    | `phone-2` | `talkOpen` | 1080 × 1920 |
+   | `phone-3` | `talkOpen`, on Fenn | 1080 × 1920 |
    | `desktop-1` | `neutral` | 1920 × 1080 |
+
+   For `phone-3` (a shot with `character: 'fenn'`), the script first clicks `.character-switch`, which exists only while the app is Asleep (where it boots), and waits for the stage canvas's `aria-label` to be "Fenn the duckling" and for its fade-in to end. Then it draws the pose on Fenn.
 
 5. Encodes the canvas in the page with `canvas.toBlob(…, 'image/webp', 0.9)` and writes the bytes.
 6. Stops the server: SIGTERM first, then SIGKILL, and it fails if port 4173 still answers. pnpm reports the stopped server as `[ELIFECYCLE] Command failed.`; that line is expected and doesn't affect the exit code.
@@ -102,4 +106,4 @@ node scripts/gen-screenshots.ts
 
 - **Determinism.** With the same Chromium, reruns give byte-identical files.
 - **Check only.** `node scripts/gen-screenshots.ts --check` runs just the final check on the committed files. It needs no build and no server.
-- **When to rerun.** Regenerate the screenshots when the bear's look changes. A Chromium bump may change the bytes; that is harmless.
+- **When to rerun.** Regenerate the screenshots when a character's look changes. The script redraws all four; the unchanged ones come out byte-identical, so `git status` shows only the files that really changed. A Chromium bump may change the bytes; that is harmless.

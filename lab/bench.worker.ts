@@ -6,8 +6,9 @@
 //                decimator, and its armed output path: 512-sample frames posted with transfer) at 48 or
 //                44.1 kHz, timed in batches of 100 quanta: the worklet itself has no `performance` (plan §4.10);
 //   voice-chain  the voice effect (src/dsp/voice.ts processVoice) on 1, 5 and 10 s clips at 48 or 44.1 kHz for
-//                the cub, chipmunk and bigbear presets, 30 timed calls each, then each of its voiceStages
-//                functions timed on its own input in batches (plan §5 X-F3; budget §4.10: p95 ≤ 15 ms per s).
+//                the cub, chipmunk, bigbear and duck presets, 30 timed calls each, then each of its voiceStages
+//                functions timed on its own input in batches (plan §5 X-F3, X-F5; budget §4.10: p95 ≤ 15 ms
+//                per s); the duck stage is timed on the duck rows only, the only ones processVoice runs it on.
 // The input is synthetic, generated here: alternating 2 s of pink noise at −40 dBFS RMS and 2 s of a synthetic
 // vowel, made as scripts/gen-fixtures.ts makes them; voice-chain clips are 400 ms vowel bursts, each followed
 // by 100 ms of that pink noise (20 % noise). Nothing is captured, stored or exported (plan Q2).
@@ -116,11 +117,14 @@ export interface VoiceRow {
   readonly warmupMs: number;
   /** The stage inputs (voiceStages composed as processVoice composes them) reproduce processVoice's output. */
   readonly composed: boolean;
-  /** One entry per voiceStages function, in chain order. */
+  /**
+   * One entry per voiceStages function that processVoice runs for this preset, in chain order: every stage but
+   * `duck` on the other presets' rows, every stage on the duck rows.
+   */
   readonly stages: readonly StageStats[];
 }
 
-/** voice-chain: one row per clip length (1, 5, 10 s) and preset (cub, chipmunk, bigbear), in that order. */
+/** voice-chain: one row per clip length (1, 5, 10 s) and preset (cub, chipmunk, bigbear, duck), in that order. */
 export interface VoiceStats {
   readonly kind: 'voice';
   readonly rate: number;
@@ -175,7 +179,7 @@ const VOICE_CLIPS_S: readonly number[] = [1, 5, 10];
 const VOICE_CALLS = 30;
 /** Untimed processVoice rounds (each preset once) on the 1 s clip before the first row, so it isn't JIT-cold. */
 const VOICE_PREWARM_ROUNDS = 10;
-const VOICE_PRESETS: readonly VoicePreset[] = [PRESETS.cub, PRESETS.chipmunk, PRESETS.bigbear];
+const VOICE_PRESETS: readonly VoicePreset[] = [PRESETS.cub, PRESETS.chipmunk, PRESETS.bigbear, PRESETS.duck];
 /** A clip is 500 ms units of a 400 ms vowel burst then 100 ms of pink noise: 20 % of it is noise. */
 const BURST_S = 0.4;
 const NOISE_GAP_S = 0.1;
@@ -594,28 +598,31 @@ function sameSamples(a: Float32Array, b: Float32Array): boolean {
 }
 
 /**
- * The inputs of each voiceStages function for one clip `pcm` at `rate` and pitch ratio `p`: processVoice's
+ * The inputs of each voiceStages function for one clip `pcm` at `rate` and `preset`: processVoice's
  * intermediate buffers, made by composing voiceStages exactly as processVoice does (x = hpfTrim(pcm, rate);
- * y = resample(x, p); voiced = isVoiced(y, rate); applyGain(y, rate, voiced); fades(y, rate)), with a copy of
- * y kept before each in-place stage. `faded` is the buffer processVoice returns (and envelope's input).
+ * y = resample(x, p); voiced = isVoiced(y, rate); z = preset.id === 'duck' ? duck(y, rate) : y;
+ * applyGain(z, rate, voiced); fades(z, rate)), with a copy kept before each in-place stage. `z` is y itself
+ * for every preset but duck. `faded` is the buffer processVoice returns (and envelope's input).
  */
 interface StageInputs {
   readonly x: Float32Array;
   readonly y: Float32Array;
   readonly voiced: boolean;
+  readonly z: Float32Array;
   readonly gained: Float32Array;
   readonly faded: Float32Array;
 }
 
-function stageInputs(pcm: Float32Array, rate: number, p: number): StageInputs {
+function stageInputs(pcm: Float32Array, rate: number, preset: VoicePreset): StageInputs {
   const x = voiceStages.hpfTrim(pcm, rate);
-  const y = voiceStages.resample(x, p);
+  const y = voiceStages.resample(x, preset.pitchRatio);
   const voiced = voiceStages.isVoiced(y, rate);
-  const gained = y.slice();
+  const z = preset.id === 'duck' ? voiceStages.duck(y, rate) : y;
+  const gained = z.slice();
   voiceStages.applyGain(gained, rate, voiced);
   const faded = gained.slice();
   voiceStages.fades(faded, rate);
-  return { x, y, voiced, gained, faded };
+  return { x, y, voiced, z, gained, faded };
 }
 
 /** The result of the latest timed call of each pure stage, kept so checkStages can compare it. */
@@ -624,12 +631,14 @@ interface StageResults {
   x: Float32Array;
   y: Float32Array;
   voiced: boolean;
+  z: Float32Array;
   envelope: Envelope | null;
 }
 
 /**
  * Per voiceStages function, a batch: `(b) => ms` runs the stage b times on its input from `inp` and returns
- * the elapsed ms; each pure stage's latest result goes to `last`. The in-place stages (applyGain, fades) first
+ * the elapsed ms; each pure stage's latest result goes to `last`. `duck` is only ever run on duck rows. The
+ * in-place stages (applyGain, fades) first
  * restore `work` from their input, outside the timed region; the calls of one batch then repeat on that copy,
  * which costs the same each time, since their loops don't depend on the sample values.
  */
@@ -658,8 +667,12 @@ function stageBatches(
       timeCalls(b, () => {
         last.voiced = voiceStages.isVoiced(inp.y, rate);
       }),
+    duck: (b) =>
+      timeCalls(b, () => {
+        last.z = voiceStages.duck(inp.y, rate);
+      }),
     applyGain: (b) => {
-      work.set(inp.y);
+      work.set(inp.z);
       return timeCalls(b, () => voiceStages.applyGain(work, rate, inp.voiced));
     },
     fades: (b) => {
@@ -688,8 +701,9 @@ function sameEnvelope(a: Envelope | null, b: Envelope): boolean {
 /**
  * Checks, once per row after the timing, what the timed batches compute: runs each batch once more with one
  * call and compares that call's result with processVoice's own (`out`) or its intermediate buffers (`inp`):
- * clipDetect with out.clipped, hpfTrim with x, resample with y, isVoiced with voiced, applyGain (on y) with
- * gained, fades (on gained) with faded, envelope with out.envelope.
+ * clipDetect with out.clipped, hpfTrim with x, resample with y, isVoiced with voiced, duck (on y, duck rows
+ * only: `duck` true) with z, applyGain (on z) with gained, fades (on gained) with faded, envelope with
+ * out.envelope. On the other rows the result has no `duck` entry.
  */
 function checkStages(
   batches: Readonly<Record<VoiceStageName, (b: number) => number>>,
@@ -697,7 +711,8 @@ function checkStages(
   out: VoiceResult,
   work: Float32Array,
   last: StageResults,
-): Readonly<Record<VoiceStageName, boolean>> {
+  duck: boolean,
+): Readonly<Partial<Record<VoiceStageName, boolean>>> {
   const ran = (stage: VoiceStageName): void => {
     batches[stage](1);
   };
@@ -709,13 +724,18 @@ function checkStages(
   const resample = sameSamples(last.y, inp.y);
   ran('isVoiced');
   const isVoiced = last.voiced === inp.voiced;
+  let duckMatches: { duck?: boolean } = {};
+  if (duck) {
+    ran('duck');
+    duckMatches = { duck: sameSamples(last.z, inp.z) };
+  }
   ran('applyGain');
   const applyGain = sameSamples(work, inp.gained);
   ran('fades');
   const fades = sameSamples(work, inp.faded);
   ran('envelope');
   const envelope = sameEnvelope(last.envelope, out.envelope);
-  return { clipDetect, hpfTrim, resample, isVoiced, applyGain, fades, envelope };
+  return { clipDetect, hpfTrim, resample, isVoiced, ...duckMatches, applyGain, fades, envelope };
 }
 
 /**
@@ -747,9 +767,10 @@ function timeStage(
 /**
  * X-F3, back to back. First an untimed pre-warm (VOICE_PREWARM_ROUNDS rounds of processVoice on the 1 s clip,
  * each preset once), so the first row isn't timed while the JIT tiers up; its total and its first, cold call
- * are logged. Then, for each clip length (1, 5, 10 s) and preset (cub, chipmunk, bigbear): one untimed warm-up
- * call of processVoice(clip, rate, preset), then VOICE_CALLS calls timed one by one with performance.now()
- * around each; then each voiceStages function timed on its own input (timeStage) in batches lasting at least
+ * are logged. Then, for each clip length (1, 5, 10 s) and preset (cub, chipmunk, bigbear, duck): one untimed
+ * warm-up call of processVoice(clip, rate, preset), then VOICE_CALLS calls timed one by one with
+ * performance.now() around each; then each voiceStages function that processVoice runs for the preset (`duck`
+ * on duck rows only) timed on its own input (timeStage) in batches lasting at least
  * max(2 ms, 20 timer steps), since a stage of a 1 s clip can take less than one timer step; then checkStages.
  */
 function voiceChain(req: BenchRequest, timerStepMs: number): VoiceStats {
@@ -804,13 +825,16 @@ function voiceChain(req: BenchRequest, timerStepMs: number): VoiceStats {
       }
       times.sort();
       const p = preset.pitchRatio;
-      const inp = stageInputs(pcm, rate, p);
-      const work = new Float32Array(inp.y.length);
+      const duck = preset.id === 'duck';
+      const inp = stageInputs(pcm, rate, preset);
+      const work = new Float32Array(inp.z.length);
       const none = new Float32Array(0);
-      const last: StageResults = { clipped: false, x: none, y: none, voiced: false, envelope: null };
+      const last: StageResults = { clipped: false, x: none, y: none, voiced: false, z: none, envelope: null };
       const batches = stageBatches(pcm, rate, p, inp, work, last);
-      const timed = STAGE_ORDER.map((stage) => timeStage(stage, batches[stage], minMs));
-      const matches = checkStages(batches, inp, out, work, last);
+      // processVoice runs the duck stage on the duck preset only, so the other rows neither time nor list it.
+      const stages = STAGE_ORDER.filter((stage) => duck || stage !== 'duck');
+      const timed = stages.map((stage) => timeStage(stage, batches[stage], minMs));
+      const matches = checkStages(batches, inp, out, work, last, duck);
       rows.push({
         clipS,
         preset: preset.id,
@@ -824,7 +848,7 @@ function voiceChain(req: BenchRequest, timerStepMs: number): VoiceStats {
         sortedMs: Array.from(times),
         warmupMs,
         composed: sameSamples(inp.faded, out.pcm),
-        stages: timed.map((t) => ({ ...t, matches: matches[t.stage] })),
+        stages: timed.map((t) => ({ ...t, matches: matches[t.stage] === true })),
       });
       post({ t: 'progress', bench: req.bench, done: rows.length, total });
     }

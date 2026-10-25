@@ -5,11 +5,18 @@ import { describe, expect, it, vi } from 'vitest';
 import { PART, PARTS } from '../art/bear-parts.gen.ts';
 import { Ch, CH_COUNT, createPose } from '../anim/pose.ts';
 import type { Pose } from '../anim/pose.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from '../anim/rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT } from '../anim/rig.ts';
 import { REGION_IDS } from './region-ids.ts';
 import type { RegionId } from './region-ids.ts';
-import { hitTest, REGIONS } from './regions.ts';
+import { compileRegions, hitTest } from './regions.ts';
 import type { RegionDef } from './regions.ts';
+import { JUNI } from '../characters/juni.ts';
+
+/** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
+const JUNI_RIG = createRig(JUNI, { paths: false });
+const JUNI_REGIONS = compileRegions(JUNI_RIG);
+/** Juni's hit regions, priority order (they moved from `regions.ts` to `JUNI.regions`). */
+const REGIONS = JUNI.regions;
 
 /** Stands in for the DOM's `Path2D`, which Node lacks: `createRig` builds them, `boneMatrices` never touches them. */
 class FakePath2D {
@@ -22,10 +29,10 @@ vi.stubGlobal('Path2D', FakePath2D);
 
 type View = { scale: number; ox: number; oy: number };
 
-const rig = createRig();
+const rig = createRig(JUNI);
 /** The real rig's bone matrices for `pose`. */
 function bonesOf(pose: Pose): Float32Array {
-  return boneMatrices(rig, pose, new Float32Array(BONE_COUNT * MAT));
+  return boneMatrices(rig, pose, new Float32Array(JUNI_RIG.boneCount * MAT));
 }
 function poseWith(ch: number, v: number): Pose {
   const p = createPose();
@@ -38,7 +45,7 @@ const UNIT: View = { scale: 1, ox: 0, oy: 0 };
 
 /** Rest-pose design point (`x`, `y`) on `bone` → CSS px, through the posed bone matrix and `view` (the forward map). */
 function toCss(bones: Float32Array, bone: string, x: number, y: number, view: View): [number, number] {
-  const o = boneIndex(bone) * MAT;
+  const o = boneIndex(JUNI_RIG, bone) * MAT;
   const dx = bones[o]! * x + bones[o + 2]! * y + bones[o + 4]!;
   const dy = bones[o + 1]! * x + bones[o + 3]! * y + bones[o + 5]!;
   return [view.scale * dx + view.ox, view.scale * dy + view.oy];
@@ -70,7 +77,7 @@ function idAt(i: number): RegionId {
  * `hitTest`'s inverse, so it serves only to tell the two `headTop` regions apart in the property test.
  */
 function holds(bones: Float32Array, view: View, pad: number, q: RegionDef, x: number, y: number): boolean {
-  const o = boneIndex(q.bone) * MAT;
+  const o = boneIndex(JUNI_RIG, q.bone) * MAT;
   const [a, b, c, d, e, f] = [
     bones[o]!,
     bones[o + 1]!,
@@ -149,19 +156,24 @@ describe('REGIONS', () => {
     ]);
   });
 
-  it('holds every RegionId except background once (headTop twice: head, then tuft), each on a rig bone, frozen', () => {
+  it("holds each of Juni's region ids once (headTop twice: head, then tuft), each on a rig bone, frozen", () => {
+    // Per character (duck plan T123): Juni's ids are REGION_IDS minus background and Fenn's beak, wings and tail.
+    const juniIds = new Set(REGIONS.map((r) => r.id));
+    expect([...juniIds].toSorted()).toEqual(
+      REGION_IDS.filter((id) => !['background', 'beak', 'wingL', 'wingR', 'tail'].includes(id)).toSorted(),
+    );
     expect(
       REGIONS.filter((r) => r.id !== 'headTop')
         .map((r) => r.id)
         .toSorted(),
-    ).toEqual(REGION_IDS.filter((id) => id !== 'background' && id !== 'headTop').toSorted());
+    ).toEqual([...juniIds].filter((id) => id !== 'headTop').toSorted());
     const heads = REGIONS.flatMap((r, i) => (r.id === 'headTop' ? [[i, r.bone]] : []));
     expect(heads).toEqual([
       [13, 'head'],
       [14, 'tuft'],
     ]);
     for (const r of REGIONS) {
-      expect(() => boneIndex(r.bone)).not.toThrow();
+      expect(() => boneIndex(JUNI_RIG, r.bone)).not.toThrow();
       expect(Object.isFrozen(r)).toBe(true);
     }
     expect(Object.isFrozen(REGIONS)).toBe(true);
@@ -187,7 +199,7 @@ describe('REGIONS', () => {
 
 describe('validation 1: neutral pose, view {scale: 1, ox: 0, oy: 0}', () => {
   it('the neutral pose gives the identity for every bone (the rest pose is the design)', () => {
-    for (let i = 0; i < BONE_COUNT; i++) {
+    for (let i = 0; i < JUNI_RIG.boneCount; i++) {
       expect(Array.from(NEUTRAL.subarray(i * MAT, i * MAT + MAT), (v) => v + 0)).toEqual([1, 0, 0, 1, 0, 0]);
     }
   });
@@ -196,7 +208,7 @@ describe('validation 1: neutral pose, view {scale: 1, ox: 0, oy: 0}', () => {
     it.each(REGIONS.map((r) => [label(r), r] as const))(
       `pad ${pad}: the centre of %s hits it`,
       (_name, r) => {
-        expect(hitTest(r.cx, r.cy, NEUTRAL, UNIT, pad)).toBe(r.id);
+        expect(hitTest(r.cx, r.cy, NEUTRAL, UNIT, JUNI_REGIONS, pad)).toBe(r.id);
       },
     );
 
@@ -207,7 +219,7 @@ describe('validation 1: neutral pose, view {scale: 1, ox: 0, oy: 0}', () => {
       REGIONS.forEach((r, i) => {
         const unique = REGIONS.filter((q) => q.id === r.id).length === 1;
         for (const [side, x, y] of axisPoints(r, pad + 0.5)) {
-          const got = hitTest(x, y, NEUTRAL, UNIT, pad);
+          const got = hitTest(x, y, NEUTRAL, UNIT, JUNI_REGIONS, pad);
           const want = neutralOracle(x, y, pad);
           expect(want, `${label(r)} ${side}`).not.toBe(i);
           expect(got, `${label(r)} ${side}`).toBe(idAt(want));
@@ -219,7 +231,7 @@ describe('validation 1: neutral pose, view {scale: 1, ox: 0, oy: 0}', () => {
     it(`pad ${pad}: points just inside each padded ellipse hit that region or one before it`, () => {
       REGIONS.forEach((r, i) => {
         for (const [side, x, y] of axisPoints(r, pad - 0.5)) {
-          const got = hitTest(x, y, NEUTRAL, UNIT, pad);
+          const got = hitTest(x, y, NEUTRAL, UNIT, JUNI_REGIONS, pad);
           expect(rank(got), `${label(r)} ${side}: ${got}`).toBeLessThanOrEqual(i);
           expect(got, `${label(r)} ${side}`).toBe(idAt(neutralOracle(x, y, pad)));
         }
@@ -243,20 +255,20 @@ describe('validation 1: neutral pose, view {scale: 1, ox: 0, oy: 0}', () => {
     ['headTop@tuft', 'bottom', 506, 238.5, 'headTop'],
     ['flankR', 'bottom', 700, 1212.5, 'footR'],
   ] as const)('pad 12: just outside %s (%s), (%d, %d) → %s', (_id, _side, x, y, want) => {
-    expect(hitTest(x, y, NEUTRAL, UNIT, 12)).toBe(want);
+    expect(hitTest(x, y, NEUTRAL, UNIT, JUNI_REGIONS, 12)).toBe(want);
   });
 
   it('a point exactly on the padded ellipse counts as inside', () => {
     // Identity bone matrices and a unit view keep these exact: u² + v² is exactly 1.
-    expect(hitTest(545, 470, NEUTRAL, UNIT, 0)).toBe('nose');
-    expect(hitTest(500, 505, NEUTRAL, UNIT, 0)).toBe('nose');
-    expect(hitTest(557, 470, NEUTRAL, UNIT, 12)).toBe('nose');
-    expect(hitTest(500, 517, NEUTRAL, UNIT, 12)).toBe('nose');
+    expect(hitTest(545, 470, NEUTRAL, UNIT, JUNI_REGIONS, 0)).toBe('nose');
+    expect(hitTest(500, 505, NEUTRAL, UNIT, JUNI_REGIONS, 0)).toBe('nose');
+    expect(hitTest(557, 470, NEUTRAL, UNIT, JUNI_REGIONS, 12)).toBe('nose');
+    expect(hitTest(500, 517, NEUTRAL, UNIT, JUNI_REGIONS, 12)).toBe('nose');
   });
 
   it('a far-away point is background', () => {
-    expect(hitTest(-50, -50, NEUTRAL, UNIT, 12)).toBe('background');
-    expect(hitTest(1200, 700, NEUTRAL, UNIT, 12)).toBe('background');
+    expect(hitTest(-50, -50, NEUTRAL, UNIT, JUNI_REGIONS, 12)).toBe('background');
+    expect(hitTest(1200, 700, NEUTRAL, UNIT, JUNI_REGIONS, 12)).toBe('background');
   });
 });
 
@@ -274,14 +286,14 @@ describe('validation 2: motion (HeadRot = 0.3, pad 0)', () => {
       expect(x).toBeCloseTo(500 + Math.cos(0.3) * (cx - 500) - Math.sin(0.3) * (385 - 600), 2);
       expect(y).toBeCloseTo(600 + Math.sin(0.3) * (cx - 500) + Math.cos(0.3) * (385 - 600), 2);
       expect(Math.hypot(x - cx, y - 385)).toBeGreaterThan(60);
-      expect(hitTest(x, y, bones, UNIT, 0)).toBe(id);
-      expect(hitTest(cx, 385, bones, UNIT, 0)).not.toBe(id);
+      expect(hitTest(x, y, bones, UNIT, JUNI_REGIONS, 0)).toBe(id);
+      expect(hitTest(cx, 385, bones, UNIT, JUNI_REGIONS, 0)).not.toBe(id);
     },
   );
 
   it('with the neutral pose the unrotated centre still hits the eye (the control)', () => {
-    expect(hitTest(405, 385, NEUTRAL, UNIT, 0)).toBe('eyeL');
-    expect(hitTest(595, 385, NEUTRAL, UNIT, 0)).toBe('eyeR');
+    expect(hitTest(405, 385, NEUTRAL, UNIT, JUNI_REGIONS, 0)).toBe('eyeL');
+    expect(hitTest(595, 385, NEUTRAL, UNIT, JUNI_REGIONS, 0)).toBe('eyeR');
   });
 });
 
@@ -302,7 +314,7 @@ describe('the tuft (plan §4.6.4 "Head top / tuft")', () => {
       for (const [x, y] of TIPS) {
         expect(x >= x0 && x <= x1 && y >= y0 && y <= y1, `${x}, ${y} on the tuftFur bbox`).toBe(true);
         expect(holds(NEUTRAL, UNIT, pad, head, x, y), `${x}, ${y} outside the head region`).toBe(false);
-        expect(hitTest(x, y, NEUTRAL, UNIT, pad), `${x}, ${y}`).toBe('headTop');
+        expect(hitTest(x, y, NEUTRAL, UNIT, JUNI_REGIONS, pad), `${x}, ${y}`).toBe('headTop');
       }
     },
   );
@@ -312,7 +324,7 @@ describe('the tuft (plan §4.6.4 "Head top / tuft")', () => {
     for (const pad of [0, 12, 30]) {
       for (const r of REGIONS.slice(0, 14)) {
         expect(holds(NEUTRAL, UNIT, pad, tuft, r.cx, r.cy), `${label(r)} pad ${pad}`).toBe(false);
-        expect(hitTest(r.cx, r.cy, NEUTRAL, UNIT, pad), `${label(r)} pad ${pad}`).toBe(r.id);
+        expect(hitTest(r.cx, r.cy, NEUTRAL, UNIT, JUNI_REGIONS, pad), `${label(r)} pad ${pad}`).toBe(r.id);
       }
     }
   });
@@ -326,9 +338,9 @@ describe('the tuft (plan §4.6.4 "Head top / tuft")', () => {
     expect(x).toBeCloseTo(500 + Math.cos(-0.5) * (rx - 500) - Math.sin(-0.5) * (ry - 170), 2);
     expect(y).toBeCloseTo(170 + Math.sin(-0.5) * (rx - 500) + Math.cos(-0.5) * (ry - 170), 2);
     expect(Math.hypot(x - rx, y - ry)).toBeGreaterThan(40);
-    expect(hitTest(x, y, bones, UNIT, 0)).toBe('headTop');
-    expect(hitTest(rx, ry, bones, UNIT, 0)).toBe('background');
-    expect(hitTest(rx, ry, NEUTRAL, UNIT, 0)).toBe('headTop');
+    expect(hitTest(x, y, bones, UNIT, JUNI_REGIONS, 0)).toBe('headTop');
+    expect(hitTest(rx, ry, bones, UNIT, JUNI_REGIONS, 0)).toBe('background');
+    expect(hitTest(rx, ry, NEUTRAL, UNIT, JUNI_REGIONS, 0)).toBe('headTop');
   });
 });
 
@@ -350,12 +362,16 @@ describe('every region follows its bone and the view (property)', () => {
         const padDesign = pad / scale;
         REGIONS.forEach((r, i) => {
           const [x, y] = toCss(bones, r.bone, r.cx, r.cy, view);
-          expect(rank(hitTest(x, y, bones, view, pad)), `${label(r)} centre`).toBeLessThanOrEqual(i);
+          expect(
+            rank(hitTest(x, y, bones, view, JUNI_REGIONS, pad)),
+            `${label(r)} centre`,
+          ).toBeLessThanOrEqual(i);
           for (const [side, px, py] of axisPoints(r, padDesign, 0.98)) {
             const [cx, cy] = toCss(bones, r.bone, px, py, view);
-            expect(rank(hitTest(cx, cy, bones, view, pad)), `${label(r)} ${side} inside`).toBeLessThanOrEqual(
-              i,
-            );
+            expect(
+              rank(hitTest(cx, cy, bones, view, JUNI_REGIONS, pad)),
+              `${label(r)} ${side} inside`,
+            ).toBeLessThanOrEqual(i);
           }
           for (const [side, px, py] of axisPoints(r, padDesign, 1.02)) {
             const [cx, cy] = toCss(bones, r.bone, px, py, view);
@@ -364,7 +380,9 @@ describe('every region follows its bone and the view (property)', () => {
               (q, j) => j !== i && q.id === r.id && holds(bones, view, pad, q, cx, cy),
             );
             if (!viaOther)
-              expect(hitTest(cx, cy, bones, view, pad), `${label(r)} ${side} outside`).not.toBe(r.id);
+              expect(hitTest(cx, cy, bones, view, JUNI_REGIONS, pad), `${label(r)} ${side} outside`).not.toBe(
+                r.id,
+              );
           }
         });
       }),
@@ -377,18 +395,20 @@ describe('every region follows its bone and the view (property)', () => {
     const view = { scale: 0.412, ox: 0, oy: (915 - 1400 * 0.412) / 2 };
     for (const r of REGIONS) {
       const [x, y] = toCss(NEUTRAL, r.bone, r.cx, r.cy, view);
-      expect(hitTest(x, y, NEUTRAL, view), label(r)).toBe(r.id);
+      expect(hitTest(x, y, NEUTRAL, view, JUNI_REGIONS), label(r)).toBe(r.id);
     }
   });
 
   it('a bone collapsed to zero scale hits nothing (EarFoldL = 2 folds the left ear flat)', () => {
     const bones = bonesOf(poseWith(Ch.EarFoldL, 2));
-    expect(hitTest(285, 195, bones, UNIT, 12)).not.toBe('earL');
-    expect(hitTest(715, 195, bones, UNIT, 12)).toBe('earR');
+    expect(hitTest(285, 195, bones, UNIT, JUNI_REGIONS, 12)).not.toBe('earL');
+    expect(hitTest(715, 195, bones, UNIT, JUNI_REGIONS, 12)).toBe('earR');
   });
 
   it('throws on a bone matrix array that is too short', () => {
-    expect(() => hitTest(0, 0, new Float32Array(BONE_COUNT * MAT - 1), UNIT)).toThrow(RangeError);
+    expect(() => hitTest(0, 0, new Float32Array(JUNI_RIG.boneCount * MAT - 1), UNIT, JUNI_REGIONS)).toThrow(
+      RangeError,
+    );
   });
 });
 
@@ -397,8 +417,8 @@ describe('validation 3: padding', () => {
 
   it('a point 10 CSS px outside the nose ellipse hits the nose with pad 12, not with pad 0 (view scale 1)', () => {
     for (const [side, x, y] of axisPoints(nose, 10)) {
-      expect(hitTest(x, y, NEUTRAL, UNIT, 12), side).toBe('nose');
-      expect(hitTest(x, y, NEUTRAL, UNIT, 0), side).not.toBe('nose');
+      expect(hitTest(x, y, NEUTRAL, UNIT, JUNI_REGIONS, 12), side).toBe('nose');
+      expect(hitTest(x, y, NEUTRAL, UNIT, JUNI_REGIONS, 0), side).not.toBe('nose');
     }
   });
 
@@ -413,13 +433,14 @@ describe('validation 3: padding', () => {
       [cx, cy - ey],
       [cx, cy + ey],
     ] as const) {
-      expect(hitTest(x, y, NEUTRAL, view, 12)).toBe('nose');
-      expect(hitTest(x, y, NEUTRAL, view, 0)).not.toBe('nose');
+      expect(hitTest(x, y, NEUTRAL, view, JUNI_REGIONS, 12)).toBe('nose');
+      expect(hitTest(x, y, NEUTRAL, view, JUNI_REGIONS, 0)).not.toBe('nose');
     }
   });
 
   it('padCssPx defaults to 12', () => {
-    for (const [side, x, y] of axisPoints(nose, 10)) expect(hitTest(x, y, NEUTRAL, UNIT), side).toBe('nose');
+    for (const [side, x, y] of axisPoints(nose, 10))
+      expect(hitTest(x, y, NEUTRAL, UNIT, JUNI_REGIONS), side).toBe('nose');
   });
 });
 
@@ -489,7 +510,7 @@ describe('validation 4: no allocation', () => {
   const hundredThousand = (): void => {
     for (let k = 0; k < 100_000; k++) {
       const j = 2 * (k % N);
-      if (hitTest(POINTS[j]!, POINTS[j + 1]!, bones, view) !== 'background') hits++;
+      if (hitTest(POINTS[j]!, POINTS[j + 1]!, bones, view, JUNI_REGIONS) !== 'background') hits++;
     }
   };
 
@@ -504,7 +525,8 @@ describe('validation 4: no allocation', () => {
 
   it('the grid hits regions and background alike', () => {
     const seen = new Set<RegionId>();
-    for (let k = 0; k < N; k++) seen.add(hitTest(POINTS[2 * k]!, POINTS[2 * k + 1]!, bones, view));
+    for (let k = 0; k < N; k++)
+      seen.add(hitTest(POINTS[2 * k]!, POINTS[2 * k + 1]!, bones, view, JUNI_REGIONS));
     expect(seen).toContain('background');
     expect(seen.size).toBeGreaterThanOrEqual(12);
   });
@@ -527,7 +549,7 @@ describe('validation 4: no allocation', () => {
       for (let k = 0; k < 100_000; k++) {
         const j = 2 * (k % N);
         sink = { x: POINTS[j]!, y: POINTS[j + 1]! };
-        if (hitTest(sink.x, sink.y, bones, view) !== 'background') hits++;
+        if (hitTest(sink.x, sink.y, bones, view, JUNI_REGIONS) !== 'background') hits++;
       }
     };
     expect(bestGrowth(allocating, 10)).toBeGreaterThanOrEqual(LIMIT);

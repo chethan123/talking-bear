@@ -1,7 +1,16 @@
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { mulberry32, rmsDb, sine, toneLevelDb } from '../../test/dsp-helpers.ts';
-import { butterworthHighpass, butterworthLowpass, cascade, type Biquad } from './biquad.ts';
+import {
+  butterworthHighpass,
+  butterworthHighpassCoefficients,
+  butterworthLowpass,
+  butterworthLowpassCoefficients,
+  cascade,
+  peaking,
+  peakingCoefficients,
+  type Biquad,
+} from './biquad.ts';
 import {
   highpassQ,
   highpassQCoefficients,
@@ -348,5 +357,116 @@ describe('highShelf / highpassQ (BS.1770 forms)', () => {
       for (let i = 48_000; i < 96_000; i++) e += y[i]! * y[i]!;
       expect(e).toBeLessThan(1e-12);
     }
+  });
+});
+
+/** The constructors' inline formulas before T115 (RBJ cookbook, Q = √½), kept to pin "outputs unchanged". */
+function butterworthBeforeT115(kind: 'hp' | 'lp', fs: number, cutoff: number): BiquadCoefficients {
+  const w0 = (2 * Math.PI * cutoff) / fs;
+  const cosw = Math.cos(w0);
+  const alpha = Math.sin(w0) / (2 * Math.SQRT1_2);
+  const a0 = 1 + alpha;
+  const b0 = (kind === 'hp' ? (1 + cosw) / 2 : (1 - cosw) / 2) / a0;
+  const b1 = kind === 'hp' ? -(1 + cosw) / a0 : (1 - cosw) / a0;
+  return { b0, b1, b2: b0, a1: (-2 * cosw) / a0, a2: (1 - alpha) / a0 };
+}
+const BUTTERWORTH_CASES = [
+  [48_000, 80],
+  [48_000, 320],
+  [48_000, 5000],
+  [44_100, 5000],
+  [16_000, 200],
+  [16_000, 3400],
+] as const;
+
+describe('butterworthHighpassCoefficients / butterworthLowpassCoefficients', () => {
+  it.each(BUTTERWORTH_CASES)('equal the pre-T115 formulas exactly (fs %d, fc %d)', (fs, fcHz) => {
+    expect(butterworthHighpassCoefficients(fs, fcHz)).toEqual(butterworthBeforeT115('hp', fs, fcHz));
+    expect(butterworthLowpassCoefficients(fs, fcHz)).toEqual(butterworthBeforeT115('lp', fs, fcHz));
+  });
+
+  it.each(BUTTERWORTH_CASES)('the factories run exactly their coefficients (fs %d, fc %d)', (fs, fcHz) => {
+    const x = noise(1024, 8);
+    expect(
+      firstMismatch(butterworthHighpass(fs, fcHz).process(x), df2t(butterworthBeforeT115('hp', fs, fcHz), x)),
+    ).toBe(-1);
+    expect(
+      firstMismatch(butterworthLowpass(fs, fcHz).process(x), df2t(butterworthBeforeT115('lp', fs, fcHz), x)),
+    ).toBe(-1);
+  });
+
+  it('are −3.01 dB at fc analytically, with unity gain at DC (low-pass) and Nyquist (high-pass)', () => {
+    const hp = butterworthHighpassCoefficients(48_000, 320);
+    const lp = butterworthLowpassCoefficients(48_000, 5000);
+    expect(Math.abs(responseDb(hp, 48_000, 320) + 3.0103)).toBeLessThan(1e-3);
+    expect(Math.abs(responseDb(lp, 48_000, 5000) + 3.0103)).toBeLessThan(1e-3);
+    expect(Math.abs((lp.b0 + lp.b1 + lp.b2) / (1 + lp.a1 + lp.a2) - 1)).toBeLessThan(1e-12);
+    expect(Math.abs((hp.b0 - hp.b1 + hp.b2) / (1 - hp.a1 + hp.a2) - 1)).toBeLessThan(1e-12);
+  });
+
+  it('throw RangeError unless 0 < fc < fs/2 and fs is finite', () => {
+    for (const f of [butterworthHighpassCoefficients, butterworthLowpassCoefficients]) {
+      expect(() => f(48_000, 0)).toThrow(RangeError);
+      expect(() => f(48_000, 24_000)).toThrow(RangeError);
+      expect(() => f(Number.NaN, 1000)).toThrow(RangeError);
+    }
+  });
+});
+
+describe('peaking (RBJ peaking EQ, duck plan T115)', () => {
+  it.each([10, -9])('is %d dB ±0.05 dB on a 1 kHz sine at its centre (48 kHz, Q 2; acceptance 1)', (g) => {
+    const measured = gainDb(() => peaking(48_000, 1000, g, 2), 48_000, 1000);
+    expect(Math.abs(measured - g)).toBeLessThanOrEqual(0.05);
+  });
+
+  it('peakingCoefficients: exactly gainDb at f0, 0 dB at DC and Nyquist, falling off monotonically below f0', () => {
+    for (const [fs, f0, g, q] of [
+      [48_000, 1600, 10, 3],
+      [48_000, 700, -9, 1.4],
+      [44_100, 3100, 6, 2.5],
+      [16_000, 3100, 6, 2.5],
+    ] as const) {
+      const c = peakingCoefficients(fs, f0, g, q);
+      expect(Math.abs(responseDb(c, fs, f0) - g)).toBeLessThan(1e-9);
+      expect(Math.abs((c.b0 + c.b1 + c.b2) / (1 + c.a1 + c.a2) - 1)).toBeLessThan(1e-12);
+      expect(Math.abs((c.b0 - c.b1 + c.b2) / (1 - c.a1 + c.a2) - 1)).toBeLessThan(1e-12);
+      expect(c.a1).toBe(c.b1);
+      let prev = Math.abs(g);
+      for (const r of [0.9, 0.7, 0.5, 0.25, 0.1]) {
+        const now = Math.abs(responseDb(c, fs, f0 * r));
+        expect(now).toBeLessThan(prev);
+        prev = now;
+      }
+    }
+  });
+
+  it('gainDb 0 is the identity (b = a, bit-exact output)', () => {
+    const c = peakingCoefficients(48_000, 1600, 0, 3);
+    expect([c.b0, c.b1, c.b2]).toEqual([1, c.a1, c.a2]);
+    const x = noise(4800, 9);
+    expect(firstMismatch(peaking(48_000, 1600, 0, 3).process(x), df2t(c, x))).toBe(-1);
+  });
+
+  it('the factory runs exactly its coefficients (bit-exact on noise)', () => {
+    const x = noise(4800, 10);
+    const ref = df2t(peakingCoefficients(44_100, 700, -9, 1.4), x);
+    expect(firstMismatch(peaking(44_100, 700, -9, 1.4).process(x), ref)).toBe(-1);
+  });
+
+  it('is stable: impulse-response energy in samples 48000…96000 < 1e-12', () => {
+    const y = peaking(48_000, 1600, 10, 3).process(impulse(96_000));
+    let e = 0;
+    for (let i = 48_000; i < 96_000; i++) e += y[i]! * y[i]!;
+    expect(e).toBeLessThan(1e-12);
+  });
+
+  it('rejects invalid parameters with RangeError', () => {
+    expect(() => peaking(48_000, 0, 6, 1)).toThrow(RangeError);
+    expect(() => peaking(48_000, 24_000, 6, 1)).toThrow(RangeError);
+    expect(() => peaking(Number.NaN, 1000, 6, 1)).toThrow(RangeError);
+    expect(() => peaking(48_000, 1000, 6, 0)).toThrow(RangeError);
+    expect(() => peaking(48_000, 1000, 6, Number.POSITIVE_INFINITY)).toThrow(RangeError);
+    expect(() => peaking(48_000, 1000, Number.NaN, 1)).toThrow(RangeError);
+    expect(() => peakingCoefficients(48_000, 1000, Number.NEGATIVE_INFINITY, 1)).toThrow(RangeError);
   });
 });

@@ -3,7 +3,8 @@ import type { RegionId } from '../src/input/region-ids.ts';
 import { noCspViolationsAfterEach, openApp, tapToWake, wake } from './helpers/app';
 import { micFlags } from './helpers/flags';
 
-// Accessibility end to end (plan §7 M8, issue #118): the canvas's accessible name, every button's name, the one
+// Accessibility end to end (plan §7 M8, issue #118): the canvas's accessible name, every button's name (the character
+// swap button's in Asleep, and its absence from the tree once awake: duck plan T126), the one
 // aria-live region (it reads the Asleep text after boot, is cleared on waking, and nothing in Listening, a reaction
 // or a pause changes it; Paused is not announced, ORCH-NOTE on #118), and reduced motion and Gentle mode playing the
 // gentle clips, with a control that plays the full ones.
@@ -193,6 +194,22 @@ test('names: the canvas is an image "Juni the bear", every button is named, one 
   await expect(page.locator(LIVE)).toHaveText(ASLEEP_TEXT);
   // Outside main#app (D4): the overlays stay text-free.
   await expect(page.locator(`main#app ${LIVE}`)).toHaveCount(0);
+});
+
+test('the swap button (T126): named after the other character in Asleep, absent from the accessibility tree once awake', async ({
+  page,
+}) => {
+  await openApp(page);
+  const button = page.locator('button.character-switch');
+  await expect(button).toBeVisible();
+  await expect(button).toHaveAccessibleName('Switch to Fenn the duckling');
+  await expect(page.getByRole('button', { name: 'Switch to Fenn the duckling' })).toHaveCount(1);
+  expect(await page.locator(APP).ariaSnapshot()).toContain('button "Switch to Fenn the duckling"');
+  await tapToWake(page);
+  await expect(page.locator(APP)).toHaveAttribute('data-state', 'Listening', { timeout: 10_000 });
+  await expect(button).toBeHidden();
+  await expect(page.getByRole('button', { name: /^Switch to / })).toHaveCount(0);
+  expect(await page.locator(APP).ariaSnapshot()).not.toContain('Switch to');
 });
 
 test('the live region: the Asleep text after boot, cleared on waking, untouched by Listening, a reaction or a pause', async ({

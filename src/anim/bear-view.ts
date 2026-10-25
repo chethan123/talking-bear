@@ -1,7 +1,8 @@
 /**
  * Juni on screen (plan §4.6, §7 M4; issue #81): the full-viewport canvas stage that replaced the M1 circle. It
  * owns the canvas, the rig, the pose buffers, the director, the layers, the springs and the frame loop. The canvas
- * is `role="img"` named "Juni the bear" (`A11Y_TEXT.stage`, plan §7 M8, #118).
+ * is `role="img"` named after the character, "Juni the bear" (`A11Y_TEXT.stage`, plan §7 M8, #118). The character
+ * is `deps.character` (duck plan §4.1): its rig, hit regions, eyes' centre, names, director cast and reactions table.
  *
  * **Per frame** (loop.ts drives it):
  * - `substep(dt)`, at 120 Hz: director tick, the playing clip's spring kicks that are due (#221), `springs.step(dt)`,
@@ -84,9 +85,9 @@
  * long-press fires without movement. Routing, by the session state (`deps.state()`):
  * - **Asleep, Error, Paused:** every `pointerdown` dispatches `tapBear` ("a tap anywhere").
  * - **Awake** (MicDenied included): a background `tap down` turns the gaze to the point for `LOOK_HOLD_S`, and a
- *   background stroke's moves keep it on the finger. A gesture with a reaction (`reactionFor`, #90) goes to the
- *   director as `{k:'gesture'}` at the director clock; its region is the cooldown key (hug and all-over:
- *   `belly`; a pinch: its first cheek), and a stroke carries `dirX`. A `stroke end` or `longPress end` releases
+ *   background stroke's moves keep it on the finger. A gesture with a reaction (the character's `reactionFor`,
+ *   #90) goes to the director as `{k:'gesture'}` at the director clock; its region is the cooldown key (hug and
+ *   all-over: `belly`; a pinch: its first cheek), and a stroke carries `dirX`. A `stroke end` or `longPress end` releases
  *   what that contact started (`{k:'release', region, gesture}`).
  * - **Every state:** the last pointer up (`onRawUp` with `active === 0`, a `pointercancel` included) releases
  *   everything (`{k:'release'}`): pinch, hug, tickle and all-over have no end gesture. `pointerdown` notes the
@@ -115,11 +116,11 @@ import type { Envelope } from '../dsp/types.ts';
 import { attachPointerAdapter } from '../input/pointer-adapter.ts';
 import type { Gesture, PointerSample } from '../input/recognizer.ts';
 import type { RegionId } from '../input/region-ids.ts';
-import { hitTest, REGIONS } from '../input/regions.ts';
+import { compileRegions, hitTest } from '../input/regions.ts';
 import type { Haptics } from '../platform/haptics.ts';
 import type { Visibility } from '../platform/visibility.ts';
 import { cancelTap, markFirstBearFrame, markTap } from '../perf.ts';
-import { reactionFor } from '../reactions/table.ts';
+import type { CharacterSpec } from '../characters/types.ts';
 import { A11Y_TEXT } from '../ui/a11y.ts';
 import type { Clip } from './clip.ts';
 import type { MimeClipName } from './clips/reactions.ts';
@@ -142,7 +143,7 @@ import { Ch, CH_COUNT, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
 import { createContext, fitView, render, resizeCanvas } from './renderer.ts';
 import type { View } from './renderer.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT } from './rig.ts';
 import { mulberry32 } from './rng.ts';
 import { SpringBank } from './springs.ts';
 import { configureSprings, SECONDARY_SPRINGS, SPRING, SPRING_CHANNEL, SPRING_COUNT } from './springs-map.ts';
@@ -266,6 +267,8 @@ export interface BearViewDeps {
   perfNow?: () => number;
   /** Defaults to `window.devicePixelRatio`. */
   devicePixelRatio?: () => number;
+  /** The character on stage (`CHARACTERS[id]`): rig, hit regions, eyes' centre, names, director cast, reactions. */
+  character: CharacterSpec;
 }
 
 export interface BearView {
@@ -286,7 +289,7 @@ export interface BearView {
    */
   gesture(g: Gesture): void;
   /**
-   * The centre of region `id`'s first `REGIONS` entry in viewport CSS px, from the bone matrices of the last drawn
+   * The centre of region `id`'s first entry in the character's regions in viewport CSS px, from the bone matrices of the last drawn
    * pose (e2e: `__bearTest.regionCenter`). Throws a RangeError for an id without a region (`background`).
    */
   regionCenter(id: RegionId): { x: number; y: number };
@@ -333,10 +336,17 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const canvas = document.createElement('canvas');
   canvas.className = 'stage';
   canvas.setAttribute('role', 'img');
-  canvas.setAttribute('aria-label', A11Y_TEXT.stage);
-  root.append(canvas);
+  const spec = deps.character;
+  /** The director's clips and escalation targets, passed to every director call (one object: monomorphic). */
+  const cast = spec.cast;
+  const reactionFor = spec.reactionFor;
+  canvas.setAttribute('aria-label', A11Y_TEXT.stage(spec.names));
+  // First child of `root`: a remount (T126) puts the new canvas back below the overlays, the gear and the sheets,
+  // and before the swap button, which styles.css hides after a fixed (`showPose`) stage.
+  root.prepend(canvas);
   const g = createContext(canvas);
-  const rig = createRig();
+  const rig = createRig(spec);
+  const regions = compileRegions(rig);
   const view: View = { scale: 0, ox: 0, oy: 0 };
   /** `view` in CSS px of the canvas: hit tests, `regionCenter` and the gaze map pointer points through it. */
   const cssView: View = { scale: 1, ox: 0, oy: 0 };
@@ -358,8 +368,8 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   const ctx: AnimContext = { rng: mulberry32(deps.seed ?? DEFAULT_SEED), weights, lookAt: null, springs };
   const blink = createBlink();
   const breathing = createBreathing();
-  const gaze = createGaze({ headRot: SPRING.headRot, headTilt: SPRING.headTilt });
-  const ears = createEarTwitch({ earL: SPRING.earL, earR: SPRING.earR });
+  const gaze = createGaze({ headRot: SPRING.headRot, headTilt: SPRING.headTilt }, spec.eyesCenter);
+  const ears = createEarTwitch({ earL: SPRING.earL, earR: SPRING.earR }, spec.eyesCenter);
   const mood = createMood();
   const mouth = new MouthLayer(deps.latencyMs ?? DISPLAY_LATENCY_MS);
   const mouthNow = (): number => T[FRAME_T]!;
@@ -467,7 +477,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     const c = dir.clip;
     if (c !== kickClip) {
       kickClip = c;
-      kicks = c === null ? undefined : clipByName(c.name)?.impulses;
+      kicks = c === null ? undefined : clipByName(c.name, cast)?.impulses;
       kickNext = 0;
     }
     if (c === null || kicks === undefined) return;
@@ -493,7 +503,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     const d = dir;
     if (d.name === 'Asleep' || d.name === 'Waking' || (d.clip !== null && d.reaction === null)) return;
     mimeIn.now = now;
-    dir = directorReduce(d, mimeIn);
+    dir = directorReduce(d, mimeIn, cast);
     T[MIME_AT] = now + MIC_DENIED_MIME_S;
   }
 
@@ -502,7 +512,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     tickIn.now = T[NOW]!;
     // A queued reaction starts on a tick, which outputs it like a gesture (#93). A quiet tick returns the shared
     // frozen result, with nothing to route.
-    const r = directorStep(dir, tickIn);
+    const r = directorStep(dir, tickIn, cast);
     dir = r.state;
     if (r.out.length !== 0) route(r.out);
     // #115: the cupped-ear mime while the session is in MicDenied.
@@ -531,9 +541,9 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   function compose(): void {
     const now = T[NOW]!;
     const alpha = T[ALPHA]!;
-    evaluateFrom(dir, T, NOW, pose, true);
+    evaluateFrom(dir, T, NOW, pose, true, cast);
     if (reduced && dir.clip !== null) {
-      evaluateFrom(withoutClip(dir), T, NOW, noClipPose);
+      evaluateFrom(withoutClip(dir), T, NOW, noClipPose, false, cast);
       const base = noClipPose[Ch.HeadRot]!;
       pose[Ch.HeadRot] = base + (pose[Ch.HeadRot]! - base) * REDUCED_MOTION_SCALE;
     }
@@ -664,7 +674,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   // ---- input (#93): pointer adapter → recogniser → reactions table → director → session ------------------------
   /** The bone matrices of the last drawn pose for hit tests; stale once a frame is drawn, recomputed on demand. */
-  const hitBones = new Float32Array(BONE_COUNT * MAT);
+  const hitBones = new Float32Array(rig.boneCount * MAT);
   let bonesStale = true;
   /** The gaze target of a background touch (design units), `ctx.lookAt` while held. */
   const look: LookAt = { x: 0, y: 0 };
@@ -682,7 +692,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   /** The region under a point in CSS px relative to the canvas, as the adapter's samples are. */
   function hit(x: number, y: number): RegionId {
-    return hitTest(x, y, bones(), cssView);
+    return hitTest(x, y, bones(), cssView, regions);
   }
 
   /** The director clock for a pointer input (s): the app clock, never stepping back. */
@@ -720,7 +730,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
 
   /** A pointer input's director step: the new state is stored before its outputs are routed. */
   function stepDirector(input: DirInput): void {
-    const r = directorStep(dir, input);
+    const r = directorStep(dir, input, cast);
     dir = r.state;
     route(r.out);
     loop.invalidate();
@@ -779,10 +789,10 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
   });
 
   function regionCenter(id: RegionId): { x: number; y: number } {
-    const r = REGIONS.find((d) => d.id === id);
+    const r = spec.regions.find((d) => d.id === id);
     if (r === undefined) throw new RangeError(`regionCenter: no hit region ${id}`);
     const m = bones();
-    const o = boneIndex(r.bone) * MAT;
+    const o = boneIndex(rig, r.bone) * MAT;
     const x = m[o]! * r.cx + m[o + 2]! * r.cy + m[o + 4]!;
     const y = m[o + 1]! * r.cx + m[o + 3]! * r.cy + m[o + 5]!;
     const rect = canvas.getBoundingClientRect();
@@ -800,10 +810,10 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
       if (ev.e === 'reaction' && ev.name === TOO_LOUD_REACTION) {
         // #117: the director's table ignores the session's reactions; this one is asked for as its clip.
         tooLoudIn.now = now;
-        dir = directorReduce(dir, tooLoudIn);
+        dir = directorReduce(dir, tooLoudIn, cast);
       } else {
         const input: DirInput = { k: 'anim', ev, now };
-        dir = directorReduce(dir, input);
+        dir = directorReduce(dir, input, cast);
       }
       if (ev.e === 'talk') startMouth();
       loop.invalidate();
@@ -816,7 +826,7 @@ export function mountBearView(root: HTMLElement, deps: BearViewDeps): BearView {
     setReducedMotion(on) {
       reduced = on;
       configureSprings(springs, on ? REDUCED_MOTION_MIN_ZETA : 0);
-      dir = directorReduce(dir, { k: 'setGentle', on });
+      dir = directorReduce(dir, { k: 'setGentle', on }, cast);
       loop.invalidate();
     },
     get reducedMotion() {

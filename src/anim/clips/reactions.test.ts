@@ -7,7 +7,7 @@ import type { Clip } from '../clip.ts';
 import { EAR_SPRING, GAZE_SPRING } from '../layers/index.ts';
 import { addPose, Ch, CH_COUNT, createPose } from '../pose.ts';
 import type { Pose } from '../pose.ts';
-import { BONE_COUNT, boneIndex, boneMatrices, createRig, MAT, partIndex, partMatrix } from '../rig.ts';
+import { boneIndex, boneMatrices, createRig, MAT, partIndex, partMatrix } from '../rig.ts';
 import { SpringBank } from '../springs.ts';
 import {
   BELLY_SPRING,
@@ -24,8 +24,13 @@ import {
   TUFT_SPRING,
 } from '../springs-map.ts';
 import { SUBSTEP } from '../stepper.ts';
-import { GENTLE_BASES, GENTLE_SCALE, MIME_CLIPS, REACTION_CLIPS } from './reactions.ts';
+import { FENN_CLIPS } from './fenn.ts';
+import { GENTLE_BASES, GENTLE_SCALE, kick, MIME_CLIPS, REACTION_CLIPS } from './reactions.ts';
 import type { ReactionClipName } from './reactions.ts';
+import { JUNI } from '../../characters/juni.ts';
+
+/** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
+const JUNI_RIG = createRig(JUNI, { paths: false });
 
 const DEG = Math.PI / 180;
 /** "Within 0.02 of neutral" (validation 2). */
@@ -36,7 +41,11 @@ const GENTLE_MAX_RATIO = 0.35;
 /** Every clip, iterated from the exported set: `[name, clip]`. */
 const CLIPS = Object.entries(REACTION_CLIPS);
 const SUSTAINED = CLIPS.filter(([, c]) => c.sustained === true);
-const NOT_SUSTAINED = CLIPS.filter(([, c]) => c.sustained !== true);
+/** Juni's reaction clips and Fenn's (duck plan §4.6, T125 acceptance 4): the per-clip validation loops run on both. */
+const FENN_ENTRIES = Object.entries(FENN_CLIPS);
+const ALL_CLIPS = [...CLIPS, ...FENN_ENTRIES];
+const ALL_SUSTAINED = ALL_CLIPS.filter(([, c]) => c.sustained === true);
+const ALL_NOT_SUSTAINED = ALL_CLIPS.filter(([, c]) => c.sustained !== true);
 
 /** The #90 table's clip names: one per reaction, the L/R ones per side (#90 "Sides"). */
 const TABLE = [
@@ -124,13 +133,13 @@ vi.stubGlobal(
     }
   },
 );
-const RIG = createRig();
-const BONE_BUF = new Float32Array(BONE_COUNT * MAT);
+const RIG = createRig(JUNI);
+const BONE_BUF = new Float32Array(JUNI_RIG.boneCount * MAT);
 
 /** Where bone `id`'s pivot is drawn (design units) in `pose`: its rest pivot through its bone matrix. */
 function posedPivot(pose: Pose, id: string): [number, number] {
   boneMatrices(RIG, pose, BONE_BUF);
-  const b = boneIndex(id);
+  const b = boneIndex(JUNI_RIG, id);
   const [x, y] = BONES[b]!.pivot;
   const o = b * MAT;
   const m = BONE_BUF;
@@ -291,8 +300,8 @@ describe('REACTION_CLIPS: the set', () => {
   });
 });
 
-describe('REACTION_CLIPS: validation 1, keys sorted, duration ≥ the last key, valid channel and spring indices', () => {
-  it.each(CLIPS)('%s', (_name, c) => {
+describe('REACTION_CLIPS and FENN_CLIPS: validation 1, keys sorted, duration ≥ the last key, valid channel and spring indices', () => {
+  it.each(ALL_CLIPS)('%s', (_name, c) => {
     expect(Number.isFinite(c.duration) && c.duration > 0).toBe(true);
     const chs = channels(c);
     expect(new Set(chs).size, 'one track per channel').toBe(chs.length);
@@ -312,11 +321,13 @@ describe('REACTION_CLIPS: validation 1, keys sorted, duration ≥ the last key, 
       expect(imp.t).toBeLessThanOrEqual(c.duration);
       expect(Number.isFinite(imp.dv) && imp.dv !== 0).toBe(true);
     }
+    const ts = (c.impulses ?? []).map((imp) => imp.t);
+    expect(ts, 'impulses in time order').toEqual(ts.toSorted((a, b) => a - b));
   });
 });
 
-describe('REACTION_CLIPS: validation 2, back to within 0.02 of neutral at 0 and at the duration', () => {
-  it.each(NOT_SUSTAINED)('%s: at 0 and at the duration', (_name, c) => {
+describe('REACTION_CLIPS and FENN_CLIPS: validation 2, back to within 0.02 of neutral at 0 and at the duration', () => {
+  it.each(ALL_NOT_SUSTAINED)('%s: at 0 and at the duration', (_name, c) => {
     for (const t of [0, c.duration]) {
       const pose = sampleClip(c, t, createPose());
       for (let ch = 0; ch < CH_COUNT; ch++)
@@ -324,7 +335,7 @@ describe('REACTION_CLIPS: validation 2, back to within 0.02 of neutral at 0 and 
     }
   });
 
-  it.each(NOT_SUSTAINED)(
+  it.each(ALL_NOT_SUSTAINED)(
     '%s: its spring kicks have rung out (within 0.02 of rest) by the duration',
     (_name, c) => {
       const { pos } = runSprings(c, c.duration);
@@ -333,14 +344,17 @@ describe('REACTION_CLIPS: validation 2, back to within 0.02 of neutral at 0 and 
     },
   );
 
-  it.each(SUSTAINED)('%s (sustained): neutral at 0, and holds a pose from the duration on', (_name, c) => {
-    const start = sampleClip(c, 0, createPose());
-    for (let ch = 0; ch < CH_COUNT; ch++)
-      expect(Math.abs(start[ch]!), `channel ${ch}`).toBeLessThanOrEqual(NEUTRAL_TOL);
-    const end = Array.from(sampleClip(c, c.duration, createPose()));
-    expect(end.some((v) => Math.abs(v) > NEUTRAL_TOL)).toBe(true);
-    expect(Array.from(sampleClip(c, c.duration + 10, createPose()))).toEqual(end);
-  });
+  it.each(ALL_SUSTAINED)(
+    '%s (sustained): neutral at 0, and holds a pose from the duration on',
+    (_name, c) => {
+      const start = sampleClip(c, 0, createPose());
+      for (let ch = 0; ch < CH_COUNT; ch++)
+        expect(Math.abs(start[ch]!), `channel ${ch}`).toBeLessThanOrEqual(NEUTRAL_TOL);
+      const end = Array.from(sampleClip(c, c.duration, createPose()));
+      expect(end.some((v) => Math.abs(v) > NEUTRAL_TOL)).toBe(true);
+      expect(Array.from(sampleClip(c, c.duration + 10, createPose()))).toEqual(end);
+    },
+  );
 });
 
 describe('REACTION_CLIPS: validation 3, every gentle variant is its base × 0.3 with no stars', () => {
@@ -437,7 +451,7 @@ describe('REACTION_CLIPS: content (issue #89 "Clips")', () => {
       ['irisL', 6],
       ['irisR', -6],
     ] as const) {
-      partMatrix(RIG, peak, BONE_BUF, partIndex(id), m);
+      partMatrix(RIG, peak, BONE_BUF, partIndex(JUNI_RIG, id), m);
       const want = [1, 0, 0, 1, dx, 0];
       for (let i = 0; i < MAT; i++) expect(m[i], `${id}[${i}]`).toBeCloseTo(want[i]!, 9);
     }
@@ -703,8 +717,8 @@ function pawToEarL(pose: Pose): number {
 function pawVisibleL(pose: Pose): number {
   boneMatrices(RIG, pose, BONE_BUF);
   const m = BONE_BUF;
-  const p = boneIndex('pawL') * MAT;
-  const h = boneIndex('head') * MAT;
+  const p = boneIndex(JUNI_RIG, 'pawL') * MAT;
+  const h = boneIndex(JUNI_RIG, 'head') * MAT;
   const [a, b, c, d, e, f] = [m[h]!, m[h + 1]!, m[h + 2]!, m[h + 3]!, m[h + 4]!, m[h + 5]!];
   const det = a * d - b * c;
   let total = 0;
@@ -890,5 +904,148 @@ describe('MIME_CLIPS: tooLoud and tooLoudGentle (#117)', () => {
       expect(gt.keys.map((key) => [key.t, key.ease])).toEqual(tr.keys.map((key) => [key.t, key.ease]));
       gt.keys.forEach((key, j) => expect(key.v).toBeCloseTo(GENTLE_SCALE * tr.keys[j]!.v, 12));
     });
+  });
+});
+
+/** `xs` equals `ys` to 6 decimals (poses are `Float32Array`s). */
+function expectClose(xs: readonly number[], ys: readonly number[]): void {
+  expect(xs).toHaveLength(ys.length);
+  ys.forEach((y, j) => expect(xs[j], `index ${j}`).toBeCloseTo(y, 6));
+}
+
+describe('FENN_CLIPS (duck plan §4.6 "New clips")', () => {
+  it('is exactly the plan’s clips, each named after its key, sharing no name with Juni’s clips', () => {
+    expect(Object.keys(FENN_CLIPS).toSorted()).toEqual(
+      [
+        'quack',
+        'bigQuack',
+        'bigQuackGentle',
+        'beakNibble',
+        'fluffRuffle',
+        'wingFlapL',
+        'wingFlapR',
+        'tailWiggle',
+      ].toSorted(),
+    );
+    for (const [name, c] of FENN_ENTRIES) {
+      expect(c.name).toBe(name);
+      expect(Object.keys(REACTION_CLIPS)).not.toContain(name);
+      expect(Object.keys(MIME_CLIPS)).not.toContain(name);
+      expect(channels(c), name).not.toContain(Ch.Stars);
+      expect(name.toLowerCase()).not.toMatch(/cry|hurt|pain|scared|fear/);
+    }
+    expect(FENN_ENTRIES.filter(([, c]) => c.sustained === true).map(([n]) => n)).toEqual(['beakNibble']);
+  });
+
+  it('quack: the jaw opens twice (0.8, then 0.6), the head bobs up 6, the bill kicks with a peak of 3', () => {
+    const c = FENN_CLIPS.quack;
+    expect(c.duration).toBe(0.45);
+    expectClose(
+      [0, 0.06, 0.16, 0.24, 0.4].map((t) => at(c, t, Ch.Jaw)),
+      [0, 0.8, 0.1, 0.6, 0],
+    );
+    expectClose(
+      [0, 0.06, 0.4].map((t) => at(c, t, Ch.HeadY)),
+      [0, -6, 0],
+    );
+    expect(c.impulses).toHaveLength(1);
+    expect(c.impulses![0]).toStrictEqual({ t: 0, spring: SPRING.nose, dv: kick(SPRING.nose, 3) });
+    expect(runSprings(c, c.duration).peak[SPRING.nose]).toBeGreaterThan(0.7 * 3);
+  });
+
+  it('bigQuack: three quacks at 0, 0.35 and 0.70 s (the last peaks at 1.0), squash, head rock, kicks at each', () => {
+    const c = FENN_CLIPS.bigQuack;
+    expect(c.duration).toBe(1.2);
+    for (const t0 of [0, 0.35]) expect(at(c, t0 + 0.06, Ch.Jaw)).toBeCloseTo(0.8, 6);
+    expect(at(c, 0.76, Ch.Jaw)).toBeCloseTo(1, 6);
+    expect(Math.max(...series(c, Ch.Jaw))).toBeCloseTo(1, 6);
+    expectClose(
+      [0, 0.1, 0.5, 1.1].map((t) => at(c, t, Ch.BodySquash)),
+      [0, -0.06, 0.04, 0],
+    );
+    expectClose(
+      [0, 0.35, 0.7, 1.1].map((t) => at(c, t, Ch.HeadRot)),
+      [0, -0.05, 0.05, 0],
+    );
+    expect(c.impulses!.map((imp) => [imp.t, imp.spring])).toEqual(
+      [0, 0.35, 0.7].flatMap((t) => [
+        [t, SPRING.tuft],
+        [t, SPRING.nose],
+      ]),
+    );
+  });
+
+  it('bigQuackGentle is bigQuack × GENTLE_SCALE: same times, every value and kick × 0.3', () => {
+    const b = FENN_CLIPS.bigQuack;
+    const g = FENN_CLIPS.bigQuackGentle;
+    expect(g.duration).toBe(b.duration);
+    expect(channels(g)).toEqual(channels(b));
+    for (const t of grid(b)) {
+      const bp = sampleClip(b, t, createPose());
+      const gp = sampleClip(g, t, createPose());
+      for (let ch = 0; ch < CH_COUNT; ch++)
+        expect(gp[ch], `channel ${ch} at ${t}`).toBeCloseTo(GENTLE_SCALE * bp[ch]!, 6);
+    }
+    b.impulses!.forEach((imp, i) => expect(g.impulses![i]!.dv).toBeCloseTo(GENTLE_SCALE * imp.dv, 9));
+    const bm = maxAbsSeen(b);
+    const gm = maxAbsSeen(g);
+    for (let ch = 0; ch < CH_COUNT; ch++)
+      expect(gm[ch], `channel ${ch}`).toBeLessThanOrEqual(GENTLE_MAX_RATIO * bm[ch]!);
+  });
+
+  it('beakNibble: Jaw 0.25, IrisConverge 4, lids 0.2, held', () => {
+    const c = FENN_CLIPS.beakNibble;
+    expect(c.duration).toBe(0.2);
+    for (const [ch, v] of [
+      [Ch.Jaw, 0.25],
+      [Ch.IrisConverge, 4],
+      [Ch.LidL, 0.2],
+      [Ch.LidR, 0.2],
+    ] as const)
+      expect(at(c, 0.2, ch)).toBeCloseTo(v, 6);
+  });
+
+  it('fluffRuffle: a shiver, the fluff tufts out ±0.3, brows −4, a crown-curl kick with a peak of 0.3', () => {
+    const c = FENN_CLIPS.fluffRuffle;
+    expect(c.duration).toBe(0.95);
+    expectClose(
+      [0, 0.1, 0.2, 0.3, 0.45].map((t) => at(c, t, Ch.BodySquash)),
+      [0, -0.03, 0.03, -0.02, 0],
+    );
+    expectClose([at(c, 0.15, Ch.EarRotL), at(c, 0.15, Ch.EarRotR)], [-0.3, 0.3]);
+    expectClose([at(c, 0.2, Ch.BrowL), at(c, 0.2, Ch.BrowR), at(c, 0.9, Ch.BrowL)], [-4, -4, 0]);
+    expect(c.impulses).toStrictEqual([{ t: 0, spring: SPRING.tuft, dv: kick(SPRING.tuft, 0.3) }]);
+    expect(runSprings(c, c.duration).peak[SPRING.tuft]).toBeGreaterThan(0.7 * 0.3);
+  });
+
+  it('wingFlapL / wingFlapR: 0.6, 0, 0.6, 0, 0.4 on ArmRotL, the same negated on ArmRotR', () => {
+    const l = FENN_CLIPS.wingFlapL;
+    const r = FENN_CLIPS.wingFlapR;
+    const ts = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+    expectClose(
+      ts.map((t) => at(l, t, Ch.ArmRotL)),
+      [0, 0.6, 0, 0.6, 0, 0.4, 0],
+    );
+    expectClose(
+      ts.map((t) => at(r, t, Ch.ArmRotR)),
+      [0, -0.6, 0, -0.6, 0, -0.4, 0],
+    );
+    expect([channels(l), channels(r)]).toEqual([[Ch.ArmRotL], [Ch.ArmRotR]]);
+    for (const t of grid(l)) expect(at(r, t, Ch.ArmRotR)).toBeCloseTo(-at(l, t, Ch.ArmRotL), 12);
+  });
+
+  it('tailWiggle: BodyLean +2°, −2°, +1°, and the tail feathers kick (peaks 0.35 and −0.3) and ring out', () => {
+    const c = FENN_CLIPS.tailWiggle;
+    expectClose(
+      [0, 0.15, 0.3, 0.45, 0.6].map((t) => at(c, t, Ch.BodyLean)),
+      [0, 2, -2, 1, 0].map((d) => d * DEG),
+    );
+    expect(c.impulses).toStrictEqual([
+      { t: 0, spring: SPRING.kerchiefA, dv: kick(SPRING.kerchiefA, 0.35) },
+      { t: 0, spring: SPRING.kerchiefB, dv: kick(SPRING.kerchiefB, -0.3) },
+    ]);
+    const { peak } = runSprings(c, c.duration);
+    expect(peak[SPRING.kerchiefA]).toBeGreaterThan(0.7 * 0.35);
+    expect(peak[SPRING.kerchiefB]).toBeGreaterThan(0.7 * 0.3);
   });
 });

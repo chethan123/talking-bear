@@ -51,7 +51,9 @@ const split =
 /** x < 300 hits the belly, x < 600 the left foot, the rest the right foot. */
 const bellyFeet: Hit = (x) => (x < 300 ? 'belly' : x < 600 ? 'footL' : 'footR');
 /** A 50 px grid over every region id, so random traces visit every region. */
-const grid: Hit = (x, y) => REGION_IDS[(((Math.floor(x / 50) + 3 * Math.floor(y / 50)) % 17) + 17) % 17]!;
+const N_REGION_IDS = REGION_IDS.length;
+const grid: Hit = (x, y) =>
+  REGION_IDS[(((Math.floor(x / 50) + 3 * Math.floor(y / 50)) % N_REGION_IDS) + N_REGION_IDS) % N_REGION_IDS]!;
 
 const dn = (t: number, x: number, y: number, id = 1): PointerSample => ({ id, t, x, y, type: 'down' });
 const mv = (t: number, x: number, y: number, id = 1): PointerSample => ({ id, t, x, y, type: 'move' });
