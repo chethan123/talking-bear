@@ -17,7 +17,7 @@ Every non-obvious factual claim carries one of these tags.
 |---|---|
 | **[V]** | Read in the primary source during this planning session: spec source, Chromium/AOSP source, MDN content or browser-compat-data, library source/README, or the npm registry. |
 | **[E]** | Measured or reproduced **in this sandbox**: headless Chromium 141 via Playwright 1.56, or Node 22 on a 2.1 GHz Xeon VM. These are *not* phone measurements. |
-| **[E N1]** | Measured in the duck research on an **aarch64 Neoverse-N1 VM (4 vCPU), Node 24.21.0, 2026-10-24**, with the throwaway spike `docs/research/spikes/09-duck-voice/`. This is a second [E] sandbox: not the Xeon above, and not D1. |
+| **[E N1]** | Measured in the duck research on an **aarch64 Neoverse-N1 VM (4 vCPU), Node 24.21.0, 2026-10-24**, with the throwaway spike `docs/research/spikes/09-duck-voice/` (deleted when `src/dsp/duck.ts` landed in T115, as the spikes rule says; the numbers live in its git history, commit 77770a8). This is a second [E] sandbox: not the Xeon above, and not D1. |
 | **[S]** | Seen only in a search-result snippet. Treat as a lead, not a fact. |
 | **[M]** | From memory, reasoning or estimation. Unverified. Every [M] that matters has an experiment in [§5](#5-risks-unknowns-and-the-experiments-that-settle-them). |
 
@@ -1430,7 +1430,7 @@ That comes to about **60 filled paths**, i.e. about 60 draw calls, from about 30
 
 #### 4.6.7 Concrete duckling design: Fenn
 
-**Status: working design (Q9, decided 2026-10-25).** The name stays a working name until the first render is reviewed (T124), like Juni's under Q4. The reaction table is in [§4.6.4](#464-gesture--region--reaction).
+**Status: working design (Q9, decided 2026-10-25); as built in T123, pending the owner's review (T124).** The geometry below records the as-built values of `art/duck.svg`, where they differ from the first draft. The name stays a working name until the first render is reviewed (T124), like Juni's under Q4. The reaction table is in [§4.6.4](#464-gesture--region--reaction).
 
 **Silhouette.** A seated chibi duckling in the same 1000 × 1400 design box as Juni:
 
@@ -1480,10 +1480,13 @@ root(500,1340) └ body(500,1250; ~squash)
   ├ belly(500,960; ~jiggle)                    ├ wingL(290,720), wingR(710,720)
   └ neck(500,640) → head(500,600; ~rot, tilt, squish)
       ├ fluffL(230,330)~, fluffR(770,330)~     ├ tuft(500,160)~
-      ├ browL(400,312), browR(600,312)         ├ eyeL(400,380), eyeR(600,380): sclera(clip) → iris+pupil → highlight; lidUpper, lidLower
       ├ cheekBlushL(330,470), cheekBlushR(670,470)
-      └ bill(500,505; ~bob) → jaw(500,540)
+      ├ bill(500,505; ~bob) → jaw(500,540)
+      ├ eyeL(400,380), eyeR(600,380): sclera(clip) → iris+pupil → highlight; lidUpper, lidLower
+      └ browL(400,312), browR(600,312)
 ```
+
+The head's children are drawn in the order shown (the art's document order, as built): fluff, tuft, cheeks, bill and jaw, eyes, brows.
 
 **Drives** (Fenn's `drives`; same `Term` semantics as Juni's table, §3.3):
 
@@ -1509,19 +1512,19 @@ root(500,1340) └ body(500,1250; ~squash)
 
 | Part | Shape and position |
 |---|---|
-| Head | ellipse rx 290, ry 250 at (500, 400): brown cap over the top half; butter face patch rx 230, ry 170 at (500, 470); eye stripe from each eye to the head edge |
+| Head | ellipse rx 290, ry 250 at (500, 400): `headFace` is the whole ellipse in butter, with `headCap` (brown, over the top half) and `capShine` drawn on it; an eye stripe from each eye to the head edge (as built: no separate face patch) |
 | Fluff tufts | 3-lobed tufts ≈ 120 × 100 at (230/770, 330), behind the head outline |
 | Crown curl | single curled feather in bbox [450, 60, 590, 170] |
 | Eyes | sclera rx 44, ry 50 at (400/600, 380); iris r 32; pupil r 18; highlight r 9 offset (−11, −13); lids as Juni's (upper drawn closed, lower static) |
 | Brows | feather strokes 60 × 14 at (400/600, 312) |
 | Cheeks | blush rx 55, ry 35 at (330/670, 470) |
-| Bill | upper bill bbox [385, 470, 615, 548] with nail and 2 nostrils (on `bill`); interior ellipse rx 85, ry 34 at (500, 548) on `bill`, drawn before the lower bill; tongue ellipse rx 40, ry 14 at (500, 566) and lower bill bbox [405, 536, 595, 590] on `jaw`. Draw order: interior, tongue, lower bill, upper bill, nostrils |
-| Body | egg from y 640 to y 1250, half-width 280 at y 1000; belly patch rx 200, ry 220 at (500, 960) |
+| Bill | As built. Upper bill (on `bill`) bbox [357, 458, 643, 559], so y 458–559 and x 357–643, with `billShine`, the nail (`billNail`, 478–522 × 541–556) and 2 nostrils. Interior (`billInterior`, on `bill`, bbox [395, 504, 605, 580]) is drawn before the lower bill. On `jaw`: `billThroat` (bbox [400, 488, 600, 544]), tongue ellipse rx 40, ry 15 at (500, 544), lower bill bbox [394, 518, 606, 587]. Draw order: interior, throat, tongue, lower bill, upper bill, shine, nail, nostrils. `billThroat` is an extra part, in the bill-interior colour, on `jaw`: the interior stays on `bill`, so when the jaw slides down (up to 60 units) the butter face would show through the gap under the upper bill; the throat moves with the jaw and fills it |
+| Body | egg from y 630 to y 1250 (`bodyDown`), half-width 290 at y 1040; `chestDown` (the butter chest, from y 624) and `bellyPatch` (rx 200, ry 220 at (500, 960), on `belly`) drawn on it |
 | Wings | teardrops ≈ 120 × 270 from the shoulder pivots down-outward to tips near (230/770, 980), teal stripe near the tip; left drawn, right mirrored |
 | Feet | webbed paddles rx 120, ry 55 at (370/630, 1275), 3 toe scallops; mirrored |
-| Tail | two feathers in bbox [745, 950, 875, 1080], behind the body, peeking out past the right hip |
+| Tail | two feathers (`tailAFeather` [742, 952, 866, 1084], `tailBFeather` [752, 1020, 876, 1098]; together [742, 952, 876, 1098]), behind the body, peeking out past the right hip |
 
-Target: 40–80 drawn parts (Juni: 54 [V]).
+Target: 40–80 drawn parts (Juni: 54 [V]). As built: 58 (mirrored copies counted, `PARTS` in `src/art/duck-parts.gen.ts`). The extra parts beyond the first draft are shading and highlights: `tailAVein`, `bodyShade`, `chestShade`, `bellyShade`, `wingShade`, `wingShine`, `fluffShade`, `tuftShine`, `capShine`, `billShine`, and the leg `shank`.
 
 Other spec constants:
 
@@ -1565,7 +1568,7 @@ Other spec constants:
 | `fluffRuffle` | 0.95 s | `BodySquash` 0, −0.03, 0.03, −0.02, 0 at 0, 0.1, 0.2, 0.3, 0.45; `EarRotL` 0 → −0.3 @0.15 → 0 @0.6; `EarRotR` 0 → +0.3 @0.15 → 0 @0.6; `BrowL`/`BrowR` 0 → −4 @0.2 → 0 @0.9; kick `SPRING.tuft` peak 0.3 at 0 |
 | `wingFlapL` | 0.6 s | `ArmRotL` 0 → 0.6 @0.1 → 0 @0.2 → 0.6 @0.3 → 0 @0.4 → 0.4 @0.5 → 0 @0.6 |
 | `wingFlapR` | 0.6 s | as `wingFlapL` on `ArmRotR` with negated values |
-| `tailWiggle` | 0.8 s | `BodyLean` 0, +2°, −2°, +1°, 0 at 0, 0.15, 0.3, 0.45, 0.6; kicks `SPRING.kerchiefA` peak 0.35 and `SPRING.kerchiefB` peak −0.3 at 0 |
+| `tailWiggle` | 1.2 s (as built; the first draft said 0.8 s) | `BodyLean` 0, +2°, −2°, +1°, 0 at 0, 0.15, 0.3, 0.45, 0.6; kicks `SPRING.kerchiefA` peak 0.35 and `SPRING.kerchiefB` peak −0.3 at 0. The clip lasts 1.2 s because both tail-feather springs must settle inside it: the clip tests require < 0.02 rad from rest at the end, and at 0.8 s feather B is still 0.021 rad off |
 
 **New sound effects** (`SfxId` += `quack`, `bigQuack`, `nibble`, `trill`, `peep`, `flap`, `pat`).
 
@@ -1573,7 +1576,7 @@ Every recipe obeys the `sfx-synths.ts` rules and its browser test [V `sfx-synths
 
 | Id | Duration | Recipe |
 |---|---|---|
-| `quack` | 0.22 s | sawtooth, exponential glide 620 → 440 Hz; band-pass 1.6 kHz Q 3; AM 70 Hz depth 0.35; envelope 0 → 1 @6 ms → 0.8 @160 ms → 0 @220 ms |
+| `quack` | 0.22 s | sawtooth, exponential glide 620 → 440 Hz; band-pass 1.6 kHz Q 3; AM 70 Hz depth 0.35 (the gain swings 0.65–1.0, i.e. 1 − 0.35 to 1, as built in `QUACK_TONE`); envelope 0 → 1 @6 ms → 0.8 @160 ms → 0 @220 ms |
 | `bigQuack` | 0.85 s | three `quack`s at 0, 0.28 and 0.56 s; the third glides 560 → 380 Hz, its envelope stretched to 0.29 s (0 → 1 @6 ms → 0.8 @0.23 s → 0 @0.29 s) |
 | `nibble` | 0.29 s | four 12 ms band-passed noise clicks (2.5 kHz, Q 2) at 0, 0.09, 0.18 and 0.27 s |
 | `trill` | 0.5 s | sine 1.4 kHz, frequency-modulated at 18 Hz by ±80 Hz, low-pass 3 kHz; envelope 0 → 1 @20 ms → 0.7 @400 ms → 0 @500 ms |
@@ -2479,13 +2482,13 @@ Ships after `v1.0.0` as `v1.1.0` (Q13). Only T114 may land before it.
 
 **Build**
 
-- **T113** Amend `docs/plan.md` with the duck plan
-- **T114** Voice chain under budget: `isVoiced` early exit, exact true-peak block skip
-- **T115** DSP: `duckStage` and the RBJ peaking biquad
-- **T116** Duckling preset wiring: types, `processVoice`, settings, sheet, bench row
-- **T117** `lab/duck`: owner pre-tune and the X-F4 listening test
-- **T118** Owner: X-F4 duck listening test and X-F5 voice-chain time on D1
-- **T119** ADR: Duckling voice parameters; apply them
+- **T113** Amend `docs/plan.md` with the duck plan. *Implemented in this branch; the issue filing was dropped (one PR).*
+- **T114** Voice chain under budget: `isVoiced` early exit, exact true-peak block skip. *Implemented in this branch.*
+- **T115** DSP: `duckStage` and the RBJ peaking biquad. *Implemented in this branch.*
+- **T116** Duckling preset wiring: types, `processVoice`, settings, sheet, bench row. *Implemented in this branch.*
+- **T117** `lab/duck`: owner pre-tune and the X-F4 listening test. *Implemented in this branch.*
+- **T118** Owner: X-F4 duck listening test and X-F5 voice-chain time on D1. *Open (owner and device task).*
+- **T119** ADR: Duckling voice parameters; apply them. *Open (needs T118).*
 
 **Exit criteria**
 
@@ -2496,9 +2499,9 @@ Ships after `v1.0.0` as `v1.1.0` (Q13). Only T114 may land before it.
 
 **Build**
 
-- **T120** Generator per character
-- **T121** `CharacterSpec`: rig, renderer, regions, gaze and texts take the character
-- **T122** Director, reactions and BearView take the cast
+- **T120** Generator per character. *Implemented in this branch.*
+- **T121** `CharacterSpec`: rig, renderer, regions, gaze and texts take the character. *Implemented in this branch.*
+- **T122** Director, reactions and BearView take the cast. *Implemented in this branch.*
 
 **Exit criteria**
 
@@ -2509,12 +2512,12 @@ Ships after `v1.0.0` as `v1.1.0` (Q13). Only T114 may land before it.
 
 **Build**
 
-- **T123** Fenn art, spec and renderer baselines
-- **T124** Owner: review the first Fenn render
-- **T125** Fenn reactions, clips and sound effects
-- **T126** Character selection: swap button, persistence, remount, e2e
-- **T127** PWA: manifest description and the Fenn installer screenshot
-- **T128** Owner: Fenn device checks on D1, then `v1.1.0`
+- **T123** Fenn art, spec and renderer baselines. *Implemented in this branch (the art as built, pending T124).*
+- **T124** Owner: review the first Fenn render. *Open (owner task).*
+- **T125** Fenn reactions, clips and sound effects. *Implemented in this branch.*
+- **T126** Character selection: swap button, persistence, remount, e2e. *Implemented in this branch.*
+- **T127** PWA: manifest description and the Fenn installer screenshot. *Implemented in this branch.*
+- **T128** Owner: Fenn device checks on D1, then `v1.1.0`. *Open (owner and device task).*
 
 **Exit criteria**
 

@@ -6,7 +6,8 @@
 //
 // - `refresh()` runs on every session state change (main.ts): the button is `hidden` unless `state()` is Asleep, and
 //   it shows the head and the name of the character `current()` is not.
-// - A `click` calls `choose(other)`; main.ts writes `settings.set({ character })` and remounts the bear.
+// - A `click` calls `choose(other)`; main.ts, if the session is still Asleep, writes `settings.set({ character })`
+//   and remounts the bear.
 // - The button is a later sibling of the stage canvas (main#app's first child), so styles.css hides it under
 //   `.stage.stage--fixed` (`showPose`): it never appears in a pose screenshot.
 // - The canvas sits under the button but is not its ancestor, so the button's pointer events never reach the stage's
@@ -32,7 +33,7 @@ export interface CharacterSwitchDeps {
   state(): StateName;
   /** The character on stage. */
   current(): CharacterId;
-  /** main.ts: `settings.set({ character: id })`. */
+  /** main.ts: `settings.set({ character: id })` if the session is still Asleep, then `refresh()`. */
   choose(id: CharacterId): void;
   /** The other character's head, drawn once (`characterThumbnail`); called at most once per character. */
   thumbnail(id: CharacterId, size: number): HTMLCanvasElement;

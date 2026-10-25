@@ -39,7 +39,9 @@ const PALETTE: ReadonlySet<string> = new Set([
 ]);
 const BLUSH = '#F2A07B';
 
-// Duck plan §4.4's rig, in document order: every bone, its parent and its pivot (design units). `root` has no parent.
+// Fenn's rig as built in art/duck.svg, in document order: every bone, its parent and its pivot (design units). `root` has
+// no parent. The head's children are drawn fluff, tuft, cheeks, bill (with its jaw), eyes, brows; docs/plan.md §4.6.7
+// lists the same order.
 const RIG: ReadonlyArray<readonly [bone: string, parent: string | undefined, pivot: string]> = [
   ['root', undefined, '500,1340'],
   ['body', 'root', '500,1250'],

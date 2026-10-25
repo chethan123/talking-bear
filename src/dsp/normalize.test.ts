@@ -15,6 +15,7 @@ import {
   voiceGainDb,
 } from './normalize.ts';
 import { resampleOffline } from './resample.ts';
+import { SAMPLE_LIMIT } from './voice.ts';
 
 // BS.1770-4 Table 1 / Table 2 coefficients at 48 kHz, as pinned by the issue.
 const PINNED_SHELF: BiquadCoefficients = {
@@ -509,18 +510,19 @@ describe('truePeakDbtp block skip (duck plan T114)', () => {
     }
   });
 
+  const gain = fc.oneof(
+    fc.constantFrom(1, 0.5, 0.25, 1 / 2.02, 0.4950495, 1e-3, 1e-30, 3.4e38),
+    fc.double({ min: 0, max: 1, noNaN: true }),
+  );
+  const segment = fc.record({
+    kind: fc.integer({ min: 0, max: 3 }),
+    length: fc.integer({ min: 1, max: 200 }),
+    gain,
+    phase: fc.integer({ min: 0, max: 3 }),
+    seed: fc.integer({ min: 0, max: 0xffff }),
+  });
+
   it('returns the same number as before on 1000 random inputs (property)', () => {
-    const gain = fc.oneof(
-      fc.constantFrom(1, 0.5, 0.25, 1 / 2.02, 0.4950495, 1e-3, 1e-30, 3.4e38),
-      fc.double({ min: 0, max: 1, noNaN: true }),
-    );
-    const segment = fc.record({
-      kind: fc.integer({ min: 0, max: 3 }),
-      length: fc.integer({ min: 1, max: 200 }),
-      gain,
-      phase: fc.integer({ min: 0, max: 3 }),
-      seed: fc.integer({ min: 0, max: 0xffff }),
-    });
     const input = fc.oneof(
       fc.float32Array({ minLength: 0, maxLength: 600, size: 'max' }),
       fc.float32Array({ minLength: 0, maxLength: 600, size: 'max', noNaN: true, min: -1, max: 1 }),
@@ -528,6 +530,40 @@ describe('truePeakDbtp block skip (duck plan T114)', () => {
     );
     fc.assert(
       fc.property(input, (x) => Object.is(truePeakDbtp(x), truePeakDbtpBeforeT114(x))),
+      { numRuns: 1000 },
+    );
+  });
+
+  it('returns the same number as before with NaN, ±Infinity and amplitudes up to ±SAMPLE_LIMIT (property)', () => {
+    const limit = Math.fround(SAMPLE_LIMIT); // ±1e30 as a Float32Array holds it
+    const special = fc.constantFrom(Number.NaN, Infinity, -Infinity, limit, -limit, 0);
+    const sample = fc.oneof(
+      { weight: 1, arbitrary: special },
+      { weight: 6, arbitrary: fc.float({ min: -limit, max: limit, noNaN: true }) },
+      { weight: 6, arbitrary: fc.float({ min: -1, max: 1, noNaN: true }) },
+    );
+    // Samples drawn one by one: specials and huge values anywhere, mixed with plain PCM.
+    const mixed = fc.array(sample, { maxLength: 600 }).map((xs) => Float32Array.from(xs));
+    // A structured input (skippable quiet blocks, worst-case patterns) with a few specials written over it, so a
+    // NaN or an infinity lands before, inside or after the blocks the skip passes over.
+    const placed = fc
+      .record({
+        segments: fc.array(segment, { minLength: 1, maxLength: 12 }),
+        writes: fc.array(
+          fc.record({ at: fc.double({ min: 0, max: 1, noNaN: true, maxExcluded: true }), v: special }),
+          {
+            minLength: 1,
+            maxLength: 4,
+          },
+        ),
+      })
+      .map(({ segments, writes }) => {
+        const x = buildSegments(segments);
+        for (const { at, v } of writes) x[Math.floor(at * x.length)] = v;
+        return x;
+      });
+    fc.assert(
+      fc.property(fc.oneof(mixed, placed), (x) => Object.is(truePeakDbtp(x), truePeakDbtpBeforeT114(x))),
       { numRuns: 1000 },
     );
   });

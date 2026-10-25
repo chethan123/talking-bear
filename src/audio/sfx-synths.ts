@@ -809,7 +809,10 @@ interface Quacks {
   notes: readonly QuackNote[];
 }
 
-/** The quack's tone: the band-pass that makes it nasal, and its AM (the gain swings between 1 − amDepth and 1). */
+/**
+ * The quack's tone: the band-pass that makes it nasal, and its AM (the gain swings between 1 − amDepth and 1, so
+ * depth 0.35 is 0.65–1.0).
+ */
 const QUACK_TONE = { bandHz: 1600, q: 3, amHz: 70, amDepth: 0.35 } as const;
 /** One quack's relative envelope: 0 → 1 at 6 ms → 0.8 at 160 ms → 0 at 220 ms. */
 const QUACK_ENV: readonly EnvPoint[] = [

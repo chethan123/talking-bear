@@ -43,19 +43,21 @@ talking-bear/
 │   │            envelope.ts fft.ts normalize.ts fades.ts yin.ts duck.ts
 │   │            silero/{model.ts,weights.ts,weights.bin,weights.provenance.json}
 │   ├── anim/    rig.ts pose.ts springs.ts director.ts renderer.ts loop.ts layers/*.ts clips/*.ts
+│   │            clips/fenn.ts
 │   ├── art/     bear-parts.gen.ts duck-parts.gen.ts   # generated from art/bear.svg, art/duck.svg (committed)
 │   ├── characters/ types.ts index.ts juni.ts fenn.ts   # one CharacterSpec per character
 │   ├── input/   recognizer.ts pointer-adapter.ts regions.ts
-│   ├── reactions/ table.ts
+│   ├── reactions/ table.ts fenn-table.ts
 │   ├── platform/ wake-lock.ts visibility.ts permissions.ts storage.ts
 │   ├── pwa/     register.ts
-│   ├── ui/      overlay.ts debug-overlay.ts styles.css
+│   ├── ui/      overlay.ts debug-overlay.ts character-switch.ts styles.css
 │   └── test-hooks.ts               # only reachable when VITE_BEAR_TEST_HOOKS==='1'
 ├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures, duck
 │                                   #   (no page ever stores or downloads captured audio: Q2)
 ├── scripts/
 │   ├── gen-bear-parts.ts   extract-silero-weights.ts   gen-fixtures.ts   gen-corpus.ts
 │   ├── precompress.mjs     check-dist.mjs              check-headers.sh
+│   ├── bench-voice.ts              duck-svg.test.ts
 │   └── vad-eval.ts                 # offline VAD evaluation harness (same TS modules)
 ├── test/                           # helpers: wav.ts, worklet-scope.ts, fixtures/*.wav(+.json),
 │                                   #   traces/<session>/{trace.json,trace.bin} (real-voice feature traces, no audio)
