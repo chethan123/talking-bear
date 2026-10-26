@@ -29,6 +29,7 @@ talking-bear/
 ├── index.html
 ├── art/
 │   ├── bear.svg                    # source art: one id per part, data-pivot, data-parent
+│   ├── duck.svg                    # source art for Fenn, same rules
 │   └── icon.svg                    # icon source → generated PNGs committed in public/icons
 ├── public/
 │   ├── icons/                      # generated once by @vite-pwa/assets-generator
@@ -39,21 +40,24 @@ talking-bear/
 │   ├── audio/   engine.ts capture.worklet.ts player.ts output-clock.ts sfx.ts messages.ts
 │   ├── workers/ dsp.worker.ts
 │   ├── dsp/     biquad.ts ring-buffer.ts resample.ts energy-gate.ts voicing.ts segmenter.ts
-│   │            envelope.ts fft.ts normalize.ts fades.ts yin.ts
+│   │            envelope.ts fft.ts normalize.ts fades.ts yin.ts duck.ts
 │   │            silero/{model.ts,weights.ts,weights.bin,weights.provenance.json}
 │   ├── anim/    rig.ts pose.ts springs.ts director.ts renderer.ts loop.ts layers/*.ts clips/*.ts
-│   ├── art/     bear-parts.gen.ts      # generated from art/bear.svg (committed)
+│   │            clips/fenn.ts
+│   ├── art/     bear-parts.gen.ts duck-parts.gen.ts   # generated from art/bear.svg, art/duck.svg (committed)
+│   ├── characters/ types.ts index.ts juni.ts fenn.ts   # one CharacterSpec per character
 │   ├── input/   recognizer.ts pointer-adapter.ts regions.ts
-│   ├── reactions/ table.ts
+│   ├── reactions/ table.ts fenn-table.ts
 │   ├── platform/ wake-lock.ts visibility.ts permissions.ts storage.ts
 │   ├── pwa/     register.ts
-│   ├── ui/      overlay.ts debug-overlay.ts styles.css
+│   ├── ui/      overlay.ts debug-overlay.ts character-switch.ts styles.css
 │   └── test-hooks.ts               # only reachable when VITE_BEAR_TEST_HOOKS==='1'
-├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures
+├── lab/                            # dev-only pages: routing, latency, vad-trace, vad-live, voices, spectrum, bench, gestures, duck
 │                                   #   (no page ever stores or downloads captured audio: Q2)
 ├── scripts/
 │   ├── gen-bear-parts.ts   extract-silero-weights.ts   gen-fixtures.ts   gen-corpus.ts
 │   ├── precompress.mjs     check-dist.mjs              check-headers.sh
+│   ├── bench-voice.ts              duck-svg.test.ts
 │   └── vad-eval.ts                 # offline VAD evaluation harness (same TS modules)
 ├── test/                           # helpers: wav.ts, worklet-scope.ts, fixtures/*.wav(+.json),
 │                                   #   traces/<session>/{trace.json,trace.bin} (real-voice feature traces, no audio)
@@ -67,7 +71,7 @@ talking-bear/
 ├── tsconfig.json                   # references: app, worklet, worker, node, test
 ├── tsconfig.app.json  tsconfig.worklet.json  tsconfig.worker.json  tsconfig.node.json  tsconfig.test.json
 ├── vite.config.ts  vitest.config.ts  playwright.config.ts
-├── .oxlintrc.json  .prettierrc  .size-limit.json
+├── .oxlintrc.json  .prettierrc  .size-limit.cjs
 └── LICENSE  README.md  THIRD_PARTY_NOTICES.md   # Silero (MIT) weights notice, etc.
 ```
 
@@ -81,7 +85,7 @@ talking-bear/
 - `pnpm format:check`: checks formatting without writing.
 - `pnpm typecheck`: runs `tsc -b` over the five project references (app, worklet, worker, node, test).
 - `pnpm test`: runs the Vitest `node` and `worklet` projects once.
-- `pnpm test:browser`: runs the Vitest `browser` project (`src/**/*.browser.test.ts` in headless Chromium via Playwright, `channel: 'chromium'`, fake-media flags) in two Vitest processes: `src/anim/frame-alloc.browser.test.ts` (the frame-allocation smoke) alone first, because the test files of one run share a renderer and a V8 isolate, then the rest of the project with that file excluded. Under an agent (`CLAUDECODE` or `AI_AGENT` set) the reporter prints no `[I214 smoke]` line on a pass: unset both, or run the file with `--silent=false`. It is not part of `pnpm verify`; CI runs it as its own step. It needs a Playwright Chromium (`pnpm exec playwright install --no-shell chromium`).
+- `pnpm test:browser`: runs the Vitest `browser` project (`src/**/*.browser.test.ts` in headless Chromium via Playwright, `channel: 'chromium'`, fake-media flags) in three Vitest processes: `src/anim/frame-alloc.browser.test.ts` (the frame-allocation smoke on Juni) alone first, because the test files of one run share a renderer and a V8 isolate, then `src/anim/frame-alloc-fenn.browser.test.ts` (the same smoke on Fenn) alone, then the rest of the project with both files excluded. Under an agent (`CLAUDECODE` or `AI_AGENT` set) the reporter prints no `[I214 smoke]` line on a pass: unset both, or run the files with `--silent=false`. It is not part of `pnpm verify`; CI runs it as its own step. It needs a Playwright Chromium (`pnpm exec playwright install --no-shell chromium`).
 - `pnpm build:e2e`: builds the e2e-mode bundle into `dist-e2e/` (`vite build --mode e2e`, which loads `.env.e2e`: `VITE_BEAR_TEST_HOOKS=1`).
 - `pnpm preview:e2e`: serves `dist-e2e/` with `vite preview` on port 4173 (fails if the port is taken), with the production headers from `server/headers.json`.
 - `pnpm e2e`: runs `build:e2e`, then the Playwright specs in `e2e/` (`playwright.config.ts`: `channel: 'chromium'`, one worker, no retries). Playwright starts `preview:e2e` itself; locally it reuses whatever already listens on port 4173, so stop other preview servers first. It is not part of `pnpm verify`; CI runs it as the `e2e` job. It needs a Playwright Chromium (`pnpm exec playwright install --no-shell chromium`).

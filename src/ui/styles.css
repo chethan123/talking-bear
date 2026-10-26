@@ -216,6 +216,43 @@ body {
   -webkit-user-select: none;
 }
 
+/* The character swap button (character-switch.ts, duck plan §3.3, T126): 72 px at the bottom left, the other
+   character's head on a round button, level with the gear, above the overlay layer and below a fixed stage and the
+   sheets. It is shown only in Asleep ([hidden] otherwise). */
+.character-switch {
+  position: fixed;
+  left: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  z-index: 2;
+  box-sizing: border-box;
+  width: 72px;
+  height: 72px;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 20%);
+  cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.character-switch-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Never in a pose screenshot: the stage canvas is main#app's first child, so the button follows it. */
+.stage.stage--fixed ~ .character-switch {
+  display: none !important;
+}
+
 /* The press's progress ring (#113): hidden at rest; while pressing, it fills in 1 s (settings-sheet.ts GEAR_HOLD_MS). */
 .settings-gear-ring {
   position: absolute;

@@ -68,7 +68,6 @@ export {
 export type { BlinkLayer } from './blink.ts';
 export { BELLY_PHASE, BREATH_AMP, BREATH_HZ, createBreathing } from './breathing.ts';
 export {
-  EYES_CENTER,
   GAZE_MAX,
   GAZE_SPRING,
   HEAD_FOLLOW,

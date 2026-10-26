@@ -3,7 +3,8 @@
  * checks that `render` allocates nothing per frame.
  *
  * The screenshots are rendered once each, with no rAF loop: `render` is a pure function of the pose, so a fixed
- * pose is a fixed seed and time. Baselines live in `__screenshots__/renderer.browser.test.ts/`; regenerate them
+ * pose is a fixed seed and time. Every key pose is drawn with Juni's rig (`<pose>`) and with Fenn's (`fenn-<pose>`, duck
+ * plan T123). Baselines live in `__screenshots__/renderer.browser.test.ts/`; regenerate them
  * with `pnpm test:browser --update` on Linux after a Playwright or Chromium bump. Never loosen the comparison.
  */
 import { beforeAll, describe, expect, test } from 'vitest';
@@ -13,9 +14,14 @@ import type { PoseName } from './poses.ts';
 import { PARTS } from '../art/bear-parts.gen.ts';
 import { Ch, createPose } from './pose.ts';
 import type { Pose } from './pose.ts';
-import { BG_BOTTOM, BG_TOP, createContext, fitView, render, resizeCanvas } from './renderer.ts';
+import { createContext, fitView, render, resizeCanvas } from './renderer.ts';
 import type { View } from './renderer.ts';
-import { BONE_COUNT, boneMatrices, createRig, MAT, partIndex, partMatrix } from './rig.ts';
+import { boneMatrices, createRig, MAT, partIndex, partMatrix } from './rig.ts';
+import { FENN } from '../characters/fenn.ts';
+import { JUNI } from '../characters/juni.ts';
+
+/** Juni's rig without paths, for bone and part indices (call-site edit for T121's `createRig(spec)`). */
+const JUNI_RIG = createRig(JUNI, { paths: false });
 
 const CSS_WIDTH = 500;
 const CSS_HEIGHT = 700;
@@ -76,8 +82,20 @@ describe('key poses match their baselines', () => {
       const { canvas, g, view } = mount(CSS_WIDTH, CSS_HEIGHT);
       expect([canvas.width, canvas.height]).toEqual([500, 700]);
       expect(view).toEqual({ scale: 0.5, ox: 0, oy: 0 });
-      render(g, createRig(), POSES[name], view);
+      render(g, createRig(JUNI), POSES[name], view);
       await expect.element(canvas).toMatchScreenshot(name);
+    });
+  }
+});
+
+describe("key poses match their baselines with Fenn's rig", () => {
+  for (const name of NAMES) {
+    test(`fenn ${name}`, async () => {
+      expect(window.devicePixelRatio).toBe(1);
+      const { canvas, g, view } = mount(CSS_WIDTH, CSS_HEIGHT);
+      expect(view).toEqual({ scale: 0.5, ox: 0, oy: 0 });
+      render(g, createRig(FENN), POSES[name], view);
+      await expect.element(canvas).toMatchScreenshot(`fenn-${name}`);
     });
   }
 });
@@ -235,7 +253,7 @@ describe('render allocates nothing per frame', () => {
 
   test('no Path2D, gradient, matrix or array per frame; one gradient per resize; save/restore balanced', () => {
     const { canvas, g, view } = mount(100, 140);
-    const rig = createRig();
+    const rig = createRig(JUNI);
     render(g, rig, POSES.neutral, view); // the first frame at this size builds the background gradient
     const frames = countAllocations(() => {
       for (let k = 0; k < 3; k++) for (const name of NAMES) render(g, rig, POSES[name], view);
@@ -299,7 +317,7 @@ describe('render allocates nothing per frame', () => {
       if (typeof gc !== 'function')
         throw new Error('needs Chromium with --js-flags=--expose-gc (vitest.config.ts)');
       const { g, view } = mount(100, 140);
-      const rig = createRig();
+      const rig = createRig(JUNI);
       const FRAMES = 5000;
       const BOUND = 16 * 1024;
       /** Heap growth over `FRAMES` frames (frame k draws `poses[k % poses.length]`, then `extra(k)`), after a GC. */
@@ -399,16 +417,16 @@ function irisRun(g: CanvasRenderingContext2D, x: number, y: number): [number, nu
 describe('blush and context reset (pixel checks, no screenshot)', () => {
   test('the squish blush is 0.35·#F2A07B over what lies under it; render resets a dirty context', () => {
     const { g, view } = mount(CSS_WIDTH, CSS_HEIGHT);
-    const rig = createRig();
+    const rig = createRig(JUNI);
     const squish = POSES.squish;
     expect(squish[Ch.Blush]).toBe(1);
     const noBlush = squish.slice();
     noBlush[Ch.Blush] = 0;
     // The posed centres of blushL and blushR in canvas pixels: bbox centre → partMatrix → view.
-    const bones = boneMatrices(rig, squish, new Float32Array(BONE_COUNT * MAT));
+    const bones = boneMatrices(rig, squish, new Float32Array(JUNI_RIG.boneCount * MAT));
     const m = new Float64Array(MAT);
     const centres = ['blushL', 'blushR'].map((id): readonly [number, number] => {
-      const part = partIndex(id);
+      const part = partIndex(JUNI_RIG, id);
       const [x0, y0, x1, y1] = PARTS[part]!.bbox;
       const cx = (x0 + x1) / 2;
       const cy = (y0 + y1) / 2;
@@ -427,8 +445,13 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
     g.setTransform(0.1, 0, 0, 0.1, 0, 0);
 
     render(g, rig, noBlush, view);
-    expectRgbNear(pixel(g, 2, 2), rgb(BG_TOP), 3, 'top-left background');
-    expectRgbNear(pixel(g, CSS_WIDTH - 3, CSS_HEIGHT - 3), rgb(BG_BOTTOM), 3, 'bottom-right background');
+    expectRgbNear(pixel(g, 2, 2), rgb(JUNI.background.top), 3, 'top-left background');
+    expectRgbNear(
+      pixel(g, CSS_WIDTH - 3, CSS_HEIGHT - 3),
+      rgb(JUNI.background.bottom),
+      3,
+      'bottom-right background',
+    );
     const under = centres.map(([x, y]) => pixel(g, x, y));
 
     render(g, rig, squish, view);
@@ -443,7 +466,7 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
 
   test('the tongue shows only when Jaw > 0.15 and the teeth only when Teeth > 0.3', () => {
     const { g, view } = mount(CSS_WIDTH, CSS_HEIGHT);
-    const rig = createRig();
+    const rig = createRig(JUNI);
     /** The canvas pixel over design point (x, y) in jaw space, which is design space here (no bone moves). */
     const at = (x: number, y: number): number[] =>
       pixel(g, Math.floor(view.scale * x + view.ox), Math.floor(view.scale * y + view.oy));
@@ -468,10 +491,10 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
   });
 
   test('the iris, pupil and highlight are clipped to the sclera', () => {
-    const rig = createRig();
+    const rig = createRig(JUNI);
     // The iris is a circle (centre and radius from its bbox), the sclera an ellipse (from its bbox).
-    const [ix0, iy0, ix1, iy1] = PARTS[partIndex('irisL')]!.bbox;
-    const [sx0, sy0, sx1, sy1] = PARTS[partIndex('scleraL')]!.bbox;
+    const [ix0, iy0, ix1, iy1] = PARTS[partIndex(JUNI_RIG, 'irisL')]!.bbox;
+    const [sx0, sy0, sx1, sy1] = PARTS[partIndex(JUNI_RIG, 'scleraL')]!.bbox;
     const r = (ix1 - ix0) / 2;
     const shifted = createPose();
     shifted[Ch.IrisX] = 10;
@@ -480,8 +503,8 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
     partMatrix(
       rig,
       shifted,
-      boneMatrices(rig, shifted, new Float32Array(BONE_COUNT * MAT)),
-      partIndex('irisL'),
+      boneMatrices(rig, shifted, new Float32Array(JUNI_RIG.boneCount * MAT)),
+      partIndex(JUNI_RIG, 'irisL'),
       m,
     );
     const icx = (ix0 + ix1) / 2;
@@ -509,7 +532,7 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
   });
 
   test('IrisConverge 6 moves the left iris +6 and the right iris −6 in screen x, at the neutral pose (#222)', () => {
-    const rig = createRig();
+    const rig = createRig(JUNI);
     const SCALE = 4;
     const converged = createPose();
     converged[Ch.IrisConverge] = 6;
@@ -518,7 +541,7 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
       ['irisR', -6],
     ] as const) {
       // Zoom ×4 onto the iris's rest centre, at the canvas centre: 1 design unit = 4 px.
-      const [x0, y0, x1, y1] = PARTS[partIndex(id)]!.bbox;
+      const [x0, y0, x1, y1] = PARTS[partIndex(JUNI_RIG, id)]!.bbox;
       const cx = (x0 + x1) / 2;
       const cy = (y0 + y1) / 2;
       const { g } = mount(CSS_WIDTH, CSS_HEIGHT);
@@ -540,9 +563,9 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
   });
 
   test('render applies the view offset: centred fits on 700×700 (ox 100) and 500×900 (oy 100)', () => {
-    const rig = createRig();
+    const rig = createRig(JUNI);
     const pose = POSES.talkOpen;
-    const bones = boneMatrices(rig, pose, new Float32Array(BONE_COUNT * MAT));
+    const bones = boneMatrices(rig, pose, new Float32Array(JUNI_RIG.boneCount * MAT));
     const m = new Float64Array(MAT);
     for (const [width, height, ox, oy] of [
       [700, 700, 100, 0],
@@ -553,7 +576,7 @@ describe('blush and context reset (pixel checks, no screenshot)', () => {
       render(g, rig, pose, view);
       /** The canvas pixel over the posed bbox centre of `id`. */
       const centreOf = (id: string): number[] => {
-        const part = partIndex(id);
+        const part = partIndex(JUNI_RIG, id);
         const [x0, y0, x1, y1] = PARTS[part]!.bbox;
         const x = (x0 + x1) / 2;
         const y = (y0 + y1) / 2;

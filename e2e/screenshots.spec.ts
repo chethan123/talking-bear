@@ -17,7 +17,21 @@ import { noCspViolationsAfterEach, openApp } from './helpers/app';
 // reduced motion keeps the paw static, and showPose freezes the canvas. Its baseline also holds the settings gear,
 // whose "⚙" is a system-font glyph, so it depends on the image's fonts: regenerate it on the CI image if the fonts
 // differ (`--update-snapshots=missing` after deleting it), and never raise maxDiffPixelRatio.
+//
+// Fenn (duck plan T126): `fenn-<pose>` and `asleep-overlay-fenn` tap the swap button in Asleep first (the bear is
+// remounted as Fenn, fading in over 200 ms unless reduced motion is on: the fade is awaited), then freeze the pose the
+// same way. showPose's fixed stage hides the swap button (styles.css), so Juni's baselines, `asleep-overlay` included,
+// are unchanged.
 noCspViolationsAfterEach();
+
+/** Taps the swap button in Asleep and waits until Fenn is on stage and his canvas has finished fading in. */
+async function switchToFenn(page: Page): Promise<void> {
+  await page.locator('button.character-switch').click();
+  const stage = page.locator('canvas.stage');
+  await expect(stage).toHaveAttribute('aria-label', 'Fenn the duckling');
+  await expect(page.locator('main#app')).toHaveAttribute('data-state', 'Asleep');
+  await stage.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+}
 
 /** Freezes the canvas on pose `name` through `__bearTest.showPose` (the loop stops for good). */
 async function showPose(page: Page, name: string): Promise<void> {
@@ -49,4 +63,32 @@ test('asleep-overlay', async ({ page }) => {
   await page.clock.pauseAt(1000);
   await showPose(page, 'asleep');
   await expect(page).toHaveScreenshot('asleep-overlay.png', { maxDiffPixelRatio: 0.001 });
+});
+
+for (const name of Object.keys(POSES)) {
+  test(`pose fenn-${name}`, async ({ page }) => {
+    await openApp(page);
+    await switchToFenn(page);
+    await page.clock.install({ time: 0 });
+    await page.clock.pauseAt(1000);
+    await showPose(page, name);
+    await expect(page.locator('canvas.stage')).toHaveScreenshot(`fenn-${name}.png`, {
+      maxDiffPixelRatio: 0.001,
+    });
+  });
+}
+
+test('asleep-overlay-fenn', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await openApp(page);
+  await switchToFenn(page);
+  const paw = page.locator('.overlay .overlay-paw');
+  await expect(paw).toBeVisible();
+  await expect(paw).toHaveAttribute('aria-label', 'Tap to wake Fenn');
+  expect(await paw.evaluate((el) => el.getAnimations().length)).toBe(0); // static under reduced motion
+  await page.clock.install({ time: 0 });
+  await page.clock.pauseAt(1000);
+  await showPose(page, 'asleep');
+  await expect(page.locator('button.character-switch')).toBeHidden(); // hidden after the fixed stage
+  await expect(page).toHaveScreenshot('asleep-overlay-fenn.png', { maxDiffPixelRatio: 0.001 });
 });

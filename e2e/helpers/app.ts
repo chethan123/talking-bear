@@ -5,6 +5,7 @@ import { ENERGY_HOP, VAD_RATE } from '../../src/audio/constants.ts';
 import { PRESETS } from '../../src/dsp/types.ts';
 import { yinF0 } from '../../src/dsp/yin.ts';
 import { LEVEL_EVERY_HOPS, SILERO_NOT_READY_MESSAGE } from '../../src/workers/vad-core.ts';
+import { AM_LINE_DUCK_MIN_DB, amLineDb } from './am-line';
 import { expectNoEnforcedViolations, installCspRecorder } from './csp';
 
 // Shared helpers for the e2e specs (plan §4.9.3, §7 M1, §7 M3), on top of the e2e test hooks, window.__bearTest
@@ -65,7 +66,7 @@ const APP = 'main#app';
 
 /**
  * The pitch ratio p of the voice the specs hear: Bear cub, the default preset (plan §4.3.4). Each spec starts
- * with empty storage, so the settings are the defaults.
+ * with empty storage, so the settings are the defaults (Juni, Bear cub); `LoopOptions.pitchRatio` overrides it.
  */
 export const PITCH_RATIO = PRESETS.cub.pitchRatio;
 
@@ -643,20 +644,41 @@ export interface LoopOptions extends WakeOptions {
   f0Tolerance?: number;
   /** The VAD's speech span tolerance against the sidecar's, in seconds; default 0.13. */
   vadToleranceSec?: number;
+  /** The pitch ratio p of the voice the loop plays (the replay length's bounds and the f0 check); default PITCH_RATIO. */
+  pitchRatio?: number;
+  /**
+   * Step 5 checks the replay's f0 with YIN (default true). `false` (the duck voice, whose AM and 320 Hz high-pass
+   * YIN can't read: duck plan §3.1.2) asserts its AM line instead: `amLineDb` ≥ AM_LINE_DUCK_MIN_DB (e2e/helpers/am-line.ts).
+   */
+  f0Check?: boolean;
+}
+
+/** What expectLoop measured on the replay at the output tap. */
+export interface LoopResult {
+  /** The replay's AM line (`amLineDb`), dB: asserted only with `f0Check: false`. */
+  amLineDb: number;
 }
 
 /**
  * One full loop on a fixture (the `loop-*` specs): wake, a non-silent mic, the loop's state changes within
  * 15 s, the replay length within processVoice's bounds, the VAD's speech span against the fixture's, the
- * replay's pitch and peak, and no `arm` while gated. `f0` is the fixture's f0 in Hz (its sidecar must agree).
+ * replay's pitch (or, with `f0Check: false`, its AM line) and peak, and no `arm` while gated. `f0` is the fixture's
+ * f0 in Hz (its sidecar must agree).
  */
 export async function expectLoop(
   page: Page,
   fixture: string,
   f0: number,
   opts: LoopOptions = {},
-): Promise<void> {
-  const { speechSec: wantSpeechSec = 1.5, f0Tolerance = 0.03, vadToleranceSec = 0.13, vad } = opts;
+): Promise<LoopResult> {
+  const {
+    speechSec: wantSpeechSec = 1.5,
+    f0Tolerance = 0.03,
+    vadToleranceSec = 0.13,
+    vad,
+    pitchRatio = PITCH_RATIO,
+    f0Check = true,
+  } = opts;
   const meta = readSidecar(fixture);
   expect(meta.f0, `${fixture}.json f0`).toBe(f0);
   expect(meta.speech, `${fixture}.json: one speech span`).toHaveLength(1);
@@ -693,7 +715,7 @@ export async function expectLoop(
   await expectNoCaptureReanchor(page, take, speechSec);
   expect(take.reason, 'the speech ended in silence').toBe('silence');
   const processed = await processedDuration(page);
-  expectProcessedDuration(processed, take, speechSec, PITCH_RATIO);
+  expectProcessedDuration(processed, take, speechSec, pitchRatio);
 
   // 4. VAD accuracy against the fixture: a flat margin, by default the energy backend's (10 ms hops; it covers
   // the vowels' fade envelope).
@@ -702,7 +724,7 @@ export async function expectLoop(
     vadToleranceSec,
   );
 
-  // 5. The replay's pitch: the fixture's f0 × p, within f0Tolerance.
+  // 5. The replay's pitch: the fixture's f0 × p, within f0Tolerance; with f0Check off, its AM line instead.
   const { samples, rate } = await page.evaluate(() => {
     const h = window.__bearTest;
     if (h === undefined) throw new Error('window.__bearTest is missing');
@@ -710,11 +732,16 @@ export async function expectLoop(
   });
   expect(samples.length, 'the output tap heard the replay').toBeGreaterThan(0);
   const outF0 = yinF0(Float32Array.from(samples), rate);
-  const wantF0 = f0 * PITCH_RATIO;
-  expect(
-    Math.abs(outF0 - wantF0) / wantF0,
-    `yinF0(outputSamples()) = ${outF0} Hz, want ${wantF0} Hz`,
-  ).toBeLessThanOrEqual(f0Tolerance);
+  const wantF0 = f0 * pitchRatio;
+  const amLine = amLineDb(samples, rate);
+  if (f0Check) {
+    expect(
+      Math.abs(outF0 - wantF0) / wantF0,
+      `yinF0(outputSamples()) = ${outF0} Hz, want ${wantF0} Hz`,
+    ).toBeLessThanOrEqual(f0Tolerance);
+  } else {
+    expect(amLine, `the replay's AM line, dB`).toBeGreaterThanOrEqual(AM_LINE_DUCK_MIN_DB);
+  }
 
   // 6. The replay's sample peak at the output tap, after the master gain and Quiet mode.
   const peak = peakDbfs(samples);
@@ -726,17 +753,19 @@ export async function expectLoop(
   expect(gatedArms, 'arm effects on steps into a gated state').toEqual([]);
 
   const preRollFrom = take.startFrame - Math.round(0.3 * take.sr);
-  const { min, max } = processedDurationBounds(take, speechSec, PITCH_RATIO);
+  const { min, max } = processedDurationBounds(take, speechSec, pitchRatio);
   console.log(
     [
       `${fixture}: sr ${take.sr}, armFrame ${take.armFrame}, startFrame ${take.startFrame}, lastSpeechFrame ${take.lastSpeechFrame}`,
       `take from ${preRollFrom >= take.armFrame ? 'pre-roll' : 'armFrame'} (onset − 0.3 s − armFrame = ${((preRollFrom - take.armFrame) / take.sr).toFixed(4)} s)`,
       `processedDuration ${processed.toFixed(6)} s in [${min.toFixed(6)}, ${max.toFixed(6)}] s (take ${takeSeconds(take).toFixed(6)} s)`,
       `VAD ${vadSec.toFixed(4)} s vs ${speechSec} s (error ${((vadSec - speechSec) * 1000).toFixed(1)} ms)`,
-      `yinF0 ${outF0.toFixed(2)} Hz vs ${wantF0} Hz (error ${(((outF0 - wantF0) / wantF0) * 100).toFixed(2)} %), output ${(samples.length / rate).toFixed(4)} s, peak ${peak.toFixed(2)} dBFS`,
+      `yinF0 ${outF0.toFixed(2)} Hz vs ${wantF0} Hz (error ${(((outF0 - wantF0) / wantF0) * 100).toFixed(2)} %${f0Check ? '' : ', not checked'}), output ${(samples.length / rate).toFixed(4)} s, peak ${peak.toFixed(2)} dBFS`,
+      `AM line ${amLine.toFixed(1)} dB${f0Check ? ' (not checked)' : ` (≥ ${AM_LINE_DUCK_MIN_DB})`}`,
       `loop ${((all[ended]!.t - woke.logT) / 1000).toFixed(2)} s`,
     ].join('; '),
   );
+  return { amLineDb: amLine };
 }
 
 /**

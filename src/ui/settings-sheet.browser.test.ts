@@ -21,7 +21,8 @@ import {
 import { commands, page, userEvent } from 'vitest/browser';
 import { realClock } from '../app/clock.ts';
 import type { Overlay, SessionEvent, StateName } from '../app/events.ts';
-import { createSettingsStore, DEFAULT_SETTINGS, type SettingsStore } from '../app/settings.ts';
+import { createSettingsStore, DEFAULT_SETTINGS, SETTINGS_KEY, type SettingsStore } from '../app/settings.ts';
+import { JUNI } from '../characters/juni.ts';
 import { mountDebugOverlay } from './debug-overlay.ts';
 import { mountOverlay } from './overlay.ts';
 import {
@@ -74,8 +75,13 @@ interface Harness {
   deps: SettingsSheetDeps;
 }
 
-function harness(): Harness {
-  const store = createSettingsStore(null);
+/** `stored`: the JSON the store loads (under SETTINGS_KEY) when it is created; none by default. */
+function harness(stored?: string): Harness {
+  const store = createSettingsStore(
+    stored === undefined
+      ? null
+      : { getItem: (k) => (k === SETTINGS_KEY ? stored : null), setItem: () => undefined },
+  );
   const set = vi.spyOn(store, 'set');
   const setQuiet = vi.fn<(on: boolean) => void>();
   const dispatch = vi.fn<(e: SessionEvent) => void>();
@@ -182,6 +188,7 @@ const RADIOS = [
   [SETTINGS_TEXT.cub, 'cub'],
   [SETTINGS_TEXT.chipmunk, 'chipmunk'],
   [SETTINGS_TEXT.bigbear, 'bigbear'],
+  [SETTINGS_TEXT.duck, 'duck'],
   [SETTINGS_TEXT.custom, 'custom'],
 ] as const;
 
@@ -216,9 +223,13 @@ describe('settings sheet', () => {
     expect(d.open).toBe(true);
     expect(d.matches(':modal')).toBe(true);
     const radios = RADIOS.map(([text]) => input(text));
-    expect(radios.map((r) => r.type)).toEqual(['radio', 'radio', 'radio', 'radio']);
+    expect(radios.map((r) => r.type)).toEqual(['radio', 'radio', 'radio', 'radio', 'radio']);
     expect(new Set(radios.map((r) => r.name)).size).toBe(1);
-    expect(radios.map((r) => r.checked)).toEqual([true, false, false, false]); // the default voice, Bear cub
+    expect(radios.map((r) => r.checked)).toEqual([true, false, false, false, false]); // the default voice, Bear cub
+    // In order: Bear cub, Chipmunk, Big bear, Duckling, Custom.
+    expect(
+      Array.from(d.querySelectorAll('fieldset input[type="radio"]'), (r) => r.parentElement?.textContent),
+    ).toEqual(['Bear cub', 'Chipmunk', 'Big bear', 'Duckling', 'Custom']);
     const pitch = input(SETTINGS_TEXT.customPitch);
     expect([pitch.type, pitch.min, pitch.max, pitch.step]).toEqual(['range', '0.7', '2.2', '0.05']);
     expect(Number(pitch.value)).toBe(DEFAULT_SETTINGS.customPitch);
@@ -260,6 +271,46 @@ describe('settings sheet', () => {
       expect(h.set).toHaveBeenLastCalledWith({ voice });
     }
     expect(h.setQuiet).not.toHaveBeenCalled();
+  });
+
+  test('T116 acceptance 6: with character fenn stored, Duckling is checked and Chipmunk writes fennVoice', () => {
+    const h = harness(JSON.stringify({ character: 'fenn' }));
+    expect(h.store.get()).toMatchObject({ character: 'fenn', voice: 'cub', fennVoice: 'duck' });
+    mountSettingsSheet(root, h.deps);
+    press(h, GEAR_HOLD_MS);
+    expect(RADIOS.map(([text]) => input(text).checked)).toEqual([false, false, false, true, false]);
+    expect(input(SETTINGS_TEXT.customPitch).disabled).toBe(true);
+    input(SETTINGS_TEXT.chipmunk).click();
+    expect(h.set).toHaveBeenCalledTimes(1);
+    expect(h.set).toHaveBeenLastCalledWith({ fennVoice: 'chipmunk' });
+    expect(h.store.get()).toMatchObject({ character: 'fenn', voice: 'cub', fennVoice: 'chipmunk' });
+    // Every voice, Custom included, writes Fenn's field; Custom's slider is the shared customPitch.
+    for (const [text, voice] of RADIOS) {
+      input(text).click();
+      expect(h.set).toHaveBeenLastCalledWith({ fennVoice: voice });
+    }
+    const pitch = input(SETTINGS_TEXT.customPitch);
+    expect(pitch.disabled).toBe(false);
+    pitch.value = '1.3';
+    pitch.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(h.set).toHaveBeenLastCalledWith({ customPitch: 1.3 });
+    expect(h.store.get()).toMatchObject({ voice: 'cub', fennVoice: 'custom', customPitch: 1.3 });
+  });
+
+  test("the voice group shows and edits the active character's voice when the sheet opens", () => {
+    const h = harness();
+    const sheet = mountSettingsSheet(root, h.deps);
+    h.store.set({ voice: 'bigbear', fennVoice: 'chipmunk', character: 'fenn' });
+    press(h, GEAR_HOLD_MS);
+    expect(RADIOS.map(([text]) => input(text).checked)).toEqual([false, true, false, false, false]);
+    sheet.close();
+    // Juni again (the swap button only works while the sheet is closed): open() re-reads the store.
+    h.store.set({ character: 'juni' });
+    expect(sheet.open()).toBe(true);
+    expect(RADIOS.map(([text]) => input(text).checked)).toEqual([false, false, true, false, false]);
+    input(SETTINGS_TEXT.duck).click();
+    expect(h.set).toHaveBeenLastCalledWith({ voice: 'duck' });
+    expect(h.store.get()).toMatchObject({ voice: 'duck', fennVoice: 'chipmunk', character: 'juni' });
   });
 
   test('the slider is enabled only for Custom and sets customPitch', () => {
@@ -336,7 +387,7 @@ describe('settings sheet', () => {
       sleepTimeoutSec: 600,
     });
     press(h, GEAR_HOLD_MS);
-    expect(RADIOS.map(([text]) => input(text).checked)).toEqual([false, false, false, true]);
+    expect(RADIOS.map(([text]) => input(text).checked)).toEqual([false, false, false, false, true]);
     const pitch = input(SETTINGS_TEXT.customPitch);
     expect(Number(pitch.value)).toBe(0.9);
     expect(pitch.disabled).toBe(false);
@@ -827,11 +878,12 @@ describe('For parents (#114)', () => {
       forParents: 'For parents',
       micRetry: 'Try the microphone again',
       micHelp: MIC_HELP_114,
-      privacy: PRIVACY_114,
       licences: 'Open-source licences',
       install: 'Install',
       restart: 'New version – restart',
     });
+    // The privacy note names the active character (T121): Juni's is #114's text.
+    expect(SETTINGS_TEXT.privacy(JUNI.names)).toBe(PRIVACY_114);
   });
 
   test('the section sits between Sleep after and Close: heading, retry, help, Install, restart, privacy, licences', () => {

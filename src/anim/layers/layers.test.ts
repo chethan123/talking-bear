@@ -23,7 +23,6 @@ import {
   EAR_TWITCH_DV,
   EAR_TWITCH_MAX,
   EAR_TWITCH_MIN,
-  EYES_CENTER,
   GAZE_MAX,
   GAZE_SPRING,
   HEAD_FOLLOW,
@@ -42,6 +41,10 @@ import {
 } from './index.ts';
 import { EAR_ORIENT_MAX, EAR_ORIENT_TAU } from './ear-twitch.ts';
 import type { AnimContext, Layer, LayerWeights, LookAt, MoodLayer } from './index.ts';
+import { JUNI } from '../../characters/juni.ts';
+
+/** Juni's eyes' centre: the gaze and ear layers take it from the character's spec (T121). */
+const EYES_CENTER = JUNI.eyesCenter;
 
 /** The issue's simulation step (#78 Validation): dt = 1/60 s. */
 const DT = 1 / 60;
@@ -568,7 +571,7 @@ function followOf(iris: number): number {
 
 /** Gaze held still on `lookAt` for 5 s. */
 function settle(lookAt: LookAt): { pose: Pose; layer: ReturnType<typeof createGaze> } {
-  const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+  const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
   const ctx = makeCtx();
   ctx.lookAt = lookAt;
   const pose = createPose();
@@ -587,7 +590,7 @@ describe('gaze', () => {
   });
 
   describe('random saccades over 10 000 s at dt = 1/60 (seed 0x7467)', () => {
-    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
     const ctx = makeCtx();
     // The bank's owner configures and steps it (#81): the layer must never call set or step.
     const setSpy = vi.spyOn(ctx.springs, 'set');
@@ -760,7 +763,7 @@ describe('gaze', () => {
       { x: Number.NaN, y: 0 },
       { x: 0, y: Number.POSITIVE_INFINITY },
     ]) {
-      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
       const ctx = makeCtx();
       let finite = true;
       run(layer, ctx, 600, (i, _t, pose) => {
@@ -776,7 +779,7 @@ describe('gaze', () => {
   });
 
   it('darts the iris to a new target with the 15 ms time constant', () => {
-    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
     const ctx = makeCtx();
     ctx.lookAt = { x: 1500, y: EYES_CENTER.y };
     const irisX: number[] = [];
@@ -788,8 +791,8 @@ describe('gaze', () => {
   });
 
   it('keeps the saccade clock running while lookAt is set', () => {
-    const free = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
-    const looking = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const free = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
+    const looking = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
     const ctxFree = makeCtx();
     const ctxLooking = makeCtx();
     let differ = 0;
@@ -811,7 +814,7 @@ describe('gaze', () => {
   });
 
   it('sinceSaccade is +Infinity after construction and after updates before the first saccade', () => {
-    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
     expect(layer.sinceSaccade).toBe(Number.POSITIVE_INFINITY);
     const ctx = makeCtx();
     // 60 updates of 1/60 s: 1 s, before SACCADE_MIN (1.5 s), the earliest first saccade.
@@ -823,9 +826,9 @@ describe('gaze', () => {
   });
 
   it('rejects bad spring indices', () => {
-    expect(() => createGaze({ headRot: -1, headTilt: 0 })).toThrow(RangeError);
-    expect(() => createGaze({ headRot: 0, headTilt: 1.5 })).toThrow(RangeError);
-    const layer = createGaze({ headRot: 0, headTilt: BANK_SIZE });
+    expect(() => createGaze({ headRot: -1, headTilt: 0 }, EYES_CENTER)).toThrow(RangeError);
+    expect(() => createGaze({ headRot: 0, headTilt: 1.5 }, EYES_CENTER)).toThrow(RangeError);
+    const layer = createGaze({ headRot: 0, headTilt: BANK_SIZE }, EYES_CENTER);
     expect(() => layer.update(DT, createPose(), makeCtx())).toThrow(RangeError);
   });
 });
@@ -850,7 +853,7 @@ describe('ear twitch', () => {
   });
 
   describe('over 10 000 s at dt = 1/60 (seed 0x7467)', () => {
-    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER);
     const ctx = makeCtx();
     const { springs } = ctx;
     const setSpy = vi.spyOn(springs, 'set');
@@ -939,7 +942,7 @@ describe('ear twitch', () => {
   });
 
   it('sinceTwitch is +Infinity after construction and after updates before the first twitch', () => {
-    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER);
     expect(layer.sinceTwitch).toBe(Number.POSITIVE_INFINITY);
     const ctx = makeCtx();
     // 300 updates of 1/60 s: 5 s, before EAR_TWITCH_MIN (6 s), the earliest first twitch.
@@ -951,9 +954,9 @@ describe('ear twitch', () => {
   });
 
   it('rejects bad spring indices', () => {
-    expect(() => createEarTwitch({ earL: -1, earR: 0 })).toThrow(RangeError);
-    expect(() => createEarTwitch({ earL: 0, earR: Number.NaN })).toThrow(RangeError);
-    const layer = createEarTwitch({ earL: BANK_SIZE, earR: 0 });
+    expect(() => createEarTwitch({ earL: -1, earR: 0 }, EYES_CENTER)).toThrow(RangeError);
+    expect(() => createEarTwitch({ earL: 0, earR: Number.NaN }, EYES_CENTER)).toThrow(RangeError);
+    const layer = createEarTwitch({ earL: BANK_SIZE, earR: 0 }, EYES_CENTER);
     expect(() => layer.update(DT, createPose(), makeCtx())).toThrow(RangeError);
   });
 });
@@ -984,7 +987,7 @@ function earRun(
   lookAtAt: (t: number) => LookAt | null,
   weights: LayerWeights = { ...FULL },
 ): EarTrace {
-  const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+  const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER);
   const ctx = makeCtx(SEED, weights);
   const steps = Math.round(seconds / dt);
   const out: EarTrace = {
@@ -1100,7 +1103,7 @@ describe('ear orientation toward a background touch (#255)', () => {
   });
 
   it('changes nothing without a touch: the ear channels hash as on main 49ee2b3 (seed 0x7467)', () => {
-    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+    const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER);
     const ctx = makeCtx();
     const b = base();
     const pose = createPose();
@@ -1250,12 +1253,12 @@ const WEIGHTED: {
   { name: 'breathing', make: () => createBreathing(), channels: [Ch.BodySquash, Ch.BellyJiggle] },
   {
     name: 'gaze',
-    make: () => createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }),
+    make: () => createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER),
     channels: [Ch.IrisX, Ch.IrisY, Ch.HeadRot, Ch.HeadTilt],
   },
   {
     name: 'ears',
-    make: () => createEarTwitch({ earL: IDX.earL, earR: IDX.earR }),
+    make: () => createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER),
     channels: [Ch.EarRotL, Ch.EarRotR],
   },
 ];
@@ -1286,14 +1289,14 @@ const CONTINUITY: { name: keyof LayerWeights; make: () => Clocked }[] = [
   {
     name: 'gaze',
     make: () => {
-      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
       return { layer, count: () => layer.count, since: () => layer.sinceSaccade };
     },
   },
   {
     name: 'ears',
     make: () => {
-      const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+      const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER);
       return { layer, count: () => layer.count, since: () => layer.sinceTwitch };
     },
   },
@@ -1396,7 +1399,7 @@ describe('weights', () => {
   );
 
   it('gives the full amount at weight 1: the iris, the springs and the breathing formula', () => {
-    const gaze = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+    const gaze = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
     const ctx = makeCtx();
     run(gaze, ctx, 600, (_i, _t, pose) => {
       expect(pose[Ch.IrisX]).toBe(Math.fround(gaze.irisX));
@@ -1446,8 +1449,8 @@ function makeAll(seed: number): AllLayers {
     layers: [
       createBlink(),
       createBreathing(),
-      createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }),
-      createEarTwitch({ earL: IDX.earL, earR: IDX.earR }),
+      createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER),
+      createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER),
       mood,
     ],
     pose: createPose(),
@@ -1567,14 +1570,14 @@ const TIMED: { name: string; make: () => Timed }[] = [
   {
     name: 'saccades',
     make: () => {
-      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
       return { layer, since: () => layer.sinceSaccade };
     },
   },
   {
     name: 'ear twitches',
     make: () => {
-      const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR });
+      const layer = createEarTwitch({ earL: IDX.earL, earR: IDX.earR }, EYES_CENTER);
       return { layer, since: () => layer.sinceTwitch };
     },
   },
@@ -1677,7 +1680,7 @@ describe('dt robustness: exact timing at any step (the app runs the layers at SU
       { side: 'right', lookAt: { x: 1500, y: 385 } },
       { side: 'down', lookAt: { x: 500, y: 1385 } },
     ])('settles the head at 0.3 ± 0.03 of the follow with lookAt held to the $side', ({ lookAt }) => {
-      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt });
+      const layer = createGaze({ headRot: IDX.headRot, headTilt: IDX.headTilt }, EYES_CENTER);
       const ctx = makeCtx();
       ctx.lookAt = lookAt;
       const last = createPose();

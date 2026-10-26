@@ -12,6 +12,7 @@ import { SETTINGS_KEY } from './app/settings.ts';
 import { boot } from './main.ts';
 import type { Pwa } from './pwa/register.ts';
 import { ANNOUNCEMENTS } from './ui/a11y.ts';
+import { JUNI } from './characters/juni.ts';
 
 const h = vi.hoisted(() => ({ views: [] as BearView[] }));
 
@@ -136,6 +137,8 @@ describe('boot: reduced motion and Gentle mode (#118)', () => {
     // Created during boot and still empty when boot returns: the screen reader registers the empty region first
     // (#295 review); the Asleep text follows once it has been exposed.
     expect(live[0]?.textContent).toBe('');
-    await vi.waitFor(() => expect(live[0]?.textContent).toBe(ANNOUNCEMENTS.Asleep), { timeout: 2_000 });
+    await vi.waitFor(() => expect(live[0]?.textContent).toBe(ANNOUNCEMENTS.Asleep(JUNI.names)), {
+      timeout: 2_000,
+    });
   });
 });

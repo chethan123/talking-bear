@@ -75,17 +75,18 @@ export type GentleClipName = `${(typeof GENTLE_BASES)[number]}Gentle`;
 export type ReactionClipName = BaseReactionClipName | GentleClipName;
 
 // ---- helpers (module setup only; nothing here runs per frame) -------------------------------------------------
+// `k`, `track`, `kick`, `gentle` and `lids` are exported for Fenn's clips (clips/fenn.ts, duck plan §4.6).
 
 type Ease = Key['ease'];
 type Side = 'L' | 'R';
 
 /** A key. */
-function k(t: number, v: number, ease?: Ease): Key {
+export function k(t: number, v: number, ease?: Ease): Key {
   return ease === undefined ? { t, v } : { t, v, ease };
 }
 
 /** A track. */
-function track(ch: number, ...keys: Key[]): Track {
+export function track(ch: number, ...keys: Key[]): Track {
   return { ch, keys };
 }
 
@@ -118,7 +119,7 @@ function pulse(t0: number, hz: number, cycles: number, amp: number): Key[] {
  * direction). The free response of an underdamped spring, x(t) = (dv/ωd)·e^(−ζωt)·sin(ωd·t), peaks where
  * ωd·t = θ = atan2(√(1 − ζ²), ζ), at (dv/ω)·e^(−ζθ/√(1 − ζ²)) (lab/rig.ts's `kickFor`).
  */
-function kick(spring: number, peak: number): number {
+export function kick(spring: number, peak: number): number {
   const p = SPRING_PARAMS[spring]!;
   const w = 2 * Math.PI * p.freqHz;
   const r = Math.sqrt(1 - p.zeta * p.zeta);
@@ -131,7 +132,7 @@ function capped(v: number, cap: number): number {
 }
 
 /** The variant of `base` with every key value and every kick × `GENTLE_SCALE`, and no `Stars` track. */
-function gentle(base: Clip): Clip {
+export function gentle(base: Clip): Clip {
   const c: Clip = {
     name: `${base.name}Gentle`,
     duration: base.duration,
@@ -156,7 +157,7 @@ const EAR_OUT = { L: -1, R: 1 } as const;
 const FOOT = { L: Ch.FootL, R: Ch.FootR } as const;
 
 /** The same keys on both lids. */
-function lids(...keys: Key[]): Track[] {
+export function lids(...keys: Key[]): Track[] {
   return [track(Ch.LidL, ...keys), track(Ch.LidR, ...keys)];
 }
 

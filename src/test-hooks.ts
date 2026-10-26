@@ -109,8 +109,8 @@ export interface BearTestApi {
   /** Every sfx the effect runner scheduled, oldest first. */
   sfxLog: SfxLogEntry[];
   /**
-   * The centre of hit region `id` (its first `REGIONS` entry) in viewport CSS px, from the bear's current bone
-   * matrices. Throws before the bear is mounted, and for `background`.
+   * The centre of hit region `id` (its first entry in the character's `spec.regions`) in viewport CSS px, from the
+   * bear's current bone matrices. Throws before the bear is mounted, and for `background`.
    */
   regionCenter(id: RegionId): { x: number; y: number };
   /**

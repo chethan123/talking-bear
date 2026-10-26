@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { cdp } from 'vitest/browser';
 import type { Overlay, SessionEvent } from '../app/events.ts';
 import { createSettingsStore } from '../app/settings.ts';
+import { JUNI } from '../characters/juni.ts';
 import type { IconName } from './icons.ts';
 import { LICENCES_TEXT } from './licences-screen.ts';
 import { mountOverlay, OVERLAY_TEXT } from './overlay.ts';
@@ -110,7 +111,14 @@ describe('overlay.ts: kid-first, text-free (#115)', () => {
   });
 
   test("the exported texts are the parent sheet's only", () => {
-    expect(OVERLAY_TEXT).toEqual({
+    // The lines that name the character are functions of its names (T121): Juni's are these.
+    const n = JUNI.names;
+    expect({
+      ...OVERLAY_TEXT,
+      parentTitle: OVERLAY_TEXT.parentTitle(n),
+      parentLocal: OVERLAY_TEXT.parentLocal(n),
+      parentMicOff: OVERLAY_TEXT.parentMicOff(n),
+    }).toEqual({
       parentTitle: PARENT[0],
       parentLocal: PARENT[1],
       parentMicOff: PARENT[2],

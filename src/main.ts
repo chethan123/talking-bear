@@ -3,7 +3,8 @@
 // (BearView: Juni on the canvas stage, driven by the session's `anim` effects and the replay's processed envelope,
 // and touched through the pointer input: adapter → recogniser → reactions table → director → session), the M1 text
 // overlays and the settings sheet (M3, M8: behind a 1 s press of the gear), with `data-state` on main#app for
-// hook-free smoke tests (plan §4.9.3), and the §4.10 performance marks (#122, src/perf.ts).
+// hook-free smoke tests (plan §4.9.3), the character swap button (duck plan §3.3, T126: Asleep only; the bear is
+// remounted with the chosen character), and the §4.10 performance marks (#122, src/perf.ts).
 import './security/tt-policy.ts'; // first: the Trusted Types default policy must exist before any sink call
 import './ui/styles.css';
 import { latencyFromQuery, mountBearView, type BearView } from './anim/bear-view.ts';
@@ -11,7 +12,8 @@ import type { Overlay, SessionState, StateName } from './app/events.ts';
 import { realClock } from './app/clock.ts';
 import { initialSessionState, overlayFor } from './app/machine.ts';
 import { createSession, type Session } from './app/session.ts';
-import { createSettingsStore, presetFor } from './app/settings.ts';
+import { createSettingsStore, presetFor, type SettingsStore } from './app/settings.ts';
+import { CHARACTERS, type CharacterId, type CharacterNames } from './characters/index.ts';
 import { createEngine } from './audio/engine.ts';
 import { createPlayer } from './audio/player.ts';
 import { createSfx } from './audio/sfx.ts';
@@ -22,6 +24,7 @@ import { createStorage } from './platform/storage.ts';
 import { createVisibility } from './platform/visibility.ts';
 import { createWakeLock } from './platform/wake-lock.ts';
 import { setupPwa } from './pwa/register.ts';
+import { characterThumbnail, mountCharacterSwitch } from './ui/character-switch.ts';
 import { mountOverlay } from './ui/overlay.ts';
 import { mountSettingsSheet, type SettingsSheet } from './ui/settings-sheet.ts';
 import { markBootStart, readPerfMeasures } from './perf.ts';
@@ -31,6 +34,8 @@ import { markBootStart, readPerfMeasures } from './perf.ts';
 markBootStart();
 
 const noop = (): void => {};
+/** The fade-in of a remounted stage (T126), ms; none under reduced motion. */
+const SWAP_FADE_MS = 200;
 
 /** A developer flag: the `localStorage` value `'1'`. Storage can throw (blocked site data); default false. */
 function readFlag(key: string): boolean {
@@ -56,6 +61,8 @@ export interface BootOptions {
   debug?: boolean;
   /** Called with the session as soon as it exists, before its first event (lab/vad-live's tally). */
   onSession?(s: Session): void;
+  /** Called with the settings store as soon as it exists (tests: a `character` change outside Asleep). */
+  onSettings?(store: SettingsStore): void;
   /**
    * With the overlay: called once it is up (`true`: it has turned the worker's feature trace on) or has failed to
    * load or mount (`false`: the trace is off), so a caller reports what actually ran (lab/vad-live's pre-gate).
@@ -106,6 +113,7 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
   const wakeLock = createWakeLock(navigator, visibility);
   const permission = createMicPermission(navigator, visibility);
   const settings = createSettingsStore(settingsStorage());
+  opts.onSettings?.(settings);
   const storage = createStorage(navigator);
   // Haptics (plan §4.6.3): the reactions' patterns, gated by the setting and by sticky activation. The latest
   // `vibrate` log line (X-A6) is kept for the debug overlay.
@@ -183,28 +191,43 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
   }
 
   const s = session;
-  // The bear (plan §7 M4) is the stage: mounted first, so the overlays and the sheet sit above it. `?L=<ms>`
-  // overrides the display-latency constant for X-A2. Its pointer input (plan §7 M5, #93) routes by the session
-  // state: in Asleep, Error and Paused a tap anywhere dispatches `tapBear`; while awake (MicDenied included) the
-  // gestures go to the director, whose `toSession` reactions come back through `dispatch` (session.dispatch),
-  // `haptic` patterns go to `haptics.play` and `mood` to its mood layer; the last pointer up and a stroke or
-  // long-press end release the director; background touches move the gaze; pointerdown / pointerup note the
-  // haptics' activation (bear-view.ts).
-  const view = mountBearView(app, {
-    visibility,
-    now: () => clock.now(),
-    state: () => s.state().name,
-    dispatch: (e) => s.dispatch(e),
-    engine,
-    haptics,
-    seed: Math.floor(Math.random() * 2 ** 32),
-    latencyMs: latencyFromQuery(location.search),
-  });
+  // The bear (plan §7 M4) is the stage: main#app's first child (bear-view.ts prepends it), so the overlays and the
+  // sheet sit above it. `?L=<ms>` overrides the display-latency constant for X-A2. Its pointer input (plan §7 M5,
+  // #93) routes by the session state: in Asleep, Error and Paused a tap anywhere dispatches `tapBear`; while awake
+  // (MicDenied included) the gestures go to the director, whose `toSession` reactions come back through `dispatch`
+  // (session.dispatch), `haptic` patterns go to `haptics.play` and `mood` to its mood layer; the last pointer up and
+  // a stroke or long-press end release the director; background touches move the gaze; pointerdown / pointerup note
+  // the haptics' activation (bear-view.ts).
+  //
+  // The character (duck plan §4.3, T126) is the stored one at boot. A change of `settings.character` is applied only
+  // in Asleep (mic closed, context suspended): the view is disposed and the new character mounted in its place, its
+  // director starting Asleep like the session. The swap button writes it only in Asleep; a change seen in any other
+  // state (no UI makes one: only a test, through `onSettings`) waits for the next entry into Asleep. The voice
+  // follows through `settingsChanged{preset}` in every state.
+  const seed = Math.floor(Math.random() * 2 ** 32);
+  const latencyMs = latencyFromQuery(location.search);
+  const mountCharacter = (id: CharacterId): BearView =>
+    mountBearView(app, {
+      visibility,
+      now: () => clock.now(),
+      state: () => s.state().name,
+      dispatch: (e) => s.dispatch(e),
+      engine,
+      haptics,
+      seed,
+      latencyMs,
+      character: CHARACTERS[id],
+    });
+  let mountedCharacter: CharacterId = settings.get().character;
+  let view = mountCharacter(mountedCharacter);
   bear = view;
+  /** The character the texts name (the paw's label, the parent sheet, the announcements, the privacy note). */
+  const names = (): CharacterNames => CHARACTERS[mountedCharacter].names;
   // Reduced motion (plan §4.6.6): the OS setting or the parent's Gentle mode; it also sets the director's gentle
-  // flag (gentle clips, no P4 escalation without one: plan §4.6.4).
+  // flag (gentle clips, no P4 escalation without one: plan §4.6.4). It reads the current view, so it follows a swap.
   const motion = matchMedia('(prefers-reduced-motion: reduce)');
-  const applyMotion = (): void => view.setReducedMotion(motion.matches || settings.get().gentleMode);
+  const reducedMotion = (): boolean => motion.matches || settings.get().gentleMode;
+  const applyMotion = (): void => view.setReducedMotion(reducedMotion());
   applyMotion();
   motion.addEventListener('change', applyMotion);
 
@@ -212,12 +235,9 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
   // engine and Gentle mode to the bear on every change. The sheet writes the store and also sets Quiet itself;
   // a repeated setQuiet is idempotent. Haptics, the sleep timeout and noisy-room NS are read where they are used
   // (createHaptics above, the session's `settings`).
+  // The store's subscriber is added below, once `applyCharacter` and the swap button it refreshes exist (nothing
+  // writes the store before then).
   s.dispatch({ t: 'settingsChanged', preset: presetFor(settings.get()) });
-  settings.subscribe((st) => {
-    s.dispatch({ t: 'settingsChanged', preset: presetFor(st) });
-    engine.setQuiet(st.quietMode);
-    applyMotion();
-  });
 
   // The hold-to-talk button (#116) stamps its holdStart / holdEnd with the context's frame clock, the capture
   // worklet's `currentFrame` domain the takes are cut in (plan §3.1); before the context exists it does nothing.
@@ -228,6 +248,7 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
       const ctx = engine.context();
       return ctx === null ? null : Math.round(ctx.currentTime * ctx.sampleRate);
     },
+    names,
   );
   sheet = mountSettingsSheet(app, {
     store: settings,
@@ -236,12 +257,52 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     // #114: "Try the microphone again" (For parents) dispatches `settingsRetry`; the sheet mounts the licences view.
     dispatch: (e) => s.dispatch(e),
     now: () => clock.now(),
+    names,
     pwa: {
       installAvailable: () => installAvailable,
       promptInstall: () => pwa.promptInstall(),
       updateReady: () => pwa.updateReady(),
       applyUpdate: () => pwa.applyUpdate(),
     },
+  });
+
+  // The swap button (T126): bottom left, shown only in Asleep, offering the other character. Mounted last, after the
+  // canvas, the overlay and the sheet (whose DOM order is unchanged), so styles.css can hide it after a fixed stage.
+  const characterSwitch = mountCharacterSwitch(app, {
+    state: () => s.state().name,
+    current: () => mountedCharacter,
+    // Only in Asleep: a click that lands just after the session left it (a second finger's tap on the canvas woke
+    // the bear between this button's pointerdown and its click) must not store a character that would only be
+    // mounted at the next Asleep, since the voice (`presetFor`) follows the stored character at once.
+    choose: (id) => {
+      if (s.state().name === 'Asleep') settings.set({ character: id }); // its subscriber's applyCharacter swaps
+      characterSwitch.refresh();
+    },
+    thumbnail: (id, size) => characterThumbnail(CHARACTERS[id], size),
+  });
+  /** Mounts the stored character in place of the current one if they differ and the session is Asleep. */
+  const applyCharacter = (): void => {
+    const want = settings.get().character;
+    if (want === mountedCharacter || s.state().name !== 'Asleep') return;
+    view.dispose();
+    mountedCharacter = want;
+    view = mountCharacter(want);
+    bear = view;
+    applyMotion();
+    // No fade under reduced motion, nor on a hidden page (a deferred swap applied on a hide into Asleep).
+    if (!reducedMotion() && visibility.current() === 'visible') {
+      view.canvas.animate({ opacity: [0, 1] }, SWAP_FADE_MS);
+    }
+    // The overlay rebuilds its named texts (the paw's label, the Asleep announcement) on a show that finds the names
+    // changed; the sheet reads them on every open.
+    showOverlay(overlayFor(s.state()));
+    characterSwitch.refresh();
+  };
+  settings.subscribe((st) => {
+    s.dispatch({ t: 'settingsChanged', preset: presetFor(st) });
+    engine.setQuiet(st.quietMode);
+    applyMotion();
+    applyCharacter();
   });
 
   // Developer overlay (plan §7 M2, M4, M5, M6, M8): the frame loop's p95 frame time and fps, the §4.10 performance
@@ -254,7 +315,7 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
       overlayModule,
       (m) =>
         m.mountDebugOverlay(app, {
-          frameStats: (out) => view.frameStats(out),
+          frameStats: (out) => view.frameStats(out), // the current view: it follows a swap
           // #122: the last first-frame and tap-to-listening measures.
           perf: readPerfMeasures,
           clock,
@@ -278,6 +339,8 @@ export async function boot(app: HTMLElement, opts: BootOptions = {}): Promise<vo
     if (st.name === shown) return;
     shown = st.name;
     app.dataset.state = st.name;
+    characterSwitch.refresh();
+    applyCharacter(); // a deferred swap, on entering Asleep
   };
   // The initial state produces no `ui` effect and no subscriber call.
   render(s.state());

@@ -29,7 +29,7 @@ const TIGHT_SEC = 0.03;
 /** The common Android rate besides 48 kHz: the checks must hold there too. */
 const OTHER_SAMPLE_RATE = 44100;
 
-/** The ids #88 lists, spelled out, so that a missing or misspelled one fails. */
+/** The ids #88 lists, then Fenn's (duck plan §4.6), spelled out, so that a missing or misspelled one fails. */
 const ISSUE_IDS = [
   'sneeze',
   'bigSneeze',
@@ -46,9 +46,29 @@ const ISSUE_IDS = [
   'hey',
   'whoa',
   'rustle',
+  'quack',
+  'bigQuack',
+  'nibble',
+  'trill',
+  'peep',
+  'flap',
+  'pat',
 ] as const satisfies readonly SfxId[];
 
-/** Every id to check: #88's, plus whatever `SYNTHS` holds (`testBeep`). */
+/** Fenn's ids (duck plan §4.6), whose level rule is a sample peak of −10 ± 1 dBFS rendered alone at 48 kHz. */
+const FENN_IDS = [
+  'quack',
+  'bigQuack',
+  'nibble',
+  'trill',
+  'peep',
+  'flap',
+  'pat',
+] as const satisfies readonly SfxId[];
+const FENN_PEAK_DB = -10;
+const FENN_PEAK_TOL_DB = 1;
+
+/** Every id to check: #88's and Fenn's, plus whatever `SYNTHS` holds (`testBeep`). */
 const IDS: readonly string[] = [...new Set<string>([...ISSUE_IDS, ...Object.keys(SYNTHS)])];
 
 interface Render {
@@ -180,8 +200,9 @@ function synthFor(id: string): SfxSynth | undefined {
 }
 
 describe('SYNTHS', () => {
-  test('holds exactly testBeep and the 15 ids of #88', () => {
+  test('holds exactly testBeep, the 15 ids of #88 and the 7 of duck plan §4.6 (23 ids)', () => {
     expect(Object.keys(SYNTHS).toSorted()).toEqual([...ISSUE_IDS, 'testBeep'].toSorted());
+    expect(Object.keys(SYNTHS)).toHaveLength(23);
   });
 
   describe.each([SAMPLE_RATE, OTHER_SAMPLE_RATE])('rendered alone at %i Hz', (sampleRate) => {
@@ -216,6 +237,21 @@ describe('SYNTHS', () => {
     expect(dur('pop')).toBe(0.06);
     expect(dur('sigh')).toBe(0.6);
     expect(dur('squeal')).toBe(0.35);
+  });
+
+  test.each(FENN_IDS)(
+    '%s: sample peak −10 ± 1 dBFS rendered alone at 48 kHz (duck plan §4.6 level rule)',
+    async (id) => {
+      const r = await render(SYNTHS[id]);
+      const peakDb = 20 * Math.log10(measure(r).peak);
+      expect(Math.abs(peakDb - FENN_PEAK_DB), describeRender(r)).toBeLessThanOrEqual(FENN_PEAK_TOL_DB);
+    },
+  );
+
+  test('the lengths duck plan §4.6 gives', () => {
+    const ctx = new OfflineAudioContext(1, 128, SAMPLE_RATE);
+    const dur = (id: SfxId): number => SYNTHS[id](ctx, ctx.destination, 0);
+    expect(FENN_IDS.map(dur)).toEqual([0.22, 0.85, 0.29, 0.5, 0.12, 0.28, 0.12]);
   });
 
   test('bigSneeze is longer and louder than sneeze', async () => {

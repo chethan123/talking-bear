@@ -10,6 +10,7 @@ import { cdp } from 'vitest/browser';
 import type { Overlay, Permission, SessionEvent, SessionState, StateName } from '../app/events.ts';
 import { initialSessionState, overlayFor, reduce, TABLE } from '../app/machine.ts';
 import { createSettingsStore } from '../app/settings.ts';
+import { JUNI } from '../characters/juni.ts';
 import { A11Y_TEXT, ANNOUNCEMENTS, announcementFor, LIVE_REGION_CLASS, liveRegion } from './a11y.ts';
 import { mountOverlay } from './overlay.ts';
 import { mountSettingsSheet, SETTINGS_TEXT, type SheetPwa } from './settings-sheet.ts';
@@ -57,7 +58,7 @@ function liveRegions(): Element[] {
 
 /** The icon-only variants and their names (issue #118 "Icon-only overlays get role=status with a hidden label"). */
 const ICON_VIEWS: readonly [Exclude<Overlay, null | 'parentPermission' | 'holdToTalk'>, string][] = [
-  ['tapToWake', A11Y_TEXT.tapToWake],
+  ['tapToWake', A11Y_TEXT.tapToWake(JUNI.names)],
   ['micHelp', A11Y_TEXT.micHelp],
   ['micMuted', A11Y_TEXT.micMuted],
   ['tooNoisy', A11Y_TEXT.tooNoisy],
@@ -109,20 +110,24 @@ describe('a11y.ts: the live region follows the overlay (#118)', () => {
   test('the announcing overlays are exactly those of Asleep, MicDenied and Error, over every state', () => {
     const STATES = Object.keys(TABLE).filter((k): k is StateName => Object.hasOwn(TABLE, k));
     expect(STATES).toHaveLength(12);
-    const announcements: Partial<Record<StateName, string>> = ANNOUNCEMENTS;
+    // Juni's texts: the character-named ones are functions of its names (T121).
+    const announcements: Partial<Record<StateName, string>> = {
+      ...ANNOUNCEMENTS,
+      Asleep: ANNOUNCEMENTS.Asleep(JUNI.names),
+    };
     for (const name of STATES) {
       for (const micMuted of [false, true]) {
         for (const tooNoisy of [false, true]) {
           for (const holdToTalk of [false, true]) {
             const o = overlayFor({ name, micMuted, tooNoisy, holdToTalk });
-            expect(announcementFor(o), `${name} ${micMuted} ${tooNoisy} ${holdToTalk}`).toBe(
+            expect(announcementFor(o, JUNI.names), `${name} ${micMuted} ${tooNoisy} ${holdToTalk}`).toBe(
               announcements[name] ?? '',
             );
           }
         }
       }
     }
-    expect(ANNOUNCEMENTS).toEqual({
+    expect(announcements).toEqual({
       Asleep: 'Juni is asleep. Tap to wake.',
       MicDenied: 'Microphone blocked. A parent can fix this in settings.',
       Error: 'Something went wrong. Tap to try again.',
@@ -206,7 +211,7 @@ describe('a11y.ts: the live region follows the overlay (#118)', () => {
         expect(node, `${variant}: a status node named ${label}`).toBeDefined();
         expect(live(node!), `${variant}: live`).toBeUndefined();
         // The region is the one polite live root: it is not named; it is the node whose child is its text.
-        const text = announcementFor(variant);
+        const text = announcementFor(variant, JUNI.names);
         if (text !== '') {
           const polite = nodes.filter((n) => live(n) === 'polite' && n.role?.value === 'generic');
           expect(polite, `${variant}: polite generic nodes`).toHaveLength(1);
@@ -259,7 +264,7 @@ describe('the live region across real transitions (#118)', () => {
     const show = mountOverlay(root, vi.fn());
     const m = session(show, 'granted');
     expect(m.s.name).toBe('Asleep');
-    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep);
+    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep(JUNI.names));
     expect(m.send({ t: 'tapBear' })).toBe('Waking');
     expect(region().textContent).toBe(''); // cleared on leaving Asleep
     const records = watch(region());
@@ -305,7 +310,7 @@ describe('the live region across real transitions (#118)', () => {
     const root = newRoot();
     const show = mountOverlay(root, vi.fn());
     show('tapToWake');
-    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep);
+    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep(JUNI.names));
     show(null); // Waking
     const records = watch(region());
     for (const o of [null, 'micMuted', 'holdToTalk', 'tooNoisy', null, 'holdToTalk'] as const) show(o);
@@ -319,7 +324,7 @@ describe('the live region across real transitions (#118)', () => {
       const root = newRoot();
       const show = mountOverlay(root, vi.fn());
       show(o);
-      const text = announcementFor(o);
+      const text = announcementFor(o, JUNI.names);
       expect(region().textContent).toBe(text);
       const records = watch(region());
       show(o);
@@ -351,7 +356,7 @@ describe('the live region across real transitions (#118)', () => {
     expect(e.send({ t: 'timer', name: 'waking' })).toBe('Error');
     expect(region().textContent).toBe('Something went wrong. Tap to try again.');
     expect(e.send({ t: 'hidden' })).toBe('Asleep');
-    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep);
+    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep(JUNI.names));
     // Error → tap → Waking clears it.
     const e2 = session(show, 'granted');
     e2.send({ t: 'tapBear' });
@@ -378,7 +383,7 @@ describe('the live region across real transitions (#118)', () => {
     expect(region().textContent).toBe('');
     // Asleep (granted) + settingsRetry.
     const c = session(show, 'granted');
-    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep);
+    expect(region().textContent).toBe(ANNOUNCEMENTS.Asleep(JUNI.names));
     expect(c.send({ t: 'settingsRetry' })).toBe('Waking');
     expect(region().textContent).toBe('');
   });
@@ -397,9 +402,9 @@ describe('a new region is exposed empty before its first text (#295 review)', ()
     expect(r.textContent).toBe('');
     const records = watch(r);
     await liveRegion().ready;
-    expect(r.textContent).toBe(ANNOUNCEMENTS.Asleep);
+    expect(r.textContent).toBe(ANNOUNCEMENTS.Asleep(JUNI.names));
     expect(records().flatMap((m) => Array.from(m.addedNodes, (n) => n.textContent))).toEqual([
-      ANNOUNCEMENTS.Asleep,
+      ANNOUNCEMENTS.Asleep(JUNI.names),
     ]);
   });
 
