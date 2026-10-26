@@ -35,7 +35,7 @@ RUN go vet ./... && go test ./... && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -buildid=" -o /out/bearserve .
 
 # gcr.io/distroless/static-debian13:nonroot index (multi-arch) digest, resolved 2026-10-09
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99
 ENV GOMEMLIMIT=48MiB
 COPY --from=server /out/bearserve /bearserve
 USER 65532:65532
