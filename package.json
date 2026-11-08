@@ -40,7 +40,7 @@
     "@vitest/browser-playwright": "5.0.2",
     "@vitest/coverage-v8": "5.0.2",
     "fast-check": "4.10.2",
-    "onnxruntime-web": "1.30.0",
+    "onnxruntime-web": "1.31.1",
     "oxlint": "1.87.0",
     "oxlint-tsgolint": "7.0.2005",
     "playwright": "1.63.0",
