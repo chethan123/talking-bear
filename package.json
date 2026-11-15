@@ -33,7 +33,7 @@
     "verify": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
-    "@playwright/test": "1.63.0",
+    "@playwright/test": "1.65.0",
     "@size-limit/file": "14.3.0",
     "@types/audioworklet": "0.0.101",
     "@types/node": "24.19.0",
