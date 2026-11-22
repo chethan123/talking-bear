@@ -42,7 +42,7 @@
     "fast-check": "4.10.2",
     "onnxruntime-web": "1.31.1",
     "oxlint": "1.87.0",
-    "oxlint-tsgolint": "7.0.2005",
+    "oxlint-tsgolint": "7.0.2007",
     "playwright": "1.63.0",
     "prettier": "3.10.1",
     "size-limit": "14.3.0",
