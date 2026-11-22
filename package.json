@@ -39,7 +39,7 @@
     "@types/node": "24.19.0",
     "@vitest/browser-playwright": "5.0.2",
     "@vitest/coverage-v8": "5.0.2",
-    "fast-check": "4.10.2",
+    "fast-check": "4.10.3",
     "onnxruntime-web": "1.31.1",
     "oxlint": "1.87.0",
     "oxlint-tsgolint": "7.0.2005",
